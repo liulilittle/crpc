@@ -1,0 +1,64 @@
+# Build outputs
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Compiler / linker artifacts
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.so.*
+*.dylib
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.map
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# Test / coverage
+Testing/
+*.log
+!docs/**/*.log
+coverage/
+*.lcov
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Working memory and private design material (kept local, not published)
+.opencode/
+.superpowers/
+
+# Third-party checkouts fetched by CMake
+_deps/
+third_party/_fetched/
+
+# Local scratch
+tmp/
+scratch/
