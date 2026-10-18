@@ -17,9 +17,9 @@ languages; the pairs are linked at the top of each file.
 | 6 | [Engineering principles](principles.md) | [工程原则](principles.zh-CN.md) |
 | 7 | [Performance report](performance.md) | [性能报告](performance.zh-CN.md) |
 
-Documents 3, 4, 7 are produced as the corresponding modules land; the index is
-updated in the same commit that adds them. A missing entry is a documentation
-defect, not an oversight.
+All documents in the index are present. Their per-module status is recorded in
+the status matrix of document 3 and in the design specification's chapter 21; a
+missing entry or a broken link is a documentation defect, not an oversight.
 
 ## Reading order
 

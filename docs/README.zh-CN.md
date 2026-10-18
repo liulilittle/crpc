@@ -16,8 +16,8 @@
 | 6 | [工程原则](principles.zh-CN.md) | [Engineering principles](principles.md) |
 | 7 | [性能报告](performance.zh-CN.md) | [Performance report](performance.md) |
 
-第 3、4、7 份文档随对应模块落地而产出；索引在新增文档的同一个提交里更新。
-索引缺项视为文档缺陷，不是疏漏。
+索引中的文档均已存在。各模块状态见第 3 份文档的状态矩阵与设计规格第 21 章；
+索引缺项或链接失效视为文档缺陷，不是疏漏。
 
 ## 阅读顺序
 

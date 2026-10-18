@@ -51,6 +51,7 @@
 #include <cstddef>
 
 #include <crpc/buffer.hpp>
+#include <crpc/codec_id.hpp>
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
 #include <crpc/span.hpp>
@@ -210,21 +211,9 @@ struct frame {
 
 // --- Call envelope -----------------------------------------------------------
 
-// Codec identifiers carried in the call envelope. Values are the same as the
-// handshake `codec` TLV (section 7.5).
-enum class codec_id : u16 {
-    binary = 0,
-    json = 1,
-    xml = 2,
-    ini = 3,
-    toml = 4,
-    protobuf = 5,
-    flatbuffers = 6
-};
-
-[[nodiscard]] constexpr bool is_known_codec(codec_id codec) noexcept {
-    return static_cast<u16>(codec) <= static_cast<u16>(codec_id::flatbuffers);
-}
+// The codec id type and its numeric values are defined in <crpc/codec_id.hpp>,
+// which both this header and the codec registry include. See that file for the
+// rules (0 reserved, append-only, fail closed on unknown).
 
 inline constexpr u8 call_flag_has_extensions = 0x01;
 inline constexpr u8 call_flag_known_mask = call_flag_has_extensions;
@@ -258,7 +247,7 @@ struct call_envelope {
     u64 service_id = 0;
     u64 method_id = 0;
     u8 call_flags = 0;
-    codec_id codec = codec_id::binary;
+    codec_id codec = codec_id::crpc_binary;
     trace_extension extensions;
     span<const std::byte> body;
 };
@@ -380,3 +369,5 @@ private:
 } // namespace crpc
 
 #endif // CRPC_FRAME_HPP
+
+

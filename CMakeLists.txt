@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+﻿cmake_minimum_required(VERSION 3.16)
 project(crpc VERSION 0.1.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
@@ -10,6 +10,8 @@ option(CRPC_BUILD_BENCH "Build microbenchmarks" OFF)
 option(CRPC_BUILD_EXAMPLES "Build the examples" OFF)
 option(CRPC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(CRPC_ENABLE_LTO "Enable link-time optimisation in Release builds" ON)
+option(CRPC_BUILD_SHARED "Build crpc as a shared library" OFF)
+option(CRPC_WITH_OPENSSL "Enable the OpenSSL TLS backend (HTTPS)" OFF)
 
 set(CRPC_SANITIZER "" CACHE STRING
     "Sanitizer to enable: empty, address, undefined, or thread")
@@ -118,7 +120,7 @@ endif()
 # CRPC_BUILD_SHARED=ON  -> shared library, CRPC_SHARED/CRPC_BUILDING defined
 # CRPC_BUILD_SHARED=OFF -> static archive (default)
 
-option(CRPC_BUILD_SHARED "Build crpc as a shared library" OFF)
+# CRPC_BUILD_SHARED is declared in the options block at the top.
 
 set(CRPC_LIBRARY_TYPE STATIC)
 if(CRPC_BUILD_SHARED)
@@ -184,6 +186,22 @@ if(CRPC_HAVE_RTTI)
     target_compile_definitions(crpc PUBLIC CRPC_HAVE_RTTI=1)
 endif()
 
+# --- Optional OpenSSL TLS backend -------------------------------------------
+#
+# Off by default: the library is fully functional without it (plain TCP and
+# HTTP/1.1 + HTTP/2 over cleartext). Turning it on adds the HTTPS entry point.
+# The public headers never include an OpenSSL header, so consumers that do not
+# enable it are unaffected.
+
+if(CRPC_WITH_OPENSSL)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(crpc PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(crpc PUBLIC CRPC_HAVE_OPENSSL=1)
+    message(STATUS "CRPC: OpenSSL ${OPENSSL_VERSION} enabled (HTTPS)")
+else()
+    message(STATUS "CRPC: OpenSSL disabled (no HTTPS)")
+endif()
+
 
 # The codec layer consumes RTTI's public reflection headers and (for JSON and
 # the text/schema adapters) its compiled static library. Linking it PUBLIC also
@@ -220,3 +238,4 @@ endif()
 if(CRPC_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
+

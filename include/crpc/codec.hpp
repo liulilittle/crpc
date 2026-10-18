@@ -85,6 +85,7 @@
 #include <vector>
 
 #include <crpc/buffer.hpp>
+#include <crpc/codec_id.hpp>
 #include <crpc/config.hpp>
 #include <crpc/endian.hpp>
 #include <crpc/error.hpp>
@@ -153,17 +154,8 @@
 
 namespace crpc {
 
-// Wire constants. Never renumbered; the numeric values are part of the
-// protocol contract (design spec section 7.5).
-enum class codec_id : u16 {
-    crpc_binary = 1,
-    json = 2,
-    xml = 3,
-    ini = 4,
-    toml = 5,
-    protobuf = 6,
-    flatbuffers = 7
-};
+// The codec id type and its numeric values live in <crpc/codec_id.hpp>; the
+// registry and the frame codec must agree, so there is exactly one definition.
 
 // Type-erased codec boundary. Implementations must be immutable after
 // construction (apart from their internal type-registration cache) so that a
@@ -1524,6 +1516,8 @@ template <typename T>
 } // namespace crpc
 
 #endif // CRPC_CODEC_HPP
+
+
 
 
 

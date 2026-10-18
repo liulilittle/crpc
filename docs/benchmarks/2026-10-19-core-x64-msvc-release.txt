@@ -1,0 +1,18 @@
+﻿=== CRPC benchmark ===
+compiler: MSVC 1951
+build: Release (NDEBUG)
+arch: x64
+note: single-process loopback unless the case name says otherwise
+
+endian/store_le64                                     0.2 ns/op   (spread 0.1, runs 7)
+endian/load_le64                                      0.1 ns/op   (spread 0.1, runs 7)
+wire/put_varint_small                                 1.4 ns/op   (spread 1.0, runs 7)
+wire/get_varint_u64                                   5.3 ns/op   (spread 1.8, runs 7)
+frame/encode_header_16B                               1.0 ns/op   (spread 0.3, runs 7)
+frame/decode_header_16B                               6.2 ns/op   (spread 2.1, runs 7)
+frame/decoder_small_16B_per_frame                    10.1 ns/op   (spread 0.6, runs 7)
+frame/decoder_large_1KiB                             46.7 ns/op   (spread 2.0, runs 7)
+codec/binary_encode_small                           218.8 ns/op   (spread 91.3, runs 7)
+codec/binary_decode_small                           232.9 ns/op   (spread 99.8, runs 7)
+
+10 case(s) recorded

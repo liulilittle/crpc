@@ -310,7 +310,7 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
     call_envelope envelope;
     envelope.service_id = service_id;
     envelope.method_id = method_id;
-    envelope.codec = codec_id::binary;
+    envelope.codec = codec_id::crpc_binary;
     envelope.body = body;
 
     trace_extension& ext = envelope.extensions;

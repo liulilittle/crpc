@@ -1,0 +1,449 @@
+// CRPC -- client facade: connection pool, load balancing, breaker and retry.
+//
+// A `client` owns one pool of connections per configured endpoint. A call
+// selects an endpoint through a `resilience::load_balancer`, admits it through
+// that endpoint's circuit breaker, takes a pooled connection and hands the
+// request to the low-level `rpc::client`. A failed connection is dropped from
+// the pool and counted; the next attempt re-selects an endpoint.
+//
+// Coroutine suspension
+// --------------------
+// `call<Resp>::get()` suspends when called from a coroutine of the runtime the
+// client was bound to with `builder::on_shard()`. The response completion runs
+// on whichever thread received the bytes; it sets the call's ready flag and
+// rings the shard doorbell. Inside the shard the coroutine parks through
+// `runtime::park()`; a plain thread instead waits on a condition variable for
+// `options::plain_thread_timeout` and then fails with `deadline_exceeded`.
+// Calling `get()` from a shard thread that is not inside a coroutine fails with
+// `failed_precondition` rather than stalling the shard.
+//
+// Retry
+// -----
+// A retry happens only when the failure code is `is_retryable`, the call is
+// declared idempotent (or carries an idempotency key), the shared retry budget
+// admits it, and the overall deadline has not passed. Every attempt re-selects
+// an endpoint through the load balancer and re-admits through the breaker. The
+// same idempotency key is reused across attempts.
+//
+// Thread safety
+// -------------
+// Public methods are intended to be called from the shard bound with
+// `on_shard()` (or from a plain thread when no shard is bound). The reader
+// path may run on any thread; per-connection access is serialized by an
+// internal recursive lock. `close()` and `stats()` are safe from any thread.
+#ifndef CRPC_CLIENT_FACADE_HPP
+#define CRPC_CLIENT_FACADE_HPP
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <crpc/buffer.hpp>
+#include <crpc/config.hpp>
+#include <crpc/error.hpp>
+#include <crpc/frame.hpp>
+#include <crpc/io.hpp>
+#include <crpc/resilience/circuit_breaker.hpp>
+#include <crpc/resilience/load_balancer.hpp>
+#include <crpc/resilience/retry.hpp>
+#include <crpc/rpc/call.hpp>
+#include <crpc/rpc/client.hpp>
+#include <crpc/runtime.hpp>
+#include <crpc/span.hpp>
+
+namespace crpc {
+
+class client;
+
+namespace client_detail {
+
+// One pooled connection plus its serialization lock.
+struct connection_slot {
+    struct guarded_source final : io::source {
+        explicit guarded_source(connection_slot* owner) noexcept : self(owner) {}
+
+        std::size_t on_data(span<const std::byte> data) noexcept override {
+            std::lock_guard<std::recursive_mutex> lk(self->mutex);
+            return self->conn ? self->conn->source().on_data(data) : 0;
+        }
+        void on_eof() noexcept override {
+            std::lock_guard<std::recursive_mutex> lk(self->mutex);
+            if (self->conn) {
+                self->conn->source().on_eof();
+            }
+        }
+        void on_error(std::error_code ec) noexcept override {
+            std::lock_guard<std::recursive_mutex> lk(self->mutex);
+            if (self->conn) {
+                self->conn->source().on_error(ec);
+            }
+        }
+
+        connection_slot* self;
+    };
+
+    std::unique_ptr<rpc::client> conn;
+    std::unique_ptr<guarded_source> guarded;
+    std::recursive_mutex mutex;
+    std::atomic<std::uint32_t> in_flight{0};
+    std::atomic<bool> healthy{true};
+    std::chrono::steady_clock::time_point idle_since{};
+    void* pool = nullptr;
+};
+
+// Type-independent per-call state.
+struct call_core {
+    client* owner = nullptr;
+    u64 service_id = 0;
+    u64 method_id = 0;
+    buffer request;
+    rpc::call_context ctx;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> done{false};
+    std::atomic<rpc_code> terminal{rpc_code::ok};
+    rpc_error error;
+    std::uint32_t attempts = 0;
+    bool idempotent = false;
+    bool has_deadline = false;
+    std::chrono::steady_clock::time_point deadline{};
+    void* pool = nullptr;
+    std::shared_ptr<connection_slot> slot;
+    resilience::breaker_permit permit;
+    std::unique_ptr<resilience::retry_sequence> retry;
+
+    void signal() noexcept;
+    void reset_for_attempt() noexcept {
+        done.store(false, std::memory_order_release);
+        terminal.store(rpc_code::ok, std::memory_order_release);
+    }
+};
+
+template <typename Resp>
+struct call_state {
+    call_core core;
+    std::unique_ptr<rpc::call<Resp>> inner;
+};
+
+template <typename Resp>
+struct wake_functor {
+    call_core* core = nullptr;
+    void operator()(rpc::call<Resp>&) const noexcept {
+        if (core != nullptr) {
+            core->signal();
+        }
+    }
+};
+
+} // namespace client_detail
+
+class CRPC_API client {
+public:
+    struct endpoint_config {
+        endpoint ep;
+        backend_factory* backend = nullptr;
+    };
+
+    struct options {
+        // Codec advertised in the call envelope. Only crpc-binary is wired.
+        codec_id codec = codec_id::crpc_binary;
+        // Connections kept per endpoint.
+        std::size_t pool_size = 1;
+        // Call slots preallocated per connection.
+        std::size_t slot_capacity = 4096;
+        // In-flight cap per connection. Zero disables the cap.
+        std::size_t max_inflight_per_connection = 1024;
+        // Load balancing across endpoints.
+        resilience::lb_strategy lb = resilience::lb_strategy::round_robin;
+        // Circuit breaker per endpoint.
+        resilience::breaker_config breaker{};
+        // Retry policy for the whole client.
+        resilience::retry_policy retry{};
+        // Applied when a call carries no explicit deadline.
+        std::chrono::nanoseconds default_deadline{std::chrono::seconds(1)};
+        bool default_idempotent = false;
+        // Plain-thread blocking bound for `get()`.
+        std::chrono::nanoseconds plain_thread_timeout{std::chrono::seconds(5)};
+        // Drop connections idle longer than this, keeping one warm connection.
+        // Zero disables idle eviction.
+        std::chrono::milliseconds idle_eviction{std::chrono::milliseconds(0)};
+        // Shard that drives the connections and the deadline tick. Optional.
+        runtime* shard = nullptr;
+    };
+
+    struct statistics {
+        std::size_t active_connections = 0;
+        std::size_t in_flight_calls = 0;
+        std::size_t failed_connections = 0;
+        std::size_t calls_started = 0;
+        std::size_t retries = 0;
+        std::size_t breaker_rejections = 0;
+    };
+
+    class builder {
+    public:
+        builder& add_endpoint(endpoint ep, backend_factory& backend);
+        builder& pool_size(std::size_t value);
+        builder& slot_capacity(std::size_t value);
+        builder& max_inflight_per_connection(std::size_t value);
+        builder& load_balancer(resilience::lb_strategy strategy);
+        builder& breaker(resilience::breaker_config config);
+        builder& retry(resilience::retry_policy policy);
+        builder& default_deadline(std::chrono::nanoseconds value);
+        builder& default_idempotent(bool value);
+        builder& plain_thread_timeout(std::chrono::nanoseconds value);
+        builder& idle_eviction(std::chrono::milliseconds value);
+        builder& on_shard(runtime& shard);
+        [[nodiscard]] std::unique_ptr<client> build();
+
+    private:
+        options options_{};
+        std::vector<endpoint_config> endpoints_;
+    };
+
+    template <typename Resp>
+    class [[nodiscard]] call {
+    public:
+        call() noexcept = default;
+        call(call&&) noexcept = default;
+        call& operator=(call&&) noexcept = default;
+        call(const call&) = delete;
+        call& operator=(const call&) = delete;
+        ~call() = default;
+
+        [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
+        [[nodiscard]] bool ready() const noexcept {
+            return state_ != nullptr && state_->core.done.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] std::uint32_t attempts() const noexcept {
+            return state_ != nullptr ? state_->core.attempts : 0;
+        }
+
+        // Suspends (or blocks) until a terminal result is available. Returns
+        // the decoded value, or the last error when retries are exhausted.
+        [[nodiscard]] rpc::rpc_result<Resp> get() {
+            if (state_ == nullptr || state_->core.owner == nullptr) {
+                return rpc::rpc_result<Resp>(
+                    rpc_error(rpc_code::failed_precondition, "invalid call handle"));
+            }
+            std::shared_ptr<client_detail::call_state<Resp>> st = state_;
+            client* owner = st->core.owner;
+            for (;;) {
+                if (st->inner != nullptr) {
+                    const status waited = owner->wait_ready(st->core);
+                    if (!waited.ok()) {
+                        rpc_error failure(rpc_code::deadline_exceeded,
+                                          "call did not complete in time");
+                        if (waited.code() == rpc_code::failed_precondition) {
+                            failure = waited.error();
+                        }
+                        return rpc::rpc_result<Resp>(std::move(failure));
+                    }
+                    rpc::rpc_result<Resp> result(
+                        rpc_error(rpc_code::internal, "call produced no result"));
+                    const bool decoded = st->inner->try_get(result);
+                    const rpc_code code = st->inner->code();
+                    st->inner.reset();
+                    owner->finish_attempt(st->core, code);
+                    if (decoded && code == rpc_code::ok) {
+                        return result;
+                    }
+                    std::chrono::nanoseconds delay{0};
+                    if (!owner->should_retry(st->core, code, delay)) {
+                        return result;
+                    }
+                    owner->sleep_for(st->core, delay);
+                    st->core.reset_for_attempt();
+                    continue;
+                }
+
+                rpc_error failure;
+                const status issued = owner->issue(*st, failure);
+                if (issued.ok()) {
+                    continue;
+                }
+                std::chrono::nanoseconds delay{0};
+                if (!owner->should_retry(st->core, failure.code, delay)) {
+                    return rpc::rpc_result<Resp>(std::move(failure));
+                }
+                owner->sleep_for(st->core, delay);
+            }
+        }
+
+        [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
+            if (state_ == nullptr || state_->inner == nullptr ||
+                !state_->core.done.load(std::memory_order_acquire)) {
+                return false;
+            }
+            return state_->inner->try_get(out);
+        }
+
+        // Cancels the in-flight attempt. Idempotent.
+        void cancel() noexcept {
+            if (state_ != nullptr && state_->inner) {
+                state_->inner->cancel();
+            }
+        }
+
+    private:
+        friend class crpc::client;
+
+        std::shared_ptr<client_detail::call_state<Resp>> state_;
+    };
+
+    // Typed stub: encodes Req, returns call<Resp>.
+    template <typename Resp, typename Req>
+    class [[nodiscard]] stub {
+    public:
+        stub(client& owner, u64 service_id, u64 method_id) noexcept
+            : owner_(&owner), service_id_(service_id), method_id_(method_id) {}
+
+        [[nodiscard]] rpc::rpc_result<client::call<Resp>> call(
+            const Req& request, rpc::call_context ctx = {}) {
+            buffer encoded;
+            const status encoded_status = rpc::call_codec<Req>::encode(request, encoded);
+            if (!encoded_status.ok()) {
+                return rpc::rpc_result<client::call<Resp>>(encoded_status.error());
+            }
+            return owner_->template start_encoded<Resp>(service_id_, method_id_,
+                                                        encoded.readable(), std::move(ctx));
+        }
+
+    private:
+        client* owner_;
+        u64 service_id_;
+        u64 method_id_;
+    };
+
+    template <typename Resp, typename Req>
+    [[nodiscard]] stub<Resp, Req> service(u64 service_id, u64 method_id) {
+        return stub<Resp, Req>(*this, service_id, method_id);
+    }
+
+    ~client();
+    client(const client&) = delete;
+    client& operator=(const client&) = delete;
+    client(client&&) = delete;
+    client& operator=(client&&) = delete;
+
+    // Closes every pooled connection and cancels in-flight calls.
+    void close() noexcept;
+
+    [[nodiscard]] bool closed() const noexcept;
+    [[nodiscard]] statistics stats() const noexcept;
+
+    // Low-level path used by `stub`. Encodes are the caller's responsibility.
+    template <typename Resp>
+    [[nodiscard]] rpc::rpc_result<client::call<Resp>> start_encoded(
+        u64 service_id, u64 method_id, span<const std::byte> request_body,
+        rpc::call_context ctx = {}) {
+        if (closed_.load(std::memory_order_acquire)) {
+            return rpc::rpc_result<client::call<Resp>>(
+                rpc_error(rpc_code::shutting_down, "client is closed"));
+        }
+        auto st = std::make_shared<client_detail::call_state<Resp>>();
+        client_detail::call_core& core = st->core;
+        core.owner = this;
+        core.service_id = service_id;
+        core.method_id = method_id;
+        if (!core.request.append(request_body)) {
+            return rpc::rpc_result<client::call<Resp>>(rpc_error(rpc_code::resource_exhausted));
+        }
+        normalize_context(core, ctx);
+        core.retry = std::make_unique<resilience::retry_sequence>(options_.retry, &budget_);
+        budget_.on_request();
+
+        rpc_error failure;
+        const status issued = issue(*st, failure);
+        if (!issued.ok()) {
+            return rpc::rpc_result<client::call<Resp>>(std::move(failure));
+        }
+        call<Resp> handle;
+        handle.state_ = std::move(st);
+        return rpc::rpc_result<client::call<Resp>>(std::move(handle));
+    }
+
+    struct impl;
+
+private:
+    friend class builder;
+    friend struct client_detail::call_core;
+    client(options opt, std::vector<endpoint_config> endpoints);
+
+    template <typename Resp>
+    status issue(client_detail::call_state<Resp>& st, rpc_error& failure);
+
+    void normalize_context(client_detail::call_core& core, const rpc::call_context& ctx);
+    bool begin_attempt(client_detail::call_core& core, rpc_error& failure);
+    std::shared_ptr<client_detail::connection_slot> acquire_slot(
+        client_detail::call_core& core, rpc_error& failure);
+    void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
+                      rpc_code code) noexcept;
+    void finish_attempt(client_detail::call_core& core, rpc_code code) noexcept;
+    [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
+                                    std::chrono::nanoseconds& delay) noexcept;
+    [[nodiscard]] status wait_ready(client_detail::call_core& core) const;
+    void sleep_for(client_detail::call_core& core, std::chrono::nanoseconds delay) noexcept;
+    void notify_waiter() noexcept;
+    rpc::call_id make_call_id() noexcept;
+    void tick_poll() noexcept;
+    void evict_idle() noexcept;
+    static void deadline_thunk(void* ctx) noexcept;
+
+    options options_;
+    std::vector<endpoint_config> endpoints_;
+    std::unique_ptr<impl> impl_;
+    std::atomic<bool> closed_{false};
+    std::atomic<std::uint64_t> seq_{0};
+    std::array<std::byte, 16> client_id_{};
+    resilience::retry_budget budget_;
+    std::atomic<std::size_t> calls_started_{0};
+    std::atomic<std::size_t> retries_{0};
+    std::atomic<std::size_t> breaker_rejections_{0};
+};
+
+// --- Template implementations ------------------------------------------------
+
+template <typename Resp>
+status client::issue(client_detail::call_state<Resp>& st, rpc_error& failure) {
+    client_detail::call_core& core = st.core;
+    if (!begin_attempt(core, failure)) {
+        return status{failure};
+    }
+    std::shared_ptr<client_detail::connection_slot> slot = acquire_slot(core, failure);
+    if (!slot) {
+        finish_attempt(core, failure.code);
+        return status{failure};
+    }
+    core.slot = slot;
+
+    std::lock_guard<std::recursive_mutex> lk(slot->mutex);
+    if (!slot->healthy.load(std::memory_order_acquire) || !slot->conn ||
+        !slot->conn->is_open()) {
+        rpc_error unavailable(rpc_code::unavailable, "connection is not usable");
+        failure = unavailable;
+        finish_attempt(core, unavailable.code);
+        return status{failure};
+    }
+    rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
+        core.service_id, core.method_id, core.request.readable(), core.ctx);
+    if (!started.ok()) {
+        failure = started.error();
+        finish_attempt(core, failure.code);
+        return status{failure};
+    }
+    st.inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+    st.inner->then(client_detail::wake_functor<Resp>{&core});
+    return status{};
+}
+
+} // namespace crpc
+
+#endif // CRPC_CLIENT_FACADE_HPP
