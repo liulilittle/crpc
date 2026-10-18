@@ -1,4 +1,4 @@
-// CRPC -- tests for the frame codec.
+﻿// CRPC -- tests for the frame codec.
 //
 // Coverage targets: every header field, flag independence, stream scope,
 // reserved field, compression flag consistency, ordered extension, golden
@@ -521,7 +521,7 @@ CRPC_TEST(call_envelope_without_extensions) {
     call_envelope value;
     value.service_id = 1;
     value.method_id = 2;
-    value.codec = codec_id::binary;
+    value.codec = codec_id::crpc_binary;
     value.body = as_span(body);
 
     CRPC_CHECK_EQ(encoded_call_envelope_size(value), static_cast<std::size_t>(19 + body.size()));
@@ -538,7 +538,7 @@ CRPC_TEST(call_envelope_without_extensions) {
 CRPC_TEST(call_envelope_rejects_unknown_codec) {
     const std::vector<std::byte> body = bytes_of("x");
     call_envelope value;
-    value.codec = static_cast<codec_id>(7);
+    value.codec = static_cast<codec_id>(200);
     value.body = as_span(body);
 
     std::vector<std::byte> out(64);
@@ -553,7 +553,7 @@ CRPC_TEST(call_envelope_rejects_unknown_codec) {
     writer.put_u64(0);
     writer.put_u64(0);
     writer.put_u8(0);
-    writer.put_u16(7);
+    writer.put_u16(200);
     CRPC_CHECK(writer.ok());
 
     call_envelope decoded;
@@ -916,3 +916,4 @@ CRPC_TEST(frame_decoder_fuzz_mutated_frames_never_crashes) {
 }
 
 CRPC_TEST_MAIN()
+

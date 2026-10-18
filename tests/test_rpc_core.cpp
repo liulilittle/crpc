@@ -1,4 +1,4 @@
-// CRPC -- RPC core tests: state machine, slot pool, client, dispatcher.
+﻿// CRPC -- RPC core tests: state machine, slot pool, client, dispatcher.
 //
 // The race tests exercise the single-terminal-transition guarantee directly on
 // a `call_slot`; the client tests wire a client to a dispatcher through the
@@ -230,7 +230,7 @@ built_request make_call(u64 service_id, u64 method_id, span<const std::byte> bod
     call_envelope envelope;
     envelope.service_id = service_id;
     envelope.method_id = method_id;
-    envelope.codec = codec_id::binary;
+    envelope.codec = codec_id::crpc_binary;
     envelope.body = body;
     if (has_deadline) {
         envelope.call_flags = call_flag_has_extensions;
@@ -843,3 +843,4 @@ CRPC_TEST(client_slots_released_and_no_leak) {
 } // namespace
 
 CRPC_TEST_MAIN()
+
