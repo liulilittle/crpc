@@ -116,6 +116,11 @@ struct tracer_config {
     void* clock_user = nullptr;
 };
 
+// Forward declaration: `friend class tracer;` inside `span` does not introduce
+// a name visible to ordinary lookup before the definition (MSVC accepts it,
+// GCC 13 rejects it with "tracer does not name a type").
+class tracer;
+
 // RAII span. Not copyable; movable. A span is tied to the thread that created
 // it and must be finished (or destroyed) on that thread.
 class [[nodiscard]] span {

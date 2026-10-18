@@ -41,18 +41,6 @@ bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
     return true;
 }
 
-std::string to_lower(std::string_view text) {
-    std::string out;
-    out.reserve(text.size());
-    for (char c : text) {
-        if (c >= 'A' && c <= 'Z') {
-            c = static_cast<char>(c - 'A' + 'a');
-        }
-        out.push_back(c);
-    }
-    return out;
-}
-
 bool parse_quality(std::string_view text, double& value) noexcept {
     const std::string_view s = trim_ows(text);
     if (s.empty()) {
@@ -1267,12 +1255,14 @@ struct content_encoder::impl {
     }
 
     void put_literal(std::uint8_t value, std::string& out) {
+        // `value` is a byte (0..255), so this covers the whole domain: RFC 1951
+        // fixed-Huffman literals use the 8-bit codes 0..143 and the 9-bit codes
+        // 144..255. The 7-bit codes are reserved for the end-of-block symbol and
+        // the length alphabet, which never reach this path.
         if (value <= 143) {
             put_code(0x30u + value, 8, out);
-        } else if (value <= 255) {
-            put_code(0x190u + (value - 144u), 9, out);
         } else {
-            put_code(value - 256u, 7, out);
+            put_code(0x190u + (value - 144u), 9, out);
         }
     }
 

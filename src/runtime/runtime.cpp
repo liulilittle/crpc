@@ -151,7 +151,20 @@ struct runtime::impl {
     }
 
     void wake() noexcept {
-        wake_flag.store(true, std::memory_order_release);
+        // The store must be serialized with the waiter's predicate evaluation.
+        // The loop clears the flag from inside the wait predicate while holding
+        // wait_mutex (the mutex `wait_for` uses). Storing the flag without that
+        // lock leaves a lost-wakeup window: the waiter can evaluate the
+        // predicate (false), the producer then stores the flag and calls
+        // notify_all() before the waiter has registered, and the waiter then
+        // blocks until the timeout -- sleeping the full idle_wait after work
+        // became available. Taking wait_mutex here means the store is either
+        // observed by the predicate or happens after the waiter is enqueued on
+        // the condition variable, so the notification is never lost.
+        {
+            std::lock_guard<std::mutex> lk(wait_mutex);
+            wake_flag.store(true, std::memory_order_release);
+        }
         wait_cv.notify_all();
     }
 

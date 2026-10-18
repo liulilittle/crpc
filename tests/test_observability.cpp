@@ -54,6 +54,28 @@ void* operator new(std::size_t size) {
 
 void* operator new[](std::size_t size) { return ::operator new(size); }
 
+// The library uses `new (std::nothrow)` on some paths (for example the logger's
+// drain buffer). Without the nothrow replacements the default nothrow operator
+// (resolved to the sanitizer runtime's) would allocate, while the matching
+// delete[] below frees through std::free: ASan flags that as an alloc-dealloc
+// mismatch. Routing nothrow through the same malloc-backed path keeps the
+// counting allocator consistent on every overload.
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete[](void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }

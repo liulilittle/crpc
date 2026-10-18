@@ -44,17 +44,34 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(MSVC)
+    # The conformance and warning flags below are C/C++ compiler options, not
+    # assembler options. They are attached at directory scope so that every
+    # in-tree target inherits them, but that scope also reaches the vendored
+    # corocc MASM backend (ml64/ml under the Visual Studio generator). Scoping
+    # each option with a COMPILE_LANGUAGE generator expression keeps them on
+    # C and C++ sources only: ml64 otherwise rejects /W4 /WX /utf-8 as
+    # "invalid command-line option" (A4018/A4008), which MSB3721 turns into a
+    # hard build failure and the missing x86_64_ms.obj then breaks the link.
+    #
     # /utf-8 keeps source encoding stable; /permissive- enforces standard
     # conformance; /Zc:preprocessor is required by the RTTI macro machinery.
-    add_compile_options(/utf-8 /permissive- /Zc:preprocessor /Zc:__cplusplus)
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/permissive->"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>"
+    )
     # NOMINMAX and WIN32_LEAN_AND_MEAN are defined for every target: a public
     # header that ends up including <windows.h> would otherwise turn min/max
     # into macros and break std::min/std::max in consumer code.
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
     if(CRPC_WARNINGS_AS_ERRORS)
-        add_compile_options(/W4 /WX)
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:C,CXX>:/W4>"
+            "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>"
+        )
     else()
-        add_compile_options(/W4)
+        add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/W4>")
     endif()
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)

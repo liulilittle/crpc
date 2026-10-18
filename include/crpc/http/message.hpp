@@ -124,7 +124,7 @@ private:
 // --- Messages ----------------------------------------------------------------
 
 struct request {
-    method method = method::get;
+    crpc::http::method method = crpc::http::method::get;
     // Canonical token for known methods, the original token for extensions.
     std::string method_token;
     target_form form = target_form::origin;

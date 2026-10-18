@@ -100,9 +100,15 @@ struct lifetime_completion final : io::completion {
 };
 
 CRPC_TEST(inproc_round_trip_both_directions) {
-    auto pair = inproc_pair::make_typed();
+    // Sources are declared before the connection pair on purpose: destruction
+    // runs in reverse order, so the pair (and its close(), which delivers a
+    // final on_eof to the peer's bound source) is torn down while both sources
+    // are still alive. The backend stores a raw pointer to the bound source;
+    // destroying the source first leaves that pointer dangling and close()
+    // calls on_eof through it (ASan: pure virtual call / use-after-free).
     recording_source left;
     recording_source right;
+    auto pair = inproc_pair::make_typed();
     pair.first->bind_source(&left);
     pair.second->bind_source(&right);
 
@@ -125,9 +131,10 @@ CRPC_TEST(inproc_round_trip_both_directions) {
 }
 
 CRPC_TEST(inproc_partial_consumption_pauses_until_resume) {
-    auto pair = inproc_pair::make_typed();
+    // See inproc_round_trip_both_directions: the sources must outlive the pair.
     recording_source left;
     recording_source right;
+    auto pair = inproc_pair::make_typed();
     pair.first->bind_source(&left);
     pair.second->bind_source(&right);
     right.credit = 1;
@@ -454,6 +461,12 @@ CRPC_TEST(inproc_reentrant_push_is_iterative) {
     CRPC_CHECK_EQ(1, first.calls.load());
     CRPC_CHECK_EQ(50001, left_calls.load() + right_calls.load());
     CRPC_CHECK_EQ(50000, completions);
+
+    // Unbind while the sources are still alive: the pair is destroyed at scope
+    // exit and its close() would otherwise deliver on_eof into `left`/`right`
+    // after those source objects are gone (see inproc_round_trip_both_directions).
+    pair.first->bind_source(nullptr);
+    pair.second->bind_source(nullptr);
 }
 
 CRPC_TEST(inproc_backend_listen_connect) {
@@ -487,6 +500,12 @@ CRPC_TEST(inproc_backend_listen_connect) {
     client->sink().push(bytes_of(std::string("ping")), &done);
     CRPC_CHECK_EQ(1, done.calls.load());
     CRPC_CHECK_EQ(std::string("ping"), text_of(server_source.received));
+
+    // Unbind before the connections are destroyed at scope exit; otherwise
+    // close() delivers on_eof into the already-destroyed recording sources
+    // (see inproc_round_trip_both_directions).
+    accepted.conn->bind_source(nullptr);
+    client->bind_source(nullptr);
 
     l->stop();
     CRPC_CHECK(backend.connect(endpoint::inproc("svc"), connect_options{}) ==
