@@ -1,4 +1,4 @@
-// CRPC -- tracer implementation.
+﻿// CRPC -- tracer implementation.
 #include <crpc/observability/tracer.hpp>
 
 #include <chrono>
@@ -310,13 +310,15 @@ void tracer::configure(const tracer_config& config) noexcept {
 
 void tracer::set_exporter(exporter* sink) noexcept {
     exporter_ = sink;
-    enabled_.store(sink != nullptr, std::memory_order_release);
-    if (sink != nullptr) {
-        // Registering an exporter is the point at which export becomes useful;
-        // starting here keeps the common "configure, set_exporter, log" order
-        // working without a separate call. `start()` remains idempotent.
-        start();
+    if (sink == nullptr) {
+        enabled_.store(false, std::memory_order_release);
+        return;
     }
+    // Registering an exporter is the point at which export becomes useful;
+    // starting here keeps the common "configure, set_exporter, log" order
+    // working without a separate call. `start()` remains idempotent.
+    start();
+    enabled_.store(running_.load(std::memory_order_acquire), std::memory_order_release);
 }
 
 void tracer::set_tail_sampler(tail_sampler_fn function, void* user) noexcept {
@@ -325,19 +327,32 @@ void tracer::set_tail_sampler(tail_sampler_fn function, void* user) noexcept {
 }
 
 void tracer::start() noexcept {
+    if (exporter_ == nullptr) {
+        // Nothing to export to: do not allocate a queue or a thread.
+        enabled_.store(false, std::memory_order_release);
+        return;
+    }
     if (running_.load(std::memory_order_acquire)) {
+        if (exporter_ != nullptr) {
+            enabled_.store(true, std::memory_order_release);
+        }
         return;
     }
     try {
         queue_ = std::unique_ptr<detail::span_queue>(new detail::span_queue(queue_capacity_));
         if (!queue_ || !queue_->valid()) {
             queue_.reset();
+            enabled_.store(false, std::memory_order_release);
             return;
         }
         running_.store(true, std::memory_order_release);
         worker_ = std::thread(&tracer::export_loop, this);
+        if (exporter_ != nullptr) {
+            enabled_.store(true, std::memory_order_release);
+        }
     } catch (...) {
         running_.store(false, std::memory_order_release);
+        enabled_.store(false, std::memory_order_release);
         queue_.reset();
     }
 }
@@ -351,6 +366,7 @@ void tracer::shutdown() noexcept {
         worker_.join();
     }
     queue_.reset();
+    enabled_.store(false, std::memory_order_release);
 }
 
 void tracer::reset() noexcept {

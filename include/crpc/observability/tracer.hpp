@@ -110,6 +110,7 @@ struct tracer_config {
     // Head-sampling rate in [0, 1]. The decision is a pure function of the
     // trace id, so two processes configured with the same rate agree.
     double sample_rate = 0.01;
+    // Rounded up to a power of two (minimum two spans).
     std::size_t queue_capacity = 4096;
     monotonic_clock_fn clock = nullptr;
     void* clock_user = nullptr;

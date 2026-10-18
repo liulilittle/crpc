@@ -96,41 +96,51 @@
 #if defined(__has_include)
 #if __has_include(<rtti/reflection.hpp>)
 #define CRPC_HAVE_RTTI 1
+#else
+#define CRPC_HAVE_RTTI 0
 #endif
+#else
+#define CRPC_HAVE_RTTI 0
 #endif
 #endif
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 #include <rtti/reflection.hpp>
 
 #if defined(__has_include)
 #if __has_include(<rtti/json.hpp>) && \
-    (!defined(RTTI_ENABLE_JSON) || RTTI_ENABLE_JSON)
+    (!defined(RTTI_ENABLE_JSON) || RTTI_ENABLE_JSON) && \
+    (!defined(CRPC_HAVE_RTTI_JSON) || CRPC_HAVE_RTTI_JSON)
 #define CRPC_HAVE_RTTI_JSON 1
 #include <rtti/json.hpp>
 #endif
 #if __has_include(<rtti/xml.hpp>) && \
-    (!defined(RTTI_ENABLE_XML) || RTTI_ENABLE_XML)
+    (!defined(RTTI_ENABLE_XML) || RTTI_ENABLE_XML) && \
+    (!defined(CRPC_HAVE_RTTI_XML) || CRPC_HAVE_RTTI_XML)
 #define CRPC_HAVE_RTTI_XML 1
 #include <rtti/xml.hpp>
 #endif
 #if __has_include(<rtti/ini.hpp>) && \
-    (!defined(RTTI_ENABLE_INI) || RTTI_ENABLE_INI)
+    (!defined(RTTI_ENABLE_INI) || RTTI_ENABLE_INI) && \
+    (!defined(CRPC_HAVE_RTTI_INI) || CRPC_HAVE_RTTI_INI)
 #define CRPC_HAVE_RTTI_INI 1
 #include <rtti/ini.hpp>
 #endif
 #if __has_include(<rtti/toml.hpp>) && \
-    (!defined(RTTI_ENABLE_TOML) || RTTI_ENABLE_TOML)
+    (!defined(RTTI_ENABLE_TOML) || RTTI_ENABLE_TOML) && \
+    (!defined(CRPC_HAVE_RTTI_TOML) || CRPC_HAVE_RTTI_TOML)
 #define CRPC_HAVE_RTTI_TOML 1
 #include <rtti/toml.hpp>
 #endif
 #if __has_include(<rtti/proto.hpp>) && \
-    (!defined(RTTI_ENABLE_PROTO) || RTTI_ENABLE_PROTO)
+    (!defined(RTTI_ENABLE_PROTO) || RTTI_ENABLE_PROTO) && \
+    (!defined(CRPC_HAVE_RTTI_PROTOBUF) || CRPC_HAVE_RTTI_PROTOBUF)
 #define CRPC_HAVE_RTTI_PROTOBUF 1
 #include <rtti/proto.hpp>
 #endif
 #if __has_include(<rtti/flat.hpp>) && \
-    (!defined(RTTI_ENABLE_FLATBUFFERS) || RTTI_ENABLE_FLATBUFFERS)
+    (!defined(RTTI_ENABLE_FLATBUFFERS) || RTTI_ENABLE_FLATBUFFERS) && \
+    (!defined(CRPC_HAVE_RTTI_FLATBUFFERS) || CRPC_HAVE_RTTI_FLATBUFFERS)
 #define CRPC_HAVE_RTTI_FLATBUFFERS 1
 #include <rtti/flat.hpp>
 #endif
@@ -224,33 +234,14 @@ template <typename T>
 inline constexpr bool is_wire_scalar_v =
     std::is_arithmetic_v<T> || std::is_enum_v<T>;
 
-#if defined(CRPC_HAVE_RTTI)
-// Number of own fields that precede this type's own fields in the merged
-// field table. `base_count` only exists for RTTI_DEFINE_TYPE_DERIVED.
-template <typename T, typename = void>
-struct own_base_count {
-    static constexpr u64 value = 0;
-};
-template <typename T>
-struct own_base_count<T, std::void_t<decltype(rtti::fields_of<T>::base_count)>> {
-    static constexpr u64 value = rtti::fields_of<T>::base_count;
-};
-
-template <std::size_t I, typename Tuple, std::size_t J = 0>
-constexpr u64 base_offset() {
-    if constexpr (J >= I) {
-        return 0;
-    } else {
-        return static_cast<u64>(
-                   rtti::field_count<std::tuple_element_t<J, Tuple>>()) +
-               base_offset<I, Tuple, J + 1>();
-    }
-}
+#if CRPC_HAVE_RTTI
+// Field ids are the declaration index plus one over the flattened table. The
+// table is built at first use; see flat_members() below.
 #endif
 
 // --- binary encode -----------------------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 template <typename T>
 status encode_value(buffer& out, const T& value, std::size_t depth,
                     std::size_t limit);
@@ -287,10 +278,16 @@ auto convert_members(const Tuple& tuple) {
         tuple, std::make_index_sequence<std::tuple_size<Tuple>::value>{});
 }
 
+template <typename Derived>
+const auto& flat_members();
+
 template <typename Derived, typename Bases, std::size_t... I>
 auto collect_base_members(std::index_sequence<I...>) {
+    // Recursive: a base may itself be derived, and `fields_of<B>::members`
+    // holds only B's own fields. The base chain is acyclic by language rule,
+    // so this recursion terminates without a depth counter.
     return std::tuple_cat(convert_members<Derived>(
-        rtti::fields_of<std::tuple_element_t<I, Bases>>::members)...);
+        flat_members<std::tuple_element_t<I, Bases>>())...);
 }
 
 template <typename Derived>
@@ -343,22 +340,6 @@ template <typename T>
 status encode_struct_fields(const T& value, buffer& out, u64 id_offset,
                             std::size_t depth, std::size_t limit);
 
-template <typename T, typename Bases, std::size_t... I>
-status encode_bases(const T& value, buffer& out, std::size_t depth,
-                    std::size_t limit, std::index_sequence<I...>) {
-    status result;
-    const auto step = [&](auto index_constant) {
-        constexpr std::size_t index = decltype(index_constant)::value;
-        if (result.ok()) {
-            using base_t = std::tuple_element_t<index, Bases>;
-            result = encode_struct_fields<base_t>(
-                static_cast<const base_t&>(value), out,
-                base_offset<index, Bases>(), depth + 1, limit);
-        }
-    };
-    (step(std::integral_constant<std::size_t, I>{}), ...);
-    return result;
-}
 
 template <typename T>
 status encode_struct_fields(const T& value, buffer& out, u64 id_offset,
@@ -513,7 +494,7 @@ status encode_value(buffer& out, const T& value, std::size_t depth,
 
 // --- binary decode -----------------------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 template <typename T>
 status decode_value(byte_reader& reader, T& value, std::size_t depth,
                     std::size_t limit, bool strict);
@@ -549,29 +530,6 @@ template <typename T>
 status decode_struct_fields(byte_reader& reader, T& value, u64 id_offset,
                             std::size_t depth, std::size_t limit, bool strict);
 
-template <typename T, typename Bases, std::size_t... I>
-status decode_base_dispatch(u64 id, byte_reader& reader, T& value,
-                            std::size_t depth, std::size_t limit, bool strict,
-                            bool& handled, std::index_sequence<I...>) {
-    status result;
-    const auto step = [&](auto index_constant) {
-        constexpr std::size_t index = decltype(index_constant)::value;
-        if (handled || !result.ok()) {
-            return;
-        }
-        using base_t = std::tuple_element_t<index, Bases>;
-        constexpr u64 offset = base_offset<index, Bases>();
-        constexpr u64 count = static_cast<u64>(rtti::field_count<base_t>());
-        if (id > offset && id <= offset + count) {
-            handled = true;
-            result = decode_struct_fields<base_t>(
-                reader, static_cast<base_t&>(value), offset, depth + 1, limit,
-                strict);
-        }
-    };
-    (step(std::integral_constant<std::size_t, I>{}), ...);
-    return result;
-}
 
 template <typename T, typename Members, std::size_t... I>
 status decode_member_dispatch(u64 id, u64 id_offset, byte_reader& reader,
@@ -906,7 +864,7 @@ status decode_value(byte_reader& reader, T& value, std::size_t depth,
 
 // --- erased type table -------------------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 struct type_ops {
     const std::type_info* type;
     status (*encode)(const void*, buffer&, std::size_t depth_limit);
@@ -943,7 +901,7 @@ const type_ops* ops_for() noexcept {
 
 // --- text-format error formatting -------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 inline std::string format_rtti_error(const char* format,
                                      const rtti::error_info& error) {
     std::string message = "rtti ";
@@ -1008,7 +966,7 @@ public:
     // require this. Registration is idempotent and thread-safe.
     template <typename T>
     void register_type() const {
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
         const detail::type_ops* ops = detail::ops_for<T>();
         std::unique_lock<std::shared_mutex> lock(types_mutex_);
         types_.emplace(std::type_index(typeid(T)), ops);
@@ -1021,7 +979,7 @@ public:
     // Typed fast path: one compile-time field walk, no registry lookup.
     template <typename T>
     status encode_typed(const T& value, buffer& out) const {
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
         try {
             return detail::encode_value(out, value, 0, depth_limit_);
         } catch (const std::bad_alloc&) {
@@ -1040,7 +998,7 @@ public:
 
     template <typename T>
     status decode_typed(span<const std::byte> in, T& value) const {
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
         try {
             byte_reader reader(in);
             const status decoded =
@@ -1087,7 +1045,7 @@ private:
 
 // --- text format tags --------------------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI_JSON)
+#if CRPC_HAVE_RTTI_JSON
 struct json_format {
     static constexpr codec_id id = codec_id::json;
     static constexpr std::string_view content_type = "application/json";
@@ -1104,7 +1062,7 @@ struct json_format {
 };
 #endif
 
-#if defined(CRPC_HAVE_RTTI_XML)
+#if CRPC_HAVE_RTTI_XML
 struct xml_format {
     static constexpr codec_id id = codec_id::xml;
     static constexpr std::string_view content_type = "application/xml";
@@ -1121,7 +1079,7 @@ struct xml_format {
 };
 #endif
 
-#if defined(CRPC_HAVE_RTTI_INI)
+#if CRPC_HAVE_RTTI_INI
 struct ini_format {
     static constexpr codec_id id = codec_id::ini;
     static constexpr std::string_view content_type = "application/ini";
@@ -1138,7 +1096,7 @@ struct ini_format {
 };
 #endif
 
-#if defined(CRPC_HAVE_RTTI_TOML)
+#if CRPC_HAVE_RTTI_TOML
 struct toml_format {
     static constexpr codec_id id = codec_id::toml;
     static constexpr std::string_view content_type = "application/toml";
@@ -1155,7 +1113,7 @@ struct toml_format {
 };
 #endif
 
-#if defined(CRPC_HAVE_RTTI_PROTOBUF)
+#if CRPC_HAVE_RTTI_PROTOBUF
 struct protobuf_format {
     static constexpr codec_id id = codec_id::protobuf;
     static constexpr std::string_view content_type = "application/x-protobuf";
@@ -1182,7 +1140,7 @@ struct protobuf_format {
 };
 #endif
 
-#if defined(CRPC_HAVE_RTTI_FLATBUFFERS)
+#if CRPC_HAVE_RTTI_FLATBUFFERS
 struct flatbuffers_format {
     static constexpr codec_id id = codec_id::flatbuffers;
     static constexpr std::string_view content_type =
@@ -1212,7 +1170,65 @@ struct flatbuffers_format {
 
 // --- generic text codec ------------------------------------------------------
 
-#if defined(CRPC_HAVE_RTTI_JSON)
+#if CRPC_HAVE_RTTI
+namespace detail {
+
+// Erased entry points for the text formats. They are separate from the binary
+// ops_for<T>() table: the erased `codec::encode`/`decode` of a text codec must
+// run that format's conversion, not the binary walk.
+template <typename Format, typename T>
+status encode_text_erased(const void* value, buffer& out, std::size_t) {
+    try {
+        const std::string text =
+            Format::template serialize<T>(*static_cast<const T*>(value));
+        if (text.empty()) {
+            const rpc_error failure(
+                rpc_code::encode_error,
+                "text codec: RTTI conversion failed (empty document)");
+            return status{failure};
+        }
+        if (!out.append(text.data(), text.size())) {
+            return status{rpc_code::encode_error};
+        }
+        return status{};
+    } catch (const std::bad_alloc&) {
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        return status{rpc_code::resource_exhausted};
+    }
+}
+
+template <typename Format, typename T>
+status decode_text_erased(span<const std::byte> in, void* value, std::size_t,
+                          bool) {
+    try {
+        const rtti::string_view text(reinterpret_cast<const char*>(in.data()),
+                                     in.size());
+        rtti::result<T> parsed = Format::template parse<T>(text);
+        if (!parsed.ok()) {
+            const rpc_error failure(
+                rpc_code::decode_error,
+                format_rtti_error(Format::name(), parsed.err));
+            return status{failure};
+        }
+        *static_cast<T*>(value) = std::move(parsed.value);
+        return status{};
+    } catch (const std::bad_alloc&) {
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        return status{rpc_code::resource_exhausted};
+    }
+}
+
+template <typename Format, typename T>
+const type_ops* text_ops_for() noexcept {
+    static const type_ops ops{&typeid(T), &encode_text_erased<Format, T>,
+                              &decode_text_erased<Format, T>};
+    return &ops;
+}
+
+} // namespace detail
+
 template <typename Format>
 class text_codec final : public codec {
 public:
@@ -1249,7 +1265,7 @@ public:
 
     template <typename T>
     void register_type() const {
-        const detail::type_ops* ops = detail::ops_for<T>();
+        const detail::type_ops* ops = detail::text_ops_for<Format, T>();
         std::unique_lock<std::shared_mutex> lock(types_mutex_);
         types_.emplace(std::type_index(typeid(T)), ops);
     }
@@ -1308,23 +1324,25 @@ private:
     mutable std::unordered_map<std::type_index, const detail::type_ops*> types_;
 };
 
+#if CRPC_HAVE_RTTI_JSON
 using json_codec = text_codec<json_format>;
-#if defined(CRPC_HAVE_RTTI_XML)
+#endif
+#if CRPC_HAVE_RTTI_XML
 using xml_codec = text_codec<xml_format>;
 #endif
-#if defined(CRPC_HAVE_RTTI_INI)
+#if CRPC_HAVE_RTTI_INI
 using ini_codec = text_codec<ini_format>;
 #endif
-#if defined(CRPC_HAVE_RTTI_TOML)
+#if CRPC_HAVE_RTTI_TOML
 using toml_codec = text_codec<toml_format>;
 #endif
-#if defined(CRPC_HAVE_RTTI_PROTOBUF)
+#if CRPC_HAVE_RTTI_PROTOBUF
 using protobuf_codec = text_codec<protobuf_format>;
 #endif
-#if defined(CRPC_HAVE_RTTI_FLATBUFFERS)
+#if CRPC_HAVE_RTTI_FLATBUFFERS
 using flatbuffers_codec = text_codec<flatbuffers_format>;
 #endif
-#endif // CRPC_HAVE_RTTI_JSON
+#endif // CRPC_HAVE_RTTI
 
 // --- codec registry ----------------------------------------------------------
 
@@ -1370,43 +1388,57 @@ private:
 
 // Zero-cost typed dispatch: one id() check, then the concrete codec's member
 // template. No std::function and no type-erased callback.
+//
+// The cast is safe because the id/content-type registry maps each built-in id
+// to exactly one built-in codec type. A custom codec registered under a
+// different id uses the erased `codec::encode`/`decode` path below.
 template <typename T>
 [[nodiscard]] status encode_into(const codec& target, const T& value,
                                  buffer& out) {
     switch (target.id()) {
     case codec_id::crpc_binary:
         return static_cast<const binary_codec&>(target).encode_typed(value, out);
-#if defined(CRPC_HAVE_RTTI_JSON)
+#if CRPC_HAVE_RTTI_JSON
     case codec_id::json:
         return static_cast<const json_codec&>(target).encode_typed(value, out);
-#if defined(CRPC_HAVE_RTTI_XML)
+#endif
+#if CRPC_HAVE_RTTI_XML
     case codec_id::xml:
         return static_cast<const xml_codec&>(target).encode_typed(value, out);
 #endif
-#if defined(CRPC_HAVE_RTTI_INI)
+#if CRPC_HAVE_RTTI_INI
     case codec_id::ini:
         return static_cast<const ini_codec&>(target).encode_typed(value, out);
 #endif
-#if defined(CRPC_HAVE_RTTI_TOML)
+#if CRPC_HAVE_RTTI_TOML
     case codec_id::toml:
         return static_cast<const toml_codec&>(target).encode_typed(value, out);
 #endif
-#if defined(CRPC_HAVE_RTTI_PROTOBUF)
+#if CRPC_HAVE_RTTI_PROTOBUF
     case codec_id::protobuf:
         if constexpr (rtti::proto::schema<T>::count > 0) {
             return static_cast<const protobuf_codec&>(target).encode_typed(
                 value, out);
+        } else {
+            const rpc_error failure(
+                rpc_code::encode_error,
+                "crpc protobuf codec: specialize rtti::proto::schema<T> for "
+                "this type before using it");
+            return status{failure};
         }
-        break;
 #endif
-#if defined(CRPC_HAVE_RTTI_FLATBUFFERS)
+#if CRPC_HAVE_RTTI_FLATBUFFERS
     case codec_id::flatbuffers:
         if constexpr (rtti::flat::schema<T>::count > 0) {
             return static_cast<const flatbuffers_codec&>(target).encode_typed(
                 value, out);
+        } else {
+            const rpc_error failure(
+                rpc_code::encode_error,
+                "crpc FlatBuffers codec: specialize rtti::flat::schema<T> for "
+                "this type before using it");
+            return status{failure};
         }
-        break;
-#endif
 #endif
     default:
         break;
@@ -1420,37 +1452,47 @@ template <typename T>
     switch (source.id()) {
     case codec_id::crpc_binary:
         return static_cast<const binary_codec&>(source).decode_typed(in, value);
-#if defined(CRPC_HAVE_RTTI_JSON)
+#if CRPC_HAVE_RTTI_JSON
     case codec_id::json:
         return static_cast<const json_codec&>(source).decode_typed(in, value);
-#if defined(CRPC_HAVE_RTTI_XML)
+#endif
+#if CRPC_HAVE_RTTI_XML
     case codec_id::xml:
         return static_cast<const xml_codec&>(source).decode_typed(in, value);
 #endif
-#if defined(CRPC_HAVE_RTTI_INI)
+#if CRPC_HAVE_RTTI_INI
     case codec_id::ini:
         return static_cast<const ini_codec&>(source).decode_typed(in, value);
 #endif
-#if defined(CRPC_HAVE_RTTI_TOML)
+#if CRPC_HAVE_RTTI_TOML
     case codec_id::toml:
         return static_cast<const toml_codec&>(source).decode_typed(in, value);
 #endif
-#if defined(CRPC_HAVE_RTTI_PROTOBUF)
+#if CRPC_HAVE_RTTI_PROTOBUF
     case codec_id::protobuf:
         if constexpr (rtti::proto::schema<T>::count > 0) {
             return static_cast<const protobuf_codec&>(source).decode_typed(
                 in, value);
+        } else {
+            const rpc_error failure(
+                rpc_code::decode_error,
+                "crpc protobuf codec: specialize rtti::proto::schema<T> for "
+                "this type before using it");
+            return status{failure};
         }
-        break;
 #endif
-#if defined(CRPC_HAVE_RTTI_FLATBUFFERS)
+#if CRPC_HAVE_RTTI_FLATBUFFERS
     case codec_id::flatbuffers:
         if constexpr (rtti::flat::schema<T>::count > 0) {
             return static_cast<const flatbuffers_codec&>(source).decode_typed(
                 in, value);
+        } else {
+            const rpc_error failure(
+                rpc_code::decode_error,
+                "crpc FlatBuffers codec: specialize rtti::flat::schema<T> for "
+                "this type before using it");
+            return status{failure};
         }
-        break;
-#endif
 #endif
     default:
         break;
@@ -1461,4 +1503,6 @@ template <typename T>
 } // namespace crpc
 
 #endif // CRPC_CODEC_HPP
+
+
 

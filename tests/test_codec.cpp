@@ -96,6 +96,23 @@ struct derived_message : base_message {
 };
 RTTI_DEFINE_TYPE_DERIVED(derived_message, base_message, b)
 
+// Two-level inheritance: the flattened field table must contain the
+// grandparent, parent, and own fields in declaration order.
+struct grand_message {
+    std::int32_t g;
+};
+RTTI_DEFINE_TYPE(grand_message, g)
+
+struct mid_message : grand_message {
+    std::int32_t m;
+};
+RTTI_DEFINE_TYPE_DERIVED(mid_message, grand_message, m)
+
+struct leaf_message : mid_message {
+    std::int32_t l;
+};
+RTTI_DEFINE_TYPE_DERIVED(leaf_message, mid_message, l)
+
 struct tree {
     std::int32_t value;
     std::vector<tree> children;
@@ -381,6 +398,23 @@ CRPC_TEST(binary_derived_types_base_first) {
     CRPC_CHECK(crpc::decode_from(binary(), encoded.readable(), output).ok());
     CRPC_CHECK_EQ(-1, output.a);
     CRPC_CHECK_EQ(2, output.b);
+}
+
+CRPC_TEST(binary_multilevel_derived_fields) {
+    leaf_message input{};
+    input.g = -1;
+    input.m = 2;
+    input.l = 3;
+
+    buffer encoded;
+    CRPC_CHECK(crpc::encode_into(binary(), input, encoded).ok());
+    CRPC_CHECK_EQ(std::string("010101020104030106"), to_hex(encoded.readable()));
+
+    leaf_message output{};
+    CRPC_CHECK(crpc::decode_from(binary(), encoded.readable(), output).ok());
+    CRPC_CHECK_EQ(-1, output.g);
+    CRPC_CHECK_EQ(2, output.m);
+    CRPC_CHECK_EQ(3, output.l);
 }
 
 CRPC_TEST(binary_missing_field_policy) {

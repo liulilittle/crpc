@@ -172,7 +172,7 @@ public:
     // hook stops the chain, sets `result` to `rpc_code::internal` and returns
     // false. A hook returning false also stops the chain and returns false;
     // the hook is responsible for setting `context.result`.
-    [[nodiscard]] bool run(hook_point point, call_context& context) noexcept {
+    [[nodiscard]] bool run(hook_point point, call_context& context) const noexcept {
         const std::size_t index = static_cast<std::size_t>(point);
         if (index >= hook_point_count()) {
             return true;

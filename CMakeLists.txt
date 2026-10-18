@@ -151,6 +151,15 @@ if(CRPC_BUILD_SHARED)
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
         WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+    if(MSVC)
+        # C4251 warns that a class with a private STL member is exported. The
+        # members are private and never appear in a signature; what they affect
+        # is the object's size and layout, which docs/abi.md section 7 already
+        # constrains to "same toolchain family and debug setting". Suppressing
+        # the warning here records that decision rather than hiding an unknown
+        # risk: a consumer built with a different STL is unsupported either way.
+        target_compile_options(crpc PUBLIC /wd4251)
+    endif()
     if(NOT MSVC)
         # Every exported symbol is marked CRPC_API; anything else stays hidden.
         target_link_options(crpc PRIVATE -Wl,--no-undefined)

@@ -33,6 +33,7 @@ static_assert(std::is_trivially_copyable<obs::deadline>::value,
 static_assert(std::is_trivially_copyable<obs::baggage>::value,
               "baggage must be trivially copyable");
 static_assert(sizeof(obs::trace_id) == 16, "trace_id is 16 bytes");
+static_assert(sizeof(crpc::observability::trace_id) == 16, "module alias resolves");
 static_assert(sizeof(obs::span_id) == 8, "span_id is 8 bytes");
 static_assert(sizeof(obs::log_record) <= 512, "log_record fits a 512-byte slot");
 
@@ -475,6 +476,8 @@ CRPC_TEST(logger_level_filtering_and_shutdown_flush) {
     remove_file(path);
     log.configure(make_log_config(path, 256));
     log.set_level(obs::log_level::warn);
+    CRPC_CHECK_FALSE(log.enabled(obs::log_level::off));
+    CRPC_CHECK(log.enabled(obs::log_level::error));
     log.start();
 
     CRPC_LOG_INFO("hidden {}", 1);

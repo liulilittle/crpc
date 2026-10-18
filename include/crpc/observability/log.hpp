@@ -1,4 +1,4 @@
-// CRPC -- high-performance asynchronous logger.
+﻿// CRPC -- high-performance asynchronous logger.
 //
 // The design separates the caller's hot path from the sink:
 //
@@ -46,7 +46,8 @@
 // Compile-time verbosity ceiling. Values:
 //   0 trace, 1 debug, 2 info, 3 warn, 4 error, 5 off.
 // A level is compiled in when CRPC_LOG_MAX_LEVEL <= its numeric value, so the
-// default (0) compiles every level in and 5 compiles every level out.
+// default (0) compiles every level in and 5 (or the token `off`) compiles every
+// level out.
 #ifndef CRPC_LOG_MAX_LEVEL
 #define CRPC_LOG_MAX_LEVEL 0
 #endif
@@ -57,10 +58,6 @@ namespace obs {
 // --- Levels ------------------------------------------------------------------
 
 enum class log_level : u8 { trace = 0, debug, info, warn, error, off };
-
-// Token accepted by CRPC_LOG_MAX_LEVEL for "compile every level out".
-// Numeric 0..5 is equally valid; 5 has the same effect as `off`.
-constexpr int off = 5;
 
 [[nodiscard]] inline const char* to_string(log_level level) noexcept {
     switch (level) {
@@ -127,6 +124,19 @@ public:
     }
 
     void append_integer(std::uint64_t value) noexcept { append_unsigned(value, false); }
+
+    template <typename T,
+              std::enable_if_t<std::is_integral<T>::value &&
+                                   !std::is_same<T, std::int64_t>::value &&
+                                   !std::is_same<T, std::uint64_t>::value,
+                               int> = 0>
+    void append_integer(T value) noexcept {
+        if constexpr (std::is_signed<T>::value) {
+            append_integer(static_cast<std::int64_t>(value));
+        } else {
+            append_integer(static_cast<std::uint64_t>(value));
+        }
+    }
 
     void append_float(double value) noexcept {
         char text[64];
@@ -310,7 +320,9 @@ template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
                                     T value) noexcept {
     char buffer[32];
     log_buffer out(buffer, sizeof(buffer));
-    if constexpr (std::is_signed<T>::value) {
+    if constexpr (std::is_same<T, bool>::value) {
+        out.append(value ? "true" : "false");
+    } else if constexpr (std::is_signed<T>::value) {
         out.append_integer(static_cast<std::int64_t>(value));
     } else {
         out.append_integer(static_cast<std::uint64_t>(value));
@@ -348,6 +360,7 @@ using compress_fn = std::size_t (*)(void* user, const char* input, std::size_t i
 struct logger_config {
     // Empty disables file output; records are drained and discarded.
     std::string file_path = "crpc.log";
+    // Rounded up to a power of two (minimum two records).
     std::size_t ring_capacity = 8192;
     std::size_t max_file_size = 64u * 1024u * 1024u;
     // Zero disables time-based rotation.
@@ -392,8 +405,9 @@ public:
     }
 
     [[nodiscard]] bool enabled(log_level level) const noexcept {
+        const int value = static_cast<int>(level);
         const int runtime = level_.load(std::memory_order_relaxed);
-        return static_cast<int>(level) >= runtime && runtime < static_cast<int>(log_level::off);
+        return value < static_cast<int>(log_level::off) && value >= runtime;
     }
 
     // Hot path. Copies `record` into the calling thread's ring. No allocation
@@ -496,7 +510,9 @@ public:
         }
         char buffer[32];
         log_buffer out(buffer, sizeof(buffer));
-        if constexpr (std::is_signed<T>::value) {
+        if constexpr (std::is_same<T, bool>::value) {
+            out.append(value ? "true" : "false");
+        } else if constexpr (std::is_signed<T>::value) {
             out.append_integer(static_cast<std::int64_t>(value));
         } else {
             out.append_integer(static_cast<std::uint64_t>(value));
@@ -510,6 +526,11 @@ private:
 };
 
 namespace detail {
+
+// Token accepted by CRPC_LOG_MAX_LEVEL for "compile every level out".
+// Numeric 0..5 is equally valid; 5 has the same effect as `off`. The name
+// lives in `detail` because only `compile_max_level()` expands the macro.
+constexpr int off = 5;
 
 constexpr int compile_max_level() noexcept { return CRPC_LOG_MAX_LEVEL; }
 

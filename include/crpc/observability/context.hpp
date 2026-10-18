@@ -250,6 +250,10 @@ private:
 };
 
 } // namespace obs
+
+// Compatibility alias for callers that spell the module name out.
+namespace observability = obs;
+
 } // namespace crpc
 
 #endif // CRPC_OBSERVABILITY_CONTEXT_HPP
