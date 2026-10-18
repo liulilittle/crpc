@@ -361,7 +361,8 @@ private:
     u32 capacity_ = 0;
     std::vector<call_slot*> free_;
     std::atomic<u32> in_use_{0};
-    std::mutex mutex_;
+    // Mutable so that `available() const` can take the lock.
+    mutable std::mutex mutex_;
 };
 
 // --- Response/request codec --------------------------------------------------

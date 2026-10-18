@@ -4,9 +4,11 @@
 //
 //   * The caller formats into a fixed stack buffer with `{}` placeholders. The
 //     formatting code never allocates, never locks and never enters the kernel.
+//     `make_record` reads the wall clock once (for the record timestamp).
 //   * The resulting fixed-size `log_record` is copied into a per-thread
 //     single-producer/single-consumer ring. The ring is wait-free in the common
-//     case (one head load, one tail load, one store).
+//     case: one acquire load of the size, one store of the record, one release
+//     increment.
 //   * One background thread drains every registered ring in batches, formats
 //     text lines and writes them with `WriteFile` (Windows) or `writev`
 //     (POSIX). It also rotates files by size and by time.
@@ -14,6 +16,11 @@
 // The only allocation on a thread's first log call is its ring (capacity is
 // configurable, default 8192 records). After that registration a log call has
 // no allocation. `logger::shutdown()` drains and joins; it is idempotent.
+//
+// Cost of an enabled record: formatting into a 128-byte stack buffer, one
+// 512-byte record copy into the ring, two atomic operations. Cost of a disabled
+// record: one atomic level load and a compare. Cost of a record above
+// CRPC_LOG_MAX_LEVEL: nothing at all -- the macro expands to an empty statement.
 //
 // Thread safety: `logger::instance()` is the only documented mutable singleton
 // in this module. `submit()` is safe from any thread. `configure()`, `start()`,
@@ -58,6 +65,22 @@ namespace obs {
 // --- Levels ------------------------------------------------------------------
 
 enum class log_level : u8 { trace = 0, debug, info, warn, error, off };
+
+namespace detail {
+
+// Token accepted by CRPC_LOG_MAX_LEVEL for "compile every level out".
+// Numeric 0..5 is equally valid; 5 has the same effect as `off`. The name
+// lives in `detail` because only `compile_max_level()` expands the macro.
+constexpr int off = 5;
+
+constexpr int compile_max_level() noexcept { return CRPC_LOG_MAX_LEVEL; }
+
+constexpr bool compile_enabled(int level_number) noexcept {
+    return compile_max_level() < static_cast<int>(log_level::off) &&
+           compile_max_level() <= level_number;
+}
+
+} // namespace detail
 
 [[nodiscard]] inline const char* to_string(log_level level) noexcept {
     switch (level) {
@@ -526,18 +549,6 @@ private:
 };
 
 namespace detail {
-
-// Token accepted by CRPC_LOG_MAX_LEVEL for "compile every level out".
-// Numeric 0..5 is equally valid; 5 has the same effect as `off`. The name
-// lives in `detail` because only `compile_max_level()` expands the macro.
-constexpr int off = 5;
-
-constexpr int compile_max_level() noexcept { return CRPC_LOG_MAX_LEVEL; }
-
-constexpr bool compile_enabled(int level_number) noexcept {
-    return compile_max_level() < static_cast<int>(log_level::off) &&
-           compile_max_level() <= level_number;
-}
 
 template <typename... Args>
 void log_at(log_level level, std::string_view format, Args&&... args) noexcept {

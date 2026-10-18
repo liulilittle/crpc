@@ -197,6 +197,20 @@ endif()
 if(CRPC_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+
+    # RTTI's own CMakeLists calls enable_testing() and registers its test
+    # binaries unconditionally. We add it with EXCLUDE_FROM_ALL (we only need
+    # the library), so those entries exist in CTest but are never built, which
+    # makes `ctest` report three "Not Run" failures. They belong to the
+    # dependency's own CI, not to ours: exclude them by name rather than
+    # patching the dependency.
+    set(CRPC_EXTERNAL_TESTS
+        rtti_tests
+        rtti_proto_extension_tests
+        rtti_flat_schema_tests
+        rtti_bench)
+    file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+         "set(CTEST_CUSTOM_TESTS_IGNORE \${CTEST_CUSTOM_TESTS_IGNORE} ${CRPC_EXTERNAL_TESTS})\n")
 endif()
 
 if(CRPC_BUILD_BENCH)

@@ -614,12 +614,18 @@ void logger::write_batch(const char* data, std::size_t size) {
 // --- Event builder -----------------------------------------------------------
 
 log_event::log_event(log_level level, std::string_view message) noexcept : submit_(false) {
-    logger& sink = logger::instance();
-    if (!sink.enabled(level)) {
-        return;
+    if constexpr (detail::compile_max_level() < static_cast<int>(log_level::off)) {
+        if (static_cast<int>(level) >= detail::compile_max_level()) {
+            logger& sink = logger::instance();
+            if (sink.enabled(level)) {
+                record_ = make_record(level, message);
+                submit_ = true;
+            }
+        }
+    } else {
+        (void)level;
+        (void)message;
     }
-    record_ = make_record(level, message);
-    submit_ = true;
 }
 
 log_event::~log_event() {

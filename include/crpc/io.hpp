@@ -1,4 +1,4 @@
-// CRPC -- transport backend contract and the in-process backend.
+﻿// CRPC -- transport backend contract and the in-process backend.
 //
 // The transport layer is deliberately two interfaces wide (R1):
 //
@@ -133,7 +133,9 @@ class endpoint {
 public:
     enum class kind : std::uint8_t { none, tcp, inproc };
 
-    constexpr endpoint() noexcept = default;
+    // Not constexpr: std::string is not a literal type, and GCC rejects a
+    // constexpr default constructor for a class with a non-literal member.
+    endpoint() noexcept = default;
 
     [[nodiscard]] static endpoint tcp(std::string host, u16 port) {
         endpoint ep;
@@ -395,3 +397,5 @@ private:
 } // namespace crpc
 
 #endif // CRPC_IO_HPP
+
+

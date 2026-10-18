@@ -8,16 +8,20 @@
 //
 // Formats
 // -------
-//   * crpc-binary -- the default, complete codec. It walks
-//     `rtti::fields_of<T>::members` at compile time with `if constexpr` and fold
-//     expressions. Derived types are encoded base-first by recursively walking
-//     `rtti::base_types<T>::list`; the recursion is bounded by `depth_limit`.
+//   * crpc-binary -- the default, complete codec. It walks a flattened
+//     member-pointer tuple at compile time with `if constexpr` and fold
+//     expressions. For a derived type the tuple is built once at first use by
+//     recursively combining `rtti::base_types<T>::list` with
+//     `rtti::fields_of<T>::members`, so the base chain is acyclic by language
+//     rule and the resulting field ids follow declaration order.
 //   * JSON -- the HTTP/debug/cross-language path. It is wired to
 //     `rtti::json::serialize<T>` / `rtti::json::parse_as<T>`.
 //   * XML, INI, TOML -- registered behind CRPC_HAVE_RTTI_<FORMAT>.
 //   * protobuf, FlatBuffers -- registered behind CRPC_HAVE_RTTI_<FORMAT>; both
-//     require an explicit user schema specialization. Using them without one
-//     is a compile error with a clear message (never a silent empty payload).
+//     require an explicit user schema specialization. Using one without a
+//     schema fails with a clear diagnostic (a compile-time static_assert in the
+//     format adapter, a typed error status through encode_into/decode_from);
+//     it is never a silent empty payload.
 //
 // crpc-binary v1 wire format
 // --------------------------
@@ -149,8 +153,8 @@
 
 namespace crpc {
 
-// Wire constants. These values are part of the handshake TLV contract and must
-// never be renumbered (see design spec section 7.5).
+// Wire constants. Never renumbered; the numeric values are part of the
+// protocol contract (design spec section 7.5).
 enum class codec_id : u16 {
     crpc_binary = 1,
     json = 2,
@@ -233,11 +237,6 @@ struct is_text<std::basic_string_view<char, Traits>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_wire_scalar_v =
     std::is_arithmetic_v<T> || std::is_enum_v<T>;
-
-#if CRPC_HAVE_RTTI
-// Field ids are the declaration index plus one over the flattened table. The
-// table is built at first use; see flat_members() below.
-#endif
 
 // --- binary encode -----------------------------------------------------------
 
@@ -411,6 +410,9 @@ status encode_value(buffer& out, const T& value, std::size_t depth,
         }
         return status{};
     } else if constexpr (rtti::is_optional<type>::value) {
+        if (depth > limit) {
+            return status{rpc_code::encode_error};
+        }
         if (!value.has_value()) {
             return out.push_back(std::byte{0}) ? status{}
                                                : status{rpc_code::encode_error};
@@ -864,7 +866,9 @@ status decode_value(byte_reader& reader, T& value, std::size_t depth,
 
 // --- erased type table -------------------------------------------------------
 
-#if CRPC_HAVE_RTTI
+// The table type itself has no RTTI dependency: it is three function pointers
+// keyed by std::type_info. Only the per-type instantiation below needs the
+// reflection headers, which is why the struct stays outside the guard.
 struct type_ops {
     const std::type_info* type;
     status (*encode)(const void*, buffer&, std::size_t depth_limit);
@@ -872,24 +876,39 @@ struct type_ops {
                      bool strict);
 };
 
+#if CRPC_HAVE_RTTI
+
 template <typename T>
 status encode_erased(const void* value, buffer& out, std::size_t depth_limit) {
-    return encode_value(out, *static_cast<const T*>(value), 0, depth_limit);
+    try {
+        return encode_value(out, *static_cast<const T*>(value), 0, depth_limit);
+    } catch (const std::bad_alloc&) {
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        return status{rpc_code::resource_exhausted};
+    }
 }
 
 template <typename T>
 status decode_erased(span<const std::byte> in, void* value,
                      std::size_t depth_limit, bool strict) {
-    byte_reader reader(in);
-    const status decoded =
-        decode_value(reader, *static_cast<T*>(value), 0, depth_limit, strict);
-    if (!decoded.ok()) {
-        return decoded;
+    try {
+        byte_reader reader(in);
+        const status decoded =
+            decode_value(reader, *static_cast<T*>(value), 0, depth_limit,
+                         strict);
+        if (!decoded.ok()) {
+            return decoded;
+        }
+        if (strict && reader.remaining() != 0) {
+            return status{rpc_code::decode_error};
+        }
+        return status{};
+    } catch (const std::bad_alloc&) {
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        return status{rpc_code::resource_exhausted};
     }
-    if (strict && reader.remaining() != 0) {
-        return status{rpc_code::decode_error};
-    }
-    return status{};
 }
 
 template <typename T>
@@ -1370,6 +1389,8 @@ public:
 
 private:
     struct snapshot;
+
+    void rollback(const codec* raw, u16 key) noexcept;
 
     mutable std::shared_mutex mutex_;
     bool frozen_ = false;

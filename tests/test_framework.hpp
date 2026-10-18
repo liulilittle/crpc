@@ -1,4 +1,4 @@
-// CRPC -- test harness.
+﻿// CRPC -- test harness.
 //
 // Two things here are not about testing as such but about what happens when a
 // test fails badly:
@@ -20,12 +20,15 @@
 #ifndef CRPC_TEST_FRAMEWORK_HPP
 #define CRPC_TEST_FRAMEWORK_HPP
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 // --- Early CRT silencing and crash capture ----------------------------------
@@ -176,17 +179,34 @@ inline int quiet_crt() {
     return 0;
 }
 
-// The CRT walks .CRT$XCU and calls every pointer there before main. The pointer
-// is per-translation-unit static, so a multi-TU binary gets several idempotent
-// calls rather than a duplicate symbol.
-#pragma section(".CRT$XCU", read)
-__declspec(allocate(".CRT$XCU"))
-inline int(__cdecl* crpc_test_quiet_crt_ctor_)(void) = quiet_crt;
+// The guards are installed from main, not from a CRT initializer.
+//
+// An earlier version put a constructor pointer in .CRT$XCU so the guards were
+// active before any other static initializer. That is a well-known MSVC trick,
+// but it has a side effect that cost real debugging time: declaring the section
+// `read` makes the compiler skip dynamic initialization for later `static
+// inline` members in the same translation unit. RTTI's reflected field tables
+// are exactly such members, so a test translation unit that included this
+// header silently got empty field tables. Installing the guards at the top of
+// main is equivalent for a test binary -- no test code runs before main -- and
+// has no effect on other static data.
+//
+// A test binary that does not use CRPC_TEST_MAIN must call
+// crpc_test::install_crash_guards() itself.
 
 } // namespace detail
+
+// Installs the CRT report redirection, the abort/invalid-parameter/purecall/
+// terminate handlers, and the minidump writer. Idempotent.
+inline void install_crash_guards() {
+#if defined(_MSC_VER) && defined(_DEBUG)
+    (void)detail::quiet_crt();
+#endif
+}
+
 } // namespace crpc_test
 
-#define CRPC_TEST_EARLY() ((void)::crpc_test::detail::quiet_crt())
+#define CRPC_TEST_EARLY() ((void)::crpc_test::install_crash_guards())
 
 #else
 
@@ -278,6 +298,35 @@ inline void check_false(const char* file, int line, const char* expression, bool
     }
 }
 
+// Waits until `pred` is true or `timeout_ms` elapses.
+//
+// A plain "sleep 1 ms then poll" loop is wrong on Windows: the default timer
+// resolution is ~15.6 ms, so sleep_for(1ms) actually sleeps ~15.6 ms. A test
+// that waits for 10,000 sequential completions then takes 156 seconds instead
+// of a few hundred milliseconds, which looks exactly like a hang and hides
+// real stalls. Spin with yield() first (completions arrive in microseconds),
+// and only fall back to sleeping once the wait is clearly long.
+template <class Pred>
+inline bool wait_for(Pred pred, int timeout_ms) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    unsigned spins = 0;
+    for (;;) {
+        if (pred()) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        if (spins < 2000) {
+            ++spins;
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
 inline int run_all(int argc, char** argv) {
     const char* filter = argc > 1 ? argv[1] : nullptr;
 
@@ -347,5 +396,7 @@ inline int run_all(int argc, char** argv) {
     }
 
 #endif // CRPC_TEST_FRAMEWORK_HPP
+
+
 
 

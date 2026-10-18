@@ -1,0 +1,494 @@
+// CRPC -- client channel implementation.
+#include <crpc/rpc/client.hpp>
+
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include <crpc/endian.hpp>
+
+namespace crpc::rpc {
+namespace {
+
+// Advances the 31-bit stream-id counter, skipping zero and the reserved high
+// bit. The caller re-checks the in-flight set after each step.
+u32 next_candidate(u32& counter) noexcept {
+    counter += 1;
+    if (counter == 0 || counter > max_stream_id) {
+        counter = 1;
+    }
+    return counter;
+}
+
+} // namespace
+
+u32 allocate_stream_id(u32& counter, bool (*in_flight)(void* ctx, u32 id), void* ctx) noexcept {
+    for (;;) {
+        const u32 id = next_candidate(counter);
+        if (!in_flight(ctx, id)) {
+            return id;
+        }
+    }
+}
+
+std::chrono::steady_clock::time_point system_clock_now(void*) noexcept {
+    return std::chrono::steady_clock::now();
+}
+
+// --- Construction ------------------------------------------------------------
+
+client::client(std::unique_ptr<connection> connection, client_options options)
+    : conn_(std::move(connection)),
+      options_(std::move(options)),
+      pool_(options_.slot_capacity),
+      decoder_(max_frame_default),
+      completion_(*this),
+      source_(*this) {
+    if (conn_) {
+        conn_->bind_source(&source_);
+    }
+}
+
+client::~client() {
+    close();
+}
+
+bool client::is_open() const noexcept {
+    return !closed_ && conn_ != nullptr && conn_->is_open();
+}
+
+void client::close() noexcept {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+    fail_all(rpc_code::shutting_down, "client closed");
+    if (conn_) {
+        conn_->close();
+    }
+}
+
+// --- Reader ------------------------------------------------------------------
+
+std::size_t client::on_data(span<const std::byte> data) noexcept {
+    decoder_.feed(data);
+    if (in_process_) {
+        // Re-entered from a synchronous push: the outer loop will drain these
+        // bytes after the current frame is handled.
+        return data.size();
+    }
+    in_process_ = true;
+    frame value;
+    frame_decoder::result result = frame_decoder::result::need_more;
+    while ((result = decoder_.next(value)) == frame_decoder::result::frame_ready) {
+        handle_frame(value);
+    }
+    in_process_ = false;
+    if (result == frame_decoder::result::error) {
+        protocol_failure();
+    }
+    return data.size();
+}
+
+void client::on_eof() noexcept {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+    fail_all(rpc_code::eof, "peer closed the connection");
+}
+
+void client::on_error(std::error_code ec) noexcept {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+    fail_all(map_error(ec), ec.message());
+}
+
+void client::handle_frame(const frame& value) {
+    switch (value.header.type) {
+    case frame_type::response:
+        handle_response(value);
+        break;
+    case frame_type::ping:
+        handle_ping(value);
+        break;
+    case frame_type::goaway:
+        handle_goaway(value);
+        break;
+    default:
+        break;
+    }
+}
+
+void client::handle_response(const frame& value) {
+    const auto it = in_flight_.find(value.header.stream_id);
+    if (it == in_flight_.end()) {
+        // Unknown or late stream: dropped, never delivered to a recycled slot.
+        return;
+    }
+    call_slot* slot = it->second;
+    rpc_code code = rpc_code::ok;
+    rpc_error error;
+    span<const std::byte> body;
+    const status decoded = decode_response(value.payload, code, error, body);
+    if (!decoded.ok()) {
+        finish(*slot, call_state::failed, rpc_code::decode_error,
+               rpc_error(rpc_code::decode_error, "response decode failed"), span<const std::byte>());
+        return;
+    }
+    finish(*slot, call_state::completed, code, std::move(error), body);
+}
+
+void client::handle_ping(const frame& value) {
+    if (value.payload.size() != 8) {
+        return;
+    }
+    frame pong;
+    pong.header.type = frame_type::pong;
+    pong.header.stream_id = 0;
+    pong.payload = value.payload;
+    const std::size_t size = encoded_frame_size(pong);
+    frame_scratch_.clear();
+    if (!frame_scratch_.reserve(size)) {
+        return;
+    }
+    std::size_t written = 0;
+    if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), pong, written).ok()) {
+        return;
+    }
+    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    flush_write();
+}
+
+void client::handle_goaway(const frame&) {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+    fail_all(rpc_code::shutting_down, "peer sent GOAWAY");
+}
+
+void client::protocol_failure() {
+    if (closed_) {
+        return;
+    }
+    closed_ = true;
+    fail_all(rpc_code::protocol_error, "frame decode error");
+}
+
+// --- Writer ------------------------------------------------------------------
+
+void client::on_write_complete(io::io_result result) noexcept {
+    write_in_flight_ = false;
+    if (!result.ok()) {
+        write_error_ = true;
+        write_ec_ = result.ec;
+        return;
+    }
+    out_sent_ += result.bytes;
+    short_write_ = result.bytes < requested_;
+    if (!in_push_) {
+        // Asynchronous completion: resume the queue from the backend thread.
+        flush_write();
+    }
+}
+
+void client::flush_write() {
+    if (write_in_flight_ || closed_ || conn_ == nullptr) {
+        return;
+    }
+    for (;;) {
+        const std::size_t remaining = out_.size() - out_sent_;
+        if (remaining == 0) {
+            out_.clear();
+            out_sent_ = 0;
+            return;
+        }
+        requested_ = remaining;
+        write_error_ = false;
+        short_write_ = false;
+        write_in_flight_ = true;
+        in_push_ = true;
+        conn_->sink().push(span<const std::byte>(out_.data() + out_sent_, remaining), &completion_);
+        in_push_ = false;
+        if (write_error_) {
+            const std::error_code ec = write_ec_;
+            write_error_ = false;
+            closed_ = true;
+            fail_all(map_error(ec), ec.message());
+            return;
+        }
+        if (write_in_flight_) {
+            // Asynchronous sink: the completion resumes the queue.
+            return;
+        }
+        if (!short_write_) {
+            out_.clear();
+            out_sent_ = 0;
+            return;
+        }
+        // A short write accepted a prefix; loop and re-push the remainder.
+    }
+}
+
+void client::enqueue_raw(span<const std::byte> bytes) {
+    (void)out_.append(bytes);
+}
+
+void client::send_rst(u32 stream_id, rpc_code code) {
+    std::byte payload[4];
+    endian::store_le32(payload, static_cast<u32>(code));
+    frame rst;
+    rst.header.type = frame_type::rst_stream;
+    rst.header.stream_id = stream_id;
+    rst.payload = span<const std::byte>(payload, sizeof(payload));
+    const std::size_t size = encoded_frame_size(rst);
+    frame_scratch_.clear();
+    if (!frame_scratch_.reserve(size)) {
+        return;
+    }
+    std::size_t written = 0;
+    if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), rst, written).ok()) {
+        return;
+    }
+    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    flush_write();
+}
+
+// --- Call lifecycle ----------------------------------------------------------
+
+call_id client::next_call_id() {
+    call_id id;
+    id.client_id = options_.client_id;
+    id.client_epoch = options_.client_epoch;
+    id.seq = ++seq_;
+    return id;
+}
+
+call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context& ctx,
+                              rpc_error& failure) {
+    call_slot* slot = pool_.try_acquire();
+    if (slot == nullptr) {
+        failure = rpc_error(rpc_code::resource_exhausted, "call slot pool exhausted");
+        return nullptr;
+    }
+
+    const auto now = options_.clock(options_.clock_ctx);
+    if (ctx.has_deadline && ctx.deadline <= now) {
+        pool_.release(slot);
+        failure = rpc_error(rpc_code::deadline_exceeded, "deadline already passed");
+        return nullptr;
+    }
+
+    slot->service_id = service_id;
+    slot->method_id = method_id;
+    slot->idempotent = ctx.idempotent;
+    slot->one_way = ctx.mode == delivery_mode::unreliable;
+    if (ctx.has_idempotency_key && !ctx.idempotency.empty()) {
+        slot->idem = ctx.idempotency;
+    } else {
+        slot->idem = next_call_id();
+    }
+    if (ctx.has_deadline) {
+        slot->has_deadline = true;
+        slot->deadline = ctx.deadline;
+    } else if (options_.default_timeout.count() > 0) {
+        slot->has_deadline = true;
+        slot->deadline = now + options_.default_timeout;
+    }
+    slot->stream_id = allocate_stream_id(stream_seq_, &client::in_flight_probe, this);
+    slot->owner = this;
+    slot->owner_cancel = &client::cancel_thunk;
+    set_state(*slot, call_state::queued);
+    return slot;
+}
+
+status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
+                             span<const std::byte> body, const call_context& ctx) {
+    call_envelope envelope;
+    envelope.service_id = service_id;
+    envelope.method_id = method_id;
+    envelope.codec = codec_id::binary;
+    envelope.body = body;
+
+    trace_extension& ext = envelope.extensions;
+    ext.flags = 0;
+    if (ctx.trace.valid()) {
+        ext.flags = static_cast<u8>(ext.flags | trace_extension::has_trace_id |
+                                    trace_extension::has_span_id);
+        ext.trace_id = ctx.trace.trace.bytes;
+        ext.span_id = ctx.trace.span.bytes;
+        if (ctx.trace.parent.valid()) {
+            ext.flags = static_cast<u8>(ext.flags | trace_extension::has_parent_span_id);
+            ext.parent_span_id = ctx.trace.parent.bytes;
+        }
+    }
+    if (slot.has_deadline) {
+        ext.flags = static_cast<u8>(ext.flags | trace_extension::has_deadline);
+        ext.deadline_ns = static_cast<u64>(slot.deadline.time_since_epoch().count());
+    }
+    const std::array<std::byte, 32> key = slot.idem.encode();
+    if (ctx.idempotent || ctx.has_idempotency_key) {
+        ext.flags = static_cast<u8>(ext.flags | trace_extension::has_idempotency_key);
+        ext.idempotency_key = span<const std::byte>(key.data(), key.size());
+    }
+    if (ext.flags != 0) {
+        envelope.call_flags = static_cast<u8>(envelope.call_flags | call_flag_has_extensions);
+    }
+
+    const std::size_t payload_size = encoded_call_envelope_size(envelope);
+    payload_scratch_.clear();
+    if (!payload_scratch_.reserve(payload_size)) {
+        return status{rpc_code::resource_exhausted};
+    }
+    std::size_t payload_written = 0;
+    status encoded = encode_call_envelope(span<std::byte>(payload_scratch_.data(), payload_size),
+                                          envelope, payload_written);
+    if (!encoded.ok()) {
+        return encoded;
+    }
+
+    frame request;
+    request.header.type = slot.one_way ? frame_type::one_way : frame_type::request;
+    request.header.flags = slot.one_way ? frame_flag_unreliable : 0;
+    request.header.stream_id = slot.stream_id;
+    request.payload = span<const std::byte>(payload_scratch_.data(), payload_written);
+
+    const std::size_t frame_size = encoded_frame_size(request);
+    if (out_.size() - out_sent_ + frame_size > options_.max_pending_write_bytes) {
+        return status{rpc_code::resource_exhausted};
+    }
+    frame_scratch_.clear();
+    if (!frame_scratch_.reserve(frame_size)) {
+        return status{rpc_code::resource_exhausted};
+    }
+    std::size_t frame_written = 0;
+    encoded = encode_frame(span<std::byte>(frame_scratch_.data(), frame_size), request, frame_written);
+    if (!encoded.ok()) {
+        return encoded;
+    }
+    if (!out_.append(span<const std::byte>(frame_scratch_.data(), frame_written))) {
+        return status{rpc_code::resource_exhausted};
+    }
+
+    slot.written = true;
+    in_flight_.emplace(slot.stream_id, &slot);
+    if (slot.has_deadline) {
+        deadlines_.emplace(slot.deadline, &slot);
+    }
+    set_state(slot, call_state::sent);
+    flush_write();
+
+    if (slot.one_way) {
+        finish(slot, call_state::completed, rpc_code::ok, rpc_error{}, span<const std::byte>());
+    }
+    return status{};
+}
+
+void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
+                    span<const std::byte> body) {
+    if (finish_slot(slot, terminal, code, std::move(error), body)) {
+        remove_in_flight(slot);
+        if (slot.callback_armed) {
+            slot.invoke_callback();
+        }
+    }
+}
+
+void client::cancel_slot(call_slot& slot) noexcept {
+    if (finish_slot(slot, call_state::canceled, rpc_code::canceled,
+                    rpc_error(rpc_code::canceled, "call canceled"), span<const std::byte>())) {
+        if (slot.written && !closed_ && conn_ != nullptr && conn_->is_open()) {
+            send_rst(slot.stream_id, rpc_code::canceled);
+        }
+        remove_in_flight(slot);
+        if (slot.callback_armed) {
+            slot.invoke_callback();
+        }
+    }
+}
+
+void client::fail_all(rpc_code code, std::string message) {
+    if (in_flight_.empty()) {
+        return;
+    }
+    std::vector<call_slot*> slots;
+    slots.reserve(in_flight_.size());
+    for (const auto& entry : in_flight_) {
+        slots.push_back(entry.second);
+    }
+    for (call_slot* slot : slots) {
+        finish(*slot, call_state::failed, code, rpc_error(code, message), span<const std::byte>());
+    }
+}
+
+void client::remove_in_flight(call_slot& slot) {
+    const auto it = in_flight_.find(slot.stream_id);
+    if (it != in_flight_.end() && it->second == &slot) {
+        in_flight_.erase(it);
+    }
+    remove_deadline(slot);
+}
+
+void client::remove_deadline(call_slot& slot) {
+    if (!slot.has_deadline) {
+        return;
+    }
+    const auto range = deadlines_.equal_range(slot.deadline);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == &slot) {
+            deadlines_.erase(it);
+            return;
+        }
+    }
+}
+
+void client::poll() noexcept {
+    if (closed_ || deadlines_.empty()) {
+        return;
+    }
+    const auto now = options_.clock(options_.clock_ctx);
+    auto it = deadlines_.begin();
+    while (it != deadlines_.end() && it->first <= now) {
+        call_slot* slot = it->second;
+        it = deadlines_.erase(it);
+        if (slot == nullptr || result_ready(*slot)) {
+            continue;
+        }
+        rpc_error error(rpc_code::deadline_exceeded, "deadline exceeded");
+        if (slot->written && !slot->idempotent) {
+            error.metadata.set("unknown_side_effect", "1");
+        }
+        finish(*slot, call_state::timed_out, rpc_code::deadline_exceeded, std::move(error),
+               span<const std::byte>());
+    }
+}
+
+bool client::in_flight_probe(void* ctx, u32 id) noexcept {
+    const auto* self = static_cast<const client*>(ctx);
+    return self->in_flight_.find(id) != self->in_flight_.end();
+}
+
+void client::cancel_thunk(void* ctx, call_slot* slot) noexcept {
+    static_cast<client*>(ctx)->cancel_slot(*slot);
+}
+
+rpc_code client::map_error(std::error_code ec) noexcept {
+    if (ec == std::errc::connection_refused) {
+        return rpc_code::connection_refused;
+    }
+    if (ec == std::errc::broken_pipe) {
+        return rpc_code::broken_pipe;
+    }
+    if (ec == std::errc::operation_canceled) {
+        return rpc_code::canceled;
+    }
+    if (ec == std::errc::connection_reset) {
+        return rpc_code::connection_reset;
+    }
+    return rpc_code::connection_reset;
+}
+
+} // namespace crpc::rpc

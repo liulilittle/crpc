@@ -27,15 +27,6 @@
 #include <utility>
 #include <vector>
 
-// test_framework.hpp (Debug) issues a file-scope
-// `#pragma section(".CRT$XCU", read)`. Under MSVC that pragma makes every
-// subsequent `static inline` data member's dynamic initializer inert, so RTTI's
-// `fields_of<T>::members` tuple would stay zero-initialized (every member
-// pointer reading as offset 0) in this translation unit. The codec's field walk
-// depends on that table, so `_DEBUG` is undefined around the harness include to
-// keep the pragma out of this TU. The CRT is still linked through /MDd, and
-// `_ITERATOR_DEBUG_LEVEL` was already fixed by <crpc/codec.hpp>.
-#undef _DEBUG
 #include "test_framework.hpp"
 
 // RTTI registration macros must be emitted at global namespace scope: they
@@ -511,6 +502,92 @@ CRPC_TEST(json_malformed_maps_to_decode_error) {
     CRPC_CHECK(decoded.code() == rpc_code::decode_error);
     CRPC_CHECK(decoded.message().find("offset") != std::string::npos);
 }
+
+CRPC_TEST(json_erased_interface) {
+    crpc::json_codec json;
+    json.register_type<inner>();
+
+    inner input{};
+    input.a = 17;
+    input.b = "erased json";
+
+    buffer encoded;
+    CRPC_CHECK(json.encode(&input, typeid(inner), encoded).ok());
+
+    inner output{};
+    CRPC_CHECK(json.decode(encoded.readable(), &output, typeid(inner)).ok());
+    CRPC_CHECK_EQ(input.a, output.a);
+    CRPC_CHECK_EQ(input.b, output.b);
+}
+#endif
+
+#if defined(CRPC_HAVE_RTTI_XML)
+CRPC_TEST(xml_roundtrip) {
+    const codec* xml = crpc::default_codec_registry().find(codec_id::xml);
+    CRPC_CHECK(xml != nullptr);
+    if (xml == nullptr) {
+        return;
+    }
+
+    inner input{};
+    input.a = 21;
+    input.b = "xml text";
+
+    buffer encoded;
+    CRPC_CHECK(crpc::encode_into(*xml, input, encoded).ok());
+    CRPC_CHECK(!encoded.empty());
+
+    inner output{};
+    CRPC_CHECK(crpc::decode_from(*xml, encoded.readable(), output).ok());
+    CRPC_CHECK_EQ(input.a, output.a);
+    CRPC_CHECK_EQ(input.b, output.b);
+}
+#endif
+
+#if defined(CRPC_HAVE_RTTI_INI)
+CRPC_TEST(ini_roundtrip) {
+    const codec* ini = crpc::default_codec_registry().find(codec_id::ini);
+    CRPC_CHECK(ini != nullptr);
+    if (ini == nullptr) {
+        return;
+    }
+
+    inner input{};
+    input.a = 23;
+    input.b = "ini text";
+
+    buffer encoded;
+    CRPC_CHECK(crpc::encode_into(*ini, input, encoded).ok());
+    CRPC_CHECK(!encoded.empty());
+
+    inner output{};
+    CRPC_CHECK(crpc::decode_from(*ini, encoded.readable(), output).ok());
+    CRPC_CHECK_EQ(input.a, output.a);
+    CRPC_CHECK_EQ(input.b, output.b);
+}
+#endif
+
+#if defined(CRPC_HAVE_RTTI_TOML)
+CRPC_TEST(toml_roundtrip) {
+    const codec* toml = crpc::default_codec_registry().find(codec_id::toml);
+    CRPC_CHECK(toml != nullptr);
+    if (toml == nullptr) {
+        return;
+    }
+
+    inner input{};
+    input.a = 22;
+    input.b = "toml text";
+
+    buffer encoded;
+    CRPC_CHECK(crpc::encode_into(*toml, input, encoded).ok());
+    CRPC_CHECK(!encoded.empty());
+
+    inner output{};
+    CRPC_CHECK(crpc::decode_from(*toml, encoded.readable(), output).ok());
+    CRPC_CHECK_EQ(input.a, output.a);
+    CRPC_CHECK_EQ(input.b, output.b);
+}
 #endif
 
 CRPC_TEST(registry_lookup_duplicate_and_freeze) {
@@ -571,6 +648,7 @@ CRPC_TEST(default_registry_contains_builtins) {
 }
 
 CRPC_TEST_MAIN()
+
 
 
 

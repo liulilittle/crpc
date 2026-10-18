@@ -5,6 +5,8 @@
 // shared mutex serializes readers against registration.
 #include <crpc/codec.hpp>
 
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -51,27 +53,33 @@ std::string_view trim_content_type(std::string_view value) noexcept {
 }
 
 bool initialize_default(codec_registry& registry) {
-    (void)registry.add(std::make_unique<binary_codec>());
+    try {
+        (void)registry.add(std::make_unique<binary_codec>());
 #if defined(CRPC_HAVE_RTTI_JSON)
-    (void)registry.add(std::make_unique<json_codec>());
+        (void)registry.add(std::make_unique<json_codec>());
 #endif
 #if defined(CRPC_HAVE_RTTI_XML)
-    (void)registry.add(std::make_unique<xml_codec>());
+        (void)registry.add(std::make_unique<xml_codec>());
 #endif
 #if defined(CRPC_HAVE_RTTI_INI)
-    (void)registry.add(std::make_unique<ini_codec>());
+        (void)registry.add(std::make_unique<ini_codec>());
 #endif
 #if defined(CRPC_HAVE_RTTI_TOML)
-    (void)registry.add(std::make_unique<toml_codec>());
+        (void)registry.add(std::make_unique<toml_codec>());
 #endif
 #if defined(CRPC_HAVE_RTTI_PROTOBUF)
-    (void)registry.add(std::make_unique<protobuf_codec>());
+        (void)registry.add(std::make_unique<protobuf_codec>());
 #endif
 #if defined(CRPC_HAVE_RTTI_FLATBUFFERS)
-    (void)registry.add(std::make_unique<flatbuffers_codec>());
+        (void)registry.add(std::make_unique<flatbuffers_codec>());
 #endif
-    (void)registry.freeze();
-    return true;
+        (void)registry.freeze();
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 } // namespace
@@ -110,10 +118,30 @@ status codec_registry::add(std::unique_ptr<codec> entry) {
     }
 
     const codec* raw = entry.get();
-    by_id_.emplace(key, raw);
-    by_content_type_.emplace_back(std::string(content_type), raw);
-    owned_.push_back(std::move(entry));
+    // Insert in an order that allows a complete rollback if an allocation
+    // fails: the registry must never keep a pointer to a codec it does not own.
+    try {
+        owned_.push_back(std::move(entry));
+        by_id_.emplace(key, raw);
+        by_content_type_.emplace_back(std::string(content_type), raw);
+    } catch (const std::bad_alloc&) {
+        rollback(raw, key);
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        rollback(raw, key);
+        return status{rpc_code::resource_exhausted};
+    }
     return status{};
+}
+
+void codec_registry::rollback(const codec* raw, u16 key) noexcept {
+    if (!owned_.empty() && owned_.back().get() == raw) {
+        owned_.pop_back();
+    }
+    by_id_.erase(key);
+    if (!by_content_type_.empty() && by_content_type_.back().second == raw) {
+        by_content_type_.pop_back();
+    }
 }
 
 const codec* codec_registry::find(codec_id id) const noexcept {
@@ -160,8 +188,16 @@ status codec_registry::freeze() {
     if (next == nullptr) {
         return status{rpc_code::resource_exhausted};
     }
-    next->by_id = by_id_;
-    next->by_content_type = by_content_type_;
+    try {
+        next->by_id = by_id_;
+        next->by_content_type = by_content_type_;
+    } catch (const std::bad_alloc&) {
+        delete next;
+        return status{rpc_code::resource_exhausted};
+    } catch (const std::length_error&) {
+        delete next;
+        return status{rpc_code::resource_exhausted};
+    }
     snapshot_.store(next, std::memory_order_release);
     snapshot_owned_ = next;
     frozen_ = true;

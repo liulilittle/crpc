@@ -240,8 +240,6 @@ public:
     [[nodiscard]] status decode(span<const std::byte> block, std::vector<header_field>& out);
 
 private:
-    [[nodiscard]] const header_field* resolve_index(u64 index) const noexcept;
-
     dynamic_table table_;
     std::size_t peer_table_limit_;
     std::size_t max_header_list_size_ = default_max_header_list_size;

@@ -358,6 +358,7 @@ void tracer::start() noexcept {
 }
 
 void tracer::shutdown() noexcept {
+    enabled_.store(false, std::memory_order_release);
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
