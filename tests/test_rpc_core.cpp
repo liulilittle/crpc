@@ -471,6 +471,51 @@ CRPC_TEST(client_round_trip) {
     CRPC_CHECK_EQ(0u, c.in_flight());
 }
 
+CRPC_TEST(client_sends_relative_deadline) {
+    auto pair = inproc_pair::make();
+    auto client_conn = std::move(pair.first);
+    auto server_conn = std::move(pair.second);
+
+    // The handler records what the peer actually advertised.
+    static std::atomic<long long> seen_ns{-1};
+    seen_ns.store(-1, std::memory_order_relaxed);
+    const auto record = [](void*, const call_envelope&, span<const std::byte> body, buffer& out,
+                           call_context& ctx) -> status {
+        seen_ns.store(static_cast<long long>(ctx.remaining(std::chrono::steady_clock::now()).count()),
+                      std::memory_order_relaxed);
+        (void)out.append(body);
+        return status{};
+    };
+
+    service_registry reg;
+    (void)reg.register_service(1, "svc");
+    (void)reg.register_method(1, 1, "record", record, nullptr);
+    (void)reg.freeze();
+    dispatcher d(reg);
+    test_server server(d, server_conn->sink());
+    server_conn->bind_source(&server);
+
+    client_options options;
+    options.slot_capacity = 16;
+    client c(std::move(client_conn), options);
+
+    call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+    std::string body = "x";
+    auto started = c.start_call<std::string>(1, 1, bytes_of(body), ctx);
+    CRPC_CHECK(started.ok());
+    auto handle = std::move(started).value();
+    const auto result_value = handle.get();
+    CRPC_CHECK(result_value.ok());
+
+    // A clock epoch would be ~1e18 ns; the remaining budget is ~1e9 ns.
+    const long long seen = seen_ns.load(std::memory_order_relaxed);
+    CRPC_CHECK(seen > 900'000'000ll);
+    CRPC_CHECK(seen <= 1'000'000'000ll);
+}
+
 CRPC_TEST(client_thousand_concurrent_calls) {
     auto pair = inproc_pair::make();
     auto client_conn = std::move(pair.first);
@@ -743,12 +788,47 @@ CRPC_TEST(dispatcher_expired_deadline_skips_handler) {
     dispatcher d(reg);
 
     const auto now = std::chrono::steady_clock::now();
-    const auto past =
-        static_cast<u64>(now.time_since_epoch().count()) - 1'000'000u; // 1 ms in the past
     std::string body = "x";
-    built_request request = make_call(1, 1, bytes_of(body), true, past);
+    // The wire field is the time left, so zero means the deadline is already
+    // gone. It must never be compared against a local clock epoch.
+    built_request request = make_call(1, 1, bytes_of(body), true, 0);
     CRPC_CHECK_EQ(rpc_code::deadline_exceeded, dispatch_code(d, request.value, now));
     CRPC_CHECK_FALSE(g_flag_ran.load(std::memory_order_relaxed));
+
+    // A sub-millisecond budget is below the documented minimum and is refused
+    // before the handler starts.
+    built_request tiny = make_call(1, 1, bytes_of(body), true, 500'000);
+    CRPC_CHECK_EQ(rpc_code::deadline_exceeded, dispatch_code(d, tiny.value, now));
+    CRPC_CHECK_FALSE(g_flag_ran.load(std::memory_order_relaxed));
+}
+
+CRPC_TEST(dispatcher_relative_deadline_becomes_local_deadline) {
+    struct deadline_controller {
+        std::chrono::nanoseconds seen{};
+        std::string run(const std::string& in, call_context& ctx) {
+            seen = ctx.remaining(std::chrono::steady_clock::now());
+            return in;
+        }
+    };
+
+    service_registry reg;
+    (void)reg.register_service(1, "svc");
+    deadline_controller controller;
+    const status registered =
+        register_typed_method<deadline_controller, &deadline_controller::run>(reg, 1, 1, "run",
+                                                                             controller);
+    CRPC_CHECK(registered.ok());
+    (void)reg.freeze();
+    dispatcher d(reg);
+
+    const auto now = std::chrono::steady_clock::now();
+    std::string body = "x";
+    built_request request = make_call(1, 1, bytes_of(body), true, 1'000'000'000ull);
+    CRPC_CHECK_EQ(rpc_code::ok, dispatch_code(d, request.value, now));
+
+    // The handler sees roughly the advertised second, not a clock epoch.
+    CRPC_CHECK(controller.seen > std::chrono::milliseconds(900));
+    CRPC_CHECK(controller.seen <= std::chrono::seconds(1));
 }
 
 CRPC_TEST(dispatcher_typed_trampoline_round_trip) {

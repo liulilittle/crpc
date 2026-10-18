@@ -177,12 +177,12 @@ enum class delivery_mode : u8 {
 // --- Call context ------------------------------------------------------------
 
 // Everything a call carries besides its request body. The deadline is an
-// absolute steady-clock time point so the client's injected monotonic clock and
-// the server's deadline check share one representation; it is encoded on the
-// wire as nanoseconds since the steady-clock epoch (a limitation noted in the
-// header of client.hpp for cross-process use).
+// absolute steady-clock time point inside one process, which is what the
+// client's injected monotonic clock and the server's deadline check compare
+// against. On the wire it travels as `remaining_ns`, a relative duration, so
+// the value stays meaningful across processes and hosts.
 struct call_context {
-    // Absolute deadline. Ignored unless `has_deadline` is set.
+    // Absolute local deadline. Ignored unless `has_deadline` is set.
     std::chrono::steady_clock::time_point deadline{};
     bool has_deadline = false;
 

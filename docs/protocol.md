@@ -33,7 +33,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 
 The CRPC binary protocol is a length-prefixed, multiplexed frame stream. A frame is a 16-byte fixed header, an optional 16-byte ordered extension, and a payload. The frame layer knows nothing about RPC methods; `REQUEST`, `RESPONSE` and `ONE_WAY` payloads carry a call envelope.
 
-Authority: `include/crpc/frame.hpp` for field widths, numeric values, flags, limits and CRC; `src/frame/frame.cpp` for validation order and envelope encoding; `src/rpc/client.cpp` for what the client writes and accepts; `src/rpc/dispatcher.cpp` for response encoding. The design specification §7 is the target contract. Two deviations are called out: the envelope uses 64-bit service/method ids and a different extension layout (§8, §9), and the deadline is currently absolute rather than relative (§9).
+Authority: `include/crpc/frame.hpp` for field widths, numeric values, flags, limits and CRC; `src/frame/frame.cpp` for validation order and envelope encoding; `src/rpc/client.cpp` for what the client writes and accepts; `src/rpc/dispatcher.cpp` for response encoding. The design specification §7 is the target contract. One deviation is called out: the envelope uses 64-bit service/method ids and a different extension layout (§8, §9). The deadline is relative as the design requires (§9).
 
 ## 2. Byte-order and alignment <a id="s2"></a>
 
@@ -147,7 +147,7 @@ When `call_flags` bit 0 is set, an extension block follows the codec field. Its 
 
 Bits 5–7 are reserved and must be zero. `span_id` requires `trace_id`; `parent_span_id` requires `span_id`. An idempotency key is at most 128 bytes; the current client writes the 32-byte R6 triple `(client_id[16], client_epoch u64, seq u64)`. If `call_flags` bit 0 is clear, `ext_flags` must be zero and no key may be present. If a presence bit is clear, its bytes are absent; a non-empty key without the bit is rejected.
 
-**Deadline deviation.** The design requires `remaining_ns`, a relative duration. The client writes `deadline.time_since_epoch().count()` from `std::chrono::steady_clock` (`src/rpc/client.cpp`). Steady-clock epochs are not comparable across processes or hosts, so the value is only meaningful for the in-process backend. Cross-process deadline propagation is **specified, not implemented**; until fixed, a peer must not treat `deadline_ns` as a wall-clock timestamp.
+**Deadline semantics.** `deadline_ns` is `remaining_ns`: the time left at the moment the frame is encoded, never an absolute instant. Steady-clock epochs differ per process and host, so an absolute value would be meaningless on the peer (P12, design §8.5). The client computes `slot.deadline - now` through its injected monotonic clock and sends `0` when the deadline has already passed; the server reconstructs its local deadline as `steady_clock::now() + deadline_ns`. Transit time is therefore not charged to the peer, and a zero remaining value must be rejected as `deadline_exceeded` without executing the handler.
 
 ## 10. Response and error payload <a id="s10"></a>
 

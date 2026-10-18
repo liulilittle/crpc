@@ -1,4 +1,4 @@
-// CRPC -- service registry and server-side dispatch implementation.
+﻿// CRPC -- service registry and server-side dispatch implementation.
 #include <crpc/rpc/dispatcher.hpp>
 
 #include <string>
@@ -38,14 +38,16 @@ status respond_error(buffer& out, bool& has_response, bool wants_response, rpc_c
 }
 
 // Rebuilds the per-call context a handler sees from the decoded envelope.
-call_context build_context(const call_envelope& envelope) {
+// `now` is the dispatcher's reference instant; the wire carries the time left,
+// so the local deadline is `now` plus that duration.
+call_context build_context(const call_envelope& envelope,
+                           std::chrono::steady_clock::time_point now) {
     call_context ctx;
     const trace_extension& ext = envelope.extensions;
     ctx.has_deadline = ext.has(trace_extension::has_deadline);
     if (ext.has(trace_extension::has_deadline)) {
-        ctx.deadline = std::chrono::steady_clock::time_point(
-            std::chrono::steady_clock::duration(
-                static_cast<std::chrono::steady_clock::duration::rep>(ext.deadline_ns)));
+        ctx.deadline = now + std::chrono::nanoseconds(
+                                 static_cast<std::chrono::nanoseconds::rep>(ext.deadline_ns));
     }
     if (ext.has(trace_extension::has_trace_id)) {
         ctx.trace.trace.bytes = ext.trace_id;
@@ -329,9 +331,10 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
     }
 
     if (envelope.extensions.has(trace_extension::has_deadline)) {
-        const auto deadline_rep =
-            static_cast<std::chrono::steady_clock::duration::rep>(envelope.extensions.deadline_ns);
-        if (now.time_since_epoch().count() >= deadline_rep) {
+        // Relative deadline (design section 8.5): refuse to start work that
+        // cannot finish. 1 ms is the documented minimum remaining time.
+        constexpr u64 min_remaining_ns = 1'000'000;
+        if (envelope.extensions.deadline_ns < min_remaining_ns) {
             return respond_error(response_out, has_response, wants_response,
                                  rpc_code::deadline_exceeded, "deadline already passed");
         }
@@ -343,7 +346,7 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
     }
     service->enter();
 
-    call_context ctx = build_context(envelope);
+    call_context ctx = build_context(envelope, now);
     buffer body_out;
     status handler_status;
     try {
@@ -369,3 +372,4 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
 }
 
 } // namespace crpc::rpc
+

@@ -33,7 +33,7 @@
 
 CRPC 二进制协议是带长度前缀的多路复用帧流。一帧由 16 字节固定头、可选的 16 字节有序扩展和负载组成。帧层不了解 RPC 方法；`REQUEST`、`RESPONSE`、`ONE_WAY` 的负载携带调用信封。
 
-权威来源：`include/crpc/frame.hpp` 规定字段宽度、数值、标志、限制与 CRC；`src/frame/frame.cpp` 规定校验顺序与信封编码；`src/rpc/client.cpp` 规定客户端写什么、接受什么；`src/rpc/dispatcher.cpp` 规定响应编码。设计规格 §7 是目标契约。有两处偏差需要明确：信封使用 64 位 service/method id 和不同的扩展布局（§8、§9）；截止时间目前写成绝对值而不是相对值（§9）。
+权威来源：`include/crpc/frame.hpp` 规定字段宽度、数值、标志、限制与 CRC；`src/frame/frame.cpp` 规定校验顺序与信封编码；`src/rpc/client.cpp` 规定客户端写什么、接受什么；`src/rpc/dispatcher.cpp` 规定响应编码。设计规格 §7 是目标契约。有一处偏差需要明确：信封使用 64 位 service/method id 和不同的扩展布局（§8、§9）。截止时间按设计使用相对值（§9）。
 
 ## 2. 字节序与对齐 <a id="s2"></a>
 
@@ -147,7 +147,7 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 
 5–7 位保留且必须为零。`span_id` 要求 `trace_id`；`parent_span_id` 要求 `span_id`。幂等键最多 128 字节；当前客户端写入 32 字节的 R6 三元组 `(client_id[16], client_epoch u64, seq u64)`。`call_flags` bit 0 未置位时，`ext_flags` 必须为零且不得有键。存在位未置位时对应字节不存在；没有该位却有非空键会被拒绝。
 
-**截止时间偏差。** 设计要求 `remaining_ns` 相对时长。客户端写入 `std::chrono::steady_clock` 的 `deadline.time_since_epoch().count()`（`src/rpc/client.cpp`）。steady_clock 的纪元不能跨进程或跨主机比较，因此该值只对进程内后端有意义。跨进程截止时间传播属于**已设计，未实现**；在修复之前，对端不得把 `deadline_ns` 当作墙钟时间戳。
+**截止时间语义。** `deadline_ns` 是 `remaining_ns`：编码该帧时剩余的时间，绝不是绝对时刻。steady_clock 的纪元因进程和主机而异，绝对值在对端没有意义（P12，设计 §8.5）。客户端通过注入的单调时钟计算 `slot.deadline - now`，截止时间已过则写 `0`；服务端按 `steady_clock::now() + deadline_ns` 重建本地截止时间。因此传输耗时不计入对端预算，剩余值为零时必须不执行处理器直接返回 `deadline_exceeded`。
 
 ## 10. 响应与错误负载 <a id="s10"></a>
 

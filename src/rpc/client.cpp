@@ -326,8 +326,17 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
         }
     }
     if (slot.has_deadline) {
+        // The wire carries the time left, not an absolute instant: steady-clock
+        // epochs are per process, so an absolute value means nothing on the
+        // peer (P12, design section 8.5). A deadline that has already elapsed
+        // is sent as zero so the server rejects without executing.
         ext.flags = static_cast<u8>(ext.flags | trace_extension::has_deadline);
-        ext.deadline_ns = static_cast<u64>(slot.deadline.time_since_epoch().count());
+        const auto now = options_.clock(options_.clock_ctx);
+        ext.deadline_ns = slot.deadline > now
+                              ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     slot.deadline - now)
+                                                     .count())
+                              : 0;
     }
     const std::array<std::byte, 32> key = slot.idem.encode();
     if (ctx.idempotent || ctx.has_idempotency_key) {

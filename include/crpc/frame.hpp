@@ -30,7 +30,7 @@
 //   trace_id          16 bytes  if bit0
 //   span_id            8 bytes  if bit1
 //   parent_span_id     8 bytes  if bit2
-//   deadline_ns   u64           if bit3
+//   deadline_ns   u64           if bit3 (remaining time, not an absolute instant)
 //   key_len       u8            if bit4, then key_len bytes (<= 128)
 //
 // The frame flags have no spare bit (bits 0-4 are defined and bits 5-7 carry
