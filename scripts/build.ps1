@@ -1,4 +1,4 @@
-# build.ps1 -- one-click build for CRPC (reference implementation, validated).
+﻿# build.ps1 -- one-click build for CRPC (reference implementation, validated).
 # Location in the final repo: <repo>/scripts/build.ps1
 #
 # Usage:
@@ -92,7 +92,7 @@ function Get-BuildDirName {
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir 'out' }
+if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir '.opencode/tmp/out' }
 $logDir = Join-Path $BuildRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -196,3 +196,4 @@ $sw.Stop()
 Write-Log ("done in {0:N1}s, failures={1}, warnings={2}" -f $sw.Elapsed.TotalSeconds, $script:Failures, $script:Warnings)
 if ($script:Failures -gt 0) { exit 1 }
 exit 0
+

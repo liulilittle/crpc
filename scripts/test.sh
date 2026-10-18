@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # test.sh -- one-click test for CRPC (Linux/macOS).
 # Location in the final repo: <repo>/scripts/test.sh
 #
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$BUILD_ROOT" ]] && BUILD_ROOT="$SOURCE_DIR/out"
+[[ -z "$BUILD_ROOT" ]] && BUILD_ROOT="$SOURCE_DIR/.opencode/tmp/out"
 LOG_DIR="$BUILD_ROOT/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/test-$ARCH-$CONFIG-$SANITIZER-$(date +%Y%m%d-%H%M%S).log"
@@ -101,3 +101,5 @@ done
 log INFO "done: failures=$FAILURES log=$LOG"
 [[ $FAILURES -gt 0 ]] && exit 1
 exit 0
+
+

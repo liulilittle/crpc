@@ -1,4 +1,4 @@
-# test.ps1 -- one-click test for CRPC (reference implementation).
+﻿# test.ps1 -- one-click test for CRPC (reference implementation).
 # Location in the final repo: <repo>/scripts/test.ps1
 #
 # Usage:
@@ -62,12 +62,47 @@ $cmake = Find-CMake
 $ctest = Find-CTest
 if (-not $cmake) { Write-Host 'cmake not found'; exit 2 }
 
-if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir 'out' }
+if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir '.opencode/tmp/out' }
 $logDir = Join-Path $BuildRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "test-$Arch-$Config-$Sanitizer-$stamp.log"
 Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat"
+
+# --- Unattended-run guards ---------------------------------------------------
+#
+# A Debug build that hits a CRT assertion, an invalid parameter, a pure virtual
+# call or an access violation will normally raise a modal dialog. In an
+# unattended run that dialog blocks the whole desktop and the test never
+# returns: ctest hangs instead of failing. Two independent guards are applied so
+# that a test binary which does not link the CRPC test harness is still safe:
+#
+#   1. Windows Error Reporting is told not to show its UI for this user.
+#   2. Every ctest entry gets a hard timeout, so a process that is blocked on
+#      something else cannot wedge the run either.
+#
+# The in-process guard (SetErrorMode + report-mode redirection + minidump) lives
+# in tests/test_framework.hpp and covers the normal case; these are the backstop.
+
+$werKey = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting'
+try {
+    if (-not (Test-Path -LiteralPath $werKey)) {
+        New-Item -Path $werKey -Force | Out-Null
+    }
+    New-ItemProperty -Path $werKey -Name 'DontShowUI' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $werKey -Name 'Disabled' -Value 1 -PropertyType DWord -Force | Out-Null
+} catch {
+    Write-Log "could not disable WER UI: $($_.Exception.Message)" 'WARN'
+}
+
+$dumpDir = Join-Path $BuildRoot 'dumps'
+New-Item -ItemType Directory -Force -Path $dumpDir | Out-Null
+$env:CRPC_TEST_MINIDUMP_DIR = $dumpDir
+
+# Per-test ceiling. A test that needs longer must raise it explicitly rather than
+# relying on the runner to hang forever.
+$testTimeoutSeconds = 300
+
 
 $sanList = if ($Sanitizer -eq 'all') { @('asan', 'ubsan', 'tsan') } else { @($Sanitizer) }
 $cfgList = if ($Config -eq 'Both') { @('Debug', 'Release') } else { @($Config) }
@@ -94,16 +129,27 @@ foreach ($san in $sanList) {
 
         for ($r = 1; $r -le $Repeat; ++$r) {
             Write-Log "--- ctest $Arch/$cfg/$san run $r/$Repeat ---"
-            $ctestArgs = @('--test-dir', $buildDir, '--output-on-failure')
+            $ctestArgs = @('--test-dir', $buildDir, '--output-on-failure',
+                           '--timeout', "$testTimeoutSeconds",
+                           '--no-tests=error')
             if ($Filter) { $ctestArgs += @('-R', $Filter) }
             $out = & $ctest @ctestArgs 2>&1
             $out | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
-            $out | Where-Object { $_ -match 'Test\s+#|tests passed|tests failed|Failed|\*\*\*' } | ForEach-Object { Write-Host $_ }
+            $out | Where-Object { $_ -match 'Test\s+#|tests passed|tests failed|Failed|Timeout|\*\*\*' } | ForEach-Object { Write-Host $_ }
 
             if ($LASTEXITCODE -ne 0) {
                 Write-Log "ctest FAILED $Arch/$cfg/$san run $r" 'ERROR'
                 $script:Failures++
             }
+
+            # A timed-out ctest entry can leave the child process alive. Kill any
+            # leftover test binary so the next run starts clean instead of
+            # inheriting a wedged process.
+            Get-Process -Name 'crpc_test_*' -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Write-Log "killing leftover test process $($_.ProcessName) (pid $($_.Id))" 'WARN'
+                    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+                }
 
             $sanPattern = 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)'
             $sanHits = @($out | Select-String -Pattern $sanPattern)
@@ -119,3 +165,4 @@ foreach ($san in $sanList) {
 Write-Log ("done: failures={0}, log={1}" -f $script:Failures, $script:LogPath)
 if ($script:Failures -gt 0) { exit 1 }
 exit 0
+

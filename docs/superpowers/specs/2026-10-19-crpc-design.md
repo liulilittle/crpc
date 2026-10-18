@@ -1,11 +1,8 @@
 # CRPC Design Specification (English)
-
 [中文版 / Chinese version](2026-10-19-crpc-design.zh-CN.md)
 
 Version 1.0 / 2026-10-19 / normative source: `.opencode/ruling.md` (W11 final ruling). Precedence: ruling > `audit-arch-a.md` > `audit-rtti-b.md`.
-
 ## Contents
-
 | # | Section |
 |---|---|
 | [0](#s0) | Positioning and invariants |
@@ -31,27 +28,20 @@ Version 1.0 / 2026-10-19 / normative source: `.opencode/ruling.md` (W11 final ru
 | [20](#s20) | Build and CI |
 | [21](#s21) | v1 scope, v1.1, milestones |
 | [22](#s22) | Open issues and risks |
-
-<a id="s0"></a>
-## 0. Positioning and invariants
-
+## 0. Positioning and invariants <a id="s0"></a>
 CRPC is a C++17 RPC framework with two first-class capabilities carried by one connection, one frame format, and one shard/coroutine model:
 
 1. **Calls**: request/response, unary and streaming, synchronous-looking inside a coroutine, asynchronous through a `call<t>` handle.
 2. **Push**: server-to-client messages through `push_hub`, subscriptions, SSE, and long polling.
 
 The framework is not an HTTP wrapper. TCP carries a length-prefixed multiplexed frame stream; `crpc-binary` is the default codec. HTTP/1.1, HTTP/2, and HTTPS are additional adapters over the same routing table, `call_context`, resilience pipeline, and handler pool.
-
 ### 0.1 Three non-negotiable bottom lines
-
 | Line | Mandatory mechanism | Verification | Failure mode |
 |---|---|---|---|
 | **Never deadlock** | Documented lock order (§18.1); no I/O, user callback, coroutine suspension, `sem_post`, log sink, or blocking allocation while holding a lock; cross-shard traffic only through MPSC plus doorbell; one reader and one writer per connection; in-coroutine waits only through `coro_rt_sem_wait`/`coro_rt_cond_wait`; self-dependent lane wait returns `protocol_error` instead of parking. | Debug lock-order assertion (thread-local held-lock stack aborts on inversion); TSan on Linux; 10-minute multi-shard cross-call stress with random cancel/close. | A shard stops forever; every connection on it times out. |
 | **Never crash** | Validate every external input (frame length, field length, element count, enum value, UTF-8, header, path, body); no UB (byte-wise wire access, unsigned arithmetic with range checks, generation-checked handles, atomics for shared state); no exception crosses a coroutine or ABI boundary; `new` is `nothrow` or caught as `resource_exhausted`; recursion bounded. | ASan/UBSan; fuzzers for frame, HTTP, JSON/XML/TOML/INI, multipart, router; malformed-input fault injection; `_GLIBCXX_ASSERTIONS`. | Process abort; all connections drop; cascading failure. |
 | **Never leak** | One-to-one pairing for every acquire/release, subscribe/unsubscribe, register/deregister, arm/cancel, wait/post, open/close; idempotent destroy; no delivery after close, in-flight completion exactly once as canceled (R9); late completions dropped by generation; no `shared_ptr` cycles; every slot/stream/lane/connection has a cap and a recycle point; timers removed when a call terminates. | ASan/LSan zero reports; `drain()` asserts `pending_calls == 0 && open_connections == 0 && armed_timers == 0 && temp_files == 0`; million-call long run with flat RSS; 1000 start/stop cycles. | Slow memory/fd growth; OOM or slot exhaustion after hours. |
-
 ### 0.2 Principles P1-P13
-
 | # | Principle | Enforcement | Verification |
 |---|---|---|---|
 | P1 | Correctness before performance | Optimizations may not change observable semantics; batch/gather/pool paths run the same conformance suite. | Same assertions in Debug and Release, fake/inproc/TCP-loopback. |
@@ -67,12 +57,8 @@ The framework is not an HTTP wrapper. TCP carries a length-prefixed multiplexed 
 | P11 | Fail-closed on unknown input | Unknown frame type, version, capability bit, enum, wire type, content type: reject. | Fuzz + handcrafted illegal frames. |
 | P12 | No wall-clock ordering | Deadlines are relative; ordering uses `stream_id`, `lane_seq`, registry `index`; breakers use monotonic time. | Clock-rollback test; static check for `system_clock::now()` in ordering paths. |
 | P13 | Platform phases | Phase 1: x86/x64 Windows/Linux. Phase 2: ARM64/BE/Android/macOS. Protocol is platform-neutral from day one. | Phase-1 matrix; phase-2 reruns the same tests. |
-
-<a id="s1"></a>
-## 1. Terminology and authority matrix
-
+## 1. Terminology and authority matrix <a id="s1"></a>
 ### 1.1 Terms
-
 | Term | Definition |
 |---|---|
 | **connection** | A concrete transport object owning a socket or an in-process queue pair. It exposes `source`, `sink`, `close()`, `is_open()`, `remote()`, and `resume_read()`. |
@@ -85,9 +71,7 @@ The framework is not an HTTP wrapper. TCP carries a length-prefixed multiplexed 
 | **instance** | A registered service endpoint: `(service, instance_id, endpoint, weight, health, incarnation, index)`. |
 | **node** | A process identity (`node_id` UUIDv4) hosting shards, clients, and optional registry authority. |
 | **watch index** | The registry's monotonic revision. Snapshot and watch events both carry it; the only ordering anchor for registry state (A §28.9). |
-
 ### 1.2 Single-writer authority matrix
-
 | State | Sole writer | Readers | Forbidden |
 |---|---|---|---|
 | Connection state (`open/closing/closed`) | Owning shard thread | Other shards via atomic load | Cross-shard write |
@@ -100,12 +84,8 @@ The framework is not an HTTP wrapper. TCP carries a length-prefixed multiplexed 
 | Configuration snapshot | Reload thread (`atomic_store`) | Shards `atomic_load` | In-place mutation |
 | Idempotency dedup table | Shard owning the handler | None | Shared multi-shard writes |
 | Subscription table | Shard owning the identity mapping | Publish path through MPSC | Direct cross-shard mutation |
-
-<a id="s2"></a>
-## 2. Layering and directory structure
-
+## 2. Layering and directory structure <a id="s2"></a>
 ### 2.1 Bounded contexts
-
 | Context | Owns | May depend on |
 |---|---|---|
 | `core` | `span`, `buffer`, `rpc_code`, `rpc_error`, `rpc_result`, endpoint, config primitives | Nothing |
@@ -120,9 +100,7 @@ The framework is not an HTTP wrapper. TCP carries a length-prefixed multiplexed 
 | `observe` | AOP chain, trace, log, metrics | `core`, `rpc` |
 
 Rules: `core` depends on nothing; `io` only on `core`; no context may include a header from a context that is not listed; `transport` never includes `rpc`; `http` never includes `cluster`; `observe` receives data through interfaces defined in `core`.
-
 ### 2.2 Directory layout
-
 ```
 include/crpc/
   core/types.hpp            span, endpoint, duration, deadline, ids
@@ -190,12 +168,8 @@ scripts/
 bench/
   bench_rpc.cpp bench_http.cpp bench_codec.cpp
 ```
-
-<a id="s3"></a>
-## 3. Transport backend contract
-
+## 3. Transport backend contract <a id="s3"></a>
 ### 3.1 Exact interfaces (R1)
-
 ```cpp
 // include/crpc/io.hpp
 #pragma once
@@ -203,14 +177,20 @@ bench/
 #include <system_error>
 #include "crpc/core/types.hpp"
 
-namespace crpc::io {
+namespace crpc {
+template <class t> class span;
+using byte_span = span<const std::byte>;
+class buffer;
+struct service_id { std::uint32_t value = 0; };
+template <class t> inline constexpr service_id service_id_of{0};
+}
 
+namespace crpc::io {
 struct io_result {
     std::error_code ec;
     std::size_t bytes = 0;
     [[nodiscard]] bool ok() const noexcept { return !ec; }
 };
-
 class completion {
 public:
     completion() = default;
@@ -219,7 +199,6 @@ public:
     completion& operator=(const completion&) = delete;
     virtual void complete(io_result r) noexcept = 0;   // exactly once, any thread, non-blocking, no throw
 };
-
 class source {
 public:
     virtual ~source() = default;
@@ -227,7 +206,6 @@ public:
     // The framework copies or parses every consumed byte before returning.
     virtual std::size_t on_data(span<const std::byte> data) noexcept = 0;
 };
-
 class sink {
 public:
     virtual ~sink() = default;
@@ -235,38 +213,35 @@ public:
     // The span stays valid until complete() returns.
     virtual void push(span<const std::byte> data, completion* c) noexcept = 0;
 };
-
 } // namespace crpc::io
 ```
-
 `source::on_data` returns a credit, not a boolean: `n == data.size()` consumes everything, `0 < n < data.size()` consumes a prefix and pauses, `0` consumes nothing and pauses. This is the whole backpressure mechanism; there is no source completion object (R1).
-
 ### 3.2 Connection and factory
-
 ```cpp
 // include/crpc/backend.hpp
 namespace crpc {
-
+struct endpoint {
+    std::string host;                 // "127.0.0.1", "::1", or a unix path when scheme == uds
+    std::uint16_t port = 0;
+    enum class scheme : std::uint8_t { tcp, uds, inproc } kind = scheme::tcp;
+};
 struct connect_options {
     std::chrono::nanoseconds connect_timeout{std::chrono::seconds(3)};
     std::size_t recv_buffer_bytes = 64 * 1024;
     std::size_t send_buffer_bytes = 64 * 1024;
     bool tcp_no_delay = true;
 };
-
 struct listen_options {
     std::size_t backlog = 1024;
     bool reuse_port = true;
     std::size_t recv_buffer_bytes = 64 * 1024;
     std::size_t send_buffer_bytes = 64 * 1024;
 };
-
 class accept_sink {
 public:
     virtual ~accept_sink() = default;
     virtual void on_accept(std::unique_ptr<class connection> c) noexcept = 0;
 };
-
 class connection {
 public:
     virtual ~connection() = default;
@@ -277,45 +252,36 @@ public:
     [[nodiscard]] virtual bool is_open() const noexcept = 0;
     [[nodiscard]] virtual endpoint remote() const = 0;
 };
-
 class listener {
 public:
     virtual ~listener() = default;
     virtual void start(accept_sink* sink) = 0;
     virtual void stop() noexcept = 0;
 };
-
 class backend_factory {
 public:
     virtual ~backend_factory() = default;
     virtual std::unique_ptr<connection> connect(const endpoint& ep, const connect_options& opt) = 0;
     virtual std::unique_ptr<listener> listen(const endpoint& ep, const listen_options& opt) = 0;
 };
-
 } // namespace crpc
 ```
-
 Establishment, close, cancel, and options live on `connection`/`backend_factory`, never on `source`/`sink`. The core RPC layer accepts only `backend_factory&`; there is no `if (is_tcp)`.
-
 ### 3.3 Contract invariants
-
 | # | Invariant | Verification |
 |---|---|---|
 | I1 | Every `completion::complete` runs exactly once, for success, failure, or cancellation. | Fake backend counts calls; 1000 random close races. |
 | I2 | Completion may run on any thread. | Thread-id assertion allows submitter or another thread. |
 | I3 | Completion must not block and must not throw. | `noexcept`; debug assertion on held locks. |
-| I4 | After `close()`, no new source delivery and no new sink callback; in-flight sink completions still run exactly once with `operation_canceled` (R9). | Close-race test. |
+| I4 | After `close()`, no new source delivery and no new sink push accepted; in-flight sink completions still run exactly once with `operation_canceled` (R9). | Close-race test. |
 | I5 | At most one sink `push` is in flight per direction. | Backend asserts `in_flight_sink <= 1`. |
 | I6 | Partial writes are completed by the backend; the framework never re-submits a tail. | Backend test with a short-write socket. |
 | I7 | Source span is valid until `on_data` returns; sink span is valid until `complete` returns. | ASan with poisoned buffers. |
 | I8 | One reader and one writer per connection at any instant. | Debug atomic owner assertion. |
 | I9 | `on_data` return value never exceeds `data.size()`. | Debug assertion; conformance test. |
 | I10 | After `on_data` returns 0 or a short count, the backend retains the unconsumed tail and delivers it only after `resume_read()`. | Backend test with a 1-byte credit. |
-
 ### 3.4 Partial reads and the resume path
-
 When `on_data` consumes a prefix, the backend must keep the remaining bytes in a stable buffer and must not overwrite them. It must not spin calling `on_data` with the same tail while the framework returns 0. `resume_read()` is the only resume signal. It is idempotent and callable from the shard thread only.
-
 ```cpp
 void epoll_connection::resume_read() noexcept {
     if (!read_paused_) return;
@@ -323,11 +289,10 @@ void epoll_connection::resume_read() noexcept {
     post_local([this] { read_loop(); });   // self-post: ET gives no new edge for a retained tail
 }
 ```
-
 For IOCP, `resume_read()` re-posts `WSARecv` only when the retained tail is empty; otherwise it delivers the tail first, then posts.
 
+Error propagation: `source` has no error return. A read error closes the connection; the framework observes close/EOF and fails every in-flight call with the mapped `rpc_code`. A `sink` error is delivered through `completion::complete({ec, bytes})`, where `bytes` is the count written before the error, and it also moves the connection to closing. No error is ever reported by dropping bytes silently.
 ### 3.5 Backpressure levels
-
 | Level | Mechanism | Over-limit behavior |
 |---|---|---|
 | Kernel receive | `on_data` returns 0, backend stops reading | TCP window closes |
@@ -339,12 +304,9 @@ For IOCP, `resume_read()` re-posts `WSARecv` only when the retained tail is empt
 | Lane queue | Default 1024 entries | `overload` or park, per `lane_full_policy` |
 
 Default policy is fast failure, not queuing. Queuing is opt-in and counts against the deadline.
-
 ### 3.6 inproc backend equivalence
-
 ```cpp
 namespace crpc {
-
 struct inproc_faults {
     std::uint32_t connect_reject_pct = 0;
     std::chrono::nanoseconds connect_delay{0};
@@ -355,29 +317,21 @@ struct inproc_faults {
     std::uint32_t duplicate_pct = 0;
     std::uint32_t seed = 0;
 };
-
 struct inproc_options {
     std::size_t max_queued_bytes = 64 * 1024;
     bool serialize = true;
     inproc_faults faults;
 };
-
 class inproc_pair {
 public:
     static std::pair<std::unique_ptr<connection>, std::unique_ptr<connection>>
     make(const inproc_options& opt);
 };
-
 } // namespace crpc
 ```
-
 Requirements: bounded queue per direction; delivery posted to the target shard, never recursively on the caller stack; `serialize = true` by default so half frames, coalescing, EOF, and error propagation match TCP; every fault injection is reproducible from `seed`; `drop_pct` applies only to frames marked `UNRELIABLE`, never to reliable calls.
-
-<a id="s4"></a>
-## 4. Thread and coroutine model
-
+## 4. Thread and coroutine model <a id="s4"></a>
 ### 4.1 Shard layout
-
 ```
 n_shards = clamp(physical_cores - 1, 1, 32)
 per shard: 1 OS thread
@@ -389,11 +343,8 @@ per shard: 1 OS thread
          + 64 handler coroutines with 64 KiB stacks
 threads = n_shards + 1 acceptor (Windows) + blocking pool (default 0)
 ```
-
 Coroutines are M:N over threads, but a shard's runtime is pumped by exactly one thread. `coro_rt_pump` refuses a second concurrent pump (`pump_active`, `[READ:F:\corocc\src\scheduler\rt_driver.c:458]`), and a LOOP runtime has exactly one worker (`[READ:F:\corocc\src\scheduler\rt.c:804]`). Handler coroutines are long-lived workers, not one per request: this avoids the 256 KiB default stack (`[READ:F:\corocc\include\corocc\coro.h:38]`) and the 256-entry default-size stack cache (`[READ:F:\corocc\src\scheduler\rt.h:167]`).
-
 ### 4.2 Runtime construction
-
 ```cpp
 struct shard_driver_ops {
     static std::uint64_t now(void* ctx) noexcept {
@@ -410,7 +361,6 @@ struct shard_driver_ops {
         return static_cast<shard*>(ctx)->timers().cancel(req) ? 0 : -1;
     }
 };
-
 void shard::start() {
     coro_rt_driver_ops ops{};
     ops.struct_size = sizeof(ops);
@@ -429,11 +379,8 @@ void shard::start() {
     }
 }
 ```
-
-Evidence for the API: `coro_rt_create` `[READ:F:\corocc\include\corocc\coro_rt.h:299]`; LOOP flag `[READ:F:\corocc\include\corocc\coro_rt_driver.h:46]`; driver registration `[READ:F:\corocc\include\corocc\coro_rt_driver.h:146]`; pump `[READ:F:\corocc\include\corocc\coro_rt_driver.h:258]`; semaphore `[READ:F:\corocc\include\corocc\coro_rt.h:631]`, `:639`, `:654`; destroy refuses live coroutines `[READ:F:\corocc\include\corocc\coro_rt.h:304]`.
-
+Evidence for the API: `coro_rt_create` `[READ:F:\corocc\include\corocc\coro_rt.h:299]`; LOOP flag `[READ:F:\corocc\include\corocc\coro_rt_driver.h:46]`; driver registration `[READ:F:\corocc\include\corocc\coro_rt_driver.h:146]`; default driver `[READ:F:\corocc\include\corocc\coro_rt_driver.h:185]`; pump `[READ:F:\corocc\include\corocc\coro_rt_driver.h:258]`; `coro_attr_default` `[READ:F:\corocc\include\corocc\coro.h:149]`; `coro_rt_spawn` `[READ:F:\corocc\include\corocc\coro_rt.h:339]`; semaphore `[READ:F:\corocc\include\corocc\coro_rt.h:631]`, `:639`, `:654`; destroy refuses live coroutines `[READ:F:\corocc\include\corocc\coro_rt.h:304]`.
 ### 4.3 Loop body
-
 ```cpp
 void shard::run() {
     while (!stopping_) {
@@ -446,13 +393,9 @@ void shard::run() {
     }
 }
 ```
-
 `next_timeout_ns()` is the earliest of: timer-wheel deadline, keepalive scan, registry lease scan, and 1 second. On Linux the exact deadline is carried by a timerfd registered in the same epoll set; the `epoll_wait` timeout is infinite when a timerfd is armed. On Windows the exact deadline is carried by a high-resolution waitable timer that posts a completion to the IOCP (R3).
-
 ### 4.4 Handler pool
-
 The reader coroutine only reads, frames, and dispatches complete messages. It never calls a user handler inline. A complete request is pushed to the shard's ready queue; an idle handler coroutine pops it and calls the user function. A suspended handler consumes one handler coroutine, not the reader and not the thread.
-
 ```cpp
 void shard::handler_main(void* self) {
     auto& s = *static_cast<shard*>(self);
@@ -467,13 +410,9 @@ void shard::handler_main(void* self) {
     }
 }
 ```
-
 Handler concurrency is bounded by `handler_workers` (64 per shard, configurable). A CPU-bound handler that never suspends occupies one worker; this is documented, and the v1.1 `handler_executor` is the escape hatch.
-
 ### 4.5 Cross-thread wake path
-
 The only cross-thread path is: producer pushes into the target shard's MPSC inbox, sets `wake_pending`, then rings the doorbell once. The target shard drains the inbox in its own loop and pumps its own runtime. No thread calls `coro_rt_spawn` or `coro_rt_pump` on another shard's runtime.
-
 ```cpp
 bool shard::post(task t) noexcept {
     if (!inbox_.try_push(std::move(t))) return false;
@@ -484,11 +423,8 @@ bool shard::post(task t) noexcept {
     return true;
 }
 ```
-
 `coro_rt_sem_post` is safe from any thread and signals activity through the driver wake callback (`[READ:F:\corocc\src\scheduler\rt_sync.c:469]`, `[READ:F:\corocc\src\scheduler\rt.c:208]`). A completion on shard A for a call owned by shard B must not touch B's runtime; it posts to B.
-
 ### 4.6 Shutdown order
-
 1. `listener.stop()`: no new accepts.
 2. Broadcast `GOAWAY`; stop admitting new calls (`shutting_down`).
 3. Drain in-flight calls for `grace_period` (default 5 s).
@@ -498,9 +434,7 @@ bool shard::post(task t) noexcept {
 7. `coro_rt_destroy(rt)`; `CORO_EBUSY` means a coroutine is still alive, so repeat step 6.
 8. Unregister the driver after the runtime is destroyed; unregister returns `CORO_EBUSY` while attached (`[READ:F:\corocc\include\corocc\coro_rt_driver.h:151]`).
 9. Release epoll/IOCP, timerfd, eventfd, and the MPSC storage.
-
 ### 4.7 Timer precision
-
 ```cpp
 class timer_wheel {
 public:
@@ -511,33 +445,23 @@ public:
     void run_expired(std::uint64_t now_ns) noexcept;
 };
 ```
-
 Linux: `timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)`, `timerfd_settime` with `TFD_TIMER_ABSTIME`, added to the epoll set. `epoll_pwait2` is an accepted alternative when available. Windows: `CreateWaitableTimerEx(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)`, `SetWaitableTimerEx` with an absolute `LARGE_INTEGER` in 100 ns units, and `RegisterWaitForSingleObject` whose callback posts a completion to the shard IOCP. The runtime's own 0.5 ms polling example must not be copied: LOOP mode does not expose its nearest deadline, which is why CRPC owns the wheel (A §8.1, D16).
-
-<a id="s5"></a>
-## 5. epoll ET-only design
-
+## 5. epoll ET-only design <a id="s5"></a>
 ### 5.1 Registration
-
 ```cpp
 epoll_event ev{};
 ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
 ev.data.u64 = make_token(slot_index, generation);
 epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-
 // listener
 epoll_event lev{};
 lev.events = EPOLLIN | EPOLLET;
 lev.data.u64 = k_listener_token;
 epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &lev);
 ```
-
 Tokens are `u64`: `token = static_cast<std::uint64_t>(slot_index) * k_slot_stride + generation`. Never shift a 32-bit index by 32; that is UB on 32-bit targets (A §4.1). `EPOLLERR` and `EPOLLHUP` need no registration and are always reported.
-
 ### 5.2 Event dispatch order
-
 For each event: validate the token and generation; handle `EPOLLERR`/`EPOLLHUP` first; mark `EPOLLRDHUP`; process `EPOLLIN`; process `EPOLLOUT`; if half-closed and read/write are both done, close gracefully. The order is fixed so an `IN` handler cannot consume an `OUT` edge without servicing it (E4).
-
 ```cpp
 for (int i = 0; i < n; ++i) {
     const std::uint64_t tok = events[i].data.u64;
@@ -551,9 +475,7 @@ for (int i = 0; i < n; ++i) {
     if (c->peer_half_closed_ && c->read_done() && c->write_done()) c->close_graceful();
 }
 ```
-
 ### 5.3 Read loop (R1 credit)
-
 ```cpp
 void epoll_connection::read_loop() noexcept {
     if (read_paused_) return;
@@ -578,11 +500,8 @@ void epoll_connection::read_loop() noexcept {
     }
 }
 ```
-
 `resume_read()` must first deliver `rx_tail_` to `source().on_data`; only when the tail is fully consumed may it call `recv` again. Returning to `epoll_wait` with a retained tail is safe only because `resume_read()` self-posts; ET will not report the retained bytes again.
-
 ### 5.4 Write loop (R4)
-
 ```cpp
 void epoll_connection::write_loop() noexcept {
     std::size_t budget = k_write_budget_bytes;      // 256 KiB per turn
@@ -612,11 +531,8 @@ void epoll_connection::write_loop() noexcept {
     complete_ready_outputs();                        // one completion per batch
 }
 ```
-
 `sink::push` enqueues into the send ring and then calls `write_loop()` optimistically if `want_write_` is false. This closes E3: an edge consumed while the ring was empty cannot strand later data.
-
 ### 5.5 Error and half-close handling
-
 | Event | Meaning | Action |
 |---|---|---|
 | `EPOLLERR` | Socket error (RST and similar) | Read `SO_ERROR`, `fail()`, no read/write retry |
@@ -624,9 +540,7 @@ void epoll_connection::write_loop() noexcept {
 | `EPOLLRDHUP` | Peer shut down its write side | Set `peer_half_closed_`; drain to `recv == 0`; still flush queued writes |
 | `EPOLLIN | EPOLLRDHUP` | Data plus FIN | Read first; evaluate EOF after the read loop |
 | `recv == 0` | EOF | No more source delivery; finish writes; close |
-
 ### 5.6 Accept
-
 ```cpp
 void epoll_listener::on_acceptable() noexcept {
     for (;;) {
@@ -641,11 +555,8 @@ void epoll_listener::on_acceptable() noexcept {
     }
 }
 ```
-
 Linux uses one listener per shard with `SO_REUSEPORT` (and `SO_REUSEADDR`), so the kernel hashes connections to shards without a cross-thread handoff. Shard-count changes require listener rebuild; rolling restart with `SO_REUSEPORT` smooths this.
-
 ### 5.7 ET lost-event checklist
-
 | # | Scenario | Prevention |
 |---|---|---|
 | E1 | Read once and return with data left | Loop until `EAGAIN`; with R1 credit, deliver tail on `resume_read` |
@@ -660,22 +571,15 @@ Linux uses one listener per shard with `SO_REUSEPORT` (and `SO_REUSEADDR`), so t
 | E10 | eventfd edge lost | Read eventfd to `EAGAIN` |
 | E11 | Close without `EPOLL_CTL_DEL` | DEL then close; generation check |
 | E12 | Blocking `send` starves the shard | All fds non-blocking; per-turn byte budget |
-
-<a id="s6"></a>
-## 6. IOCP design
-
+## 6. IOCP design <a id="s6"></a>
 ### 6.1 Port and concurrency
-
 ```cpp
 HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
 // NumberOfConcurrentThreads = 1: one logical consumer per shard.
 // The value limits threads that dequeue packets, not in-flight overlapped operations.
 ```
-
 One IOCP and one thread per shard. Listener and connection sockets are bound with `CreateIoCompletionPort(sock, iocp, key, 0)`. The completion key is the same `(slot_index, generation)` token scheme used by epoll.
-
 ### 6.2 Per-connection operations
-
 ```cpp
 struct io_op {
     OVERLAPPED ov{};                 // must be first
@@ -688,9 +592,7 @@ struct io_op {
     std::byte* buf;
 };
 ```
-
 At most one read and one write per connection. Read completion with `got == 0` is EOF; otherwise deliver to `source::on_data`. If `on_data` consumes less than `got`, retain the tail and do not post the next `WSARecv` until `resume_read()`. Write completion with `sent < want` re-posts the remainder; when all bytes are written, call `complete({ec, total})` exactly once.
-
 ```cpp
 OVERLAPPED_ENTRY entries[64];
 ULONG n = 0;
@@ -698,32 +600,23 @@ if (GetQueuedCompletionStatusEx(iocp, entries, 64, &n, timeout_ms, FALSE)) {
     for (ULONG i = 0; i < n; ++i) dispatch(entries[i]);
 }
 ```
-
 Batch size is 64; per-turn completion budget is 1024 completions or 200 microseconds, whichever comes first, so timers and the inbox are not starved.
-
 ### 6.3 AcceptEx
-
 ```cpp
 BOOL ok = AcceptEx(lfd, accept_sock, addr_buf, 0,
                    sizeof(sockaddr_storage) + 16, sizeof(sockaddr_storage) + 16,
                    &got, &op->ov);
 ```
-
 Pre-post 64 to 256 accept operations. On completion: `GetAcceptExSockaddrs`, `setsockopt(SO_UPDATE_ACCEPT_CONTEXT)`, bind the new socket to the target shard's IOCP, then immediately pre-post the next `AcceptEx`. Sockets must be created with `WSA_FLAG_OVERLAPPED`. Windows has no `SO_REUSEPORT`: v1 uses a single acceptor that hands the accepted socket to the target shard with one `PostQueuedCompletionStatus`; the acceptor performs no per-connection I/O.
-
 ### 6.4 Graceful close
-
 ```cpp
 shutdown(sock, SD_SEND);                                  // FIN, still readable
 // wait for peer FIN or timeout
 DisconnectEx(sock, &op->ov, TF_REUSE_SOCKET, 0);          // overlapped
 // completion, then closesocket / reuse
 ```
-
 Close order is fixed: `CancelIoEx(sock, nullptr)`; wait for both in-flight operations to complete exactly once; `shutdown`/`DisconnectEx`; `closesocket`; release the slot and increment the generation. Never `closesocket` while an operation is in flight: its `OVERLAPPED` may already be freed.
-
 ### 6.5 CancelIoEx races
-
 | Race | Result | Handling |
 |---|---|---|
 | Operation already completed | `CancelIoEx` returns `ERROR_NOT_FOUND` | Normal completion path; do not call back twice |
@@ -733,9 +626,7 @@ Close order is fixed: `CancelIoEx(sock, nullptr)`; wait for both in-flight opera
 | Repeated `CancelIoEx` | `ERROR_NOT_FOUND` | Idempotent |
 
 Every `OVERLAPPED` has exactly one owner and the owner releases it in the completion handler. Cancellation is a request, never a guarantee that no completion will follow.
-
 ### 6.6 Error mapping
-
 | Win32 / Winsock | Meaning | Mapping |
 |---|---|---|
 | `ERROR_OPERATION_ABORTED` (995) | Local cancel | `std::errc::operation_canceled` |
@@ -747,9 +638,7 @@ Every `OVERLAPPED` has exactly one owner and the owner releases it in the comple
 | `WSAENOBUFS` | Kernel buffers exhausted | Bounded backoff or `no_buffer_space` |
 | `ERROR_IO_PENDING` | Not an error | Keep waiting |
 | `ERROR_NOT_FOUND` | Cancel target already done | Ignore |
-
 ### 6.7 ET / IOCP semantic alignment
-
 | Semantics | epoll-ET | IOCP |
 |---|---|---|
 | Readable | `EPOLLIN` edge, read to `EAGAIN` | `WSARecv` completion |
@@ -762,12 +651,8 @@ Every `OVERLAPPED` has exactly one owner and the owner releases it in the comple
 | Backpressure | Stop `recv` | Do not post the next `WSASend`/`WSARecv` |
 
 The RPC layer sees only `source`, `sink`, and `connection`; it cannot tell which backend is below.
-
-<a id="s7"></a>
-## 7. Wire protocol
-
+## 7. Wire protocol <a id="s7"></a>
 ### 7.1 Frame header (16 bytes, explicit LE)
-
 | Offset | Width | Field | Type | Rule |
 |---|---|---|---|---|
 | 0 | 4 | `payload_len` | u32 | LE; `<= max_frame` (default 16 MiB, hard cap 64 MiB) |
@@ -778,18 +663,14 @@ The RPC layer sees only `source`, `sink`, and `connection`; it cannot tell which
 | 12 | 4 | `ext` | u32 | LE; CRC32C when `flags.CRC32C`, else 0 |
 
 Byte order is fixed by A §30.1, the single wire authority. Every multi-byte field is written and read byte-wise; no struct `memcpy`, no bitfield, no unaligned cast.
-
 ### 7.2 Ordered extension header (16 bytes, only when `flags.ORDERED = 1`)
-
 | Offset (after header) | Width | Field | Type |
 |---|---|---|---|
 | 0 | 8 | `lane_id` | u64 LE |
 | 8 | 8 | `lane_seq` | u64 LE |
 
 `payload_len` counts only the payload after all extension headers. If `flags.ORDERED` is set and the payload is shorter than 16 bytes, the frame is rejected with `protocol_error`. If `flags.ORDERED` is clear, no extension bytes exist; any receiver that assumes otherwise is non-conformant.
-
 ### 7.3 Frame types
-
 | Value | Name | Stream scope | Payload |
 |---|---|---|---|
 | 0x00 | `DATA` | non-zero | Streaming chunk or push body fragment |
@@ -807,9 +688,7 @@ Byte order is fixed by A §30.1, the single wire authority. Every multi-byte fie
 | 0x0C | `PUSH_ACK` | non-zero | `push_seq` u64 |
 
 Numeric values are fixed by this specification for the first time. They consolidate the union of A §9.2, A §23 and B §4.2.1; changing them is a wire break.
-
 ### 7.4 Flags
-
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `END_STREAM` | Last frame of this stream |
@@ -820,9 +699,7 @@ Numeric values are fixed by this specification for the first time. They consolid
 | 5-7 | `ALGO` | 0 none, 1 lz4, 2 zstd, 3 gzip, 4-7 reserved |
 
 A frame with `COMPRESSED = 0` must have `ALGO = 0`; otherwise `protocol_error`. A frame with `ALGO != 0` and `COMPRESSED = 0` is rejected. This resolves the A/B conflict in favor of A §30.1 plus §31.1; B §4.2.1's flag assignment is superseded.
-
 ### 7.5 Handshake
-
 Client hello (12-byte prefix plus TLVs):
 
 | Offset | Width | Field |
@@ -850,11 +727,8 @@ Server hello has the same 12-byte prefix, with byte 8 = `status` u8 (0 ok, 1 ver
 | 0x0A | `hmac` | 32 bytes |
 
 Handshake limit is 4 KiB and timeout 3 s. Unknown TLV type, unknown codec, unknown capability bit, non-zero reserved, or version mismatch is fail-closed: send a server hello with a non-zero status where possible, then close (R9).
-
 ### 7.6 Payload envelopes
-
 Call envelope (`REQUEST`, `ONE_WAY`, and the success path of `RESPONSE`):
-
 ```
 service_id      u32 LE
 method_id       u32 LE
@@ -869,7 +743,6 @@ remaining_ns    varint (0 = no deadline)
 meta_len        u16 LE + meta TLV
 body            remaining bytes
 ```
-
 `call_flags`: bit0 `has_trace`, bit1 `has_parent`, bit2 `has_idem`, bit3 `has_versions`, bit4 reserved for HLC, bits 5-7 must be 0.
 
 `RESPONSE` payload starts with `status` u8: 0 success, 1 error. Success carries the response body. Error carries the error envelope of §9.3.
@@ -877,9 +750,7 @@ body            remaining bytes
 `PUSH` payload: `topic_len` u16, topic bytes, `key_len` u16, key bytes, `push_seq` u64, `idem_len` u8, idempotency key bytes, body. `PUSH_ACK` payload: `push_seq` u64.
 
 Meta TLV: repeated `key_len` u8, key bytes, `value_len` u16, value bytes. Keys are ASCII, values are opaque bytes. Total meta is at most 1 KiB.
-
 ### 7.7 Static assertions and primitives
-
 ```cpp
 static_assert(CHAR_BIT == 8);
 static_assert(sizeof(std::uint8_t) == 1 && sizeof(std::uint16_t) == 2);
@@ -887,7 +758,6 @@ static_assert(sizeof(std::uint32_t) == 4 && sizeof(std::uint64_t) == 8);
 static_assert(std::numeric_limits<float>::is_iec559);
 static_assert(std::numeric_limits<double>::is_iec559);
 static_assert(sizeof(void*) == 4 || sizeof(void*) == 8);
-
 namespace crpc::endian {
 inline void put_le16(std::byte* p, std::uint16_t v) noexcept;
 inline void put_le32(std::byte* p, std::uint32_t v) noexcept;
@@ -900,11 +770,8 @@ template <class t> constexpr t to_le(t v) noexcept;
 template <class t> constexpr t from_le(t v) noexcept;
 }
 ```
-
 varint is LE base-128: low 7 bits first, bit 7 is continuation. `u64` uses at most 10 bytes; byte 10 may only be `0x00` or `0x01`. Zigzag is `(n << 1) ^ (n >> 63)` for encode and `(u >> 1) ^ -(u & 1)` for decode, with unsigned arithmetic. Floating point is `bit_cast` to `u32`/`u64`, then LE.
-
 ### 7.8 Length and overflow checks
-
 | Check | Rule |
 |---|---|
 | Frame length | `payload_len <= max_frame`; reject before allocation |
@@ -914,33 +781,23 @@ varint is LE base-128: low 7 bits first, bit 7 is continuation. `u64` uses at mo
 | String | `len <= max_string_bytes` (1 MiB) |
 | Allocation | Every `resize`/`reserve` is preceded by a cap check; failure is `resource_exhausted` |
 | Nesting | Codec depth 32; HTTP header count 100; route segments 32 |
-
 ### 7.9 Golden bytes
-
 Header for a `REQUEST` with `payload_len = 16`, `stream_id = 1`, no flags:
-
 ```
 10 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00
 ```
-
 Ordered variant, `lane_id = 7`, `lane_seq = 9`:
-
 ```
 10 00 00 00 01 08 00 00 01 00 00 00 00 00 00 00
 07 00 00 00 00 00 00 00 09 00 00 00 00 00 00 00
 ```
-
 `PING` with payload `01 02 03 04 05 06 07 08`:
-
 ```
 08 00 00 00 07 00 00 00 00 00 00 00 00 00 00 00
 01 02 03 04 05 06 07 08
 ```
-
 These byte strings are committed as `tests/golden/*.bin`; CI asserts byte equality on every platform and decodes them identically.
-
 ### 7.10 Fail-closed rules
-
 | Condition | Action |
 |---|---|
 | Unknown `type` | `GOAWAY(protocol_error)`, close |
@@ -955,12 +812,8 @@ These byte strings are committed as `tests/golden/*.bin`; CI asserts byte equali
 | Unknown `stream_id` data | Drop and count; no close |
 | CRC mismatch | `RST_STREAM(protocol_error)` and count |
 | `payload_len > max_frame` | `GOAWAY(protocol_error)`, no allocation |
-
-<a id="s8"></a>
-## 8. Message semantics
-
+## 8. Message semantics <a id="s8"></a>
 ### 8.1 Three message forms
-
 | Form | Identifier | Has call slot | Completion signal |
 |---|---|---|---|
 | Call (unary) | `stream_id` | Yes | `RESPONSE` frame |
@@ -968,18 +821,14 @@ These byte strings are committed as `tests/golden/*.bin`; CI asserts byte equali
 | Push | `(topic, key, push_seq)` | No (subscription instead) | `PUSH_ACK` when reliable |
 
 A call slot is created before the first byte is sent and released only after a terminal state. Push has no call slot; it has a subscription entry and a replay buffer.
-
 ### 8.2 Delivery × ordering matrix
-
 | | Reliable | Unreliable |
 |---|---|---|
 | **Plain** | Default RPC: request/response, timeout, cancel, retry with idempotency key, explicit failure | Metrics, logs, heartbeats: `ONE_WAY` with `UNRELIABLE`; queue full drops and counts; no handle |
 | **Ordered (lane)** | Command stream: strict enqueue/send/arrival order, server-side serial execution, in-place retry with the same `lane_seq` and idempotency key | Ordered send, may drop; a gap is reported as a counter; no retransmission |
 
 Default is plain plus reliable. Ordered and unreliable are explicit opt-ins. There is no separate reliable one-way message type in v1: reliable one-way is a `REQUEST` whose response body is empty (A §19.1). `ONE_WAY` is always unreliable.
-
 ### 8.3 ACK, retransmission, dedup
-
 TCP already provides ordered, reliable byte delivery within a connection. CRPC does not re-implement per-frame ACK, cumulative windows, or RTO for calls. Reliability across connection loss and handler failure is an RPC-layer concern:
 
 | Case | Mechanism |
@@ -990,46 +839,89 @@ TCP already provides ordered, reliable byte delivery within a connection. CRPC d
 | Unreliable message | No ACK, no retry, drop with counter `crpc_unreliable_dropped_total{reason}` |
 
 Idempotency key (A §28.3):
-
 ```
 idempotency_key = { client_id (16 bytes), client_epoch (u64), seq (u64) }
 ```
-
-`client_id` is persisted per process; `client_epoch` increments on every start; `seq` increments per `(client_id, target_service)`. A natural business key may replace the triple. Random UUIDs are forbidden as idempotency keys.
+`client_id` is persisted per process; `client_epoch` increments on every start; `seq` increments per `(client_id, target_service)`. A natural business key may replace the triple. Random UUIDs are forbidden as idempotency keys. The triple is the monotonic dedup anchor: `seq` never decreases within an epoch, so the server can evict by FIFO and detect replays without any wall-clock comparison.
 
 Server dedup table: per-client ring, default 256 entries, keyed by `(client_id, client_epoch, seq)`; FIFO eviction only; never cleared wholesale. `fresh` executes; `in_progress` parks the caller until completion or deadline; `done` returns the cached result without re-execution. The table is memory-only in v1, so exactly-once holds within one authority epoch (A §28.3).
-
 ### 8.4 Ordered lanes
-
 - Lane scope is `(client_id, target_service_id)`; `lane_id` is client-assigned and stable across reconnects.
 - `lane_seq` is allocated once, at MPSC enqueue, by `fetch_add`; it never wraps.
 - Frames of one lane always use one connection at a time; on reconnect the lane pauses until the new connection is established.
 - Server `ordered_execution = true` keeps a FIFO per lane with one handler in flight.
 - Retry is in place: same lane, same `lane_seq`, same idempotency key. Unacknowledged later sequences are not sent while a retry is pending.
 - Default failure policy is continue-after-failure; `fail_fast` cancels the remaining lane entries.
-
 ### 8.5 Deadline propagation
-
 The wire carries `remaining_ns`, never an absolute timestamp (P12).
-
 ```
 client:   deadline_abs = monotonic_now + timeout
           remaining_ns = deadline_abs - monotonic_now
 server:   if remaining_ns <= min_remaining (1 ms) -> do not execute, return deadline_exceeded
           downstream: remaining_ns' = remaining_ns - elapsed - safety_margin (1 ms)
 ```
-
 A handler must not continue after its deadline. `call_context::remaining()` is authoritative; `derive()` subtracts elapsed time and makes the current span the parent.
-
 ### 8.6 Cancellation
-
 `call<t>::cancel()` and the deadline timer both call `call_slot::try_finish` with `canceled` or `deadline_exceeded`. The CAS winner sends `RST_STREAM`; the loser observes the terminal state and does nothing. A response that arrives after a terminal state is dropped and counted, never delivered to a recycled slot (generation check).
-
-<a id="s9"></a>
-## 9. Error model
-
+### 8.7 Push API
+```cpp
+enum class delivery_mode : std::uint8_t { reliable, unreliable };
+enum class overflow_policy : std::uint8_t { drop_oldest, drop_newest, disconnect };
+struct identity { std::array<std::byte, 16> bytes; };
+struct subscribe_options {
+    std::string key;
+    std::size_t max_queued = 1024;
+    overflow_policy on_overflow = overflow_policy::drop_oldest;
+    delivery_mode mode = delivery_mode::reliable;
+};
+struct subscription_stats {
+    std::uint64_t subscriptions = 0;
+    std::uint64_t dropped = 0;
+};
+class subscription {
+public:
+    subscription() noexcept = default;
+    subscription(subscription&&) noexcept;
+    subscription& operator=(subscription&&) noexcept;
+    subscription(const subscription&) = delete;
+    ~subscription();                     // unsubscribe
+    [[nodiscard]] bool valid() const noexcept;
+    void unsubscribe() noexcept;
+};
+class push_hub {
+public:
+    void publish(std::string_view topic, std::string_view key,
+                 byte_span payload, delivery_mode mode) noexcept;
+    void publish_to_identity(const identity& who, std::string_view topic,
+                             byte_span payload, delivery_mode mode) noexcept;
+    [[nodiscard]] subscription_stats stats() const noexcept;
+};
+class push_channel {
+public:
+    [[nodiscard]] subscription subscribe(std::string_view topic,
+                                         void (*on_msg)(byte_span, void*) noexcept,
+                                         void* user, subscribe_options opt = {});
+    [[nodiscard]] rpc_error unsubscribe(std::string_view topic) noexcept;
+};
+```
+A push target is a logical identity, not a connection. The server maps `identity -> connection*` on the authority shard. A disconnected identity keeps its subscription for 30 s to allow resume. Reliable push uses `PUSH_ACK` plus a 256-entry replay buffer per subscription; unreliable push drops on overflow and counts. Slow clients never block a shard: the send-ring high-water policy applies.
+### 8.8 Streaming
+```cpp
+class stream_reader {
+public:
+    virtual ~stream_reader() = default;
+    [[nodiscard]] virtual rpc_result<std::size_t> read(byte_span dst) = 0;
+};
+class stream_writer {
+public:
+    virtual ~stream_writer() = default;
+    [[nodiscard]] virtual status write(byte_span src) = 0;
+    [[nodiscard]] virtual status finish() = 0;
+};
+```
+A stream maps to `DATA` frames plus `END_STREAM`; HTTP/1.1 maps it to chunked or Content-Length; HTTP/2 maps it to DATA plus flow-control windows. `RST_STREAM` cancels, and cancellation releases the stream slot, the subscription, and any temporary file.
+## 9. Error model <a id="s9"></a>
 ### 9.1 `rpc_code` (exactly R6)
-
 ```cpp
 enum class rpc_code : std::uint16_t {
     ok = 0, canceled = 1, deadline_exceeded = 2, unavailable = 3,
@@ -1040,14 +932,10 @@ enum class rpc_code : std::uint16_t {
     unknown_side_effect = 18, internal = 19, shutting_down = 20
 };
 ```
-
 Numeric values are the declaration order and are stable forever. The larger table in B §14.1 is superseded by R6; no code may be added, renamed, or renumbered without a new ruling.
-
 ### 9.2 `rpc_error` and `rpc_result`
-
 ```cpp
 using metadata_map = std::vector<std::pair<std::string, std::string>>;
-
 struct rpc_error {
     rpc_code code = rpc_code::ok;
     std::string message;
@@ -1055,7 +943,10 @@ struct rpc_error {
     std::chrono::milliseconds retry_after{0};
     metadata_map metadata;
 };
-
+struct status {
+    rpc_code code = rpc_code::ok;
+    [[nodiscard]] bool ok() const noexcept { return code == rpc_code::ok; }
+};
 template <class t>
 class rpc_result {
 public:
@@ -1071,11 +962,8 @@ private:
     std::variant<t, rpc_error> v_;
 };
 ```
-
 `rpc_result` does not require `t` to be default-constructible (D6). An enum is never used as an error object (R6). Error paths may allocate; success paths may not.
-
 ### 9.3 Error wire envelope
-
 ```
 RESPONSE payload:
   status          u8 = 1
@@ -1085,13 +973,10 @@ RESPONSE payload:
   message_len     u16 LE + UTF-8 bytes (<= 512)
   meta_len        u16 LE + meta TLV (<= 1024)
 ```
-
 Meta keys: `crpc.raw_code` (unknown future code), `trace_id`, `rtti_code`, `field`, `upstream_service`, `http.status`. `rtti::error_code` is a local detail and is never sent as the RPC error domain; it is mapped to `decode_error`/`encode_error` plus `rtti_code`.
 
 Truncation: `message` is cut to 512 bytes with a trailing ellipsis; meta entries are dropped in key order beyond 1 KiB; a protocol frame is never truncated, it is rejected before send.
-
 ### 9.4 HTTP status mapping
-
 | `rpc_code` | HTTP | Note |
 |---|---|---|
 | `ok` | 200 / 201 / 204 | Depends on verb and body |
@@ -1117,15 +1002,10 @@ Truncation: `message` is cut to 512 bytes with a trailing ellipsis; meta entries
 | `shutting_down` | 503 | |
 
 Framework-level statuses without an `rpc_code`: 405 (path matched, verb not allowed, with `Allow`), 406 (no acceptable codec), 413 (body too large), 415 (unsupported content type or encoding), 431 (headers too large). Error body is RFC 7807 `application/problem+json` with `type`, `title`, `status`, `detail`, `instance`, and `crpc_code`.
-
-<a id="s10"></a>
-## 10. Serialization
-
+## 10. Serialization <a id="s10"></a>
 ### 10.1 Codec registry
-
 ```cpp
 namespace crpc::codec {
-
 class registry {
 public:
     static registry& instance();
@@ -1133,14 +1013,12 @@ public:
     [[nodiscard]] bool enabled(std::string_view content_type) const noexcept;
     [[nodiscard]] std::string_view canonical(std::string_view ct) const noexcept;
 };
-
 template <class t>
 struct binding {
     std::string_view content_type;
-    error_code (*decode)(byte_span, t&);
-    error_code (*encode)(const t&, buffer&);
+    rpc_code (*decode)(byte_span, t&);
+    rpc_code (*encode)(const t&, buffer&);
 };
-
 template <class t>
 inline constexpr binding<t> request_codecs[] = {
     {"application/crpc", &binary_decode<t>, &binary_encode<t>},
@@ -1151,21 +1029,15 @@ inline constexpr binding<t> request_codecs[] = {
     {"application/x-protobuf", &proto_decode<t>, &proto_encode<t>},
     {"application/x-flatbuffers", &flat_decode<t>, &flat_encode<t>}
 };
-
 } // namespace crpc::codec
 ```
-
 The registry only toggles formats and canonicalizes content types; it does no type erasure. Each DTO instantiates its own binding array at compile time. Request selection is `Content-Type`; no match is 415. Response selection is `Accept` with q-values; no match is 406 unless `fallback_identity` is configured.
-
 ### 10.2 crpc-binary layout
-
 Payload body is a sequence of fields:
-
 ```
 key   = varint((field_id << 3) | wire_type)
 value = wire_type-specific
 ```
-
 | `wire_type` | Meaning | Encoding |
 |---|---|---|
 | 0 | varint | bool, int32/64, uint32/64, enum |
@@ -1177,36 +1049,29 @@ value = wire_type-specific
 `field_id` is the declaration index plus one, matching `fields_of<t>::members` order, and is known at compile time. `4`, `6`, and `7` are invalid and produce `decode_error`.
 
 Containers: numeric sequences are packed; other sequences are length-delimited with per-element encoding; maps are repeated entries of key field 1 and value field 2. Optional fields are written only when present. Unknown fields are skipped by wire type; an unknown wire type is rejected.
-
 ### 10.3 RTTI wiring
-
 Hot-path encode uses member pointers directly; no virtual dispatch and no DOM:
-
 ```cpp
 template <class t, class tuple_t, std::size_t... i>
-error_code encode_members(const t& v, const tuple_t& m, buffer& out,
-                          std::index_sequence<i...>) {
-    error_code ec = error_code::ok;
-    ((ec = ec == error_code::ok
+rpc_code encode_members(const t& v, const tuple_t& m, buffer& out,
+                        std::index_sequence<i...>) {
+    rpc_code ec = rpc_code::ok;
+    ((ec = ec == rpc_code::ok
                ? encode_field(static_cast<std::uint32_t>(i + 1), v.*std::get<i>(m), out)
                : ec), ...);
     return ec;
 }
-
 template <class t>
-error_code binary_encode(const t& v, buffer& out) {
+rpc_code binary_encode(const t& v, buffer& out) {
     using members_t = typename rtti::fields_of<t>::members_type;
     return encode_members(v, rtti::fields_of<t>::members, out,
                           std::make_index_sequence<std::tuple_size_v<members_t>>{});
 }
 ```
-
 `fields_of<t>::members` is a `std::tuple` of member pointers with constant initialization (`[READ:F:\RTTI\include\rtti\reflection.hpp:5449]`). Cold paths (HTTP binding, management, debugging) may use `field_access_base::set_value`/`get_value` (`[READ:F:\RTTI\include\rtti\reflection.hpp:451]`, `:461`, `:463`).
 
 Derived types are rejected by crpc-binary with a `static_assert`: `RTTI_DEFINE_TYPE_DERIVED` places base fields outside `members` (D12, `[READ:F:\RTTI\include\rtti\reflection.hpp:5490]`). Text formats may still encode derived types through the virtual path.
-
 ### 10.4 Text and schema formats
-
 | Format | Decode | Encode | Evidence |
 |---|---|---|---|
 | JSON | `json::parse` then `rtti::from_value` (preserves offset) | `rtti::to_value` then `json::serialize(document)` | `[READ:F:\RTTI\include\rtti\json.hpp:170]`, `:174`, `[READ:F:\RTTI\include\rtti\convert.hpp:1354]`, `:1414` |
@@ -1214,14 +1079,12 @@ Derived types are rejected by crpc-binary with a `static_assert`: `RTTI_DEFINE_T
 | INI | `ini::parse_as<t>` | `rtti::to_value` then `ini::serialize(document)` | `[READ:F:\RTTI\include\rtti\ini.hpp:346]`, `:320` |
 | TOML | `toml::parse_as<t>` | `rtti::to_value` then `toml::serialize(document)` | `[READ:F:\RTTI\include\rtti\toml.hpp:297]`, `:271` |
 | protobuf | `rtti::proto::parse_as<t>(bytes, cfg)` | `rtti::proto::serialize<t>(obj, out)` | `[READ:F:\RTTI\include\rtti\proto.hpp:2700]`, `:2679` |
-| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, schema_of<t>(), out, cfg)` | `[READ:F:\RTTI\include\rtti\flat.hpp:346]`, `:312` |
+| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, rtti::flat::schema_of<t>(), out, cfg)` | `[READ:F:\RTTI\include\rtti\flat.hpp:346]`, `:290` |
 
 Two-phase encoding is mandatory for text formats because the convenience `serialize<T>` returns an empty string on conversion failure (D9, `[READ:F:\RTTI\include\rtti\json.hpp:222]`). Two-phase decoding is mandatory for JSON because `parse_as` loses the byte offset (D8, `[READ:F:\RTTI\include\rtti\json.hpp:193]`).
 
 protobuf and FlatBuffers require an explicit user specialization of `rtti::proto::schema<t>` (`[READ:F:\RTTI\include\rtti\proto.hpp:432]`) or `rtti::flat::schema<t>` (`[READ:F:\RTTI\include\rtti\flat.hpp:198]`). The primary template is empty, so an unregistered type silently encodes to zero bytes. CRPC must therefore require a `schema_hash` and fail registration when the schema count is zero for a type used on those formats (D13). FlatBuffers typed encode goes through a DOM, so no zero-copy claim is made (D14).
-
 ### 10.5 Limits, endianness, error mapping
-
 | Limit | Default | Over-limit |
 |---|---|---|
 | Binary nesting depth | 32 | `decode_error` |
@@ -1230,24 +1093,17 @@ protobuf and FlatBuffers require an explicit user specialization of `rtti::proto
 | Text document | 8 MiB | `resource_exhausted` |
 | RTTI format depth | 32 (configured) | `decode_error` |
 
-All integer and floating-point wire values are explicit LE; text formats are UTF-8 without BOM and locale-independent. `rtti::error_code` values (`[READ:F:\RTTI\include\rtti\error.hpp:15]`) map to `rpc_code::decode_error` on input and `encode_error` on output, with the original code in `metadata["rtti_code"]`. Schema mismatch is `failed_precondition` when `strict_schema = true`; otherwise decoding proceeds by field id and the mismatch is counted.
-
-<a id="s11"></a>
-## 11. Service API and stubs
-
+All integer and floating-point wire values are explicit LE; text formats are UTF-8 without BOM and locale-independent. The binary layout has no alignment or padding requirement: every field is encoded and decoded byte-wise, so a reader never performs an aligned load and a writer never inserts padding. `rtti::error_code` values (`[READ:F:\RTTI\include\rtti\error.hpp:15]`) map to `rpc_code::decode_error` on input and `encode_error` on output, with the original code in `metadata["rtti_code"]`. Schema mismatch is `failed_precondition` when `strict_schema = true`; otherwise decoding proceeds by field id and the mismatch is counted.
+## 11. Service API and stubs <a id="s11"></a>
 ### 11.1 Declaration macros (R8)
-
 ```cpp
 #define CRPC_ROUTE(path_literal) \
     inline static constexpr ::crpc::http::controller_meta crpc_route_meta{ path_literal }
-
 #define CRPC_SERVICE(controller_t, service_number) \
     template <> inline constexpr ::crpc::service_id ::crpc::service_id_of<controller_t>{ service_number }
-
 #define CRPC_METHOD(controller_t, method, path_literal) \
     inline const ::crpc::rpc::method_registrar<controller_t, &controller_t::method> \
         crpc_method_##controller_t##_##method{ ::crpc::rpc::kind::binary, path_literal, #method, __LINE__ }
-
 #define CRPC_HTTP_GET(controller_t, method, path_literal) \
     inline const ::crpc::rpc::method_registrar<controller_t, &controller_t::method> \
         crpc_get_##controller_t##_##method{ ::crpc::http::verb::get, path_literal, #method, __LINE__ }
@@ -1264,11 +1120,9 @@ All integer and floating-point wire values are explicit LE; text formats are UTF
     inline const ::crpc::rpc::method_registrar<controller_t, &controller_t::method> \
         crpc_delete_##controller_t##_##method{ ::crpc::http::verb::del, path_literal, #method, __LINE__ }
 ```
-
 Every action macro carries the controller type and member, because C++17 cannot infer a member pointer from a following declaration. Return and parameter types are derived from `decltype(&controller_t::method)`, never written by hand.
 
 Field binding attributes are RTTI attributes:
-
 ```cpp
 #define CRPC_FROM_ROUTE(name)   RTTI_ATTR("FromRoute", name)
 #define CRPC_FROM_QUERY(name)   RTTI_ATTR("FromQuery", name)
@@ -1277,18 +1131,12 @@ Field binding attributes are RTTI attributes:
 #define CRPC_FROM_FORM(name)    RTTI_ATTR("FromForm", name)
 #define CRPC_FROM_FILE(name)    RTTI_ATTR("FromFile", name)
 ```
-
 They are used inside `RTTI_DEFINE_FIELD_ATTRS`, for example `RTTI_DEFINE_FIELD_ATTRS(get_user_req, RTTI_FIELD_ATTR_ENTRY(id, CRPC_FROM_ROUTE("id")))`. This uses only public RTTI APIs (`[READ:F:\RTTI\include\rtti\reflection.hpp:6791]`, `:6766`, `:1142`).
-
 ### 11.2 Method traits and invocation
-
 ```cpp
 namespace crpc::rpc {
-
 enum class kind : std::uint8_t { binary, http };
-
 template <class sig> struct method_traits;
-
 template <class ctl_t, class resp_t, class req_t>
 struct method_traits<resp_t (ctl_t::*)(const req_t&)> {
     using controller_type = ctl_t;
@@ -1296,7 +1144,6 @@ struct method_traits<resp_t (ctl_t::*)(const req_t&)> {
     using response_type = resp_t;
     static constexpr bool has_context = false;
 };
-
 template <class ctl_t, class resp_t, class req_t>
 struct method_traits<resp_t (ctl_t::*)(const req_t&, call_context&)> {
     using controller_type = ctl_t;
@@ -1304,7 +1151,6 @@ struct method_traits<resp_t (ctl_t::*)(const req_t&, call_context&)> {
     using response_type = resp_t;
     static constexpr bool has_context = true;
 };
-
 template <class ctl_t, class resp_t>
 struct method_traits<resp_t (ctl_t::*)()> {
     using controller_type = ctl_t;
@@ -1312,34 +1158,40 @@ struct method_traits<resp_t (ctl_t::*)()> {
     using response_type = resp_t;
     static constexpr bool has_context = false;
 };
-
+template <class ctl_t, class req_t>
+struct method_traits<void (ctl_t::*)(const req_t&)> {
+    using controller_type = ctl_t;
+    using request_type = req_t;
+    using response_type = void;
+    static constexpr bool has_context = false;
+};
+template <class ctl_t, class req_t>
+struct method_traits<void (ctl_t::*)(const req_t&, call_context&)> {
+    using controller_type = ctl_t;
+    using request_type = req_t;
+    using response_type = void;
+    static constexpr bool has_context = true;
+};
 template <class ctl_t>
-struct method_traits<void (ctl_t::*)(const call_context&)> {
+struct method_traits<void (ctl_t::*)(call_context&)> {
     using controller_type = ctl_t;
     using request_type = void;
     using response_type = void;
     static constexpr bool has_context = true;
 };
-
 template <class ctl_t, auto method>
 struct method_registrar {
     method_registrar(kind k, const char* path, const char* name, std::uint32_t ordinal) noexcept;
     method_registrar(http::verb v, const char* path, const char* name, std::uint32_t ordinal) noexcept;
 };
-
 template <class ctl_t, auto method>
 status invoke_binary(ctl_t& self, span<const std::byte> in, buffer& out, call_context& ctx);
-
 template <class ctl_t, auto method>
 status invoke_http(ctl_t& self, const http::request& req, http::response& resp, call_context& ctx);
-
 } // namespace crpc::rpc
 ```
-
 `invoke_binary` decodes `request_type`, calls `(self.*method)(req, ctx)` or `(self.*method)(req)`, and encodes `response_type`; `void` returns an empty body. Exceptions at the handler boundary are caught and converted to `rpc_error{rpc_code::internal, "internal error"}`.
-
 ### 11.3 `call<t>`
-
 ```cpp
 template <class t>
 class call {
@@ -1351,7 +1203,6 @@ public:
     call(const call&) = delete;
     call& operator=(const call&) = delete;
     ~call();                                                   // unfinished: cancel and recycle
-
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] bool ready() const noexcept;
     [[nodiscard]] rpc_result<t> get();                         // parks in a coroutine; blocks elsewhere
@@ -1359,19 +1210,18 @@ public:
     template <class fn_t> void then(fn_t&& fn);
     void cancel() noexcept;
 };
-
 template <class... calls_t>
 auto when_all(calls_t&&... calls)
     -> call<std::tuple<typename std::decay_t<calls_t>::value_type...>>;
 ```
-
 The handle is 16 bytes: `call_slot*` plus `std::uint32_t generation`. Slots come from a per-shard freelist preallocated at startup. `then` stores a function pointer plus user pointer or a small buffer object of at most 32 bytes; it never uses `std::function` on the hot path (R7). The callback runs on the shard owning the connection, on a later pump turn, never inside `try_finish` and never on the registering stack.
 
 `get()` behavior: inside a coroutine it parks on `coro_rt_sem_wait`; on a non-shard thread it blocks on a condition variable; on a shard thread without a coroutine context it returns `rpc_error{rpc_code::failed_precondition}` with `metadata["reason"] = "would_block"` and never blocks (A §18.6).
-
 ### 11.4 `call_context`
-
 ```cpp
+struct trace_id { std::array<std::byte, 16> bytes; };
+struct span_id { std::array<std::byte, 8> bytes; };
+struct lane_token { std::uint64_t lane_id = 0; std::uint64_t seq = 0; };
 class call_context {
 public:
     [[nodiscard]] std::chrono::nanoseconds remaining() const noexcept;
@@ -1390,25 +1240,17 @@ public:
     [[nodiscard]] call_context derive() const;
 };
 ```
-
 `call_context` is per call, move-only, passed by reference to the handler, and invalid after the handler returns. It is never `thread_local`, because coroutines migrate between execution contexts (B §4.5).
-
-<a id="s12"></a>
-## 12. HTTP/1.1, HTTP/2, HTTPS
-
+## 12. HTTP/1.1, HTTP/2, HTTPS <a id="s12"></a>
 ### 12.1 Same-port dispatch
-
 ```
 accept -> peek first bytes ->
   TLS: ALPN "h2" -> HTTP/2; ALPN "http/1.1" -> HTTP/1.1
   cleartext "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" -> h2c
   otherwise -> HTTP/1.1
 ```
-
 Both protocols share the router, binding layer, handler pool, `call_context`, and resilience pipeline. ALPN is mandatory for TLS: a client that offers only an unsupported protocol is rejected, never downgraded to cleartext.
-
 ### 12.2 HTTP/1.1
-
 | Item | v1 rule |
 |---|---|
 | Keep-alive | Default on; `Connection: close` disables; HTTP/1.0 requires explicit `keep-alive` |
@@ -1425,13 +1267,9 @@ Both protocols share the router, binding layer, handler pool, `call_context`, an
 | Host | Required in HTTP/1.1; absent is 400 |
 | Parsing | Strict RFC 9112; reject bare LF and whitespace before colon |
 | HEAD | Executes the GET handler and discards the body |
-
 ### 12.3 HTTPS
-
 TLS 1.2 and 1.3 via OpenSSL. ALPN advertises `h2` and `http/1.1`. SNI selects the certificate context; certificate reload atomically replaces `shared_ptr<SSL_CTX>`, old connections finish on the old context, new connections use the new one. Server-side session cache is enabled. OCSP stapling and client certificates are out of v1 scope. TLS-level compression is disabled.
-
 ### 12.4 HTTP/2
-
 The minimum correct set is mandatory (R5); there is no "simplified h2".
 
 | Area | Requirement |
@@ -1447,7 +1285,6 @@ The minimum correct set is mandatory (R5); there is no "simplified h2".
 | Interop | h2spec must pass the mandatory sections before release |
 
 Two independent flow-control layers exist. The h2 layer owns connection and stream windows; the CRPC layer owns its own connection and stream windows for the binary protocol. They are not shared. h2 `stream_id` and CRPC `stream_id` are separate spaces; the adapter keeps `h2_stream_id -> call_slot*`.
-
 ```
 h2 HEADERS :method POST, :path /svc/method, content-type application/crpc
   -> router lookup -> call_slot created with an internal stream_id
@@ -1456,30 +1293,35 @@ RESPONSE bytes -> h2 HEADERS (:status) + DATA frames
 h2 RST_STREAM -> call_slot try_finish(canceled)
 h2 GOAWAY -> no new streams; existing streams drain or cancel
 ```
-
 HTTP/2 header names are lowercase. `x-crpc-*` fields are ordinary headers, never pseudo-headers. The same `x-crpc-trace-id`, `x-crpc-timeout-ms`, `x-crpc-idempotency-key`, `x-crpc-attempt`, `x-crpc-lane-id`, and `x-crpc-lane-seq` semantics apply on both HTTP versions.
-
 ### 12.5 Status and error mapping
-
 HTTP status selection uses §9.4. `problem+json` is the only error body for 4xx/5xx generated by CRPC. A gateway or interceptor may set `metadata["http.status"]` to produce 401, 403, 409, or 422, because R6 does not define those codes; this bridge is recorded as an open issue in §22.
-
-<a id="s13"></a>
-## 13. MVC and RESTful
-
+## 13. MVC and RESTful <a id="s13"></a>
 ### 13.1 Route table
-
 ```cpp
 namespace crpc::http {
-
 enum class verb : std::uint8_t { get, post, put, patch, del, head, options };
-
+struct controller_meta {
+    const char* prefix;
+    constexpr explicit controller_meta(const char* p) noexcept : prefix(p) {}
+};
+struct request {
+    verb method = verb::get;
+    std::string path;
+    std::vector<std::pair<std::string, std::string>> headers;
+    byte_span body;
+};
+struct response {
+    int status = 200;
+    std::vector<std::pair<std::string, std::string>> headers;
+    buffer body;
+};
 struct route_entry {
     const char* path;
     const char* name;
     verb method;
     std::uint32_t ordinal;
 };
-
 struct action_record {
     std::string pattern;
     std::string name;
@@ -1490,6 +1332,7 @@ struct action_record {
     status (*invoke_http)(void*, const request&, response&, call_context&);
     std::uint64_t schema_hash;
 };
+struct match_result;
 
 class http_router {
 public:
@@ -1497,13 +1340,11 @@ public:
     [[nodiscard]] status build();
     [[nodiscard]] match_result match(verb, std::string_view path, std::string* allow) const noexcept;
 };
-
 } // namespace crpc::http
 ```
-
 `route_entry` is constant-initialized and lives at static storage. `build()` runs after `main`, detects conflicts, binds controller instances, and builds the exact and parameter tables. Two entries with the same `(verb, normalized_pattern)` are a `route_conflict` and abort startup with both names and ordinals. A controller with routes but no registered instance also aborts startup.
-
 ### 13.2 Matching and binding
+The route tree is represented at v1 scale as an exact-match table plus a pre-sorted parameter list; a trie is an implementation option only if it preserves the same priority and conflict rules.
 
 | Step | Rule |
 |---|---|
@@ -1517,10 +1358,8 @@ public:
 | Verb mismatch | 405 with `Allow` |
 | No match | 404 |
 
-DTO binding walks `fields_of<req>()` and reads field attributes. `FromRoute`, `FromQuery`, `FromHeader`, `FromForm` take the named source; `FromBody` or no attribute takes the body document. A missing required field is 400 with the field name; a missing `std::optional` is left empty; unknown body keys are ignored unless `strict_body = true`. Integer parsing uses `std::from_chars` and must consume every character; enums use `rtti::enum_table<t>` labels first, then numeric values (`[READ:F:\RTTI\include\rtti\reflection.hpp:1837]`). Conversion failure is 400 with `crpc_code = invalid_argument`.
-
+DTO binding walks `rtti::fields<req>()` (`[READ:F:\RTTI\include\rtti\reflection.hpp:884]`) and reads field attributes. `FromRoute`, `FromQuery`, `FromHeader`, `FromForm` take the named source; `FromBody` or no attribute takes the body document. A missing required field is 400 with the field name; a missing `std::optional` is left empty; unknown body keys are ignored unless `strict_body = true`. Integer parsing uses `std::from_chars` and must consume every character; enums use `rtti::enum_table<t>` labels first, then numeric values (`[READ:F:\RTTI\include\rtti\reflection.hpp:1837]`). Conversion failure is 400 with `crpc_code = invalid_argument`.
 ### 13.3 Responses
-
 | Handler result | Default |
 |---|---|
 | `t` | 200 with body; POST 201, DELETE 200 |
@@ -1531,9 +1370,7 @@ DTO binding walks `fields_of<req>()` and reads field attributes. `FromRoute`, `F
 | Thrown `rpc_exception` | Its `rpc_code`; other exceptions become 500 `internal` |
 
 `Accept` negotiation selects the response codec; no match is 406. `HEAD` executes the GET handler and drops the body. Error bodies use `problem+json` with `instance` set to the request path.
-
 ### 13.4 Upload
-
 `multipart/form-data` is parsed incrementally; the body is never fully buffered.
 
 | Limit | Default |
@@ -1545,7 +1382,6 @@ DTO binding walks `fields_of<req>()` and reads field attributes. `FromRoute`, `F
 | Spill threshold | 1 MiB |
 
 Parser states: `preamble`, `part_header`, `part_body`, `epilogue`. The body scanner keeps `boundary_len + 4` bytes of rollback so a boundary prefix inside content is not mis-split. Malformed input (missing boundary, unterminated part, illegal CRLF) is 400 and closes the connection. Files above the spill threshold are written to an `O_EXCL` temporary file under the configured root; `file_part` removes it on destruction, cancellation, or error. Client filenames are sanitized and used only as metadata; the on-disk name is random. `Expect: 100-continue` is honored only after routing and size checks; over-limit or unsupported requests get 413/415 without a 100 response.
-
 ```cpp
 struct file_part {
     std::string name;
@@ -1556,18 +1392,12 @@ struct file_part {
     std::shared_ptr<stream_reader> reader;
 };
 ```
-
 ### 13.5 Download and SSE
-
 Download uses `file_response{path, content_type, allow_range}`. It sends `Content-Length` and `Accept-Ranges: bytes`, streams in 64 KiB chunks, and never reads the whole file. `Range: bytes=a-b` yields 206 with `Content-Range`; invalid or unsatisfiable ranges yield 416. Range is ignored when the response is compressed (§14.4).
 
 SSE responses use `text/event-stream`, `Cache-Control: no-cache`, and `X-Accel-Buffering: no`. Event format is `id: <index>`, `event: <name>`, `data: <json>`, blank line; heartbeat is `: ping` every 15 s. Reconnect uses `Last-Event-ID`; the server replays from a bounded buffer of 1024 entries, and beyond that sends `event: reset` followed by a full snapshot. Slow clients are disconnected after a 30 s write stall and their subscription is released.
-
-<a id="s14"></a>
-## 14. Compression
-
+## 14. Compression <a id="s14"></a>
 ### 14.1 HTTP content encoding
-
 | Item | v1 |
 |---|---|
 | Request `Content-Encoding` | gzip, deflate; anything else is 415 |
@@ -1579,19 +1409,13 @@ SSE responses use `text/event-stream`, `Cache-Control: no-cache`, and `X-Accel-B
 | `identity;q=0` and no alternative | 406 unless `fallback_identity` is set |
 
 Compression and decompression are streaming `stream_reader`/`stream_writer` decorators; nothing is fully buffered. Backpressure propagates from the downstream write to the upstream read.
-
 ### 14.2 CRPC frame compression
-
 `flags.COMPRESSED` plus `flags.ALGO` select lz4 (1) or zstd (2); gzip (3) is for compatibility. The handshake `compress_bitmap` is the intersection of both sides. `compress_min` defaults to 512 bytes; smaller payloads are sent uncompressed. Compression is per frame payload; a batch is not compressed across frames. A compression failure is fail-closed: the connection closes, never a silent plaintext fallback.
 
 Flow control counts compressed bytes on the wire. `WINDOW_UPDATE` returns compressed bytes, so both sides agree on window accounting.
-
 ### 14.3 Large messages
-
 Payloads above `max_frame` are split into frames with `END_STREAM = 0` except the last. Each fragment is compressed independently and is at most 64 KiB before compression. The receiver decompresses and delivers each fragment incrementally.
-
 ### 14.4 Bomb protection
-
 | Limit | CRPC frame | HTTP |
 |---|---|---|
 | Decompressed total | 64 MiB | 64 MiB |
@@ -1601,26 +1425,46 @@ Payloads above `max_frame` are split into frames with `END_STREAM = 0` except th
 | Nested encodings | 1 | 1 |
 
 Over-limit is `resource_exhausted` or `protocol_error` and closes the connection (CRPC) or returns 413/400 and closes (HTTP). Range requests are ignored when `Content-Encoding` is present: the response is 200 with the full compressed entity and no `Accept-Ranges`.
-
-<a id="s15"></a>
-## 15. Resilience and governance
-
+## 15. Resilience and governance <a id="s15"></a>
 ### 15.1 Pipeline
-
 Six fixed stages, assembled at startup, read-only at runtime:
-
 ```cpp
 enum class resilience_stage : std::uint8_t {
     rate_limit, bulkhead, breaker, load_balance, retry, deadline
 };
-
 class resilience_policy {
 public:
     virtual ~resilience_policy() = default;
     [[nodiscard]] virtual rpc_error admit(call_context& ctx) noexcept = 0;
     virtual void on_result(call_context& ctx, const rpc_error& e) noexcept = 0;
 };
-
+struct rate_limit_config {
+    std::uint32_t rate_per_second = 10000;
+    std::uint32_t burst = 1000;
+};
+struct bulkhead_config {
+    std::uint32_t max_concurrent = 1024;
+};
+struct breaker_config {
+    std::chrono::seconds window{10};
+    std::uint32_t min_requests = 50;
+    double failure_ratio = 0.5;
+    double slow_ratio = 0.5;
+    std::chrono::nanoseconds slow_threshold{std::chrono::microseconds(200)};
+    std::uint32_t half_open_max_probes = 3;
+    std::uint32_t recovery_successes = 5;
+    std::chrono::seconds open_duration{5};
+};
+struct retry_config {
+    std::uint32_t max_attempts = 3;
+    std::chrono::nanoseconds base_backoff{std::chrono::milliseconds(2)};
+    std::chrono::nanoseconds max_backoff{std::chrono::milliseconds(200)};
+    double jitter = 0.2;
+    double budget_ratio = 0.1;
+    bool retry_on_connection_error = true;
+    bool retry_on_timeout = false;
+};
+using fallback_fn = rpc_error (*)(call_context&, const rpc_error&) noexcept;
 struct resilience_config {
     rate_limit_config rate;
     bulkhead_config bulkhead;
@@ -1631,18 +1475,14 @@ struct resilience_config {
     bool fail_fast_on_open = true;
 };
 ```
-
 `admit` runs `rate_limit -> bulkhead -> breaker -> load_balance -> deadline`; `on_result` runs in reverse. `retry` wraps a single attempt and re-runs `load_balance` before each attempt. Total success-path overhead is budgeted at 35-65 ns (A §27.8).
-
 ### 15.2 Circuit breaker
-
 ```
 closed --(failure_ratio >= threshold and requests >= min_requests)--> open
 open --(open_duration elapsed)--> half_open
 half_open --(recovery_successes consecutive successes)--> closed
 half_open --(any probe failure)--> open (reset duration, exponential backoff)
 ```
-
 | Parameter | Default |
 |---|---|
 | Window | 10 s, ten 1 s buckets |
@@ -1656,9 +1496,7 @@ half_open --(any probe failure)--> open (reset duration, exponential backoff)
 | Granularity | Method and instance enabled; service and connection disabled |
 
 Statistics are per-shard `alignas(64)` buckets with relaxed atomic increments; bucket rotation uses monotonic time only (P12). State transitions are CAS; the CAS winner performs the side effect. `probes_left` is an atomic token count, so only three half-open probes can run. Breaker-open skips retries. Breaker failure accounting uses the logical call result, not each retry attempt.
-
 ### 15.3 Rate limit, bulkhead, fallback, retry
-
 | Policy | Default | Over-limit |
 |---|---|---|
 | Client token bucket | Per `(target, method)`, capacity and rate configurable | `resource_exhausted` with `retry_after` |
@@ -1668,18 +1506,14 @@ Statistics are per-shard `alignas(64)` buckets with relaxed atomic increments; b
 | Fallback | One function per method, called only after final failure | Result marked `degraded=true` |
 | Retry | Max 3 attempts, base 2 ms, max 200 ms, jitter 20%, budget 10% | Stop retrying; return the last error |
 
-Retry is allowed only for idempotent calls (explicit flag or idempotency key). `deadline_exceeded` is not retried by default because the side effect may have occurred. A retry attempt must fit within the remaining deadline.
-
+Retry is allowed only for idempotent calls (explicit flag or idempotency key). `deadline_exceeded` is not retried by default because the side effect may have occurred. A retry attempt must fit within the remaining deadline. A fallback returns `ok` after writing its cached value into the call's response buffer; any other code replaces the original error.
 ### 15.4 Health, load balancing, node interop
-
 Active health checks run every 5 s (TCP connect, HTTP `/health`, or RPC `Ping`); passive health comes from breaker and connection failures. A recovering instance ramps weight from 1 to its configured value by consecutive successes.
 
 Selection order: same datacenter, healthy, breaker closed, then smooth weighted round-robin. Instance-level breaker open removes the instance from the endpoint set by atomic snapshot replacement.
 
 Nodes use lazy peer connections; there is no full mesh. Inter-node calls are ordinary CRPC calls to the `crpc.registry` service, not a second protocol. Node identity is a persisted UUIDv4.
-
 ### 15.5 Registry (Consul-shaped, single authority)
-
 | Operation | HTTP | CRPC method |
 |---|---|---|
 | Register/renew | `PUT /v1/agent/service/register` | `register` |
@@ -1699,25 +1533,19 @@ KV values are base64 on both HTTP and wire. `cas=N` succeeds only when `modify_i
 Watch uses long polling: `index == current` parks the handler coroutine until a change or the wait timeout. A timeout returns 200 with the current value and unchanged index, not 504. One watch per HTTP/1.1 connection; global watch count is capped at 10k.
 
 Two-order convergence: snapshot index `S`; event index `E`. `E <= S` is dropped; `E == S + 1` is applied; `E > S + 1` is buffered with a bound and triggers a snapshot fetch. State never rolls back.
-
-<a id="s16"></a>
-## 16. Observability
-
+## 16. Observability <a id="s16"></a>
 ### 16.1 AOP
-
 ```cpp
 enum class hook_point : std::uint8_t {
     client_before_call, client_after_call, client_encode_before, client_encode_after,
     server_before_call, server_after_call, server_decode_before, server_decode_after,
     conn_open, conn_close, conn_error
 };
-
 class interceptor {
 public:
     virtual ~interceptor() = default;
     [[nodiscard]] virtual bool on_hook(hook_point p, call_context& ctx) noexcept = 0;
 };
-
 class aop_chain {
 public:
     void add(hook_point p, interceptor* i) noexcept;
@@ -1725,26 +1553,15 @@ public:
     [[nodiscard]] bool run(hook_point p, call_context& ctx) noexcept;
 };
 ```
-
 `run` begins with `if (hooks_[p].empty()) return true;`, so an unused hook costs about 1 ns. The chain is frozen before serving; interceptors are constructed at startup and must not allocate or block in a hook. An exception inside a hook is caught and converted to `internal`.
-
 ### 16.2 Tracing
-
 Trace context is 16-byte `trace_id`, 8-byte `span_id`, 8-byte `parent_span_id`, plus flags. HTTP uses W3C `traceparent` (`00-<32 hex>-<16 hex>-<2 hex>`); CRPC carries the same fields in the call envelope. Parent/child is established by the send/receive pair, never by timestamps. Head sampling defaults to 1% and is decided once at call initiation. Baggage is at most 8 KiB and never affects routing. Exporters are asynchronous with a bounded queue of 8192; overflow drops and counts. With no exporter configured, tracing has zero allocations.
-
 ### 16.3 Logging
-
 Hot path: stack formatting plus a per-shard SPSC ring of 8192 entries; no `malloc`, no lock, no syscall, no `std::string`. Format is `{}` style. Level filtering is compile-time (`CRPC_LOG_MAX_LEVEL`) plus a runtime atomic. A single background thread batches entries to `writev`/`WriteFile`, rotates by size or time, and writes UTF-8. Queue overflow drops and increments `crpc_log_dropped_total`. Structured fields include trace id, span id, service, method. Fields whose names contain `token`, `secret`, `password`, or `key` are refused by default. Target cost is at most 150 ns per enabled entry.
-
 ### 16.4 Metrics
-
 Counters: `crpc_calls_total{service,method,code}`, `crpc_call_duration_ns` histogram, `crpc_unreliable_dropped_total{reason}`, `crpc_log_dropped_total`, `crpc_retry_attempts_total`, `crpc_breaker_state{key}`, `crpc_breaker_open_total`, `crpc_rate_limited_total`, `crpc_bulkhead_rejected_total`, `crpc_registry_watch_total`, `crpc_push_dropped_total{policy}`. Histograms use fixed buckets and no allocation.
-
-<a id="s17"></a>
-## 17. Memory and performance budgets
-
+## 17. Memory and performance budgets <a id="s17"></a>
 ### 17.1 Memory
-
 | Item | Budget | Composition |
 |---|---|---|
 | Idle connection | <= 2 KiB | Connection object 256 B, lazy read buffer 1 KiB, no write buffer, table entry 64 B |
@@ -1754,12 +1571,11 @@ Counters: `crpc_calls_total{service,method,code}`, `crpc_call_duration_ns` histo
 | 100k in-flight calls | <= 64 MiB | 100k × 128 B plus mostly empty buffers |
 | 10k idle connections | <= 20 MiB | 2 KiB each |
 | Subscription table | <= 5 MiB | 100k entries × 48 B |
+| Per-lane queue | <= 16 KiB | 1024 entries × 16 B, bounded ring |
 | Send ring per connection | <= 256 KiB | Bounded, high-water reclaim |
 
 All queues are bounded. Pools have caps and release memory at low water; a pool may not grow forever. Coroutine stacks are 64 KiB with a guard page; the handler pool is long-lived so the 256-entry default-stack cache is not on the request path.
-
 ### 17.2 Performance targets and measurement
-
 | Metric | Target | Status |
 |---|---|---|
 | Aggregate throughput | 5M RPC/s | Target, not a gate (R10) |
@@ -1770,12 +1586,8 @@ All queues are bounded. Pools have caps and release memory at low water; a pool 
 | Resilience pipeline | 35-65 ns per successful call | Budget |
 
 Benchmarks must report message size, connection count, thread count, batching, toolchain, CPU model, and p50/p99/p999. Results must use an independent request counter. Converting "64 frames per RTT" into RPC/s is forbidden (R10). Measurement uses `bench/bench_rpc.cpp`, a 10 s warmup, five 30 s runs, and the median of the five.
-
-<a id="s18"></a>
-## 18. Concurrency correctness
-
+## 18. Concurrency correctness <a id="s18"></a>
 ### 18.1 Lock order
-
 | Level | Lock | May acquire while held |
 |---|---|---|
 | 1 | `registry_catalog_lock` (authority) | None |
@@ -1786,9 +1598,7 @@ Benchmarks must report message size, connection count, thread count, batching, t
 | 6 | breaker state (atomic, not a lock) | Not applicable |
 
 Only increasing levels may be acquired. A shard lock is never held while acquiring another shard's lock. No I/O, user code, coroutine suspension, `sem_post`, log sink, or blocking allocation occurs while a lock is held. Paths that cannot be proven acyclic use `try_lock` with a timeout and an explicit recovery path.
-
 ### 18.2 One-to-one pairing
-
 | Acquire | Release | Recycle point |
 |---|---|---|
 | `call_slot` from freelist | Return to freelist | Terminal state and refcount zero |
@@ -1799,12 +1609,9 @@ Only increasing levels may be acquired. A shard lock is never held while acquiri
 | Sink `push` | `completion::complete` | Write complete, error, or cancel |
 | Temp upload file | `std::filesystem::remove` | `file_part` destruction or cancel |
 | Registry instance | Deregister or TTL tombstone | Lease expiry |
-
 ### 18.3 State machine convergence
-
 ```cpp
 enum class call_state : std::uint8_t { idle, pending, completed, canceled, timed_out, conn_lost, recycled };
-
 bool try_finish(call_slot& s, call_state terminal, rpc_error e) noexcept {
     std::uint32_t expected = static_cast<std::uint32_t>(call_state::pending);
     if (!s.state.compare_exchange_strong(expected, static_cast<std::uint32_t>(terminal),
@@ -1816,11 +1623,8 @@ bool try_finish(call_slot& s, call_state terminal, rpc_error e) noexcept {
     return true;
 }
 ```
-
 Every terminal path (response, timeout, cancel, connection loss, rejection) calls `try_finish`. The first CAS wins; all later paths observe a terminal state and drop. Because `stream_id` is never reused, a late response can only hit a live slot or a terminal slot, never a recycled call with a different generation. This gives order-independent convergence: arrival order does not affect the terminal state.
-
 ### 18.4 D1-D20 defect mapping
-
 D1-D15 are the RTTI integration defects from B §8; D16-D20 are the corocc integration defects A §1.1 D1-D5.
 
 | ID | Defect | Mitigation | Test |
@@ -1845,12 +1649,8 @@ D1-D15 are the RTTI integration defects from B §8; D16-D20 are the corocc integ
 | D18 | LOOP runtime has only `worker[0]` | One runtime per shard | `test_shard_isolation` |
 | D19 | A runtime cannot be pumped concurrently | `pump_active`; single shard thread | `test_pump_exclusive` |
 | D20 | corocc has no I/O completion reaping | `epoll_wait` / `GQCSEx` batch arrays | `test_batch_completion` |
-
-<a id="s19"></a>
-## 19. Test strategy
-
+## 19. Test strategy <a id="s19"></a>
 ### 19.1 Layers
-
 | Layer | Content | Gate |
 |---|---|---|
 | Unit | Frame codec, varint, byte order, router, HTTP parser, multipart, codecs, error mapping, breaker, token bucket, dedup | Every test green, x86 and x64 |
@@ -1860,9 +1660,7 @@ D1-D15 are the RTTI integration defects from B §8; D16-D20 are the corocc integ
 | Fuzz | Frame, HTTP/1.1, h2 HPACK, JSON/XML/TOML/INI, multipart, router | No crash, no over-limit allocation |
 | Sanitizer | ASan/LSan, UBSan, TSan, optional MSan | Zero reports |
 | Long run | 1M calls, 1000 start/stop, RSS plateau, active counts zero | No growth |
-
 ### 19.2 Law-to-verification matrix
-
 | Law | Verification | Test asset |
 |---|---|---|
 | No real-time global state | Reorder injection plus terminal-state assertion | `test_inproc_reorder` |
@@ -1876,9 +1674,7 @@ D1-D15 are the RTTI integration defects from B §8; D16-D20 are the corocc integ
 | Asymmetric safety | Illegal frame/version/cert rejected | `test_fail_closed` |
 | Event before data | Both arrival orders converge | `test_watch_two_order` |
 | NULL cannot pass through | Deregister, stale heartbeat does not revive | `test_tombstone` |
-
 ### 19.3 PIN protocol
-
 Every defect found during implementation is pinned before it is fixed:
 
 1. **Pin**: write a failing test that reproduces the defect exactly, with the observed error, not a paraphrase.
@@ -1888,9 +1684,7 @@ Every defect found during implementation is pinned before it is fixed:
 5. **Never delete or weaken** the pinned test; extend it if the defect has more branches.
 
 This follows the project rule that a failure must be proven before the fix and that the test must not be removed afterwards (`[READ:F:\crpc\.opencode\memory.md:90]`).
-
 ### 19.4 Sanitizer matrix
-
 | Tool | Targets | Job |
 |---|---|---|
 | ASan + LSan | Frame parsing, buffer reuse, slot recycling, close races, multipart, upload cancel | Linux Clang Debug |
@@ -1899,12 +1693,8 @@ This follows the project rule that a failure must be proven before the fix and t
 | MSan (optional) | Uninitialized reads on decode | Linux Clang |
 
 corocc already provides fiber hooks: `COROCC_ASAN` and `COROCC_TSAN` build options, ASan context switching, and TSan fiber annotations. CRPC builds the dependency with those options; it does not add its own fiber annotations.
-
-<a id="s20"></a>
-## 20. Build and CI
-
+## 20. Build and CI <a id="s20"></a>
 ### 20.1 CMake targets
-
 | Target | Content |
 |---|---|
 | `crpc_core` | `core`, `io`, `wire` |
@@ -1920,23 +1710,16 @@ corocc already provides fiber hooks: `COROCC_ASAN` and `COROCC_TSAN` build optio
 Options: `CRPC_BUILD_TESTS`, `CRPC_BUILD_BENCH`, `CRPC_BUILD_FUZZ`, `CRPC_WITH_OPENSSL`, `CRPC_WITH_LZ4`, `CRPC_WITH_ZSTD`, `CRPC_SANITIZER=none|asan|ubsan|tsan`, `CRPC_RTTI_DIR`, `CRPC_COROCC_DIR`, `CRPC_32BIT_FRAME_CAP`.
 
 Zero-warning policy: MSVC `/W4 /WX`; GCC/Clang `-Wall -Wextra -Wpedantic -Werror`; additionally `-Wconversion -Wsign-conversion` where practical. Warnings are never disabled for CRPC code; third-party suppressions must name the library and the reason.
-
 ### 20.2 Scripts and CI
-
 ```
 scripts/build.ps1 -Config Debug|Release|Both -Arch x86|x64 -Sanitizer none|asan|ubsan|tsan -Jobs N -Clean
 scripts/build.sh  --config debug|release|both --arch x64 --sanitizer none|asan|ubsan|tsan --jobs N --clean
 scripts/test.ps1  -Config Debug|Release -Arch x86|x64 -Sanitizer none|all -Filter <substring> -Repeat N
 scripts/test.sh   --config debug|release --sanitizer none|all --filter <substring> --repeat N
 ```
-
 CI jobs: MSVC x64 Debug/Release, MSVC x86 Debug/Release, GCC x64, Clang x64, ASan, UBSan, TSan, fuzz smoke, golden bytes, benchmark report. CI calls the same scripts developers use; it does not duplicate build logic. Logs are UTF-8; failures exit non-zero; builds are idempotent.
-
-<a id="s21"></a>
-## 21. v1 scope, v1.1, milestones
-
+## 21. v1 scope, v1.1, milestones <a id="s21"></a>
 ### 21.1 v1 (R5, authoritative)
-
 | Area | v1 content |
 |---|---|
 | Transport | `source`/`sink` (R1), epoll ET, IOCP, inproc |
@@ -1954,13 +1737,9 @@ CI jobs: MSVC x64 Debug/Release, MSVC x86 Debug/Release, GCC x64, Clang x64, ASa
 | Push | `push_hub`, subscriptions, streaming, SSE, long polling |
 | Observability | AOP, W3C traceparent, high-performance logging |
 | Engineering | One-command scripts, sanitizer matrix, zero warnings |
-
 ### 21.2 v1.1 (R5)
-
 Gossip/Raft strong consistency, dynamic policy distribution, io_uring/shm/RDMA, ARM64/BE/Android/macOS. WebSocket is not in v1 or v1.1: SSE plus push covers the unidirectional requirement (A §32, B §19.2).
-
 ### 21.3 Milestones and acceptance gates
-
 | Milestone | Deliverable | Exit gate |
 |---|---|---|
 | M0 | Skeleton, build scripts, core types, CI | Zero warnings x86/x64; core unit tests |
@@ -1972,10 +1751,7 @@ Gossip/Raft strong consistency, dynamic policy distribution, io_uring/shm/RDMA, 
 | M6 | All codecs, observability, hardening | Sanitizer zero; long run; benchmark report |
 
 Release gates (R11): zero errors and zero warnings on x86 and x64; ASan/LSan/UBSan/TSan zero reports; fuzz no crashes; all tests pass on both architectures; scripts reproduce the build; performance measured and reported honestly.
-
-<a id="s22"></a>
-## 22. Open issues and risks
-
+## 22. Open issues and risks <a id="s22"></a>
 | # | Issue | Impact | Blocking point / plan |
 |---|---|---|---|
 | O1 | R6 has no `permission_denied`, `unauthenticated`, `already_exists`, `out_of_range`, `unimplemented`, `data_loss`, or `not_leader` | HTTP 401/403/409/422/501 and registry leader hints cannot be expressed as `rpc_code` | Bridge: HTTP layer sets the status directly and records `metadata["http.status"]`; registry returns `unavailable` plus `metadata["leader"]`. Requires ruling confirmation before M3/M5 freeze. |

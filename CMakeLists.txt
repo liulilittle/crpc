@@ -15,9 +15,18 @@ set(CRPC_SANITIZER "" CACHE STRING
     "Sanitizer to enable: empty, address, undefined, or thread")
 
 # Dependency locations. Both are consumed read-only through their public
-# headers and static libraries. Set these to the checkout roots.
+# headers and static libraries. Set these to the checkout roots, either as cache
+# variables or through the environment (the one-click scripts forward the
+# environment without needing extra arguments).
 set(CRPC_RTTI_DIR "" CACHE PATH "Root of the RTTI checkout")
 set(CRPC_COROCC_DIR "" CACHE PATH "Root of the corocc checkout")
+
+if(NOT CRPC_RTTI_DIR AND DEFINED ENV{CRPC_RTTI_DIR})
+    set(CRPC_RTTI_DIR "$ENV{CRPC_RTTI_DIR}" CACHE PATH "Root of the RTTI checkout" FORCE)
+endif()
+if(NOT CRPC_COROCC_DIR AND DEFINED ENV{CRPC_COROCC_DIR})
+    set(CRPC_COROCC_DIR "$ENV{CRPC_COROCC_DIR}" CACHE PATH "Root of the corocc checkout" FORCE)
+endif()
 
 # ---------------------------------------------------------------------------
 # Global settings
@@ -36,6 +45,10 @@ if(MSVC)
     # /utf-8 keeps source encoding stable; /permissive- enforces standard
     # conformance; /Zc:preprocessor is required by the RTTI macro machinery.
     add_compile_options(/utf-8 /permissive- /Zc:preprocessor /Zc:__cplusplus)
+    # NOMINMAX and WIN32_LEAN_AND_MEAN are defined for every target: a public
+    # header that ends up including <windows.h> would otherwise turn min/max
+    # into macros and break std::min/std::max in consumer code.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
     if(CRPC_WARNINGS_AS_ERRORS)
         add_compile_options(/W4 /WX)
     else()
@@ -93,19 +106,80 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Core library (no third-party dependency)
+# Core library
 # ---------------------------------------------------------------------------
+#
+# The library builds either as a static archive or as a shared library. Both
+# forms are first-class: a static build is the default because it has no
+# runtime deployment requirements, and a shared build is what a plugin host or
+# a multi-language deployment needs. The ABI rules in docs/abi.md apply to the
+# shared form.
+#
+# CRPC_BUILD_SHARED=ON  -> shared library, CRPC_SHARED/CRPC_BUILDING defined
+# CRPC_BUILD_SHARED=OFF -> static archive (default)
 
-add_library(crpc_core STATIC
-    src/error.cpp
-)
+option(CRPC_BUILD_SHARED "Build crpc as a shared library" OFF)
 
-target_include_directories(crpc_core PUBLIC
+set(CRPC_LIBRARY_TYPE STATIC)
+if(CRPC_BUILD_SHARED)
+    set(CRPC_LIBRARY_TYPE SHARED)
+endif()
+
+add_library(crpc ${CRPC_LIBRARY_TYPE})
+
+# Sources are discovered by pattern so that independent subsystems can be added
+# without editing this file. CONFIGURE_DEPENDS re-globs on reconfigure.
+file(GLOB_RECURSE CRPC_CORE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+target_sources(crpc PRIVATE ${CRPC_CORE_SOURCES})
+
+# The alias keeps test and consumer targets independent of the library type.
+add_library(crpc::crpc ALIAS crpc)
+add_library(crpc_core ALIAS crpc)
+
+target_include_directories(crpc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-target_compile_features(crpc_core PUBLIC cxx_std_17)
+target_compile_features(crpc PUBLIC cxx_std_17)
+
+if(CRPC_BUILD_SHARED)
+    target_compile_definitions(crpc PUBLIC CRPC_SHARED)
+    target_compile_definitions(crpc PRIVATE CRPC_BUILDING)
+    set_target_properties(crpc PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+    if(NOT MSVC)
+        # Every exported symbol is marked CRPC_API; anything else stays hidden.
+        target_link_options(crpc PRIVATE -Wl,--no-undefined)
+    endif()
+endif()
+
+# Platform libraries the transport and timing layers need.
+if(WIN32)
+    target_link_libraries(crpc PUBLIC ws2_32 mswsock)
+elseif(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(crpc PUBLIC Threads::Threads)
+endif()
+
+if(CRPC_HAVE_COROCC)
+    target_link_libraries(crpc PUBLIC corocc)
+    target_compile_definitions(crpc PUBLIC CRPC_HAVE_COROCC=1)
+endif()
+
+if(CRPC_HAVE_RTTI)
+    target_link_libraries(crpc PUBLIC rtti)
+    target_compile_definitions(crpc PUBLIC CRPC_HAVE_RTTI=1)
+endif()
+
+
+# The codec layer consumes RTTI's public reflection headers and (for JSON and
+# the text/schema adapters) its compiled static library. Linking it PUBLIC also
+# propagates the RTTI include directory to every crpc consumer. This is already
+# covered by the CRPC_HAVE_RTTI block above; the duplicate was removed.
 
 # ---------------------------------------------------------------------------
 # Tests

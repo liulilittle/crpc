@@ -1,0 +1,566 @@
+// CRPC -- high-performance asynchronous logger.
+//
+// The design separates the caller's hot path from the sink:
+//
+//   * The caller formats into a fixed stack buffer with `{}` placeholders. The
+//     formatting code never allocates, never locks and never enters the kernel.
+//   * The resulting fixed-size `log_record` is copied into a per-thread
+//     single-producer/single-consumer ring. The ring is wait-free in the common
+//     case (one head load, one tail load, one store).
+//   * One background thread drains every registered ring in batches, formats
+//     text lines and writes them with `WriteFile` (Windows) or `writev`
+//     (POSIX). It also rotates files by size and by time.
+//
+// The only allocation on a thread's first log call is its ring (capacity is
+// configurable, default 8192 records). After that registration a log call has
+// no allocation. `logger::shutdown()` drains and joins; it is idempotent.
+//
+// Thread safety: `logger::instance()` is the only documented mutable singleton
+// in this module. `submit()` is safe from any thread. `configure()`, `start()`,
+// `shutdown()` and `reset()` are lifecycle operations: call them from one
+// thread, and call `reset()` only when no other thread is logging.
+#ifndef CRPC_OBSERVABILITY_LOG_HPP
+#define CRPC_OBSERVABILITY_LOG_HPP
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <crpc/config.hpp>
+#include <crpc/observability/context.hpp>
+
+// Compile-time verbosity ceiling. Values:
+//   0 trace, 1 debug, 2 info, 3 warn, 4 error, 5 off.
+// A level is compiled in when CRPC_LOG_MAX_LEVEL <= its numeric value, so the
+// default (0) compiles every level in and 5 compiles every level out.
+#ifndef CRPC_LOG_MAX_LEVEL
+#define CRPC_LOG_MAX_LEVEL 0
+#endif
+
+namespace crpc {
+namespace obs {
+
+// --- Levels ------------------------------------------------------------------
+
+enum class log_level : u8 { trace = 0, debug, info, warn, error, off };
+
+// Token accepted by CRPC_LOG_MAX_LEVEL for "compile every level out".
+// Numeric 0..5 is equally valid; 5 has the same effect as `off`.
+constexpr int off = 5;
+
+[[nodiscard]] inline const char* to_string(log_level level) noexcept {
+    switch (level) {
+    case log_level::trace:
+        return "TRACE";
+    case log_level::debug:
+        return "DEBUG";
+    case log_level::info:
+        return "INFO";
+    case log_level::warn:
+        return "WARN";
+    case log_level::error:
+        return "ERROR";
+    case log_level::off:
+        return "OFF";
+    }
+    return "OFF";
+}
+
+// --- Bounded stack formatter -------------------------------------------------
+
+// A writer over a caller-supplied fixed buffer. When the buffer is full the
+// excess is discarded and `truncated()` becomes true; the writer never
+// allocates and never writes past the end.
+class log_buffer {
+public:
+    log_buffer(char* out, std::size_t capacity) noexcept
+        : out_(out), capacity_(capacity), size_(0), truncated_(false) {}
+
+    void append(const char* data, std::size_t count) noexcept {
+        if (data == nullptr || count == 0) {
+            return;
+        }
+        if (count > capacity_ - size_) {
+            count = capacity_ - size_;
+            truncated_ = true;
+        }
+        std::memcpy(out_ + size_, data, count);
+        size_ += count;
+    }
+
+    void append(std::string_view text) noexcept { append(text.data(), text.size()); }
+
+    void append(char value) noexcept {
+        if (size_ == capacity_) {
+            truncated_ = true;
+            return;
+        }
+        out_[size_] = value;
+        ++size_;
+    }
+
+    void append_integer(std::int64_t value) noexcept {
+        using unsigned_type = std::uint64_t;
+        unsigned_type magnitude;
+        bool negative = false;
+        if (value < 0) {
+            negative = true;
+            magnitude = static_cast<unsigned_type>(0) - static_cast<unsigned_type>(value);
+        } else {
+            magnitude = static_cast<unsigned_type>(value);
+        }
+        append_unsigned(magnitude, negative);
+    }
+
+    void append_integer(std::uint64_t value) noexcept { append_unsigned(value, false); }
+
+    void append_float(double value) noexcept {
+        char text[64];
+        const int written = std::snprintf(text, sizeof(text), "%.6g", value);
+        if (written > 0) {
+            const std::size_t count =
+                static_cast<std::size_t>(written) < sizeof(text)
+                    ? static_cast<std::size_t>(written)
+                    : sizeof(text) - 1;
+            append(text, count);
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    [[nodiscard]] bool truncated() const noexcept { return truncated_; }
+    [[nodiscard]] const char* data() const noexcept { return out_; }
+
+    void clear() noexcept {
+        size_ = 0;
+        truncated_ = false;
+    }
+
+private:
+    void append_unsigned(std::uint64_t value, bool negative) noexcept {
+        char digits[24];
+        std::size_t count = 0;
+        do {
+            digits[count] = static_cast<char>('0' + (value % 10));
+            ++count;
+            value /= 10;
+        } while (value != 0);
+        if (negative) {
+            append('-');
+        }
+        while (count != 0) {
+            --count;
+            append(digits[count]);
+        }
+    }
+
+    char* out_;
+    std::size_t capacity_;
+    std::size_t size_;
+    bool truncated_;
+};
+
+inline void append_value(log_buffer& out, std::string_view value) noexcept {
+    out.append(value);
+}
+
+inline void append_value(log_buffer& out, const std::string& value) noexcept {
+    out.append(value.data(), value.size());
+}
+
+inline void append_value(log_buffer& out, const char* value) noexcept {
+    if (value == nullptr) {
+        out.append("(null)");
+    } else {
+        out.append(value);
+    }
+}
+
+inline void append_value(log_buffer& out, std::nullptr_t) noexcept { out.append("(null)"); }
+
+inline void append_value(log_buffer& out, char value) noexcept { out.append(value); }
+
+inline void append_value(log_buffer& out, bool value) noexcept {
+    out.append(value ? "true" : "false");
+}
+
+template <typename T,
+          std::enable_if_t<std::is_integral<T>::value && !std::is_same<T, bool>::value &&
+                               !std::is_same<T, char>::value,
+                           int> = 0>
+inline void append_value(log_buffer& out, T value) noexcept {
+    if constexpr (std::is_signed<T>::value) {
+        out.append_integer(static_cast<std::int64_t>(value));
+    } else {
+        out.append_integer(static_cast<std::uint64_t>(value));
+    }
+}
+
+template <typename T, std::enable_if_t<std::is_floating_point<T>::value, int> = 0>
+inline void append_value(log_buffer& out, T value) noexcept {
+    out.append_float(static_cast<double>(value));
+}
+
+namespace detail {
+
+template <typename Tuple, std::size_t Index = 0>
+void format_impl(log_buffer& out, std::string_view format, const Tuple& args) noexcept {
+    std::size_t position = 0;
+    while (position < format.size()) {
+        const char current = format[position];
+        if (current == '{' && position + 1 < format.size() && format[position + 1] == '{') {
+            out.append('{');
+            position += 2;
+            continue;
+        }
+        if (current == '}' && position + 1 < format.size() && format[position + 1] == '}') {
+            out.append('}');
+            position += 2;
+            continue;
+        }
+        if (current == '{' && position + 1 < format.size() && format[position + 1] == '}') {
+            if constexpr (Index < std::tuple_size<Tuple>::value) {
+                append_value(out, std::get<Index>(args));
+                format_impl<Tuple, Index + 1>(out, format.substr(position + 2), args);
+                return;
+            } else {
+                out.append("{}");
+                position += 2;
+                continue;
+            }
+        }
+        out.append(current);
+        ++position;
+    }
+}
+
+} // namespace detail
+
+// Formats `{}` placeholders from `format` into `out`. Supports `{{` and `}}`
+// as literal braces. Missing arguments leave `{}` in the output; extra
+// arguments are ignored. No allocation, no exceptions.
+template <typename... Args>
+void format_to(log_buffer& out, std::string_view format, Args&&... args) noexcept {
+    const auto tuple = std::forward_as_tuple(std::forward<Args>(args)...);
+    detail::format_impl(out, format, tuple);
+}
+
+// --- Structured record -------------------------------------------------------
+
+struct log_field {
+    static constexpr std::size_t max_key = 16;
+    static constexpr std::size_t max_value = 56;
+
+    char key[max_key];
+    char value[max_value];
+    u8 key_len;
+    u8 value_len;
+    u8 truncated;
+};
+
+// Fixed-size record. The size is part of the memory contract: the per-thread
+// ring stores records by value and never allocates per entry.
+struct log_record {
+    static constexpr std::size_t max_message = 128;
+    static constexpr std::size_t max_fields = 4;
+    static constexpr u8 flag_truncated = 0x01;
+
+    std::uint64_t timestamp_ns;
+    std::uint64_t thread_id;
+    trace_id trace;
+    span_id span;
+    log_level level;
+    u8 field_count;
+    u8 flags;
+    u16 message_len;
+    char message[max_message];
+    log_field fields[max_fields];
+};
+
+static_assert(sizeof(log_record) <= 512, "log_record must stay within one 512-byte ring slot");
+
+// Builds a record with the current timestamp and thread id. The message is
+// truncated to the inline capacity; the truncation flag is set when that
+// happens.
+[[nodiscard]] log_record make_record(log_level level, std::string_view message,
+                                     const trace_context& trace = trace_context{}) noexcept;
+
+// Appends a bounded key/value pair. Returns false when the record already
+// holds `max_fields` entries. Key/value truncation is reflected in
+// `log_field::truncated` and `log_record::flags`.
+[[nodiscard]] bool record_add_field(log_record& record, std::string_view key,
+                                    std::string_view value) noexcept;
+
+template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
+[[nodiscard]] bool record_add_field(log_record& record, std::string_view key,
+                                    T value) noexcept {
+    char buffer[32];
+    log_buffer out(buffer, sizeof(buffer));
+    if constexpr (std::is_signed<T>::value) {
+        out.append_integer(static_cast<std::int64_t>(value));
+    } else {
+        out.append_integer(static_cast<std::uint64_t>(value));
+    }
+    return record_add_field(record, key, std::string_view(buffer, out.size()));
+}
+
+// --- Overflow policy ---------------------------------------------------------
+
+enum class overflow_policy : u8 {
+    // Drop the record and increment the ring's drop counter. Default.
+    drop_and_count,
+    // Spin until the sink makes room. This may stall the caller and must not
+    // be used before the sink thread is running.
+    block,
+    // Yield for a bounded number of attempts, then drop and count.
+    throttle
+};
+
+// --- Redaction / compression hooks ------------------------------------------
+
+// Called for every structured field. The callback may rewrite `value` in place
+// and update `*length`. `capacity` includes room for the terminating NUL but
+// the length must not count it. It must not block or throw.
+using redact_fn = void (*)(void* user, const char* key, std::size_t key_len, char* value,
+                           std::size_t capacity, std::size_t* length) noexcept;
+
+// Called on the sink thread with one batch of formatted bytes. Returns the
+// compressed size, or 0 to leave the batch uncompressed. Off by default.
+using compress_fn = std::size_t (*)(void* user, const char* input, std::size_t input_size,
+                                    char* output, std::size_t output_capacity) noexcept;
+
+// --- Configuration -----------------------------------------------------------
+
+struct logger_config {
+    // Empty disables file output; records are drained and discarded.
+    std::string file_path = "crpc.log";
+    std::size_t ring_capacity = 8192;
+    std::size_t max_file_size = 64u * 1024u * 1024u;
+    // Zero disables time-based rotation.
+    std::chrono::milliseconds rotate_interval{0};
+    overflow_policy overflow = overflow_policy::drop_and_count;
+    bool enable_file = true;
+};
+
+// --- Logger ------------------------------------------------------------------
+
+class log_ring;
+
+class logger {
+public:
+    // The one documented mutable singleton of this module. Constructed on
+    // first use; destroyed at process exit (its destructor calls shutdown()).
+    static logger& instance() noexcept {
+        static logger value;
+        return value;
+    }
+
+    logger(const logger&) = delete;
+    logger& operator=(const logger&) = delete;
+
+    // Lifecycle. `configure()` and `start()` must be called while stopped.
+    void configure(const logger_config& config);
+    void start();
+    void shutdown() noexcept;
+
+    // Testing/administrative reset. Stops the sink, drops every registered
+    // ring and restores defaults. No other thread may be logging.
+    void reset();
+
+    [[nodiscard]] bool running() const noexcept { return running_.load(std::memory_order_acquire); }
+
+    void set_level(log_level level) noexcept {
+        level_.store(static_cast<int>(level), std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] log_level level() const noexcept {
+        return static_cast<log_level>(level_.load(std::memory_order_relaxed));
+    }
+
+    [[nodiscard]] bool enabled(log_level level) const noexcept {
+        const int runtime = level_.load(std::memory_order_relaxed);
+        return static_cast<int>(level) >= runtime && runtime < static_cast<int>(log_level::off);
+    }
+
+    // Hot path. Copies `record` into the calling thread's ring. No allocation
+    // after the thread's first call, no lock, no syscall.
+    void submit(const log_record& record) noexcept;
+
+    // Structured field helper that applies the redaction hook before the
+    // bounded copy. No allocation.
+    [[nodiscard]] bool add_field(log_record& record, std::string_view key,
+                                 std::string_view value) noexcept;
+
+    [[nodiscard]] std::uint64_t dropped_total() const;
+    [[nodiscard]] std::uint64_t written_records() const noexcept {
+        return written_.load(std::memory_order_relaxed);
+    }
+
+    void set_redactor(redact_fn function, void* user) noexcept {
+        redactor_.store(function, std::memory_order_relaxed);
+        redactor_user_.store(user, std::memory_order_relaxed);
+    }
+
+    void set_compressor(compress_fn function, void* user) noexcept {
+        compressor_.store(function, std::memory_order_relaxed);
+        compressor_user_.store(user, std::memory_order_relaxed);
+    }
+
+private:
+    logger() noexcept;
+    ~logger();
+
+    [[nodiscard]] log_ring* current_ring() noexcept;
+    [[nodiscard]] log_ring* register_ring() noexcept;
+
+    void sink_loop() noexcept;
+    void ensure_drain_buffer() noexcept;
+    bool drain_all();
+    bool open_file() noexcept;
+    void close_file() noexcept;
+    void rotate_file() noexcept;
+    void write_bytes(const char* data, std::size_t size) noexcept;
+    void write_batch(const char* data, std::size_t size);
+
+    mutable std::mutex config_mutex_;
+    logger_config config_;
+    std::atomic<std::size_t> ring_capacity_{8192};
+    std::atomic<int> overflow_{static_cast<int>(overflow_policy::drop_and_count)};
+    std::atomic<int> level_{static_cast<int>(log_level::trace)};
+    std::atomic<bool> running_{false};
+
+    std::thread sink_;
+    std::mutex wait_mutex_;
+    std::condition_variable wait_cv_;
+
+    mutable std::mutex rings_mutex_;
+    std::vector<std::unique_ptr<log_ring>> rings_;
+    std::atomic<std::uint64_t> allocation_drops_{0};
+    std::atomic<std::uint64_t> written_{0};
+
+    std::atomic<redact_fn> redactor_{nullptr};
+    std::atomic<void*> redactor_user_{nullptr};
+    std::atomic<compress_fn> compressor_{nullptr};
+    std::atomic<void*> compressor_user_{nullptr};
+
+#if defined(CRPC_OS_WINDOWS)
+    void* file_handle_ = nullptr;
+#else
+    int file_fd_ = -1;
+#endif
+    std::uint64_t file_size_ = 0;
+    std::chrono::steady_clock::time_point file_opened_{};
+
+    std::unique_ptr<log_record[]> drain_buffer_;
+    std::size_t drain_capacity_ = 0;
+    std::string batch_;
+    std::string compressed_;
+};
+
+// Convenience builder for structured records. The record is submitted when the
+// temporary is destroyed, so the common form is:
+//
+//     log_event(log_level::info, "login").field("user", name);
+//
+// The constructor checks the runtime level; a disabled event does no work.
+class log_event {
+public:
+    log_event(log_level level, std::string_view message) noexcept;
+    ~log_event();
+
+    log_event(const log_event&) = delete;
+    log_event& operator=(const log_event&) = delete;
+
+    log_event& field(std::string_view key, std::string_view value) noexcept;
+    log_event& field(std::string_view key, std::int64_t value) noexcept;
+    log_event& field(std::string_view key, std::uint64_t value) noexcept;
+
+    template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
+    log_event& field(std::string_view key, T value) noexcept {
+        if (!submit_) {
+            return *this;
+        }
+        char buffer[32];
+        log_buffer out(buffer, sizeof(buffer));
+        if constexpr (std::is_signed<T>::value) {
+            out.append_integer(static_cast<std::int64_t>(value));
+        } else {
+            out.append_integer(static_cast<std::uint64_t>(value));
+        }
+        return field(key, std::string_view(buffer, out.size()));
+    }
+
+private:
+    log_record record_;
+    bool submit_;
+};
+
+namespace detail {
+
+constexpr int compile_max_level() noexcept { return CRPC_LOG_MAX_LEVEL; }
+
+constexpr bool compile_enabled(int level_number) noexcept {
+    return compile_max_level() < static_cast<int>(log_level::off) &&
+           compile_max_level() <= level_number;
+}
+
+template <typename... Args>
+void log_at(log_level level, std::string_view format, Args&&... args) noexcept {
+    if constexpr (compile_max_level() >= static_cast<int>(log_level::off)) {
+        (void)level;
+        (void)format;
+        ((void)args, ...);
+    } else {
+        if (static_cast<int>(level) < compile_max_level()) {
+            return;
+        }
+        logger& sink = logger::instance();
+        if (!sink.enabled(level)) {
+            return;
+        }
+
+        log_record record = make_record(level, std::string_view{});
+        log_buffer buffer(record.message, log_record::max_message);
+        format_to(buffer, format, std::forward<Args>(args)...);
+        record.message_len = static_cast<u16>(buffer.size());
+        if (buffer.truncated()) {
+            record.flags = static_cast<u8>(record.flags | log_record::flag_truncated);
+        }
+        sink.submit(record);
+    }
+}
+
+} // namespace detail
+} // namespace obs
+} // namespace crpc
+
+// Logging macros. The compile-time ceiling is evaluated with `if constexpr`, so
+// a level above the ceiling is not even type-checked into the call.
+#define CRPC_LOG_IMPL(level_value, level_number, ...)                                  \
+    do {                                                                               \
+        if constexpr (::crpc::obs::detail::compile_enabled(level_number)) {           \
+            ::crpc::obs::detail::log_at((level_value), __VA_ARGS__);                   \
+        }                                                                              \
+    } while (0)
+
+#define CRPC_LOG_TRACE(...) CRPC_LOG_IMPL(::crpc::obs::log_level::trace, 0, __VA_ARGS__)
+#define CRPC_LOG_DEBUG(...) CRPC_LOG_IMPL(::crpc::obs::log_level::debug, 1, __VA_ARGS__)
+#define CRPC_LOG_INFO(...) CRPC_LOG_IMPL(::crpc::obs::log_level::info, 2, __VA_ARGS__)
+#define CRPC_LOG_WARN(...) CRPC_LOG_IMPL(::crpc::obs::log_level::warn, 3, __VA_ARGS__)
+#define CRPC_LOG_ERROR(...) CRPC_LOG_IMPL(::crpc::obs::log_level::error, 4, __VA_ARGS__)
+
+#endif // CRPC_OBSERVABILITY_LOG_HPP
