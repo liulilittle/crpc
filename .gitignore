@@ -62,3 +62,8 @@ third_party/_fetched/
 # Local scratch
 tmp/
 scratch/
+
+# Test-run artifacts that must never be committed
+obs_rotation.log*
+*.dmp
+crash-*.txt
