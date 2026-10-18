@@ -24,6 +24,11 @@ namespace {
 
 struct server_connection;
 
+// Called when a queued frame could not be written (e.g. a second push while one
+// is in flight violates I5, or the peer is gone). Defined after the connection
+// type below; a failure must never leave the peer waiting silently (R18).
+void report_send_failure(server_connection* sc, std::error_code ec) noexcept;
+
 // Owns the bytes of one outgoing frame until the backend completes the write.
 struct send_op final : io::completion {
     std::unique_ptr<std::byte[]> bytes;
@@ -31,7 +36,9 @@ struct send_op final : io::completion {
     std::shared_ptr<server_connection> keep_alive;
 
     void complete(io::io_result result) noexcept override {
-        (void)result;
+        if (!result.ok() && keep_alive) {
+            report_send_failure(keep_alive.get(), result.ec);
+        }
         delete this;
     }
 };
@@ -82,6 +89,23 @@ struct server_connection {
     void submit(frame& request) noexcept;
     void complete_call_safe() noexcept;
 };
+
+void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
+    (void)ec;
+    if (sc == nullptr) {
+        return;
+    }
+    bool expected = false;
+    if (!sc->closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // A lost response would otherwise strand the peer until its deadline. Close
+    // explicitly so every in-flight call observes EOF/failure; the drop is then
+    // visible to the client instead of disappearing silently (R18).
+    if (sc->conn) {
+        sc->conn->close();
+    }
+}
 
 struct server::impl {
     options opt;

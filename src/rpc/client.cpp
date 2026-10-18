@@ -54,10 +54,12 @@ client::~client() {
 }
 
 bool client::is_open() const noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     return !closed_ && conn_ != nullptr && conn_->is_open();
 }
 
 void client::close() noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (closed_) {
         return;
     }
@@ -71,6 +73,7 @@ void client::close() noexcept {
 // --- Reader ------------------------------------------------------------------
 
 std::size_t client::on_data(span<const std::byte> data) noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     decoder_.feed(data);
     if (in_process_) {
         // Re-entered from a synchronous push: the outer loop will drain these
@@ -91,6 +94,7 @@ std::size_t client::on_data(span<const std::byte> data) noexcept {
 }
 
 void client::on_eof() noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (closed_) {
         return;
     }
@@ -99,6 +103,7 @@ void client::on_eof() noexcept {
 }
 
 void client::on_error(std::error_code ec) noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (closed_) {
         return;
     }
@@ -181,6 +186,10 @@ void client::protocol_failure() {
 // --- Writer ------------------------------------------------------------------
 
 void client::on_write_complete(io::io_result result) noexcept {
+    // Runs on the backend thread; serialize with start_request/flush_write on
+    // the caller thread (A-4). A synchronous implementation re-enters through
+    // flush_write, hence the recursive lock.
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     write_in_flight_ = false;
     if (!result.ok()) {
         write_error_ = true;
@@ -301,6 +310,7 @@ call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context&
     slot->stream_id = allocate_stream_id(stream_seq_, &client::in_flight_probe, this);
     slot->owner = this;
     slot->owner_cancel = &client::cancel_thunk;
+    slot->owner_detach = &client::detach_thunk;
     set_state(*slot, call_state::queued);
     return slot;
 }
@@ -400,22 +410,21 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
                     span<const std::byte> body) {
     if (finish_slot(slot, terminal, code, std::move(error), body)) {
         remove_in_flight(slot);
-        if (slot.callback_armed) {
-            slot.invoke_callback();
-        }
+        // The atomic claim inside invoke_callback decides whether `then` or
+        // this completion path runs the callback exactly once.
+        slot.invoke_callback();
     }
 }
 
 void client::cancel_slot(call_slot& slot) noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (finish_slot(slot, call_state::canceled, rpc_code::canceled,
                     rpc_error(rpc_code::canceled, "call canceled"), span<const std::byte>())) {
         if (slot.written && !closed_ && conn_ != nullptr && conn_->is_open()) {
             send_rst(slot.stream_id, rpc_code::canceled);
         }
         remove_in_flight(slot);
-        if (slot.callback_armed) {
-            slot.invoke_callback();
-        }
+        slot.invoke_callback();
     }
 }
 
@@ -455,6 +464,7 @@ void client::remove_deadline(call_slot& slot) {
 }
 
 void client::poll() noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (closed_ || deadlines_.empty()) {
         return;
     }
@@ -482,6 +492,20 @@ bool client::in_flight_probe(void* ctx, u32 id) noexcept {
 
 void client::cancel_thunk(void* ctx, call_slot* slot) noexcept {
     static_cast<client*>(ctx)->cancel_slot(*slot);
+}
+
+void client::detach_slot(call_slot& slot) noexcept {
+    // Every completion callback invocation runs under `mutex_`, so holding it
+    // here guarantees that once this returns no callback is running and none
+    // can start for this slot.
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    slot.callback_armed.store(false, std::memory_order_release);
+    slot.callback_invoke = nullptr;
+    slot.callback_owner = nullptr;
+}
+
+void client::detach_thunk(void* ctx, call_slot* slot) noexcept {
+    static_cast<client*>(ctx)->detach_slot(*slot);
 }
 
 rpc_code client::map_error(std::error_code ec) noexcept {

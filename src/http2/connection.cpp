@@ -325,7 +325,11 @@ h2_error connection::send_data(u32 stream_id, span<const std::byte> data,
     }
     const std::size_t remainder = data.size() - allowance;
     if (remainder != 0) {
-        if (entry->send_queue.size() > options_.max_send_queue_bytes - remainder) {
+        // The subtraction is guarded on the left: with `remainder` larger than
+        // the cap the unsigned difference would wrap to a huge value and the
+        // check would never fire (B-1).
+        if (remainder > options_.max_send_queue_bytes ||
+            entry->send_queue.size() > options_.max_send_queue_bytes - remainder) {
             return stream_error(stream_id, error_code::enhance_your_calm);
         }
         entry->send_queue.insert(entry->send_queue.end(), data.begin() + allowance,

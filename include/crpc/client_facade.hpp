@@ -69,18 +69,22 @@ struct connection_slot {
     struct guarded_source final : io::source {
         explicit guarded_source(connection_slot* owner) noexcept : self(owner) {}
 
+        // The low-level `rpc::client` now serializes its own entry points with
+        // an internal lock, so the facade must not additionally hold
+        // `connection_slot::mutex` here: an in-process push can synchronously
+        // deliver queued bytes back into this source while the writer already
+        // holds that lock, which would invert the lock order (CF-1 follow-up).
+        // `self->conn` is installed once and never replaced, so it is safe to
+        // read without a lock.
         std::size_t on_data(span<const std::byte> data) noexcept override {
-            std::lock_guard<std::recursive_mutex> lk(self->mutex);
             return self->conn ? self->conn->source().on_data(data) : 0;
         }
         void on_eof() noexcept override {
-            std::lock_guard<std::recursive_mutex> lk(self->mutex);
             if (self->conn) {
                 self->conn->source().on_eof();
             }
         }
         void on_error(std::error_code ec) noexcept override {
-            std::lock_guard<std::recursive_mutex> lk(self->mutex);
             if (self->conn) {
                 self->conn->source().on_error(ec);
             }
@@ -100,7 +104,9 @@ struct connection_slot {
 
 // Type-independent per-call state.
 struct call_core {
-    client* owner = nullptr;
+    // Atomic: the completion callback may read it on a backend thread while
+    // close()/~client detaches it (CF-1).
+    std::atomic<client*> owner{nullptr};
     u64 service_id = 0;
     u64 method_id = 0;
     buffer request;
@@ -108,6 +114,10 @@ struct call_core {
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<bool> done{false};
+    // Set by whichever of finish_attempt/abandon_attempt wins the attempt's
+    // terminal transition. Guards exactly-once release of the deadline timer,
+    // the connection slot and the breaker permit.
+    std::atomic<bool> finalized{false};
     std::atomic<rpc_code> terminal{rpc_code::ok};
     rpc_error error;
     std::uint32_t attempts = 0;
@@ -122,6 +132,7 @@ struct call_core {
     void signal() noexcept;
     void reset_for_attempt() noexcept {
         done.store(false, std::memory_order_release);
+        finalized.store(false, std::memory_order_release);
         terminal.store(rpc_code::ok, std::memory_order_release);
     }
 };
@@ -212,11 +223,19 @@ public:
     class [[nodiscard]] call {
     public:
         call() noexcept = default;
-        call(call&&) noexcept = default;
-        call& operator=(call&&) noexcept = default;
+        call(call&& other) noexcept : state_(std::move(other.state_)) {}
+        call& operator=(call&& other) noexcept {
+            if (this != &other) {
+                // Releasing a still-active old state_ must abandon its attempt
+                // (cancel timer, release slot) before taking over the new one.
+                release();
+                state_ = std::move(other.state_);
+            }
+            return *this;
+        }
         call(const call&) = delete;
         call& operator=(const call&) = delete;
-        ~call() = default;
+        ~call() { release(); }
 
         [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
         [[nodiscard]] bool ready() const noexcept {
@@ -229,12 +248,13 @@ public:
         // Suspends (or blocks) until a terminal result is available. Returns
         // the decoded value, or the last error when retries are exhausted.
         [[nodiscard]] rpc::rpc_result<Resp> get() {
-            if (state_ == nullptr || state_->core.owner == nullptr) {
+            if (state_ == nullptr ||
+                state_->core.owner.load(std::memory_order_acquire) == nullptr) {
                 return rpc::rpc_result<Resp>(
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
             }
             std::shared_ptr<client_detail::call_state<Resp>> st = state_;
-            client* owner = st->core.owner;
+            client* const owner = st->core.owner.load(std::memory_order_acquire);
             for (;;) {
                 if (st->inner != nullptr) {
                     const status waited = owner->wait_ready(st->core);
@@ -244,6 +264,9 @@ public:
                         if (waited.code() == rpc_code::failed_precondition) {
                             failure = waited.error();
                         }
+                        // The attempt is over: cancel the timer and release the
+                        // connection slot before returning without a finalize.
+                        release();
                         return rpc::rpc_result<Resp>(std::move(failure));
                     }
                     rpc::rpc_result<Resp> result(
@@ -282,18 +305,50 @@ public:
                 !state_->core.done.load(std::memory_order_acquire)) {
                 return false;
             }
-            return state_->inner->try_get(out);
+            const bool decoded = state_->inner->try_get(out);
+            if (decoded) {
+                // The handle has delivered its terminal result: finalize the
+                // attempt so the timer and slot are released.
+                release();
+            }
+            return decoded;
         }
 
         // Cancels the in-flight attempt. Idempotent.
         void cancel() noexcept {
             if (state_ != nullptr && state_->inner) {
                 state_->inner->cancel();
+                // Release the attempt's timer and slot now; `inner` is kept so
+                // a subsequent get()/try_get() can still observe `canceled`.
+                client* const owner = state_->core.owner.load(std::memory_order_acquire);
+                if (owner != nullptr) {
+                    owner->abandon_attempt(state_->core);
+                }
             }
         }
 
     private:
         friend class crpc::client;
+
+        // Ends the attempt if one is active: drops the inner low-level call
+        // (which cancels it when still pending) and abandons the facade-level
+        // attempt. Leaves the handle ready for destruction.
+        void release() noexcept {
+            if (state_ == nullptr) {
+                return;
+            }
+            std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
+            if (st->inner) {
+                // Resetting `inner` runs the low-level handle destructor, which
+                // detaches (and synchronizes with) any in-flight callback under
+                // the connection lock before the call_state can be freed.
+                st->inner.reset();
+            }
+            client* const owner = st->core.owner.load(std::memory_order_acquire);
+            if (owner != nullptr) {
+                owner->abandon_attempt(st->core);
+            }
+        }
 
         std::shared_ptr<client_detail::call_state<Resp>> state_;
     };
@@ -350,7 +405,7 @@ public:
         }
         auto st = std::make_shared<client_detail::call_state<Resp>>();
         client_detail::call_core& core = st->core;
-        core.owner = this;
+        core.owner.store(this, std::memory_order_release);
         core.service_id = service_id;
         core.method_id = method_id;
         if (!core.request.append(request_body)) {
@@ -387,6 +442,12 @@ private:
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
                       rpc_code code) noexcept;
     void finish_attempt(client_detail::call_core& core, rpc_code code) noexcept;
+    // Idempotent counterpart to finish_attempt for paths that end an attempt
+    // without a result (handle destruction, try_get, cancel, close).
+    void abandon_attempt(client_detail::call_core& core) noexcept;
+    void register_core(client_detail::call_core& core) noexcept;
+    void unregister_core(client_detail::call_core& core) noexcept;
+    void finalize_active() noexcept;
     [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
                                     std::chrono::nanoseconds& delay) noexcept;
     [[nodiscard]] status wait_ready(client_detail::call_core& core) const;

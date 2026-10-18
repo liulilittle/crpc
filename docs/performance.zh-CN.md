@@ -2,7 +2,7 @@
 
 **English** | [简体中文](performance.zh-CN.md)
 
-版本 1.0 / 2026-10-19
+版本 1.1 / 2026-10-19
 
 本文说明仓库中真正测过什么、在什么硬件与工具链上测的、哪些只是预算，以及库将如何基准测试。目标是目标，
 不是结果。不存在的数字会明确标为缺失，而不是估算。
@@ -37,12 +37,10 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 
 ## 2. 已记录证据 <a id="s2"></a>
 
-**仓库中没有库级基准。** `bench/` 为空（没有 `CMakeLists.txt`，没有
-`bench_rpc.cpp`、`bench_http.cpp`、`bench_codec.cpp`），
-`docs/benchmarks/` 不存在，`.opencode/` 中没有基准结果文件。因此
-`CRPC_BUILD_BENCH` 关闭，本节数字都不是 CRPC 吞吐。
-
-现有两条记录：
+`bench/bench_rpc.cpp` 现已存在（目标 `crpc_bench_rpc`，由 `CRPC_BUILD_BENCH`
+门控），在进程内后端上测量真实 client 门面与 dispatcher，并在 Windows 上测量
+IOCP TCP loopback（§2.3）。`bench/bench_core.cpp` 覆盖线格式/编解码微基准。
+下面的裸 loopback 探针与对象布局探针早于该基准，作为历史保留。
 
 1. **裸 loopback 探针**，位于 `.opencode/audit-arch-a.md`
    §12.2。硬件：AMD Ryzen 9 7945HX，16 核 / 32 线程。工具链：MSVC
@@ -73,7 +71,41 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 字节调用槽预算未被当前实现满足（`std::mutex`、`condition_variable`、
 缓冲区、`rpc_error` 与回调存储占主导）。
 
-目前不存在 p99、p999、跨分片交接、编解码或韧性流水线的测量。今天报告中出现这类数字就是编造。
+### 2.3 端到端 RPC 实测（2026-10-19）
+
+源码：`bench/bench_rpc.cpp`；命令：`crpc_bench_rpc`（Windows MSVC Release）与
+`.opencode/tmp/verify/release/bench/crpc_bench_rpc`（WSL GCC Release）。
+负载：64 字节 `std::string` 回显，经注册的 `bench.echo` 方法，`call_codec<std::string>`
+（crpc-binary 路径）编解码，单客户端线程，进程内后端（Windows 上另有 IOCP TCP loopback）。
+机器：AMD Ryzen 9 7945HX，32 逻辑核。编译器：MSVC 19.44 x64 Release；WSL2 内
+GCC 13.3 Release（内核 6.18）。三次运行取中位。
+
+| 用例 | depth | MSVC inproc | GCC/WSL inproc | MSVC IOCP loopback |
+|---|---:|---|---|---|
+| 同步时延 p50 | 1 | 2.90 µs | 54.4 µs | 103.9 µs |
+| 同步时延 p90 | 1 | 4.30 µs | 91.6 µs | 145.3 µs |
+| 同步时延 p99 | 1 | **29.1 µs** | 139.7 µs | 194.1 µs |
+| 同步时延 p999 | 1 | 56.3 µs | 232 µs | 247.9 µs |
+| 吞吐 | 1 | 0.106 M RPC/s | 0.087 M RPC/s | 0.0095 M RPC/s |
+| 吞吐 | 16 | 0.170 M RPC/s | 0.361 M RPC/s | 0.0215 M RPC/s |
+| 吞吐 | 64 | 0.203 M RPC/s | 0.854 M RPC/s | 未运行 |
+| 多分片 1/2/4 | 16 | 0.159 / 0.152 / 0.153 M | 0.289 / 0.293 / 0.294 M | 不适用 |
+
+尾延迟警示：进程内最大时延在两种工具链上偶发 ≈100 ms（MSVC 100.2/113.2/101.1 ms；
+GCC 100.2 ms），与 `runtime_options::idle_wait` 默认 100 ms 吻合。`runtime::wake()` 在
+`wait_mutex` 之外写 `wake_flag`，而分片循环在同一互斥量下把该标志作为 `wait_for` 谓词求值，
+因此落在“谓词求值后、真正阻塞前”的唤醒会丢失，分片睡满整个空闲间隔。这是等待路径的缺陷，
+不是编解码或调度开销。
+
+瓶颈证据（实测，非推断）。MSVC Release 单点成本：`make_shared<call_state<std::string>>` 55 ns
+（约 3.07 µs 每次调用的 1.8%）、每连接 `std::recursive_mutex` 11 ns（约 0.4%）、string 编解码
+合计 15 ns（约 0.5%）。深度 64、20 万次调用的阶段拆分：issue 2033 ns + wait 1040 ns；仅 0.8%
+的调用在发起时已完成，说明时间花在往返本身而非簿记。多客户端线程对多分片：1/2/4/8 线程
+→ 0.353/0.459/0.597/0.728 M RPC/s（1→8 仅 2.06×，0.7–0.9 M 饱和）。当前设计的实测天花板约
+1 M RPC/s 每进程；距 5 M 目标还差 5–14×，需要消除往返（批量合并或客户端分片亲和），
+而不是调分配与锁。目标未达成（见 §3）。
+
+在本文之前不存在 p99/p999 实测；上文 p99/p999 现已实测，跨分片交接与韧性流水线预算仍未测量。
 
 ## 3. 预算与目标 <a id="s3"></a>
 
@@ -95,24 +127,23 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 
 | 指标 | 目标 | 状态 |
 |---|---|---|
-| 聚合吞吐 | 5M RPC/s | 目标，明确不是门禁（R10） |
-| 单连接对、批处理 | ≥ 1M RPC/s | 裸审计探针 1.05M，不是 CRPC |
-| p99 延迟 | < 100 µs | 目标；必须端到端测量 |
-| 跨分片交接 | 每条批量消息 15–30 ns | 预算；分片模型未实现 |
-| 编解码，64 字节消息 | 编码与解码均 < 100 ns | 预算；未测量 |
-| 韧性流水线 | 每次成功调用 35–65 ns | 预算；流水线未实现 |
+| 聚合吞吐 | 5M RPC/s | **未达成**：最佳实测 0.203M RPC/s（inproc，MSVC，depth 64）；IOCP loopback 0.0215M |
+| 单连接对、批处理 | ≥ 1M RPC/s | **未达成**：inproc 实测 0.203M RPC/s（§2.3） |
+| p99 延迟 | < 100 µs | **部分达成**：inproc 29.1 µs（MSVC）；IOCP loopback 194 µs；WSL inproc 139.7 µs |
+| 跨分片交接 | 每条批量消息 15–30 ns | 预算；未测量 |
+| 编解码，64 字节消息 | 编码与解码均 < 100 ns | 预算；见 `bench/bench_core.cpp` / `docs/benchmarks/` |
+| 韧性流水线 | 每次成功调用 35–65 ns | 预算；未测量 |
 
 今天唯一可辩护的陈述是：传输层围绕有界队列与批处理设计，Windows loopback
 裸探针显示批处理把吞吐改变约 50 倍。这解释了设计动机，不证明目标。
 
 ## 4. 基准计划 <a id="s4"></a>
 
-基准目标落地后将是：
+基准现在落地为 `bench/bench_rpc.cpp`（§2.3）。当前用例为 64 B 同步时延、管线深度
+1/16/64 与 1/2/4 分片（inproc），Windows 上另有 IOCP loopback；更宽的矩阵仍待补：
 
-- `bench/bench_rpc.cpp` —— 在 inproc、epoll loopback、
-  IOCP loopback 上的 unary 调用；请求/响应 16 B、64 B、256 B、1
-  KiB；1、8、64、512 条连接；批处理 1 与 64；分片数 = 物理核 − 1；可靠调用、
-  不可靠单向、有序 lane 分开运行。
+- `bench/bench_rpc.cpp` —— 扩展到 16 B/256 B/1 KiB、1/8/64/512 连接、
+  epoll loopback，以及可靠/不可靠/有序 lane 分开运行。
 - `bench/bench_http.cpp` —— HTTP/1.1 与 HTTP/2 请求/响应、
   keep-alive、头部大小、上传/下载流。
 - `bench/bench_codec.cpp` —— crpc-binary、JSON、XML、INI、
@@ -146,6 +177,7 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 它必须说明测量了哪些后端、哪些代码路径被关闭（消毒器、追踪、日志）。目标未达成时，报告写出实测值与差距；
 不得用推算替代缺失的测量。
 
-当前状态：库有功能测试覆盖与一个裸传输探针，但没有端到端基准。上述基准计划是下一步测量工作；
-在它运行之前，5M RPC/s 与 p99 目标仍是**未验证的设计目标**，128
-字节调用槽预算在已测工具链上仍是**未达成的 440 字节**。
+当前状态：库有功能测试覆盖、进程内与 IOCP 端到端 RPC 基准（§2.3）以及线格式/编解码微基准。
+5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 0.203M RPC/s、IOCP p99 194 µs）；进程内
+p99 目标在 MSVC 上以 29.1 µs **达成**。128 字节调用槽预算在已测工具链上仍是**未达成的 440 字节**。
+验证矩阵、缺陷清单与原始日志见 `.opencode/verify-round.md`。

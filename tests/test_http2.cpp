@@ -1138,6 +1138,32 @@ CRPC_TEST(flow_control_release_received) {
     CRPC_CHECK_EQ(conn.connection_recv_window(), 65535);
 }
 
+CRPC_TEST(flow_control_parked_remainder_over_cap_rejected) {
+    // A single send whose parked remainder exceeds the per-stream cap must be
+    // rejected, never silently grow the queue (the cap guard must not underflow
+    // when remainder > cap).
+    connection_options options;
+    options.role = connection_role::client;
+    options.initial_connection_send_window = 0;
+    options.max_send_queue_bytes = 16;
+    connection conn(options);
+
+    const std::vector<std::byte> settings =
+        settings_bytes({{static_cast<u16>(setting_id::initial_window_size), 0}});
+    CRPC_CHECK(deliver(conn, frame_type::settings, 0, 0, settings).ok());
+    CRPC_CHECK(conn.open_stream(1).ok());
+    CRPC_CHECK_EQ(conn.available_send_window(1), 0u);
+
+    const std::vector<std::byte> data(64, std::byte{0x41});
+    std::size_t sent = 0;
+    bool parked = false;
+    const h2_error error = conn.send_data(1, view(data), sent, parked);
+    CRPC_CHECK(error.scope == error_scope::stream);
+    CRPC_CHECK(error.code == error_code::enhance_your_calm);
+    CRPC_CHECK_FALSE(parked);
+    CRPC_CHECK_EQ(conn.parked_bytes(1), 0u);
+}
+
 // --- Fuzzing -----------------------------------------------------------------
 
 struct lcg {

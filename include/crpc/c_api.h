@@ -30,10 +30,26 @@ extern "C" {
 
 #define CRPC_C_ABI_VERSION 1u
 
+/* Export/import selection mirrors config.hpp's CRPC_API:
+ *   - building a shared library:  CRPC_SHARED + CRPC_BUILDING -> dllexport
+ *   - consuming a shared library: CRPC_SHARED                 -> dllimport
+ *   - static library (default):   neither                     -> no decoration
+ * The previous unconditional `dllimport` made every static consumer fail to
+ * link (no __imp_ symbols exist in a static archive). */
 #if defined(_WIN32)
+#if defined(CRPC_SHARED) && defined(CRPC_BUILDING)
+#define CRPC_C_API __declspec(dllexport)
+#elif defined(CRPC_SHARED)
 #define CRPC_C_API __declspec(dllimport)
 #else
 #define CRPC_C_API
+#endif
+#else
+#if defined(CRPC_BUILDING) && defined(__GNUC__)
+#define CRPC_C_API __attribute__((visibility("default")))
+#else
+#define CRPC_C_API
+#endif
 #endif
 
 /* Status codes. Values are stable; new ones are appended. */

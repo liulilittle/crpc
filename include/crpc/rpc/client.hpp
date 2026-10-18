@@ -8,11 +8,12 @@
 // ------------
 // The client does not spawn any thread. It runs on whatever thread drives the
 // backend: the in-process backend delivers `source::on_data` synchronously on
-// the pushing thread, and a production backend delivers on its shard thread. All
-// public methods must be called from that one owning thread; the client is not
-// internally synchronized for concurrent API calls. The atomic state machine in
-// `call_slot` is the only cross-thread safe part, and it is exercised directly by
-// the tests rather than through the client.
+// the pushing thread, and a production backend delivers on its shard thread.
+// The write loop (`start_request`/`flush_write`) may run on a caller thread
+// while a sink completion runs on the backend thread, so the mutating entry
+// points are serialized by a recursive lock (A-4). The lock is recursive
+// because a synchronous backend completes `push` inside `flush_write` and the
+// completion re-enters `flush_write`.
 //
 // `get()` blocks the calling thread on a condition variable until the terminal
 // state. On the single-threaded in-process path the response has already been
@@ -40,6 +41,7 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -109,6 +111,8 @@ public:
     [[nodiscard]] rpc_result<call<Resp>> start_call(u64 service_id, u64 method_id,
                                                     span<const std::byte> request_body,
                                                     call_context ctx = {}) {
+        // Serializes with a backend-thread write completion (A-4).
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
         if (closed_) {
             return rpc_result<call<Resp>>(rpc_error(rpc_code::shutting_down, "client is closed"));
         }
@@ -136,6 +140,7 @@ public:
     void poll() noexcept;
 
     [[nodiscard]] u32 in_flight() const noexcept {
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
         return static_cast<u32>(in_flight_.size());
     }
     [[nodiscard]] u32 slots_in_use() const noexcept { return pool_.in_use(); }
@@ -187,6 +192,10 @@ private:
     void finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
                 span<const std::byte> body);
     void cancel_slot(call_slot& slot) noexcept;
+    // Disarms a slot's completion callback under `mutex_` and synchronizes with
+    // any callback already running, so the caller may then recycle the slot
+    // safely (CF-1).
+    void detach_slot(call_slot& slot) noexcept;
     void fail_all(rpc_code code, std::string message);
     void protocol_failure();
     void remove_in_flight(call_slot& slot);
@@ -195,6 +204,7 @@ private:
 
     static bool in_flight_probe(void* ctx, u32 id) noexcept;
     static void cancel_thunk(void* ctx, call_slot* slot) noexcept;
+    static void detach_thunk(void* ctx, call_slot* slot) noexcept;
     static rpc_code map_error(std::error_code ec) noexcept;
 
     std::unique_ptr<connection> conn_;
@@ -219,6 +229,9 @@ private:
     std::multimap<std::chrono::steady_clock::time_point, call_slot*> deadlines_;
     write_completion completion_;
     reader_source source_;
+    // Guards the mutating entry points against a backend-thread completion.
+    // Recursive because a synchronous sink completion re-enters flush_write.
+    mutable std::recursive_mutex mutex_;
 };
 
 } // namespace crpc::rpc

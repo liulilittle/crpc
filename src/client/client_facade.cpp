@@ -7,6 +7,7 @@
 #include <new>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <crpc/endian.hpp>
@@ -62,6 +63,13 @@ struct client::impl {
     std::vector<resilience::instance> instances;
     instance_view view;
     std::unique_ptr<resilience::load_balancer> balancer;
+
+    // Live call cores that may still have a shard timer armed. Guarded by
+    // `calls_mutex`; a core is removed when it is finalized. `close()` walks
+    // this set so a client destruction can never leave a `deadline_thunk`
+    // pointing at freed memory.
+    std::mutex calls_mutex;
+    std::unordered_set<client_detail::call_core*> active_calls;
 };
 
 // --- call_core ---------------------------------------------------------------
@@ -74,8 +82,9 @@ void call_core::signal() noexcept {
         std::lock_guard<std::mutex> lk(mutex);
     }
     cv.notify_all();
-    if (owner != nullptr) {
-        owner->notify_waiter();
+    client* const who = owner.load(std::memory_order_acquire);
+    if (who != nullptr) {
+        who->notify_waiter();
     }
 }
 
@@ -133,6 +142,45 @@ void client::close() noexcept {
                 slot->conn->close();
             }
         }
+    }
+    // Cancel the deadline timer and release the slot for every attempt that is
+    // still active; detach its owner so a handle that outlives the client can
+    // never call back into it.
+    finalize_active();
+}
+
+void client::register_core(client_detail::call_core& core) noexcept {
+    std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+    impl_->active_calls.insert(&core);
+}
+
+void client::unregister_core(client_detail::call_core& core) noexcept {
+    std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+    impl_->active_calls.erase(&core);
+}
+
+void client::finalize_active() noexcept {
+    std::vector<client_detail::call_core*> active;
+    {
+        std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+        active.assign(impl_->active_calls.begin(), impl_->active_calls.end());
+        impl_->active_calls.clear();
+    }
+    for (client_detail::call_core* core : active) {
+        // A concurrent finish_attempt/abandon_attempt must win exactly once;
+        // only the winner releases the timer and slot.
+        if (core->finalized.exchange(true, std::memory_order_acq_rel)) {
+            continue;
+        }
+        if (options_.shard != nullptr) {
+            (void)options_.shard->cancel_timer(core);
+        }
+        core->permit = resilience::breaker_permit{};
+        if (core->slot) {
+            release_slot(core->slot, rpc_code::shutting_down);
+            core->slot.reset();
+        }
+        core->owner.store(nullptr, std::memory_order_release);
     }
 }
 
@@ -194,12 +242,19 @@ bool client::begin_attempt(client_detail::call_core& core, rpc_error& failure) {
     core.pool = &pool;
     core.attempts += 1;
     calls_started_.fetch_add(1, std::memory_order_relaxed);
+    // Track the attempt before arming the timer so close()/~client can always
+    // see and cancel it.
+    register_core(core);
     if (options_.shard != nullptr && core.has_deadline) {
         const std::uint64_t deadline_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 core.deadline.time_since_epoch())
                 .count());
         (void)options_.shard->arm_timer(&core, deadline_ns, &client::deadline_thunk, this);
+        if (core.finalized.load(std::memory_order_acquire)) {
+            // close()/~client won the race while the timer was being armed.
+            (void)options_.shard->cancel_timer(&core);
+        }
     }
     return true;
 }
@@ -330,6 +385,9 @@ void client::release_slot(
 }
 
 void client::finish_attempt(client_detail::call_core& core, rpc_code code) noexcept {
+    if (core.finalized.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
     if (options_.shard != nullptr) {
         (void)options_.shard->cancel_timer(&core);
     }
@@ -345,6 +403,23 @@ void client::finish_attempt(client_detail::call_core& core, rpc_code code) noexc
         release_slot(core.slot, code);
         core.slot.reset();
     }
+    unregister_core(core);
+}
+
+void client::abandon_attempt(client_detail::call_core& core) noexcept {
+    if (core.finalized.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (options_.shard != nullptr) {
+        (void)options_.shard->cancel_timer(&core);
+    }
+    // An abandoned attempt records no breaker outcome; just drop the permit.
+    core.permit = resilience::breaker_permit{};
+    if (core.slot) {
+        release_slot(core.slot, rpc_code::canceled);
+        core.slot.reset();
+    }
+    unregister_core(core);
 }
 
 bool client::should_retry(client_detail::call_core& core, rpc_code code,
@@ -394,7 +469,22 @@ status client::wait_ready(client_detail::call_core& core) const {
         }
     }
     std::unique_lock<std::mutex> lk(core.mutex);
-    const bool ready = core.cv.wait_for(lk, options_.plain_thread_timeout, [&core] {
+    // Without a shard there is no timer wheel to drive the low-level poll, so
+    // the wait itself must honour the call deadline (A-3). A call with no
+    // deadline keeps the documented plain-thread bound.
+    std::chrono::nanoseconds bound = options_.plain_thread_timeout;
+    if (core.has_deadline) {
+        const auto now = steady_now();
+        if (now >= core.deadline) {
+            return status{rpc_code::deadline_exceeded};
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(core.deadline - now);
+        if (remaining < bound) {
+            bound = remaining;
+        }
+    }
+    const bool ready = core.cv.wait_for(lk, bound, [&core] {
         return core.done.load(std::memory_order_acquire);
     });
     if (!ready) {

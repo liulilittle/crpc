@@ -302,11 +302,18 @@ public:
     call_callback_storage callback_storage{};
     call_callback_invoker callback_invoke = nullptr;
     void* callback_owner = nullptr;
-    bool callback_armed = false;
+    // Claimed exactly once: by the completion path or by `then()` when the call
+    // already completed. Atomic so a handle destructor can disarm it without a
+    // race against a backend-thread invocation (CF-1).
+    std::atomic<bool> callback_armed{false};
 
     // --- Owning client (opaque to keep this header client-independent) ---
     void* owner = nullptr;
     void (*owner_cancel)(void* owner, call_slot* slot) noexcept = nullptr;
+    // Optional: synchronizes with any in-flight callback and disarms it. Called
+    // unconditionally when the handle is destroyed, so the slot can be recycled
+    // only after no callback can still touch the handle.
+    void (*owner_detach)(void* owner, call_slot* slot) noexcept = nullptr;
 };
 
 // Loads the state word with acquire ordering.
@@ -543,10 +550,6 @@ public:
         if (slot_ == nullptr) {
             return;
         }
-        if (result_ready(*slot_)) {
-            fn(*this);
-            return;
-        }
         using fn_type = std::decay_t<F>;
         static_assert(std::is_trivially_copyable_v<fn_type>,
                       "call<T>::then callback must be trivially copyable");
@@ -558,7 +561,16 @@ public:
                     sizeof(fn_type));
         slot_->callback_invoke = &call::template then_thunk<fn_type>;
         slot_->callback_owner = this;
-        slot_->callback_armed = true;
+        // Publish the callback before arming it; the completion path claims it
+        // with an acquire exchange. If completion already happened, claim it
+        // here instead so the callback runs exactly once.
+        slot_->callback_armed.store(true, std::memory_order_release);
+        if (result_ready(*slot_) &&
+            slot_->callback_armed.exchange(false, std::memory_order_acq_rel)) {
+            slot_->callback_invoke = nullptr;
+            slot_->callback_owner = nullptr;
+            fn(*this);
+        }
     }
 
     // Requests cancellation. Idempotent; a call that already terminated is left
@@ -600,9 +612,19 @@ private:
         slot_ = nullptr;
         generation_ = 0;
         pool_ = nullptr;
-        // The handle is going away: an armed callback must not run against a
-        // half-destroyed handle.
-        slot->callback_armed = false;
+        // The handle is going away. Disarm a possibly still-armed callback and
+        // synchronize with any callback that is already running. This is done
+        // unconditionally: a terminal slot can still have a completion thread
+        // between `finish_slot` and `invoke_callback` (CF-1). The client's
+        // detach runs under the same lock every callback invocation holds, so
+        // once it returns no callback can run against the freed handle.
+        if (slot->owner_detach != nullptr) {
+            slot->owner_detach(slot->owner, slot);
+        } else {
+            slot->callback_armed.store(false, std::memory_order_release);
+            slot->callback_invoke = nullptr;
+            slot->callback_owner = nullptr;
+        }
         if (!result_ready(*slot) && slot->owner_cancel != nullptr) {
             slot->owner_cancel(slot->owner, slot);
         }
@@ -612,7 +634,8 @@ private:
     }
 
     void rebind_owner(call* old) noexcept {
-        if (slot_ != nullptr && slot_->callback_armed && slot_->callback_owner == old) {
+        if (slot_ != nullptr && slot_->callback_armed.load(std::memory_order_acquire) &&
+            slot_->callback_owner == old) {
             slot_->callback_owner = this;
         }
     }

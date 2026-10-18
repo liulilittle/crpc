@@ -112,19 +112,23 @@ void call_slot::reset() noexcept {
     result_ready.store(false, std::memory_order_relaxed);
     callback_invoke = nullptr;
     callback_owner = nullptr;
-    callback_armed = false;
+    callback_armed.store(false, std::memory_order_relaxed);
     owner = nullptr;
     owner_cancel = nullptr;
+    owner_detach = nullptr;
 }
 
 void call_slot::invoke_callback() noexcept {
-    if (!callback_armed) {
+    // Claim exactly once. An acquire exchange synchronizes with `then()`'s
+    // release store, so `callback_invoke`/`callback_owner` are visible; a
+    // concurrent detach or `then()` claim makes this a no-op (CF-1).
+    if (!callback_armed.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    callback_armed = false;
     const call_callback_invoker invoke = callback_invoke;
+    void* const callback_context = callback_owner;
     if (invoke != nullptr) {
-        invoke(callback_storage.bytes, callback_owner, *this);
+        invoke(callback_storage.bytes, callback_context, *this);
     }
 }
 

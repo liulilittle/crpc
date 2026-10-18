@@ -5,6 +5,10 @@
 # merge conflicts on the build script. CONFIGURE_DEPENDS makes CMake re-glob
 # when a file is added or removed, so a stale configure is not a trap.
 
+# The C ABI smoke test is a real C translation unit (not C++ compiled with a C
+# driver), so the C language must be enabled for this directory.
+enable_language(C)
+
 file(GLOB CRPC_TEST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*/test_*.cpp")
@@ -31,3 +35,15 @@ foreach(source ${CRPC_TEST_SOURCES})
     add_test(NAME ${target} COMMAND ${target})
     set_tests_properties(${target} PROPERTIES TIMEOUT 300)
 endforeach()
+
+# --- C ABI smoke test --------------------------------------------------------
+# Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is
+# required because the library needs the C++ runtime at link time.
+add_executable(crpc_test_c_api "${CMAKE_CURRENT_SOURCE_DIR}/test_c_api.c")
+set_target_properties(crpc_test_c_api PROPERTIES
+    LINKER_LANGUAGE CXX
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+target_link_libraries(crpc_test_c_api PRIVATE crpc_core)
+add_test(NAME crpc_test_c_api COMMAND crpc_test_c_api)
+set_tests_properties(crpc_test_c_api PROPERTIES TIMEOUT 60)
