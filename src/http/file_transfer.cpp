@@ -572,7 +572,8 @@ range_parse_result parse_range_header(std::string_view value,
     }
     const std::size_t equals = trimmed.find('=');
     if (equals == std::string_view::npos) {
-        result.kind = range_kind::unsatisfiable;
+        // No unit at all: syntactically invalid, ignore the header (200).
+        result.kind = range_kind::invalid;
         return result;
     }
     const std::string_view unit = trim_ows(trimmed.substr(0, equals));
@@ -582,13 +583,19 @@ range_parse_result parse_range_header(std::string_view value,
         return result;
     }
     const std::string_view spec = trim_ows(trimmed.substr(equals + 1));
-    if (spec.empty() || spec.find(',') != std::string_view::npos) {
-        result.kind = range_kind::unsatisfiable;
+    if (spec.empty()) {
+        result.kind = range_kind::invalid;
+        return result;
+    }
+    if (spec.find(',') != std::string_view::npos) {
+        // Multiple ranges require multipart/byteranges, which is not
+        // implemented; ignore the header and serve the full entity (200).
+        result.kind = range_kind::multiple;
         return result;
     }
     const std::size_t dash = spec.find('-');
     if (dash == std::string_view::npos) {
-        result.kind = range_kind::unsatisfiable;
+        result.kind = range_kind::invalid;
         return result;
     }
     const std::string_view first_text = spec.substr(0, dash);
@@ -596,7 +603,12 @@ range_parse_result parse_range_header(std::string_view value,
 
     if (first_text.empty()) {
         std::uint64_t suffix = 0;
-        if (!parse_u64(last_text, suffix) || suffix == 0 || entity_size == 0) {
+        if (!parse_u64(last_text, suffix)) {
+            result.kind = range_kind::invalid;
+            return result;
+        }
+        if (suffix == 0 || entity_size == 0) {
+            // A zero-length suffix or an empty entity is unsatisfiable.
             result.kind = range_kind::unsatisfiable;
             return result;
         }
@@ -608,14 +620,24 @@ range_parse_result parse_range_header(std::string_view value,
     }
 
     std::uint64_t first = 0;
-    if (!parse_u64(first_text, first) || first >= entity_size) {
+    if (!parse_u64(first_text, first)) {
+        result.kind = range_kind::invalid;
+        return result;
+    }
+    if (first >= entity_size) {
+        // Well-formed but out of range: unsatisfiable (416).
         result.kind = range_kind::unsatisfiable;
         return result;
     }
     std::uint64_t last = entity_size - 1;
     if (!last_text.empty()) {
-        if (!parse_u64(last_text, last) || last < first) {
-            result.kind = range_kind::unsatisfiable;
+        if (!parse_u64(last_text, last)) {
+            result.kind = range_kind::invalid;
+            return result;
+        }
+        if (last < first) {
+            // `last < first` is syntactically invalid: ignore (200).
+            result.kind = range_kind::invalid;
             return result;
         }
         if (last >= entity_size) {
@@ -732,7 +754,9 @@ status download_source::seek_to(std::uint64_t offset) {
 
 status download_source::apply_range(std::string_view range_header) {
     const range_parse_result parsed = parse_range_header(range_header, size_);
-    if (parsed.kind == range_kind::none) {
+    if (parsed.kind == range_kind::none ||
+        parsed.kind == range_kind::invalid ||
+        parsed.kind == range_kind::multiple) {
         first_ = 0;
         range_length_ = size_;
         remaining_ = size_;

@@ -20,10 +20,11 @@
 // `download_source` streams a file or an in-memory buffer. A file is never read
 // into memory as a whole; `read` fills the caller's span in chunks. Range
 // parsing implements `bytes=a-b`, `bytes=a-` and `bytes=-n`; a satisfiable
-// range yields status 206 and a Content-Range value, an unsatisfiable or
-// syntactically invalid one yields 416 and `bytes */<size>`. Multiple ranges
-// are rejected with 416 (v1 limitation). A `Range` header with a unit other
-// than `bytes` is ignored (200), as RFC 9110 requires.
+// range yields status 206 and a Content-Range value, and a well-formed but
+// unsatisfiable one yields 416 and `bytes */<size>`. Syntactically invalid
+// values, `last < first` and multiple ranges are ignored (200), as RFC 9110
+// 14.1.2 requires; `multipart/byteranges` is not implemented (v1 limitation).
+// A `Range` header with a unit other than `bytes` is also ignored (200).
 //
 // Thread safety: one sink or source per thread. Distinct instances share no
 // mutable state (the temporary-name generator is seeded per call).
@@ -156,7 +157,18 @@ private:
 
 // --- Download ---------------------------------------------------------------
 
-enum class range_kind : std::uint8_t { none, satisfiable, unsatisfiable };
+enum class range_kind : std::uint8_t {
+    none,
+    satisfiable,
+    unsatisfiable,
+    // Syntactically invalid (missing `=`, missing `-`, unparseable or
+    // overflowing numbers, `last < first`). RFC 9110 14.1.2 requires the
+    // header to be ignored, so the caller serves 200.
+    invalid,
+    // More than one byte-range spec (`bytes=0-1,3-4`). `multipart/byteranges`
+    // is not implemented; the header is ignored and the caller serves 200.
+    multiple
+};
 
 struct range_parse_result {
     range_kind kind = range_kind::none;
@@ -167,8 +179,10 @@ struct range_parse_result {
 
 // Parses one Range header value against an entity of `entity_size` bytes.
 // `none` means "serve the full entity" (absent header or a non-bytes unit).
-// A malformed value, a multiple-range value, or an unsatisfiable range yields
-// `unsatisfiable` (the caller sends 416).
+// A syntactically invalid value or a multiple-range value yields `invalid` or
+// `multiple` (the caller ignores the header and serves 200). A well-formed but
+// unsatisfiable range (e.g. `first >= entity_size`, `bytes=-0`) yields
+// `unsatisfiable` (the caller sends 416 with `bytes */<size>`).
 [[nodiscard]] range_parse_result parse_range_header(std::string_view value,
                                                     std::uint64_t entity_size);
 

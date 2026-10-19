@@ -31,6 +31,7 @@
 | [19](#s19) | 推送投递（已实现子集） |
 | [20](#s20) | HTTP/1.1 Server-Sent Events（已实现子集） |
 | [21](#s21) | HTTP 内容编码（已实现子集） |
+| [22](#s22) | HTTP 文件下载与 Range（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -392,3 +393,38 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 ### 21.4 HTTP/2
 
 本切片中 HTTP/2 不使用这些编码：请求携带需要解码的 `Content-Encoding` 返回 `501`；响应协商会选中 gzip/deflate 时返回 `501`（fail-closed，禁止静默降级为 identity）。`Accept-Encoding` 选中 identity（且未拒绝）时正常响应；拒绝 identity 返回 `406`。
+
+## 22. HTTP 文件下载与 Range（已实现子集） <a id="s22"></a>
+
+本节对服务器门面的 `download_route`（HTTP/1.1、进程内）具有规范效力。`download_source` 与 Range 解析位于 `include/crpc/http/file_transfer.hpp` / `src/http/file_transfer.cpp`；会话级流式接线位于 `src/http/server.cpp`。
+
+### 22.1 路由与路径安全
+
+路由注册请求路径前缀 `path` 与文件系统 `root`。剩余部分先做百分号解码，再在 `root` 下解析。空路径、绝对路径、反斜杠、`.`/`..` 段、目录目标、缺失/不可读文件，以及规范化（解析符号链接）后不在规范化 `root` 之下的结果，均返回 `404`。仅服务 `GET` 与 `HEAD`；其他方法返回 `405` 并携带 `Allow: GET, HEAD`。
+
+### 22.2 Range 语义
+
+`Range` 作用于文件实体：
+
+| 头值 | 结果 |
+|---|---|
+| 缺失 / 未知单位 | `200`，完整实体 |
+| `bytes=a-b` 且 `b >= size` | `206`，`b` clamp 为 `size-1` |
+| `bytes=a-` | `206` |
+| `bytes=-n`（`n > 0`） | `206` 后缀区间 |
+| `bytes=a-b` 且 `a >= size` | `416` + `Content-Range: bytes */size` |
+| `bytes=-0` | `416` |
+| 缺 `=`、缺 `-`、数字不可解析、`last < first` | 忽略，`200` |
+| 多区间（`bytes=0-1,3-4`） | 忽略，`200`（未实现 `multipart/byteranges`） |
+
+空实体上的 Range 返回 `416`（`bytes */0`）。`206` 携带 `Content-Range` 与 `Accept-Ranges: bytes`；`200` 携带 `Accept-Ranges: bytes`，且启用响应编码时携带 `Vary: Accept-Encoding`（下载路径本身永不参与内容编码）。`416` 体为空且 `Content-Length: 0`。
+
+本切片不产生验证器（`ETag` / `Last-Modified`），因此 `If-Range` 被忽略：存在该头时忽略 `Range` 并返回完整实体（`200`），符合 RFC 9110 13.1.5 在无验证器时的要求。
+
+### 22.3 流式与存活
+
+响应头为手写（`206` 的长度为所选区间长度），随后按 `download_chunk_bytes`（默认 64 KiB）分块读取，并以已知 `Content-Length` 的普通字节写入（非 chunked）。输出由写完成驱动，并受 `egress_cap_bytes` 限制，慢对端会对文件读取形成背压而不是增长内存。下载保留连接的 idle 截止时间（由写进展刷新），并使用独立的 `output_stall_timeout`（默认 30 秒）：暂存输出在该时间内未排空即关闭连接。该计时器与 SSE 的 stall 截止时间相互独立；与 SSE 不同，下载保留 `idle_timeout`。`HEAD` 发送相同响应头但不发送体（含 `HEAD` + `Range` → `206` 头）。keep-alive 下载完成后，连接可继续服务下一个请求。
+
+### 22.4 HTTP/2
+
+HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不进行文件流式传输。

@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -83,6 +84,15 @@ struct sse_options {
     // decision; a `disconnect_subscriber` policy ends delivery to that
     // subscriber. The replay window bounds reconnect replay.
     push::subscribe_options subscribe{};
+};
+
+// One file download endpoint. `path` is the request path prefix (e.g.
+// `/files`); the remainder is resolved under `root` after percent-decoding and
+// a path-traversal check. `GET` and `HEAD` are served, `Range` is honored with
+// `bytes` units only.
+struct download_route {
+    std::string path;
+    std::filesystem::path root;
 };
 
 // One SSE endpoint. The request may override `topic`, `mode` and `ordered`
@@ -164,6 +174,14 @@ struct http_server_options {
     // Decoded/encoded ratio ceiling applied on top of `coding`. Zero disables
     // the check (the default: requests may be highly compressible).
     std::size_t max_decoded_ratio = 0;
+
+    // --- File download -------------------------------------------------------
+    // A download response keeps the connection alive: the idle deadline stays
+    // armed, refreshed by write progress. This bounds a peer that stops
+    // draining for this long after staged output is non-empty (0 disables).
+    std::chrono::milliseconds download_stall_timeout{30000};
+    // Read chunk size for a streamed download body.
+    std::size_t download_chunk_bytes = 64u * 1024u;
 };
 
 struct http_statistics {
@@ -196,6 +214,8 @@ struct http_statistics {
     std::size_t responses_compressed = 0;
     // Request bodies decoded from a Content-Encoding.
     std::size_t requests_decoded = 0;
+    // Download responses (200/206/416) served from a download route.
+    std::size_t downloads_served = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with
@@ -227,6 +247,9 @@ public:
         // fails with `failed_precondition` otherwise. An HTTP/2 request that
         // targets an SSE path is answered with 501 (fail-closed, no stream).
         builder& add_sse_route(sse_route route);
+        // Registers a file download endpoint (HTTP/1.1 only; HTTP/2 requests
+        // that match are answered with 501).
+        builder& add_download_route(download_route route);
 
         [[nodiscard]] std::unique_ptr<http_server> build();
 
@@ -234,6 +257,7 @@ public:
         http_server_options options_{};
         std::vector<listener_config> listeners_;
         std::vector<sse_route> sse_routes_;
+        std::vector<download_route> download_routes_;
         const mvc::router* router_ = nullptr;
     };
 

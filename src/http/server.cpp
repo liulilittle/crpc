@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <crpc/http/content_coding.hpp>
+#include <crpc/http/file_transfer.hpp>
 #include <crpc/http/sse.hpp>
 #include <crpc/http2/connection.hpp>
 #include <crpc/http2/frame.hpp>
@@ -161,6 +162,101 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
         }
     }
     return nullptr;
+}
+
+// A download route match: the longest registered prefix that bounds the path at
+// a '/' and the (still percent-encoded) remainder.
+struct download_match {
+    const download_route* route = nullptr;
+    std::string relative;
+};
+
+[[nodiscard]] download_match find_download_route(
+    const std::vector<download_route>& routes, std::string_view path) noexcept {
+    download_match best;
+    for (const download_route& route : routes) {
+        if (route.path.empty()) {
+            continue;
+        }
+        bool matched = false;
+        std::string_view remainder;
+        if (path.size() == route.path.size() &&
+            path.compare(0, route.path.size(), route.path) == 0) {
+            matched = true;
+            remainder = std::string_view{};
+        } else if (path.size() > route.path.size() &&
+                   path.compare(0, route.path.size(), route.path) == 0 &&
+                   path[route.path.size()] == '/') {
+            matched = true;
+            remainder = path.substr(route.path.size() + 1);
+        }
+        if (!matched) {
+            continue;
+        }
+        if (best.route == nullptr || route.path.size() > best.route->path.size()) {
+            best.route = &route;
+            best.relative.assign(remainder.data(), remainder.size());
+        }
+    }
+    return best;
+}
+
+// Resolves a download remainder under `root`, rejecting absolute paths,
+// backslashes and any `..`/`.` segment, then verifying (after resolving
+// symlinks) that the result stays inside `root` and is a regular file.
+[[nodiscard]] bool resolve_download_path(const std::filesystem::path& root,
+                                         std::string_view relative,
+                                         std::filesystem::path& out) {
+    std::string decoded;
+    if (!http::percent_decode(relative, decoded).ok()) {
+        return false;
+    }
+    if (decoded.empty() || decoded.front() == '/' ||
+        decoded.find('\\') != std::string::npos) {
+        return false;
+    }
+    std::filesystem::path candidate = root;
+    std::size_t start = 0;
+    while (start <= decoded.size()) {
+        const std::size_t slash = decoded.find('/', start);
+        const std::string_view segment =
+            slash == std::string::npos
+                ? std::string_view(decoded).substr(start)
+                : std::string_view(decoded).substr(start, slash - start);
+        if (segment.empty() || segment == "." || segment == "..") {
+            return false;
+        }
+        candidate /= std::filesystem::path(segment);
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    std::error_code ec;
+    const std::filesystem::path canonical_root =
+        std::filesystem::weakly_canonical(root, ec);
+    if (ec) {
+        return false;
+    }
+    const std::filesystem::path canonical_file =
+        std::filesystem::weakly_canonical(candidate, ec);
+    if (ec) {
+        return false;
+    }
+    if (std::filesystem::is_directory(canonical_file, ec) || ec) {
+        return false;
+    }
+    // The file must be under the root: compare component-wise so `/var/wwwe`
+    // cannot pass a naive string prefix of `/var/www`.
+    auto root_it = canonical_root.begin();
+    auto file_it = canonical_file.begin();
+    for (; root_it != canonical_root.end(); ++root_it, ++file_it) {
+        if (file_it == canonical_file.end() || *file_it != *root_it) {
+            return false;
+        }
+    }
+    out = canonical_file;
+    return true;
 }
 
 // Media types that are already compressed (or binary); re-compressing them
@@ -390,6 +486,14 @@ private:
     void apply_response_coding(const http::request& request,
                                http::response& response);
 
+    // File download. `download_open` writes the head (and, for HEAD/416, the
+    // whole response) and arms the streaming state used by `download_pump`.
+    void download_open(http::request& request, const download_route& route,
+                       const std::string& relative, bool keep);
+    void download_pump();
+    void download_complete() noexcept;
+    void download_mark_output();
+
     // Server-Sent Events. `sse_open` runs on the shard after the request has
     // been parsed and takes ownership of the response (the connection is
     // dedicated to the event stream).
@@ -493,6 +597,16 @@ private:
     u64 sse_heartbeat_ns_ = 0;
     // Non-zero while staged output has not drained; fires `slow_timeout`.
     u64 sse_stall_deadline_ns_ = 0;
+
+    // Download state. `download_active_` is atomic because the transport source
+    // callback (any thread) consults it to refuse further ingress; the rest is
+    // shard-only. A download keeps the idle deadline armed (refreshed by write
+    // progress) and uses its own output stall deadline, never the SSE one.
+    std::unique_ptr<download_source> download_;
+    std::atomic<bool> download_active_{false};
+    bool download_keep_alive_ = true;
+    std::string download_buffer_;
+    u64 output_stall_deadline_ns_ = 0;
 };
 
 // --- Server state ------------------------------------------------------------
@@ -505,6 +619,8 @@ struct server_state {
     // access is serialized by `hub_mutex`: publishes arrive from arbitrary
     // threads while sessions pump on their shard. No hub method blocks.
     std::vector<sse_route> sse_routes;
+    // File download routes. Immutable once the server is built.
+    std::vector<download_route> download_routes;
     std::recursive_mutex hub_mutex;
     std::unique_ptr<push::hub> hub;
     // Per (subscriber, topic) high water: the largest seq ever handed to that
@@ -531,6 +647,7 @@ struct server_state {
     std::atomic<std::size_t> timed_out{0};
     std::atomic<std::size_t> responses_compressed{0};
     std::atomic<std::size_t> requests_decoded{0};
+    std::atomic<std::size_t> downloads_served{0};
 
     struct pending_listener {
         endpoint ep;
@@ -750,7 +867,7 @@ std::size_t session::handle_data(span<const std::byte> data) noexcept {
         if (input_closed_) {
             return 0;
         }
-        if (read_paused_) {
+        if (read_paused_ || download_active_.load(std::memory_order_acquire)) {
             return 0;
         }
         const std::size_t cap = state_.options.ingress_cap_bytes;
@@ -866,6 +983,10 @@ void session::process() {
                 if (sse_active_.load(std::memory_order_acquire)) {
                     sse_write_failed = true;
                 }
+            } else if (download_active_.load(std::memory_order_acquire)) {
+                // A completed write proves the downloading peer is alive; the
+                // idle deadline is refreshed from that progress.
+                note_activity();
             }
         }
         if (sse_write_failed) {
@@ -874,10 +995,12 @@ void session::process() {
             sse_abort();
             return;
         }
-        if (!input.empty() && !sse_active_.load(std::memory_order_acquire)) {
+        if (!input.empty() && !sse_active_.load(std::memory_order_acquire) &&
+            !download_active_.load(std::memory_order_acquire)) {
             // Once the response is an event stream the connection is dedicated
             // to it: later bytes are not a pipelined request (HTTP/1.1 cannot
-            // answer them in order) and must not be parsed.
+            // answer them in order) and must not be parsed. A streamed download
+            // likewise holds the connection until its body is written.
             note_activity();
             consume(std::move(input));
             arm_probe();
@@ -900,6 +1023,12 @@ void session::process() {
             }
             close_when_drained_ = true;
         }
+        if (download_active_.load(std::memory_order_acquire)) {
+            download_pump();
+            if (out_.empty() && !write_in_flight_) {
+                output_stall_deadline_ns_ = 0;
+            }
+        }
         flush_writes();
         maybe_finish();
         if (finished_) {
@@ -914,7 +1043,7 @@ void session::process() {
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (read_paused_ && ingress_.empty() && !close_when_drained_ &&
-                !stop_reading_ &&
+                !stop_reading_ && !download_active_.load(std::memory_order_acquire) &&
                 out_bytes_ <= state_.options.egress_cap_bytes) {
                 read_paused_ = false;
                 resume = true;
@@ -925,7 +1054,8 @@ void session::process() {
             // the unbounded queue the cap exists to prevent.
             over_egress = state_.options.egress_cap_bytes != 0 &&
                           out_bytes_ > state_.options.egress_cap_bytes;
-            if (ingress_.empty() || over_egress) {
+            if (ingress_.empty() || over_egress ||
+                download_active_.load(std::memory_order_acquire)) {
                 break;
             }
         }
@@ -1207,6 +1337,16 @@ void session::process_http1(std::string input) {
         request_deadline_ns_ = 0;
 
         handle_http1_request(std::move(request));
+        if (download_active_.load(std::memory_order_acquire)) {
+            // The connection is dedicated to the download body until it is
+            // fully written; keep any pipelined bytes for after that.
+            if (!pending.empty()) {
+                std::lock_guard<std::mutex> lk(mu_);
+                ingress_.insert(0, pending);
+                read_paused_ = true;
+            }
+            return;
+        }
         if (stop_reading_ || pending.empty()) {
             return;
         }
@@ -1278,6 +1418,12 @@ void session::handle_http1_request(http::request request) {
             sse_open(std::move(request), *sse);
             return;
         }
+        const download_match download =
+            find_download_route(state_.download_routes, request.path);
+        if (download.route != nullptr) {
+            download_open(request, *download.route, download.relative, keep);
+            return;
+        }
         http::request routed = std::move(request);
         if (head_only) {
             routed.method = http::method::get;
@@ -1319,6 +1465,205 @@ void session::handle_http1_request(http::request request) {
             return;
         }
     }
+}
+
+// --- session: file download --------------------------------------------------
+
+void session::download_mark_output() {
+    if (output_stall_deadline_ns_ != 0 || shard_ == nullptr ||
+        state_.options.download_stall_timeout.count() <= 0) {
+        return;
+    }
+    output_stall_deadline_ns_ =
+        shard_->now_ns() +
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             state_.options.download_stall_timeout)
+                             .count());
+}
+
+void session::download_complete() noexcept {
+    output_stall_deadline_ns_ = 0;
+    download_.reset();
+    download_buffer_.clear();
+    download_active_.store(false, std::memory_order_release);
+    if (!download_keep_alive_) {
+        close_when_drained_ = true;
+        stop_reading_ = true;
+    }
+}
+
+void session::download_pump() {
+    if (!download_active_.load(std::memory_order_acquire) || finished_ ||
+        write_failed_ || download_ == nullptr) {
+        return;
+    }
+    const std::size_t cap = state_.options.egress_cap_bytes;
+    std::size_t chunk = state_.options.download_chunk_bytes;
+    if (chunk == 0) {
+        chunk = 64u * 1024u;
+    }
+    while (download_active_.load(std::memory_order_acquire) && !write_failed_) {
+        if (!download_keep_alive_ && close_when_drained_) {
+            break;
+        }
+        const std::uint64_t remaining = download_->remaining();
+        if (remaining == 0) {
+            download_complete();
+            return;
+        }
+        std::size_t wanted = chunk;
+        if (static_cast<std::uint64_t>(wanted) > remaining) {
+            wanted = static_cast<std::size_t>(remaining);
+        }
+        if (cap != 0) {
+            if (out_bytes_ >= cap) {
+                break;
+            }
+            if (wanted > cap - out_bytes_) {
+                wanted = cap - out_bytes_;
+            }
+        }
+        if (wanted == 0) {
+            break;
+        }
+        download_buffer_.resize(wanted);
+        std::size_t count = 0;
+        const status result = download_->read(
+            span<std::byte>(reinterpret_cast<std::byte*>(download_buffer_.data()),
+                            download_buffer_.size()),
+            count);
+        if (!result.ok()) {
+            download_.reset();
+            download_active_.store(false, std::memory_order_release);
+            write_failed_ = true;
+            close_when_drained_ = true;
+            stop_reading_ = true;
+            break;
+        }
+        if (count == 0) {
+            download_complete();
+            return;
+        }
+        enqueue(std::string(download_buffer_.data(), count));
+        download_mark_output();
+        note_activity();
+    }
+}
+
+void session::download_open(http::request& request, const download_route& route,
+                            const std::string& relative, bool keep) {
+    if (request.method != http::method::get &&
+        request.method != http::method::head) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        http::response response =
+            make_problem(405, "download requires GET or HEAD", request.path);
+        response.version = request.version;
+        response.headers.add("Allow", "GET, HEAD");
+        if (!keep) {
+            response.headers.add("Connection", "close");
+        }
+        std::string wire;
+        if (!http::serialize(response, wire).ok()) {
+            wire = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
+                   "Connection: close\r\n\r\n";
+            keep = false;
+        }
+        enqueue(std::move(wire));
+        state_.responded.fetch_add(1, std::memory_order_relaxed);
+        if (!keep) {
+            close_when_drained_ = true;
+            stop_reading_ = true;
+        }
+        flush_writes();
+        return;
+    }
+    const bool head_only = request.method == http::method::head;
+
+    std::filesystem::path file;
+    if (!resolve_download_path(route.root, relative, file)) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(404, "download file not found", request, keep);
+        return;
+    }
+    result<download_source> opened = download_source::open_file(file);
+    if (!opened.ok()) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(404, "download file not found", request, keep);
+        return;
+    }
+    download_ =
+        std::make_unique<download_source>(std::move(opened.value()));
+    // `If-Range` can only be honored against a validator (ETag or Last-Modified)
+    // that this slice does not emit; without one the Range must be ignored and
+    // the full entity served (RFC 9110 13.1.5).
+    if (!request.headers.contains("if-range")) {
+        if (const std::string* range = request.headers.find("range")) {
+            (void)download_->apply_range(*range);
+        }
+    }
+
+    const int code = download_->status_code();
+    std::string head;
+    head.reserve(256);
+    head += "HTTP/1.1 ";
+    head += std::to_string(code);
+    head += " ";
+    head += local_reason(code);
+    head += "\r\n";
+    if (code == 416) {
+        head += "Content-Range: ";
+        head += download_->content_range();
+        head += "\r\n";
+        head += "Accept-Ranges: bytes\r\n";
+        head += "Content-Length: 0\r\n";
+    } else {
+        if (code == 206) {
+            head += "Content-Range: ";
+            head += download_->content_range();
+            head += "\r\n";
+        } else if (state_.options.enable_response_coding) {
+            // The full-body form could be encoded; advertise that it varies.
+            head += "Vary: Accept-Encoding\r\n";
+        }
+        head += "Accept-Ranges: bytes\r\n";
+        head += "Content-Length: ";
+        head += std::to_string(download_->content_length());
+        head += "\r\n";
+    }
+    if (keep) {
+        head += "Connection: keep-alive\r\n";
+    } else {
+        head += "Connection: close\r\n";
+    }
+    head += "\r\n";
+    enqueue(std::move(head));
+    state_.handled.fetch_add(1, std::memory_order_relaxed);
+    state_.responded.fetch_add(1, std::memory_order_relaxed);
+    state_.downloads_served.fetch_add(1, std::memory_order_relaxed);
+
+    if (code == 416 || head_only) {
+        download_.reset();
+        if (!keep) {
+            close_when_drained_ = true;
+            stop_reading_ = true;
+        }
+        flush_writes();
+        return;
+    }
+
+    download_keep_alive_ = keep;
+    download_active_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        read_paused_ = true;
+    }
+    // A download has no inbound liveness signal; the idle deadline stays armed
+    // and is refreshed by write progress, and the output stall deadline bounds
+    // a peer that stops draining.
+    note_activity();
+    download_pump();
+    flush_writes();
+    arm_probe();
 }
 
 // --- session: Server-Sent Events --------------------------------------------
@@ -1911,9 +2256,9 @@ void session::dispatch_h2(u32 stream_id) {
         routed.method = http::method::get;
         routed.method_token = "GET";
     }
-    // Request and response content coding are HTTP/1.1-only in this slice:
-    // HTTP/2 requests that would need them fail closed with a complete
-    // response instead of a silent identity downgrade.
+    // Request content coding, file download and response content coding are
+    // HTTP/1.1-only in this slice: HTTP/2 requests that would need them fail
+    // closed with a complete response instead of a silent identity downgrade.
     const auto h2_not_implemented = [&](std::string_view detail) {
         http::response response;
         response.status_code = 501;
@@ -1929,6 +2274,10 @@ void session::dispatch_h2(u32 stream_id) {
             h2_not_implemented("request content coding is not supported over HTTP/2\n");
             return;
         }
+    }
+    if (find_download_route(state_.download_routes, routed.path).route != nullptr) {
+        h2_not_implemented("file download is not supported over HTTP/2\n");
+        return;
     }
     if (state_.options.enable_response_coding) {
         const std::string* accept = routed.headers.find("accept-encoding");
@@ -2409,6 +2758,9 @@ void session::finish_now() {
     // same ordering the push control path requires; a token that outlives its
     // connection would receive deliveries into a dead session.
     sse_detach();
+    download_active_.store(false, std::memory_order_release);
+    download_.reset();
+    output_stall_deadline_ns_ = 0;
     close_when_drained_ = true;
     stop_reading_ = true;
     if (shard_ != nullptr) {
@@ -2495,6 +2847,14 @@ void session::arm_probe() {
             deadline = stream_deadline;
         }
     }
+    // A streamed download keeps the idle deadline and adds its own output stall
+    // deadline (the earlier of the two fires first; the deadline list above
+    // already includes the idle deadline).
+    if (download_active_.load(std::memory_order_relaxed) &&
+        output_stall_deadline_ns_ != 0 &&
+        (deadline == 0 || output_stall_deadline_ns_ < deadline)) {
+        deadline = output_stall_deadline_ns_;
+    }
     if (deadline == 0) {
         return;
     }
@@ -2544,6 +2904,21 @@ void session::on_probe() {
                         .count());
             sse_send_heartbeat();
             flush_writes();
+        }
+        arm_probe();
+        return;
+    }
+    if (download_active_.load(std::memory_order_acquire)) {
+        if (output_stall_deadline_ns_ != 0 && now >= output_stall_deadline_ns_) {
+            // The peer is connected but stopped draining the download body.
+            output_stall_deadline_ns_ = 0;
+            state_.timed_out.fetch_add(1, std::memory_order_relaxed);
+            download_active_.store(false, std::memory_order_release);
+            download_.reset();
+            close_when_drained_ = true;
+            stop_reading_ = true;
+            finish_now();
+            return;
         }
         arm_probe();
         return;
@@ -2656,10 +3031,17 @@ http_server::builder& http_server::builder::add_sse_route(sse_route route) {
     return *this;
 }
 
+http_server::builder& http_server::builder::add_download_route(
+    download_route route) {
+    download_routes_.push_back(std::move(route));
+    return *this;
+}
+
 std::unique_ptr<http_server> http_server::builder::build() {
     auto result = std::unique_ptr<http_server>(new http_server(options_));
     result->impl_->state.router = router_;
     result->impl_->state.sse_routes = sse_routes_;
+    result->impl_->state.download_routes = download_routes_;
     for (const listener_config& config : listeners_) {
         server_state::pending_listener pending;
         pending.ep = config.ep;
@@ -2751,6 +3133,24 @@ status http_server::start() {
             if (state.sse_routes[j].path == state.sse_routes[i].path) {
                 return status{rpc_error(rpc_code::invalid_argument,
                                         "duplicate SSE route path")};
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < state.download_routes.size(); ++i) {
+        const std::string& path = state.download_routes[i].path;
+        if (path.empty() || path.front() != '/') {
+            return status{rpc_error(rpc_code::invalid_argument,
+                                    "a download route requires an absolute path")};
+        }
+        if (path.size() > 1 && path.back() == '/') {
+            return status{rpc_error(rpc_code::invalid_argument,
+                                    "a download route path must not end with '/'")};
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (state.download_routes[j].path == path) {
+                return status{rpc_error(rpc_code::invalid_argument,
+                                        "duplicate download route path")};
             }
         }
     }
@@ -2915,6 +3315,8 @@ http_statistics http_server::stats() const noexcept {
         impl_->state.responses_compressed.load(std::memory_order_relaxed);
     out.requests_decoded =
         impl_->state.requests_decoded.load(std::memory_order_relaxed);
+    out.downloads_served =
+        impl_->state.downloads_served.load(std::memory_order_relaxed);
     out.sse_connections =
         impl_->state.sse_connections.load(std::memory_order_relaxed);
     out.sse_events_delivered =

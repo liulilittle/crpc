@@ -31,6 +31,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [19](#s19) | Push delivery (implemented subset) |
 | [20](#s20) | HTTP/1.1 Server-Sent Events (implemented subset) |
 | [21](#s21) | HTTP content coding (implemented subset) |
+| [22](#s22) | HTTP file download and Range (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -490,3 +491,63 @@ HTTP/2 does not use these codings in this slice: a request that carries a
 would select gzip/deflate is `501` (fail closed, no silent identity downgrade).
 `Accept-Encoding` that selects identity (and does not refuse it) is answered
 normally; refusing identity is `406`.
+
+## 22. HTTP file download and Range (implemented subset) <a id="s22"></a>
+
+This section is normative for `download_route` in the server facade (HTTP/1.1,
+in process). `download_source` and range parsing live in
+`include/crpc/http/file_transfer.hpp` / `src/http/file_transfer.cpp`; the
+session-level streaming wiring lives in `src/http/server.cpp`.
+
+### 22.1 Routing and path safety
+
+A route registers a request-path prefix `path` and a filesystem `root`. The
+remainder is percent-decoded and resolved under `root`. Empty paths, absolute
+paths, backslashes, `.`/`..` segments, a directory target, a missing/unreadable
+file, and any result whose canonical (symlink-resolved) path is not under the
+canonical root are answered with `404`. `GET` and `HEAD` are served; every
+other method is `405` with `Allow: GET, HEAD`.
+
+### 22.2 Range semantics
+
+A `Range` header is applied to the file entity:
+
+| Header value | Result |
+|---|---|
+| absent / unknown unit | `200`, full entity |
+| `bytes=a-b` with `b >= size` | `206`, `b` clamped to `size-1` |
+| `bytes=a-` | `206` |
+| `bytes=-n` (`n > 0`) | `206` suffix range |
+| `bytes=a-b` with `a >= size` | `416` + `Content-Range: bytes */size` |
+| `bytes=-0` | `416` |
+| missing `=`, missing `-`, unparseable number, `last < first` | ignored, `200` |
+| multiple ranges (`bytes=0-1,3-4`) | ignored, `200` (`multipart/byteranges` not implemented) |
+
+An empty entity with a Range is `416` (`bytes */0`). A `206` response carries
+`Content-Range` and `Accept-Ranges: bytes`; a `200` response carries
+`Accept-Ranges: bytes` and, when response coding is enabled, `Vary:
+Accept-Encoding` (the download path itself is never content-coded). A `416` has
+an empty body and `Content-Length: 0`.
+
+`If-Range` is ignored because this slice emits no validator (`ETag` /
+`Last-Modified`): when present, the `Range` is ignored and the full entity is
+served (`200`), as RFC 9110 13.1.5 requires without a validator.
+
+### 22.3 Streaming and liveness
+
+The head is hand-written (for a `206` the length is the selected range), then
+the body is read in `download_chunk_bytes` chunks (default 64 KiB) and queued
+as ordinary bytes with a known `Content-Length` (not chunked). Output is driven
+by write completions and bounded by `egress_cap_bytes`, so a slow peer
+backpressures the file read instead of growing memory. A download keeps the
+connection's idle deadline active (refreshed by write progress) and uses its
+own `output_stall_timeout` (default 30 s): a peer that leaves staged output
+undrained for that long is closed. The timer is independent of the SSE stall
+deadline; unlike SSE, the download keeps `idle_timeout`. `HEAD` sends the same
+headers without a body (including `HEAD` + `Range` -> `206` headers). After a
+keep-alive download the connection can serve the next request.
+
+### 22.4 HTTP/2
+
+A request path that matches a download route is answered with a complete `501`
+over HTTP/2 (fail closed); no file is streamed.

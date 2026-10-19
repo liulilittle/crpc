@@ -239,9 +239,13 @@ CRPC_TEST(file_transfer_range_parser) {
     CRPC_CHECK(range_kind::satisfiable == parse_range_header("bytes=-3", 10).kind);
     CRPC_CHECK(range_kind::unsatisfiable == parse_range_header("bytes=20-30", 10).kind);
     CRPC_CHECK(range_kind::unsatisfiable == parse_range_header("bytes=-0", 10).kind);
-    CRPC_CHECK(range_kind::unsatisfiable == parse_range_header("bytes=0-1,3-4", 10).kind);
-    CRPC_CHECK(range_kind::unsatisfiable == parse_range_header("bytes=abc", 10).kind);
-    CRPC_CHECK(range_kind::unsatisfiable == parse_range_header("bytes=5-3", 10).kind);
+    // Syntactically invalid / multiple ranges are ignored (RFC 9110 14.1.2);
+    // the caller serves 200 with the full entity.
+    CRPC_CHECK(range_kind::multiple == parse_range_header("bytes=0-1,3-4", 10).kind);
+    CRPC_CHECK(range_kind::invalid == parse_range_header("bytes=abc", 10).kind);
+    CRPC_CHECK(range_kind::invalid == parse_range_header("bytes=5-3", 10).kind);
+    CRPC_CHECK(range_kind::invalid == parse_range_header("bytes", 10).kind);
+    CRPC_CHECK(range_kind::satisfiable == parse_range_header("bytes=1-", 10).kind);
 
     const auto full = parse_range_header("bytes=0-999", 10);
     CRPC_CHECK(range_kind::satisfiable == full.kind);
