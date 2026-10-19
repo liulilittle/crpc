@@ -166,6 +166,11 @@ public:
         return retry_after_;
     }
 
+    // True when this permit is the half-open probe token reserved by `allow()`.
+    // Read it from the permit (not `state()`) so a concurrent transition cannot
+    // misclassify a closed-state admission as a probe.
+    [[nodiscard]] bool is_probe() const noexcept { return probe_; }
+
     void success() noexcept;
     void failure() noexcept;
     void slow() noexcept;

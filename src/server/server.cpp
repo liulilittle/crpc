@@ -2,7 +2,11 @@
 #include <crpc/server.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -65,9 +69,26 @@ struct request_job {
     std::chrono::milliseconds forced_retry_after{0};
 };
 
+// One immutable admission record per registered service, built in `start()`
+// after the registry is frozen. The handler path only reads it: no lock, no
+// `operator[]`, no allocation. A service that is not in the registry has no
+// entry and therefore never creates state.
+struct service_guard {
+    std::optional<resilience::bulkhead> bulkhead;
+    std::optional<resilience::rate_limiter> rate;
+    std::unique_ptr<resilience::circuit_breaker> breaker;
+    // Existing per-service in-flight cap. Atomic so the handler path never
+    // takes a lock. Ignored (not counted) when the cap is unlimited.
+    std::atomic<std::size_t> in_flight{0};
+};
+
 struct server_connection {
     server::impl* owner = nullptr;
     runtime* shard = nullptr;
+
+    // Connection-level flood bucket. It lives on the connection, is read only
+    // by that connection's reader, and is absent unless configured.
+    std::unique_ptr<resilience::rate_limiter> rate;
 
     struct reader_source final : io::source {
         explicit reader_source(server_connection* owner) noexcept : owner(owner) {}
@@ -214,6 +235,12 @@ struct server::impl {
     std::atomic<std::size_t> handled{0};
     std::atomic<std::size_t> rejected{0};
     std::atomic<std::size_t> failures{0};
+    std::atomic<std::uint64_t> rate_limited_connection{0};
+    std::atomic<std::uint64_t> rate_limited_service{0};
+    std::atomic<std::uint64_t> bulkhead_rejected{0};
+    std::atomic<std::uint64_t> breaker_open{0};
+    std::atomic<std::uint64_t> deadline_rejected{0};
+    std::atomic<std::uint64_t> probe_admitted{0};
 
     std::mutex connections_mutex;
     std::vector<std::shared_ptr<server_connection>> connections;
@@ -221,9 +248,11 @@ struct server::impl {
     std::mutex drain_mutex;
     std::condition_variable drain_cv;
 
-    std::mutex service_mutex;
-    std::unordered_map<u64, std::size_t> service_in_flight;
-    std::unordered_map<u64, std::unique_ptr<resilience::circuit_breaker>> breakers;
+    // Frozen in `start()` before any listener can accept, and destroyed only
+    // after every shard has been joined. The index is read concurrently after
+    // freeze; `guard_index` itself is never mutated while handlers run.
+    std::vector<std::unique_ptr<service_guard>> guards;
+    std::unordered_map<u64, std::size_t> guard_index;
 
     // --- push ---------------------------------------------------------------
     // One hub for the (single) shard. The hub itself has no internal locking;
@@ -260,6 +289,96 @@ struct server::impl {
 
     explicit impl(options o) : opt(std::move(o)) {}
 
+    // Built once after `registry.freeze()`. Every registered service gets a
+    // breaker (the pre-existing behaviour); the rate and bulkhead stages exist
+    // only when explicitly configured and enabled.
+    void build_guards() {
+        guards.clear();
+        guard_index.clear();
+        guards.reserve(registry.service_count());
+        registry.for_each_service([this](const rpc::service_slot& service) {
+            auto guard = std::make_unique<service_guard>();
+            if (opt.resilience_enabled) {
+                if (opt.per_service_rate) {
+                    guard->rate.emplace(*opt.per_service_rate);
+                }
+                if (opt.per_service_bulkhead) {
+                    resilience::bulkhead_config config = *opt.per_service_bulkhead;
+                    if (config.capacity == 0) {
+                        if (opt.per_service_inflight == 0) {
+                            config.capacity = 0;
+                        } else {
+                            config.capacity = static_cast<u32>(std::min(
+                                opt.per_service_inflight,
+                                static_cast<std::size_t>(
+                                    std::numeric_limits<u32>::max())));
+                        }
+                    }
+                    if (config.capacity != 0) {
+                        guard->bulkhead.emplace(config);
+                    }
+                }
+            }
+            guard->breaker =
+                std::make_unique<resilience::circuit_breaker>(opt.breaker);
+            guard_index.emplace(service.id(), guards.size());
+            guards.push_back(std::move(guard));
+        });
+    }
+
+    [[nodiscard]] service_guard* find_guard(u64 service_id) const noexcept {
+        const auto entry = guard_index.find(service_id);
+        if (entry == guard_index.end()) {
+            return nullptr;
+        }
+        return guards[entry->second].get();
+    }
+
+    // Existing per-service cap, now lock-free and stored on the guard. A zero
+    // cap means unlimited and is not counted.
+    [[nodiscard]] bool enter_service_cap(service_guard& guard) noexcept {
+        if (opt.per_service_inflight == 0) {
+            return true;
+        }
+        std::size_t current = guard.in_flight.load(std::memory_order_relaxed);
+        for (;;) {
+            if (current >= opt.per_service_inflight) {
+                return false;
+            }
+            if (guard.in_flight.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
+    void leave_service_cap(service_guard& guard) noexcept {
+        if (opt.per_service_inflight != 0) {
+            guard.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    // Called after the shards are joined. Debug builds assert the drain
+    // invariant before the table is released.
+    void clear_guards() noexcept {
+        for (const std::unique_ptr<service_guard>& guard : guards) {
+            if (!guard) {
+                continue;
+            }
+#ifndef NDEBUG
+            assert(guard->in_flight.load(std::memory_order_acquire) == 0);
+            if (guard->bulkhead) {
+                assert(guard->bulkhead->in_use() == 0);
+            }
+#else
+            (void)guard;
+#endif
+        }
+        guards.clear();
+        guard_index.clear();
+    }
+
     void on_accept(std::unique_ptr<connection> c) noexcept {
         if (c == nullptr) {
             return;
@@ -277,6 +396,10 @@ struct server::impl {
             auto sc = std::make_shared<server_connection>();
             sc->owner = this;
             sc->shard = shards[index].get();
+            if (opt.resilience_enabled && opt.per_connection_rate) {
+                sc->rate = std::make_unique<resilience::rate_limiter>(
+                    *opt.per_connection_rate);
+            }
             sc->conn = std::move(c);
             sc->source = std::make_unique<server_connection::reader_source>(sc.get());
             sc->self = sc;
@@ -761,8 +884,12 @@ struct server::impl {
         const bool wants_response = job.header.type != frame_type::one_way;
         if (job.forced_error) {
             if (wants_response) {
+                const char* message =
+                    job.forced_code == rpc_code::resource_exhausted
+                        ? "rate limit exceeded"
+                        : "overloaded";
                 send_error(sc, job.header.stream_id, job.forced_code,
-                           job.forced_retry_after, "overloaded");
+                           job.forced_retry_after, message);
             }
             complete_call(sc, job.counted);
             return;
@@ -827,60 +954,116 @@ struct server::impl {
         }
 
         // Validate the service id against the frozen registry before touching
-        // any per-service guard table. An arbitrary client-chosen id must not
-        // allocate a cap slot or a breaker: those maps are keyed by wire input
-        // and would otherwise grow without bound. The dispatcher still runs for
-        // an unknown id so it produces the canonical `not_found` response.
+        // any per-service guard. An arbitrary client-chosen id must not
+        // allocate state: the frozen guard index is keyed by registered ids
+        // only. The dispatcher still runs for an unknown id so it produces the
+        // canonical `not_found` response.
         const bool guarded =
             decoded && registry.find_service(service_id) != nullptr;
+        service_guard* guard = guarded ? find_guard(service_id) : nullptr;
 
-        if (guarded && opt.per_service_inflight != 0) {
-            bool over = false;
-            {
-                std::lock_guard<std::mutex> lk(service_mutex);
-                std::size_t& count = service_in_flight[service_id];
-                if (count >= opt.per_service_inflight) {
-                    over = true;
-                } else {
-                    ++count;
-                }
-            }
-            if (over) {
-                rejected.fetch_add(1, std::memory_order_relaxed);
-                if (wants_response) {
-                    send_error(sc, job.header.stream_id, rpc_code::overload,
-                               opt.overload_retry_after, "service concurrency limit reached");
-                }
-                complete_call(sc, job.counted);
-                return;
-            }
-        } else if (guarded) {
-            std::lock_guard<std::mutex> lk(service_mutex);
-            ++service_in_flight[service_id];
-        }
-
-        resilience::circuit_breaker* breaker = nullptr;
+        // Breaker-first: a half-open probe must be able to reach the service
+        // even when the per-service rate bucket or bulkhead is saturated.
+        // `is_probe()` comes from the permit itself, so a concurrent state
+        // transition cannot misclassify a closed-state admission.
         resilience::breaker_permit permit;
-        if (guarded) {
-            std::lock_guard<std::mutex> lk(service_mutex);
-            std::unique_ptr<resilience::circuit_breaker>& slot = breakers[service_id];
-            if (!slot) {
-                slot.reset(new (std::nothrow) resilience::circuit_breaker(opt.breaker));
-            }
-            breaker = slot.get();
-        }
-        if (breaker != nullptr) {
-            permit = breaker->allow();
+        bool probe = false;
+        if (guard != nullptr && guard->breaker) {
+            permit = guard->breaker->allow();
             if (!permit.allowed()) {
-                rejected.fetch_add(1, std::memory_order_relaxed);
+                breaker_open.fetch_add(1, std::memory_order_relaxed);
                 if (wants_response) {
                     send_error(sc, job.header.stream_id, rpc_code::unavailable,
                                permit.retry_after(), "service circuit breaker is open");
                 }
-                release_service(guarded, service_id);
                 complete_call(sc, job.counted);
                 return;
             }
+            probe = permit.is_probe();
+            if (probe) {
+                probe_admitted.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // Closed path: rate -> bulkhead -> existing per-service cap. A probe
+        // skips all three and goes straight to the dispatcher.
+        bool cap_entered = false;
+        resilience::bulkhead_permit bulkhead_permit;
+        if (guard != nullptr && !probe) {
+            if (opt.resilience_enabled) {
+                if (guard->rate) {
+                    resilience::rate_limit_result limited;
+                    if (decoded && envelope.extensions.has(trace_extension::has_deadline)) {
+                        const auto now = steady_now();
+                        const auto now_ns = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                now.time_since_epoch())
+                                .count());
+                        const std::uint64_t remaining =
+                            envelope.extensions.deadline_ns;
+                        const std::uint64_t deadline_ns =
+                            remaining >
+                                    std::numeric_limits<std::uint64_t>::max() - now_ns
+                                ? std::numeric_limits<std::uint64_t>::max()
+                                : now_ns + remaining;
+                        limited = guard->rate->acquire_for(
+                            1, std::chrono::nanoseconds(deadline_ns));
+                    } else {
+                        limited = guard->rate->try_acquire(1);
+                    }
+                    if (!limited.ok()) {
+                        // Local admission: never record it as a service
+                        // failure.
+                        permit.ignore();
+                        rate_limited_service.fetch_add(1, std::memory_order_relaxed);
+                        if (!limited.deadline_met) {
+                            deadline_rejected.fetch_add(1, std::memory_order_relaxed);
+                            if (wants_response) {
+                                send_error(sc, job.header.stream_id,
+                                           rpc_code::deadline_exceeded,
+                                           std::chrono::milliseconds(0),
+                                           "service rate limit cannot meet the deadline");
+                            }
+                        } else if (wants_response) {
+                            send_error(sc, job.header.stream_id,
+                                       rpc_code::resource_exhausted,
+                                       limited.retry_after,
+                                       "service rate limit reached");
+                        }
+                        complete_call(sc, job.counted);
+                        return;
+                    }
+                }
+                if (guard->bulkhead) {
+                    bulkhead_permit = guard->bulkhead->try_enter();
+                    if (!bulkhead_permit.allowed()) {
+                        permit.ignore();
+                        bulkhead_rejected.fetch_add(1, std::memory_order_relaxed);
+                        if (wants_response) {
+                            const std::chrono::milliseconds hint =
+                                bulkhead_permit.retry_after().count() > 0
+                                    ? bulkhead_permit.retry_after()
+                                    : opt.overload_retry_after;
+                            send_error(sc, job.header.stream_id, rpc_code::overload,
+                                       hint, "service bulkhead is full");
+                        }
+                        complete_call(sc, job.counted);
+                        return;
+                    }
+                }
+            }
+            if (!enter_service_cap(*guard)) {
+                permit.ignore();
+                rejected.fetch_add(1, std::memory_order_relaxed);
+                if (wants_response) {
+                    send_error(sc, job.header.stream_id, rpc_code::overload,
+                               opt.overload_retry_after,
+                               "service concurrency limit reached");
+                }
+                complete_call(sc, job.counted);
+                return;
+            }
+            cap_entered = true;
         }
 
         buffer response;
@@ -899,6 +1082,13 @@ struct server::impl {
             if (rpc::decode_response(response.readable(), coded, ignored, body).ok()) {
                 outcome_code = coded;
             }
+        }
+        if (outcome_code == rpc_code::deadline_exceeded) {
+            deadline_rejected.fetch_add(1, std::memory_order_relaxed);
+        } else if (outcome_code == rpc_code::overload && !handler_ran) {
+            // The dispatcher's per-method concurrency limit. Application
+            // handlers that return `overload` are not local admissions.
+            rejected.fetch_add(1, std::memory_order_relaxed);
         }
         if (permit.allowed()) {
             switch (outcome_code) {
@@ -950,19 +1140,10 @@ struct server::impl {
             }
         }
         handled.fetch_add(1, std::memory_order_relaxed);
-        release_service(guarded, service_id);
+        if (cap_entered) {
+            leave_service_cap(*guard);
+        }
         complete_call(sc, job.counted);
-    }
-
-    void release_service(bool decoded, u64 service_id) noexcept {
-        if (!decoded) {
-            return;
-        }
-        std::lock_guard<std::mutex> lk(service_mutex);
-        auto it = service_in_flight.find(service_id);
-        if (it != service_in_flight.end() && it->second > 0) {
-            --it->second;
-        }
     }
 
     static void run_job(void* ctx) noexcept {
@@ -1156,6 +1337,34 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
 }
 
 void server_connection::submit(frame& request) noexcept {
+    // Connection-level flood protection, before the in-flight cap and before
+    // any job allocation. The bucket belongs to this connection; it is not the
+    // per-service rate stage.
+    if (rate) {
+        const resilience::rate_limit_result limited = rate->try_acquire(1);
+        if (!limited.ok()) {
+            owner->rate_limited_connection.fetch_add(1,
+                                                     std::memory_order_relaxed);
+            if (request.header.type != frame_type::one_way) {
+                request_job* reject = new (std::nothrow) request_job();
+                if (reject != nullptr) {
+                    reject->conn = self.lock();
+                    reject->header = request.header;
+                    reject->counted = false;
+                    reject->forced_error = true;
+                    reject->forced_code = rpc_code::resource_exhausted;
+                    reject->forced_retry_after = limited.retry_after;
+                    if (reject->conn &&
+                        !shard->submit(&server::impl::run_job, reject,
+                                       &server::impl::drop_job)) {
+                        delete reject;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     const std::size_t cap = owner->opt.per_connection_inflight;
     const std::uint32_t current =
         in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -1280,6 +1489,29 @@ server::builder& server::builder::breaker(resilience::breaker_config config) {
     return *this;
 }
 
+server::builder& server::builder::per_connection_rate(
+    resilience::rate_limit_config config) {
+    options_.per_connection_rate = config;
+    return *this;
+}
+
+server::builder& server::builder::per_service_rate(
+    resilience::rate_limit_config config) {
+    options_.per_service_rate = config;
+    return *this;
+}
+
+server::builder& server::builder::per_service_bulkhead(
+    resilience::bulkhead_config config) {
+    options_.per_service_bulkhead = config;
+    return *this;
+}
+
+server::builder& server::builder::resilience_enabled(bool enabled) {
+    options_.resilience_enabled = enabled;
+    return *this;
+}
+
 server::builder& server::builder::push_egress_max_bytes(std::size_t bytes) {
     options_.push_egress_max_bytes = bytes;
     return *this;
@@ -1331,6 +1563,12 @@ status server::start() {
     if (!frozen.ok()) {
         impl_->running.store(false, std::memory_order_release);
         return frozen;
+    }
+    try {
+        impl_->build_guards();
+    } catch (...) {
+        impl_->running.store(false, std::memory_order_release);
+        return status{rpc_code::resource_exhausted};
     }
 
     try {
@@ -1392,6 +1630,8 @@ void server::stop() noexcept {
             impl_->push_acks.store(0, std::memory_order_relaxed);
             impl_->refresh_push_stats_locked();
         }
+        // Every shard is joined: no handler can still hold a guard permit.
+        impl_->clear_guards();
         return;
     }
 
@@ -1433,6 +1673,9 @@ void server::stop() noexcept {
         impl_->push_acks.store(0, std::memory_order_relaxed);
         impl_->refresh_push_stats_locked();
     }
+    // The guard table is the last resilience object to go: every shard has
+    // been joined and every admitted call has released its permits.
+    impl_->clear_guards();
 }
 
 bool server::running() const noexcept {
@@ -1454,6 +1697,16 @@ server::statistics server::stats() const noexcept {
     out.requests_handled = impl_->handled.load(std::memory_order_relaxed);
     out.rejected_overload = impl_->rejected.load(std::memory_order_relaxed);
     out.handler_failures = impl_->failures.load(std::memory_order_relaxed);
+    out.rate_limited_connection =
+        impl_->rate_limited_connection.load(std::memory_order_relaxed);
+    out.rate_limited_service =
+        impl_->rate_limited_service.load(std::memory_order_relaxed);
+    out.bulkhead_rejected =
+        impl_->bulkhead_rejected.load(std::memory_order_relaxed);
+    out.breaker_open = impl_->breaker_open.load(std::memory_order_relaxed);
+    out.deadline_rejected =
+        impl_->deadline_rejected.load(std::memory_order_relaxed);
+    out.probe_admitted = impl_->probe_admitted.load(std::memory_order_relaxed);
     out.push_active_connections = static_cast<std::size_t>(
         impl_->push_active_connections.load(std::memory_order_relaxed));
     out.push_queued_messages = static_cast<std::size_t>(

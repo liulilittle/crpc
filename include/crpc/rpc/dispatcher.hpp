@@ -143,6 +143,15 @@ public:
     [[nodiscard]] const method_slot* find_method(u64 method_id) const noexcept;
     [[nodiscard]] std::size_t method_count() const noexcept { return methods_.size(); }
 
+    // Read-only traversal used by startup code to pre-build a frozen guard
+    // table. Call it after `freeze()`; it does not allocate or lock.
+    template <typename Fn>
+    void for_each_method(Fn&& fn) const {
+        for (const auto& entry : methods_) {
+            fn(*entry.second);
+        }
+    }
+
 private:
     friend class service_registry;
 
@@ -187,6 +196,15 @@ public:
 
     [[nodiscard]] std::size_t service_count() const noexcept { return services_.size(); }
     [[nodiscard]] std::size_t method_count() const noexcept;
+
+    // Read-only traversal used by startup code to pre-build a frozen guard
+    // table. Call it after `freeze()`; it does not allocate or lock.
+    template <typename Fn>
+    void for_each_service(Fn&& fn) const {
+        for (const auto& entry : services_) {
+            fn(*entry.second);
+        }
+    }
 
 private:
     std::unordered_map<u64, std::unique_ptr<service_slot>> services_;

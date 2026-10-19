@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,7 +52,9 @@
 #include <crpc/io.hpp>
 #include <crpc/push/hub.hpp>
 #include <crpc/push/wire.hpp>
+#include <crpc/resilience/bulkhead.hpp>
 #include <crpc/resilience/circuit_breaker.hpp>
+#include <crpc/resilience/rate_limiter.hpp>
 #include <crpc/rpc/dispatcher.hpp>
 #include <crpc/runtime.hpp>
 #include <crpc/span.hpp>
@@ -91,6 +94,21 @@ public:
         // keeps failing; disabled when `min_requests` is zero and no window
         // activity ever opens it.
         resilience::breaker_config breaker{};
+        // Connection-level flood protection applied in `submit`, before the
+        // per-connection in-flight cap and before any job is allocated. The
+        // bucket belongs to the connection and is not part of the per-service
+        // six-stage pipeline. Null disables it (the default).
+        std::optional<resilience::rate_limit_config> per_connection_rate;
+        // Optional per-service admission stages. Null means disabled. The
+        // bulkhead capacity defaults to the configured capacity; a zero
+        // capacity falls back to `per_service_inflight`. A zero
+        // `per_service_inflight` means unlimited and builds no bulkhead.
+        std::optional<resilience::rate_limit_config> per_service_rate;
+        std::optional<resilience::bulkhead_config> per_service_bulkhead;
+        // When false, the per-connection/per-service rate and bulkhead stages
+        // are skipped entirely. The per-service circuit breaker stays active,
+        // so this matches the pre-pipeline behaviour.
+        bool resilience_enabled = true;
         bool send_goaway_on_stop = true;
 
         // Per-connection bound on PUSH bytes staged for the transport (the
@@ -108,8 +126,18 @@ public:
         std::size_t in_flight_calls = 0;
         std::size_t accepted_connections = 0;
         std::size_t requests_handled = 0;
+        // Per-connection cap and per-method concurrency rejections only. Rate,
+        // bulkhead and breaker rejections are reported in their own counters.
         std::size_t rejected_overload = 0;
         std::size_t handler_failures = 0;
+        // Resilience admissions. Monotonic, never reset, snapshot from 64-bit
+        // atomics.
+        std::uint64_t rate_limited_connection = 0;
+        std::uint64_t rate_limited_service = 0;
+        std::uint64_t bulkhead_rejected = 0;
+        std::uint64_t breaker_open = 0;
+        std::uint64_t deadline_rejected = 0;
+        std::uint64_t probe_admitted = 0;
         // Push counters. They are snapshots published under the push lock, so a
         // reader never touches the single-threaded hub.
         std::size_t push_active_connections = 0;
@@ -151,6 +179,10 @@ public:
         builder& drain_timeout(std::chrono::milliseconds value);
         builder& overload_retry_after(std::chrono::milliseconds value);
         builder& breaker(resilience::breaker_config config);
+        builder& per_connection_rate(resilience::rate_limit_config config);
+        builder& per_service_rate(resilience::rate_limit_config config);
+        builder& per_service_bulkhead(resilience::bulkhead_config config);
+        builder& resilience_enabled(bool enabled);
         builder& push_egress_max_bytes(std::size_t bytes);
         builder& push_subscribe_options(push::subscribe_options options);
 

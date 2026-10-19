@@ -49,6 +49,7 @@ constexpr crpc::u64 kFlaky = 3;
 constexpr crpc::u64 kFail = 4;
 constexpr crpc::u64 kReturnCode = 5;
 constexpr crpc::u64 kSlowDeadline = 6;
+constexpr crpc::u64 kBlocking = 7;
 
 // Diagnostic override for the coroutine stack size. Unset (or <= 0) keeps the
 // library default. It exists so the TSan matrix can test whether the
@@ -79,9 +80,21 @@ struct service_state {
     std::atomic<int> fail_calls{0};
     std::atomic<int> canceled_observed{0};
     std::atomic<int> flaky_failures_remaining{1};
+    // Deterministic long-running handler: it stays inside dispatch until the
+    // test raises `blocking_gate`. Used to hold a bulkhead slot.
+    std::atomic<int> blocking_calls{0};
+    std::atomic<int> blocking_gate{0};
 
     int echo(const int& value) {
         echo_calls.fetch_add(1, std::memory_order_relaxed);
+        return value + 1;
+    }
+
+    int blocking(const int& value) {
+        blocking_calls.fetch_add(1, std::memory_order_relaxed);
+        while (blocking_gate.load(std::memory_order_acquire) == 0) {
+            std::this_thread::sleep_for(1ms);
+        }
         return value + 1;
     }
 
@@ -156,10 +169,13 @@ void register_services(crpc::server::builder& builder, service_state& service) {
                            &service_state::raw_return_code, &service);
     builder.add_raw_method(kService, kSlowDeadline, "slow_deadline",
                            &service_state::raw_slow_deadline, &service);
+    builder.template add_method<service_state, &service_state::blocking>(
+        kService, kBlocking, "blocking", service);
 }
 
 struct fixture_config {
     std::size_t server_workers = 8;
+    std::size_t server_shards = 1;
     std::size_t per_connection = 1024;
     std::size_t per_service = 65536;
     std::chrono::milliseconds drain{2000};
@@ -175,6 +191,13 @@ struct fixture_config {
     crpc::resilience::breaker_config breaker{};
     bool configure_server_breaker = false;
     crpc::resilience::breaker_config server_breaker{};
+    bool configure_connection_rate = false;
+    crpc::resilience::rate_limit_config connection_rate{};
+    bool configure_service_rate = false;
+    crpc::resilience::rate_limit_config service_rate{};
+    bool configure_service_bulkhead = false;
+    crpc::resilience::bulkhead_config service_bulkhead{};
+    bool resilience_enabled = true;
 };
 
 struct fixture {
@@ -204,6 +227,7 @@ bool start_inproc(fixture& f, const fixture_config& cfg) {
     crpc::server::builder sb;
     sb.add_listener(crpc::endpoint::inproc(f.name), f.backend);
     register_services(sb, f.service);
+    sb.shards(cfg.server_shards);
     sb.handler_workers(cfg.server_workers);
     sb.per_connection_inflight(cfg.per_connection);
     sb.per_service_inflight(cfg.per_service);
@@ -211,6 +235,16 @@ bool start_inproc(fixture& f, const fixture_config& cfg) {
     sb.overload_retry_after(cfg.overload_retry);
     if (cfg.configure_server_breaker) {
         sb.breaker(cfg.server_breaker);
+    }
+    sb.resilience_enabled(cfg.resilience_enabled);
+    if (cfg.configure_connection_rate) {
+        sb.per_connection_rate(cfg.connection_rate);
+    }
+    if (cfg.configure_service_rate) {
+        sb.per_service_rate(cfg.service_rate);
+    }
+    if (cfg.configure_service_bulkhead) {
+        sb.per_service_bulkhead(cfg.service_bulkhead);
     }
     if (stack_bytes != 0) {
         sb.handler_stack_bytes(stack_bytes);
@@ -673,6 +707,245 @@ CRPC_TEST(per_connection_overload) {
     CRPC_CHECK(f.srv->stats().rejected_overload >= 1);
 }
 
+CRPC_TEST(server_connection_rate_limits_submit) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.pool_size = 1;
+    cfg.configure_connection_rate = true;
+    // No refill: the second request on this connection must be refused.
+    cfg.connection_rate.rate_per_second = 0.0;
+    cfg.connection_rate.burst = 1.0;
+    cfg.connection_rate.initial_tokens = 1.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int first_code = -1;
+    int second_code = -1;
+    int retry_after = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto stub = f.cli->service<int, int>(kService, kEcho);
+            auto first = stub.call(1);
+            if (!first.ok()) {
+                first_code = static_cast<int>(first.code());
+            } else {
+                auto handle = std::move(first).value();
+                auto result = handle.get();
+                first_code = result.ok() ? 0 : static_cast<int>(result.code());
+            }
+            auto second = stub.call(2);
+            if (!second.ok()) {
+                second_code = static_cast<int>(second.code());
+            } else {
+                auto handle = std::move(second).value();
+                auto result = handle.get();
+                if (result.ok()) {
+                    second_code = 0;
+                } else {
+                    second_code = static_cast<int>(result.code());
+                    retry_after =
+                        static_cast<int>(result.error().retry_after.count());
+                }
+            }
+        },
+        10000);
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(0, first_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted),
+                  second_code);
+    CRPC_CHECK(retry_after > 0);
+    // The rejected request never reached a handler and never allocated an
+    // in-flight slot.
+    CRPC_CHECK_EQ(1, f.service.echo_calls.load());
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1),
+                  f.srv->stats().rate_limited_connection);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), f.srv->stats().rejected_overload);
+}
+
+CRPC_TEST(server_service_bulkhead_limits_concurrency) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    // Any outcome recorded as a failure would open this breaker immediately.
+    cfg.configure_server_breaker = true;
+    cfg.server_breaker.min_requests = 1;
+    // A plain success is below this ratio; one failure among two opens it.
+    cfg.server_breaker.failure_ratio_threshold = 0.5;
+    // The blocked handler is a success here: only a misclassified local
+    // rejection could open this breaker.
+    cfg.server_breaker.slow_call_threshold = 10s;
+    cfg.server_breaker.open_duration = 5s;
+    cfg.configure_service_bulkhead = true;
+    cfg.service_bulkhead.capacity = 1;
+    cfg.service_bulkhead.retry_after = 7ms;
+    // The in-process handler pool is cooperative: a blocking handler stalls
+    // its whole shard. Two shards let the two connections truly overlap while
+    // sharing the same frozen guard table.
+    cfg.server_shards = 2;
+    cfg.pool_size = 2;
+    // Force the second call onto a fresh connection: the pool only grows when
+    // the existing slot is saturated.
+    cfg.max_inflight = 1;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    // Two raw connections land on the two server shards (round-robin on
+    // accept), so their blocking handlers really overlap. The frozen guard
+    // table, and therefore the bulkhead, is shared.
+    auto first_conn =
+        f.backend.connect(crpc::endpoint::inproc(f.name), crpc::connect_options{});
+    auto second_conn =
+        f.backend.connect(crpc::endpoint::inproc(f.name), crpc::connect_options{});
+    CRPC_CHECK(first_conn != nullptr);
+    CRPC_CHECK(second_conn != nullptr);
+    if (!first_conn || !second_conn) {
+        return;
+    }
+    crpc::rpc::client_options co;
+    co.slot_capacity = 8;
+    co.default_timeout = std::chrono::nanoseconds{0};
+    crpc::rpc::client first(std::move(first_conn), co);
+    crpc::rpc::client second(std::move(second_conn), co);
+
+    crpc::buffer first_body;
+    crpc::buffer second_body;
+    crpc::buffer echo_body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, first_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(2, second_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(9, echo_body).ok());
+
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    auto first_started =
+        first.start_call<int>(kService, kBlocking, first_body.readable());
+    CRPC_CHECK(first_started.ok());
+    if (!first_started.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first_started).value();
+
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
+
+    int first_code = -1;
+    int second_code = -1;
+    int retry_after = -1;
+    auto second_started =
+        second.start_call<int>(kService, kBlocking, second_body.readable());
+    if (second_started.ok()) {
+        auto handle = std::move(second_started).value();
+        auto result = handle.get();
+        second_code = result.ok() ? 0 : static_cast<int>(result.code());
+        if (!result.ok()) {
+            retry_after = static_cast<int>(result.error().retry_after.count());
+        }
+    } else {
+        second_code = static_cast<int>(second_started.error().code);
+    }
+
+    // Release the blocked handler now that the second admission was refused.
+    f.service.blocking_gate.store(1, std::memory_order_release);
+    auto first_result = first_handle.get();
+    first_code = first_result.ok() ? 0 : static_cast<int>(first_result.code());
+
+    // The blocked call released its slot. A healthy call now succeeds, which also
+    // proves the bulkhead rejection was ignored by the breaker (it would
+    // otherwise be open and answer unavailable).
+    auto echo_started =
+        first.start_call<int>(kService, kEcho, echo_body.readable());
+    int echo_code = -1;
+    if (echo_started.ok()) {
+        auto handle = std::move(echo_started).value();
+        auto result = handle.get();
+        echo_code = result.ok() ? 0 : static_cast<int>(result.code());
+    } else {
+        echo_code = static_cast<int>(echo_started.error().code);
+    }
+
+    // The released slot is reusable for another blocked call.
+    int third_code = -1;
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    auto third_started =
+        first.start_call<int>(kService, kBlocking, first_body.readable());
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.blocking_calls.load() >= 2; }, 2000));
+    f.service.blocking_gate.store(1, std::memory_order_release);
+    if (third_started.ok()) {
+        auto handle = std::move(third_started).value();
+        auto result = handle.get();
+        third_code = result.ok() ? 0 : static_cast<int>(result.code());
+    } else {
+        third_code = static_cast<int>(third_started.error().code);
+    }
+
+    CRPC_CHECK_EQ(0, first_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::overload), second_code);
+    CRPC_CHECK(retry_after > 0);
+    CRPC_CHECK_EQ(0, echo_code);
+    CRPC_CHECK_EQ(0, third_code);
+    CRPC_CHECK_EQ(2, f.service.blocking_calls.load());
+
+    const crpc::server::statistics stats = f.srv->stats();
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.bulkhead_rejected);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(0), stats.breaker_open);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.rejected_overload);
+}
+
+CRPC_TEST(server_service_rate_cannot_meet_deadline) {
+    crpc::inproc_backend backend;
+    service_state service;
+    const std::string name = "crpc-rate-deadline";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(name), backend);
+    register_services(sb, service);
+    sb.handler_workers(4);
+    sb.drain_timeout(2000ms);
+    crpc::resilience::rate_limit_config rate;
+    rate.rate_per_second = 0.0;
+    rate.burst = 1.0;
+    rate.initial_tokens = 0.0;
+    sb.per_service_rate(rate);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    auto conn = backend.connect(crpc::endpoint::inproc(name), crpc::connect_options{});
+    CRPC_CHECK(conn != nullptr);
+    if (!conn) {
+        srv->stop();
+        return;
+    }
+    crpc::rpc::client_options co;
+    co.slot_capacity = 8;
+    co.default_timeout = std::chrono::nanoseconds{0};
+    crpc::rpc::client raw(std::move(conn), co);
+
+    crpc::buffer body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, body).ok());
+    crpc::rpc::call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = clock_type::now() + 5ms;
+    auto started = raw.start_call<int>(kService, kEcho, body.readable(), ctx);
+    CRPC_CHECK(started.ok());
+    int code = -1;
+    if (started.ok()) {
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        code = result.ok() ? 0 : static_cast<int>(result.code());
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded), code);
+    CRPC_CHECK_EQ(0, service.echo_calls.load());
+
+    const crpc::server::statistics stats = srv->stats();
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.rate_limited_service);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.deadline_rejected);
+
+    srv->stop();
+}
+
 CRPC_TEST(graceful_shutdown_drains_and_rejects) {
     fixture f;
     fixture_config cfg;
@@ -926,6 +1199,194 @@ CRPC_TEST(unknown_service_ids_do_not_create_server_guards) {
             CRPC_CHECK(after - before < 8u * 1024u * 1024u);
         }
     }
+}
+
+CRPC_TEST(server_half_open_probe_bypasses_saturated_service_rate) {
+    fixture f;
+    fixture_config cfg;
+    // No wire deadline: the saturated rate bucket must answer
+    // resource_exhausted rather than deadline_exceeded.
+    cfg.default_deadline = std::chrono::nanoseconds{0};
+    cfg.configure_server_breaker = true;
+    cfg.server_breaker.min_requests = 1;
+    cfg.server_breaker.failure_ratio_threshold = 0.0;
+    cfg.server_breaker.open_duration = 100ms;
+    cfg.server_breaker.half_open_max_probes = 1;
+    cfg.server_breaker.half_open_successes_to_close = 1;
+    cfg.configure_service_rate = true;
+    // One token, no refill. The failing call consumes it, so only a probe that
+    // bypasses the per-service rate stage can still be dispatched.
+    cfg.service_rate.rate_per_second = 0.0;
+    cfg.service_rate.burst = 1.0;
+    cfg.service_rate.initial_tokens = 1.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int failure_code = -1;
+    int open_code = -1;
+    int probe_code = -1;
+    int after_code = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto fail = f.cli->service<int, int>(kService, kFail);
+            auto failed = fail.call(1);
+            if (failed.ok()) {
+                auto handle = std::move(failed).value();
+                auto result = handle.get();
+                failure_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                failure_code = static_cast<int>(failed.code());
+            }
+
+            // The breaker is open: the admission order rejects here before the
+            // (empty) rate bucket is consulted.
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto opened = echo.call(1);
+            if (opened.ok()) {
+                auto handle = std::move(opened).value();
+                auto result = handle.get();
+                open_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                open_code = static_cast<int>(opened.code());
+            }
+
+            // Cross the open duration while keeping the client coroutine idle.
+            std::this_thread::sleep_for(250ms);
+
+            // Half-open: `allow()` hands out the probe token, and the probe
+            // skips the empty per-service rate bucket.
+            auto probe = echo.call(2);
+            if (probe.ok()) {
+                auto handle = std::move(probe).value();
+                auto result = handle.get();
+                probe_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                probe_code = static_cast<int>(probe.code());
+            }
+
+            // The probe success closed the breaker; a normal call now hits the
+            // still-empty per-service rate bucket.
+            auto after = echo.call(3);
+            if (after.ok()) {
+                auto handle = std::move(after).value();
+                auto result = handle.get();
+                after_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                after_code = static_cast<int>(after.code());
+            }
+        },
+        15000);
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), failure_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), open_code);
+    CRPC_CHECK_EQ(0, probe_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted), after_code);
+
+    const crpc::server::statistics stats = f.srv->stats();
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.breaker_open);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.probe_admitted);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1), stats.rate_limited_service);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.rejected_overload);
+}
+
+CRPC_TEST(server_resilience_disabled_matches_baseline) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.resilience_enabled = false;
+    cfg.configure_connection_rate = true;
+    cfg.connection_rate.rate_per_second = 0.0;
+    cfg.connection_rate.burst = 1.0;
+    cfg.connection_rate.initial_tokens = 1.0;
+    cfg.configure_service_rate = true;
+    cfg.service_rate.rate_per_second = 0.0;
+    cfg.service_rate.burst = 1.0;
+    cfg.service_rate.initial_tokens = 0.0;
+    cfg.configure_service_bulkhead = true;
+    cfg.service_bulkhead.capacity = 1;
+    cfg.configure_server_breaker = true;
+    cfg.server_breaker.min_requests = 1;
+    cfg.server_breaker.failure_ratio_threshold = 0.5;
+    cfg.server_breaker.slow_call_threshold = 10s;
+    cfg.server_breaker.open_duration = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int echoes_ok = 0;
+    int slow_ok = 0;
+    int failure_code = -1;
+    int after_failure = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            // The connection rate and (empty) service rate are skipped.
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            for (int i = 0; i < 2; ++i) {
+                auto started = echo.call(i);
+                if (!started.ok()) {
+                    continue;
+                }
+                auto handle = std::move(started).value();
+                auto result = handle.get();
+                if (result.ok() && result.value() == i + 1) {
+                    ++echoes_ok;
+                }
+            }
+
+            // The per-service bulkhead is skipped: both concurrent slow calls
+            // are admitted.
+            auto slow = f.cli->service<int, int>(kService, kSlow);
+            auto first = slow.call(1);
+            auto second = slow.call(2);
+            if (first.ok()) {
+                auto handle = std::move(first).value();
+                auto result = handle.get();
+                if (result.ok()) {
+                    ++slow_ok;
+                }
+            }
+            if (second.ok()) {
+                auto handle = std::move(second).value();
+                auto result = handle.get();
+                if (result.ok()) {
+                    ++slow_ok;
+                }
+            }
+
+            // The breaker is not part of `resilience_enabled`: it still opens
+            // on dependency failures. Six failures outweigh the four successes
+            // above against the 0.5 failure-ratio threshold.
+            auto fail = f.cli->service<int, int>(kService, kFail);
+            for (int i = 0; i < 6; ++i) {
+                auto failed = fail.call(1);
+                if (failed.ok()) {
+                    auto handle = std::move(failed).value();
+                    auto result = handle.get();
+                    failure_code =
+                        result.ok() ? 0 : static_cast<int>(result.code());
+                } else {
+                    failure_code = static_cast<int>(failed.code());
+                }
+            }
+            auto after = echo.call(9);
+            if (after.ok()) {
+                auto handle = std::move(after).value();
+                auto result = handle.get();
+                after_failure = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                after_failure = static_cast<int>(after.code());
+            }
+        },
+        15000);
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(2, echoes_ok);
+    CRPC_CHECK_EQ(2, slow_ok);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), failure_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), after_failure);
+
+    const crpc::server::statistics stats = f.srv->stats();
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(0), stats.rate_limited_connection);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(0), stats.rate_limited_service);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(0), stats.bulkhead_rejected);
 }
 
 CRPC_TEST(server_breaker_ignores_client_side_outcomes_single_shot) {
