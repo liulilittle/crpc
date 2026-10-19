@@ -288,6 +288,66 @@ struct download_match {
            ci_equal(minor, "x-rar-compressed");
 }
 
+[[nodiscard]] bool vary_value_covers_accept_encoding(
+    std::string_view value) noexcept {
+    std::size_t pos = 0;
+    while (pos <= value.size()) {
+        while (pos < value.size() &&
+               (value[pos] == ' ' || value[pos] == '\t' || value[pos] == ',')) {
+            ++pos;
+        }
+        std::size_t end = pos;
+        while (end < value.size() && value[end] != ',') {
+            ++end;
+        }
+        std::string_view token = value.substr(pos, end - pos);
+        while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+            token.remove_suffix(1);
+        }
+        if (ci_equal(token, "accept-encoding") || token == "*") {
+            return true;
+        }
+        if (end >= value.size()) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+// Adds `Accept-Encoding` to Vary without overwriting an existing Vary value:
+// the token is appended to the first Vary field (and duplicates are not added).
+void merge_vary_accept_encoding(http::header_list& headers) {
+    bool have_vary = false;
+    for (const header& field : headers) {
+        if (!ci_equal(field.name, "vary")) {
+            continue;
+        }
+        have_vary = true;
+        if (vary_value_covers_accept_encoding(field.value)) {
+            return;
+        }
+    }
+    if (!have_vary) {
+        headers.add("Vary", "Accept-Encoding");
+        return;
+    }
+    http::header_list rebuilt;
+    bool merged = false;
+    for (const header& field : headers) {
+        if (!merged && ci_equal(field.name, "vary")) {
+            const std::string value =
+                field.value.empty() ? std::string("Accept-Encoding")
+                                    : field.value + ", Accept-Encoding";
+            rebuilt.add("Vary", value);
+            merged = true;
+        } else {
+            rebuilt.add(field.name, field.value);
+        }
+    }
+    headers = std::move(rebuilt);
+}
+
 enum class query_result : u8 { missing, ok, invalid };
 
 // Extracts one raw query parameter (percent decoding the value). The query is
@@ -984,9 +1044,12 @@ void session::process() {
                     sse_write_failed = true;
                 }
             } else if (download_active_.load(std::memory_order_acquire)) {
-                // A completed write proves the downloading peer is alive; the
-                // idle deadline is refreshed from that progress.
+                // A completed write proves the downloading peer is alive: both
+                // the idle deadline and the download output stall deadline are
+                // refreshed from that progress, so a slow-but-draining peer is
+                // never cut off at a fixed offset from the first chunk.
                 note_activity();
+                download_mark_output();
             }
         }
         if (sse_write_failed) {
@@ -1246,6 +1309,7 @@ void session::apply_response_coding(const http::request& request,
     if (!neg.acceptable) {
         response = make_problem(406, "no acceptable content coding", request.path);
         response.version = request.version;
+        merge_vary_accept_encoding(response.headers);
         return;
     }
     const int status_code = response.status_code;
@@ -1254,10 +1318,9 @@ void session::apply_response_coding(const http::request& request,
         return;
     }
     // A negotiated response varies on Accept-Encoding even when the body stays
-    // identity (a cache must not reuse it for a different client).
-    if (response.headers.find("vary") == nullptr) {
-        response.headers.add("Vary", "Accept-Encoding");
-    }
+    // identity (a cache must not reuse it for a different client). An existing
+    // Vary value (e.g. Origin) is merged, never overwritten.
+    merge_vary_accept_encoding(response.headers);
     if (!neg.compressed || !should_compress(neg, response.body.size(),
                                             state_.options.coding) ||
         response.body.empty()) {
@@ -1470,10 +1533,12 @@ void session::handle_http1_request(http::request request) {
 // --- session: file download --------------------------------------------------
 
 void session::download_mark_output() {
-    if (output_stall_deadline_ns_ != 0 || shard_ == nullptr ||
+    if (shard_ == nullptr ||
         state_.options.download_stall_timeout.count() <= 0) {
         return;
     }
+    // Refreshed on every progress event (a queued chunk or a completed write),
+    // so a slow-but-progressing peer is never mistaken for a stalled one.
     output_stall_deadline_ns_ =
         shard_->now_ns() +
         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1552,6 +1617,7 @@ void session::download_pump() {
 
 void session::download_open(http::request& request, const download_route& route,
                             const std::string& relative, bool keep) {
+    const bool head_only = request.method == http::method::head;
     if (request.method != http::method::get &&
         request.method != http::method::head) {
         state_.bad.fetch_add(1, std::memory_order_relaxed);
@@ -1562,8 +1628,10 @@ void session::download_open(http::request& request, const download_route& route,
         if (!keep) {
             response.headers.add("Connection", "close");
         }
+        http::serialize_options options;
+        options.include_body = !head_only;
         std::string wire;
-        if (!http::serialize(response, wire).ok()) {
+        if (!http::serialize(response, wire, options).ok()) {
             wire = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
                    "Connection: close\r\n\r\n";
             keep = false;
@@ -1577,18 +1645,42 @@ void session::download_open(http::request& request, const download_route& route,
         flush_writes();
         return;
     }
-    const bool head_only = request.method == http::method::head;
+
+    // A HEAD error must carry the headers a GET would carry but no body;
+    // `send_http1_error` always serializes the problem body, so handle HEAD
+    // locally to keep the connection in sync.
+    const auto head_error = [&](int status, std::string_view detail) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        http::response response = make_problem(status, detail, request.path);
+        response.version = request.version;
+        if (!keep) {
+            response.headers.add("Connection", "close");
+        }
+        http::serialize_options options;
+        options.include_body = !head_only;
+        std::string wire;
+        if (!http::serialize(response, wire, options).ok()) {
+            wire = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
+                   "Connection: close\r\n\r\n";
+            keep = false;
+        }
+        enqueue(std::move(wire));
+        state_.responded.fetch_add(1, std::memory_order_relaxed);
+        if (!keep) {
+            close_when_drained_ = true;
+            stop_reading_ = true;
+        }
+        flush_writes();
+    };
 
     std::filesystem::path file;
     if (!resolve_download_path(route.root, relative, file)) {
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(404, "download file not found", request, keep);
+        head_error(404, "download file not found");
         return;
     }
     result<download_source> opened = download_source::open_file(file);
     if (!opened.ok()) {
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(404, "download file not found", request, keep);
+        head_error(404, "download file not found");
         return;
     }
     download_ =
@@ -1610,6 +1702,11 @@ void session::download_open(http::request& request, const download_route& route,
     head += " ";
     head += local_reason(code);
     head += "\r\n";
+    if (!route.content_type.empty()) {
+        head += "Content-Type: ";
+        head += route.content_type;
+        head += "\r\n";
+    }
     if (code == 416) {
         head += "Content-Range: ";
         head += download_->content_range();
@@ -2287,15 +2384,14 @@ void session::dispatch_h2(u32 stream_id) {
             http::response response =
                 make_problem(406, "no acceptable content coding", routed.path);
             response.version = routed.version;
+            merge_vary_accept_encoding(response.headers);
             state_.handled.fetch_add(1, std::memory_order_relaxed);
             send_h2_response(stream_id, response, head_only);
             return;
         }
-        if (neg.compressed) {
-            h2_not_implemented(
-                "response content coding is not supported over HTTP/2\n");
-            return;
-        }
+        // HTTP/2 does not encode responses in this slice, but an acceptable
+        // gzip/deflate offer must NOT fail the request: serve identity and
+        // advertise the variance (a normal h2 client sends gzip by default).
     }
     // SSE is not implemented over HTTP/2 in this slice. A matching route must
     // fail closed with a complete, non-streaming response rather than pretend
@@ -2315,6 +2411,11 @@ void session::dispatch_h2(u32 stream_id) {
         (void)state_.router->handle(routed, response);
     } else {
         response = make_problem(404, "no router configured", routed.path);
+    }
+    if (state_.options.enable_response_coding &&
+        !response_forbids_body(response.status_code)) {
+        // Identity is served, but the negotiation is still advertised.
+        merge_vary_accept_encoding(response.headers);
     }
     state_.handled.fetch_add(1, std::memory_order_relaxed);
     send_h2_response(stream_id, response, head_only);

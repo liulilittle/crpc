@@ -463,8 +463,10 @@ request may be highly compressible). Request decoding is controlled by
 When `enable_response_coding` is set, the response body is negotiated from
 `Accept-Encoding` (q-values; gzip preferred over deflate over identity).
 Negotiation happens even for a body that is not compressed, and such a response
-carries `Vary: Accept-Encoding`. A client that refuses every supported coding
-(`identity;q=0` with no acceptable gzip/deflate) is answered `406`.
+carries `Vary: Accept-Encoding`. An existing `Vary` (e.g. `Origin`) is merged
+with `Accept-Encoding` (no duplicate token, never overwritten). A client that
+refuses every supported coding (`identity;q=0` with no acceptable gzip/deflate)
+is answered `406`, which also carries `Vary: Accept-Encoding`.
 
 The body is actually encoded only when a coding was selected, the body is at
 least `coding_limits::min_response_bytes` (default 1024), the media type is not
@@ -480,17 +482,20 @@ the same headers with no body.
 
 The encoder emits fixed-Huffman deflate blocks with a minimal LZ77 matcher
 (3-byte hash chains, a 32 KiB history ring, greedy matching up to 258 bytes;
-matches may cross `write` boundaries) wrapped in a gzip or zlib container. Its
+matches may cross `write` boundaries and every input byte enters the history
+ring before the next write) wrapped in a gzip or zlib container. Hash-chain
+positions are 32-bit, so after 2 GiB of streamed input matching degrades to
+literals (no corruption). Its
 output is valid for any conforming decoder; the decoder is independently
 verified against zlib vectors and the encoder against Python `zlib`/`gzip`.
 
 ### 21.4 HTTP/2
 
-HTTP/2 does not use these codings in this slice: a request that carries a
-`Content-Encoding` needing decoding is `501`, and a response whose negotiation
-would select gzip/deflate is `501` (fail closed, no silent identity downgrade).
-`Accept-Encoding` that selects identity (and does not refuse it) is answered
-normally; refusing identity is `406`.
+HTTP/2 does not encode responses in this slice: a request that carries a
+`Content-Encoding` needing decoding is `501`. A normal h2 client that offers
+`gzip`/`deflate` is served **identity `200`** (no compression) with
+`Vary: Accept-Encoding`; only refusing identity (`identity;q=0` with no
+acceptable coding) is `406`, which also carries `Vary`.
 
 ## 22. HTTP file download and Range (implemented subset) <a id="s22"></a>
 
@@ -506,7 +511,11 @@ remainder is percent-decoded and resolved under `root`. Empty paths, absolute
 paths, backslashes, `.`/`..` segments, a directory target, a missing/unreadable
 file, and any result whose canonical (symlink-resolved) path is not under the
 canonical root are answered with `404`. `GET` and `HEAD` are served; every
-other method is `405` with `Allow: GET, HEAD`.
+other method is `405` with `Allow: GET, HEAD`. A `HEAD` error response (404/405/
+416) has the same headers as `GET` but never a body, so keep-alive framing stays
+in sync. The route's `content_type` (default `application/octet-stream`) is
+sent as `Content-Type`; it never overrides the path-safety rules. A stat/open
+TOCTOU window remains (documented limitation, not hardened in this slice).
 
 ### 22.2 Range semantics
 
@@ -540,12 +549,15 @@ the body is read in `download_chunk_bytes` chunks (default 64 KiB) and queued
 as ordinary bytes with a known `Content-Length` (not chunked). Output is driven
 by write completions and bounded by `egress_cap_bytes`, so a slow peer
 backpressures the file read instead of growing memory. A download keeps the
-connection's idle deadline active (refreshed by write progress) and uses its
-own `output_stall_timeout` (default 30 s): a peer that leaves staged output
-undrained for that long is closed. The timer is independent of the SSE stall
+connection's idle deadline active and uses its own `download_stall_timeout`
+(default 30 s). The stall deadline is refreshed by every progress event (a
+chunk is queued, or a write completes) and cleared when the queue is empty, so
+a slow peer that keeps draining is never cut off; only a peer with no progress
+for the whole timeout is closed. The timer is independent of the SSE stall
 deadline; unlike SSE, the download keeps `idle_timeout`. `HEAD` sends the same
-headers without a body (including `HEAD` + `Range` -> `206` headers). After a
-keep-alive download the connection can serve the next request.
+headers without a body (including `HEAD` + `Range` -> `206` headers and HEAD
+404/405/416 errors). After a keep-alive download the connection can serve the
+next request.
 
 ### 22.4 HTTP/2
 

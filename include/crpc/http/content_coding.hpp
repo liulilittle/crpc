@@ -49,7 +49,10 @@
 //
 // Allocation: `content_decoder`/`content_encoder` allocate their state in the
 // constructor; `feed`/`write` append to the caller's string and back-reference
-// history is a fixed 32 KiB ring (no per-byte allocation).
+// history is a fixed 32 KiB ring (no per-byte allocation). Every byte of a
+// `write` enters that ring before the next call, so a match may safely span the
+// boundary. Hash-chain positions are 32-bit: beyond 2 GiB of streamed input,
+// matching degrades to literals (never corruption).
 #ifndef CRPC_HTTP_CONTENT_CODING_HPP
 #define CRPC_HTTP_CONTENT_CODING_HPP
 

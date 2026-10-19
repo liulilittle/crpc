@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <crpc/http/content_coding.hpp>
 
@@ -440,5 +441,171 @@ CRPC_TEST(content_coding_lz77_match_crosses_write_boundary) {
     // The second half repeats the first: the match surely crosses the boundary.
     CRPC_CHECK(encoded.size() < (first.size() + second.size()));
 }
+
+namespace {
+
+// Encodes `data` split at `chunks` boundaries and requires an exact round trip.
+void check_split_round_trip(content_coding coding, const std::string& data,
+                            const std::vector<std::size_t>& cuts) {
+    content_encoder encoder(coding);
+    std::string encoded;
+    CRPC_CHECK(encoder.start(encoded).ok());
+    std::size_t begin = 0;
+    for (const std::size_t cut : cuts) {
+        if (cut < begin || cut > data.size()) {
+            continue;
+        }
+        CRPC_CHECK(encoder
+                       .write(span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(data.data() +
+                                                                     begin),
+                                  cut - begin),
+                              encoded)
+                       .ok());
+        begin = cut;
+    }
+    CRPC_CHECK(encoder
+                   .write(span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data.data() +
+                                                                 begin),
+                              data.size() - begin),
+                          encoded)
+                   .ok());
+    CRPC_CHECK(encoder.finish(encoded).ok());
+
+    coding_limits limits;
+    limits.max_compression_ratio = 0;
+    limits.max_decompressed_bytes = 4u * 1024u * 1024u;
+    auto decoded = crpc::http::decompress_all(coding, as_span(encoded), limits);
+    CRPC_CHECK(decoded.ok());
+    if (decoded.ok()) {
+        CRPC_CHECK_EQ(data.size(), decoded.value().size());
+        CRPC_CHECK_EQ(data, decoded.value());
+    }
+}
+
+std::uint32_t next_random(std::uint32_t& state) noexcept {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+// The exact shape reported by the independent audit: the second write starts
+// with a run that matches the first write, so a match extension crosses the
+// write boundary into bytes whose ring slots were never written.
+CRPC_TEST(content_coding_two_write_pattern_round_trip) {
+    std::string first(98, 'B');
+    first.push_back('A');
+    first.push_back('B');
+    std::string second(98, 'B');
+    second.push_back('\0');
+    second.push_back('\0');
+    for (const content_coding coding : {content_coding::gzip,
+                                        content_coding::deflate}) {
+        content_encoder encoder(coding);
+        std::string encoded;
+        CRPC_CHECK(encoder.start(encoded).ok());
+        CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+        CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+        CRPC_CHECK(encoder.finish(encoded).ok());
+
+        coding_limits limits;
+        limits.max_compression_ratio = 0;
+        auto decoded =
+            crpc::http::decompress_all(coding, as_span(encoded), limits);
+        CRPC_CHECK(decoded.ok());
+        if (decoded.ok()) {
+            CRPC_CHECK_EQ(first + second, decoded.value());
+        }
+    }
+}
+
+// Audit B's minimal reproducer: the stale boundary bytes happen to equal the
+// continuation bytes, so a wrong match is only caught by the CRC.
+CRPC_TEST(content_coding_minimal_two_write_boundary) {
+    std::string first = "ABC";
+    first.push_back('\x42');
+    first.push_back('\x43');
+    std::string second = "ABC";
+    second.push_back('\0');
+    second.push_back('\0');
+    second += "XYZ";
+    content_encoder encoder(content_coding::gzip);
+    std::string encoded;
+    CRPC_CHECK(encoder.start(encoded).ok());
+    CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+    CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+    CRPC_CHECK(encoder.finish(encoded).ok());
+    auto decoded =
+        crpc::http::decompress_all(content_coding::gzip, as_span(encoded));
+    CRPC_CHECK(decoded.ok());
+    if (decoded.ok()) {
+        CRPC_CHECK_EQ(first + second, decoded.value());
+    }
+}
+
+// Deterministic random splits (1..~300 byte chunks) over mixed payloads. This
+// exercises every tail position of a write, not just the two-byte boundary.
+CRPC_TEST(content_coding_split_fuzz_round_trip) {
+    std::uint32_t state = 0x12345678u;
+    for (int round = 0; round < 200; ++round) {
+        std::string data;
+        const std::size_t size =
+            1 + static_cast<std::size_t>(next_random(state) % 5000u);
+        data.reserve(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            const std::uint32_t value = next_random(state);
+            if ((value & 3u) == 0u && !data.empty()) {
+                // Repeat a recent byte to create matches.
+                data.push_back(data[data.size() - 1 -
+                                    (value % (data.size() > 64 ? 64 : data.size()))]);
+            } else {
+                data.push_back(static_cast<char>(value & 0xffu));
+            }
+        }
+        std::vector<std::size_t> cuts;
+        std::size_t position = 0;
+        while (position < data.size()) {
+            position += 1 + (next_random(state) % 300u);
+            if (position >= data.size()) {
+                break;
+            }
+            cuts.push_back(position);
+        }
+        for (const content_coding coding : {content_coding::gzip,
+                                            content_coding::deflate}) {
+            check_split_round_trip(coding, data, cuts);
+        }
+    }
+}
+
+// More than one 32 KiB window of input split across writes: the ring wraps and
+// old slots are reused by newer positions.
+CRPC_TEST(content_coding_multi_write_window_wrap) {
+    std::uint32_t state = 0x9e3779b9u;
+    std::string data;
+    data.reserve(100000);
+    for (std::size_t i = 0; i < 100000; ++i) {
+        const std::uint32_t value = next_random(state);
+        if ((value & 7u) == 0u && !data.empty()) {
+            const std::size_t back =
+                static_cast<std::size_t>(value % 1000u) % data.size();
+            data.push_back(data[data.size() - 1 - back]);
+        } else {
+            data.push_back(static_cast<char>('a' + (value % 26u)));
+        }
+    }
+    std::vector<std::size_t> cuts;
+    for (std::size_t position = 777; position < data.size(); position += 777) {
+        cuts.push_back(position);
+    }
+    for (const content_coding coding : {content_coding::gzip,
+                                        content_coding::deflate}) {
+        check_split_round_trip(coding, data, cuts);
+    }
+}
+
+} // namespace
 
 CRPC_TEST_MAIN()

@@ -7,6 +7,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,28 @@ struct capture_source final : io::source {
         std::lock_guard<std::mutex> lk(mu);
         data.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         return bytes.size();
+    }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+    [[nodiscard]] std::string snapshot() {
+        std::lock_guard<std::mutex> lk(mu);
+        return data;
+    }
+};
+
+// A peer that accepts at most `budget` bytes per `on_data` call and then
+// returns short (the backend pauses reading until `resume_read`). The test
+// resumes it on a timer, producing steady but slow progress.
+struct slow_source final : io::source {
+    std::mutex mu;
+    std::string data;
+    std::size_t budget = 1024;
+
+    std::size_t on_data(span<const std::byte> bytes) noexcept override {
+        std::lock_guard<std::mutex> lk(mu);
+        const std::size_t take = std::min(budget, bytes.size());
+        data.append(reinterpret_cast<const char*>(bytes.data()), take);
+        return take;
     }
     void on_eof() noexcept override {}
     void on_error(std::error_code) noexcept override {}
@@ -174,6 +197,7 @@ struct fixture {
         root = test_root();
         write_file(root / "small.txt", "0123456789");
         write_file(root / "big.bin", big_payload());
+        write_file(root / "slow.bin", big_payload().substr(0, 16384));
         write_file(root.parent_path() / "crpc_dl_secret.txt", "SECRET");
         mvc::route_entry entry;
         entry.method = http::method::get;
@@ -233,6 +257,7 @@ struct h2_parse_state {
     bool in_header_block = false;
     int status = 0;
     bool headers_seen = false;
+    bool vary_accept_encoding = false;
     std::string body;
 
     void feed(std::string_view bytes) {
@@ -293,6 +318,10 @@ struct h2_parse_state {
                         if (field.name == ":status") {
                             status = std::atoi(field.value.c_str());
                             headers_seen = true;
+                        } else if (field.name == "vary" &&
+                                   field.value.find("Accept-Encoding") !=
+                                       std::string::npos) {
+                            vary_accept_encoding = true;
                         }
                     }
                 }
@@ -347,24 +376,9 @@ std::string h2_settings(std::initializer_list<h2::setting> entries) {
     return h2_frame(h2::frame_type::settings, 0, 0, payload);
 }
 
-std::string h2_request(u32 stream_id,
-                       std::initializer_list<std::pair<std::string, std::string>>
-                           fields,
-                       h2::hpack_encoder& encoder) {
-    std::vector<h2::header_field> all;
-    for (const auto& item : fields) {
-        all.push_back({item.first, item.second});
-    }
-    std::string block;
-    (void)encoder.encode(
-        span<const h2::header_field>(all.data(), all.size()), block);
-    return h2_frame(h2::frame_type::headers,
-                    static_cast<u8>(h2::flags::end_headers | h2::flags::end_stream),
-                    stream_id, block);
-}
-
 int h2_status(fixture& fx, std::string_view path,
-              std::initializer_list<std::pair<std::string, std::string>> extra) {
+              std::initializer_list<std::pair<std::string, std::string>> extra,
+              bool* vary_accept_encoding = nullptr) {
     capture_source capture;
     auto client = fx.connect();
     if (client == nullptr) {
@@ -404,6 +418,9 @@ int h2_status(fixture& fx, std::string_view path,
             return state.headers_seen;
         },
         5000));
+    if (vary_accept_encoding != nullptr) {
+        *vary_accept_encoding = state.vary_accept_encoding;
+    }
     return state.status;
 }
 
@@ -418,6 +435,8 @@ CRPC_TEST(download_full_file_200) {
     CRPC_CHECK_EQ(std::string("10"), response.header("Content-Length"));
     CRPC_CHECK(response.has("Accept-Ranges", "bytes"));
     CRPC_CHECK(response.has("Vary", "Accept-Encoding"));
+    CRPC_CHECK_EQ(std::string("application/octet-stream"),
+                  response.header("Content-Type"));
 }
 
 CRPC_TEST(download_range_returns_206_exact_bytes) {
@@ -430,6 +449,8 @@ CRPC_TEST(download_range_returns_206_exact_bytes) {
     CRPC_CHECK_EQ(std::string("bytes 2-5/10"), response.header("Content-Range"));
     CRPC_CHECK_EQ(std::string("4"), response.header("Content-Length"));
     CRPC_CHECK(response.has("Accept-Ranges", "bytes"));
+    CRPC_CHECK_EQ(std::string("application/octet-stream"),
+                  response.header("Content-Type"));
     // Range responses are never content-coded and do not vary on encoding.
     CRPC_CHECK(!response.has_name("Content-Encoding"));
     CRPC_CHECK(!response.has_name("Vary"));
@@ -599,6 +620,71 @@ CRPC_TEST(download_large_file_streams_with_backpressure) {
     CRPC_CHECK_EQ(big_payload(), response.body);
 }
 
+CRPC_TEST(download_head_404_has_no_body) {
+    fixture fx;
+    capture_source capture;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+    send_raw(*client, http1("HEAD", "/files/nope.txt"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            return capture.snapshot().find("\r\n\r\n") != std::string::npos;
+        },
+        5000));
+    // Give a buggy body a chance to arrive, then require the response to end
+    // exactly at the header terminator.
+    (void)crpc_test::wait_for(
+        [&] {
+            const std::string data = capture.snapshot();
+            const std::size_t end = data.find("\r\n\r\n");
+            return end != std::string::npos && data.size() > end + 4;
+        },
+        200);
+    const std::string data = capture.snapshot();
+    const std::size_t end = data.find("\r\n\r\n");
+    CRPC_CHECK_EQ(end + 4, data.size());
+}
+
+// A slow peer that still drains bytes must survive longer than the stall
+// timeout: every write completion refreshes the deadline.
+CRPC_TEST(download_slow_progress_survives_stall_timeout) {
+    http::http_server_options options;
+    options.download_chunk_bytes = 4096;
+    options.egress_cap_bytes = 8192;
+    options.download_stall_timeout = std::chrono::milliseconds(200);
+    fixture fx(options);
+
+    slow_source capture;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+    send_raw(*client, http1("GET", "/files/slow.bin"));
+
+    auto last_resume = std::chrono::steady_clock::now();
+    parsed_response response;
+    bool complete = false;
+    const bool ok = crpc_test::wait_for(
+        [&] {
+            if (parse_response(capture.snapshot(), response)) {
+                complete = true;
+                return true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_resume >= std::chrono::milliseconds(30)) {
+                last_resume = now;
+                client->resume_read();
+            }
+            return false;
+        },
+        15000);
+    CRPC_CHECK(ok);
+    CRPC_CHECK(complete);
+    CRPC_CHECK_EQ(200, response.status);
+    CRPC_CHECK_EQ(std::string("16384"), response.header("Content-Length"));
+    CRPC_CHECK_EQ(big_payload().substr(0, 16384), response.body);
+}
+
 CRPC_TEST(download_206_never_content_coded) {
     fixture fx;
     parsed_response response;
@@ -629,12 +715,18 @@ CRPC_TEST(h2_accept_encoding_negotiation) {
     // Identity is acceptable on an ordinary route: served normally.
     CRPC_CHECK_EQ(200,
                   h2_status(fx, "/plain", {{"accept-encoding", "identity"}}));
-    // Selecting gzip would require h2 response compression, which this slice
-    // does not implement: fail closed.
-    CRPC_CHECK_EQ(501, h2_status(fx, "/plain", {{"accept-encoding", "gzip"}}));
-    // Identity refused and no supported coding acceptable -> 406.
+    // A normal h2 client offers gzip: serve identity 200 (no 501) and advertise
+    // the variance.
+    bool vary = false;
+    CRPC_CHECK_EQ(200, h2_status(fx, "/plain", {{"accept-encoding", "gzip"}},
+                                 &vary));
+    CRPC_CHECK(vary);
+    // Identity refused and no supported coding acceptable -> 406 + Vary.
+    bool denied_vary = false;
     CRPC_CHECK_EQ(406, h2_status(fx, "/plain",
-                                 {{"accept-encoding", "identity;q=0"}}));
+                                 {{"accept-encoding", "identity;q=0"}},
+                                 &denied_vary));
+    CRPC_CHECK(denied_vary);
 }
 
 CRPC_TEST_MAIN()

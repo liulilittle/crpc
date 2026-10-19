@@ -175,6 +175,16 @@ status handle_image(void*, const http::request&, const mvc::route_params&,
     return status{};
 }
 
+status handle_vary(void*, const http::request&, const mvc::route_params&,
+                   const codec&, const codec_registry&, http::response& out) {
+    out.status_code = 200;
+    out.reason = "OK";
+    out.headers.add("Content-Type", "text/plain");
+    out.headers.add("Vary", "Origin");
+    out.body = repetitive_payload();
+    return status{};
+}
+
 void add_route(mvc::router& router, http::method method, const char* path,
                mvc::invoke_fn fn, void* ctx) {
     mvc::route_entry entry;
@@ -197,6 +207,7 @@ struct fixture {
         add_route(router, http::method::get, "/big", &handle_big, nullptr);
         add_route(router, http::method::get, "/small", &handle_small, nullptr);
         add_route(router, http::method::get, "/image", &handle_image, nullptr);
+        add_route(router, http::method::get, "/vary", &handle_vary, nullptr);
         add_route(router, http::method::post, "/echo", &handle_echo, &state);
         CRPC_CHECK(router.freeze().ok());
 
@@ -302,6 +313,20 @@ CRPC_TEST(http1_response_406_when_identity_refused) {
                           response));
     CRPC_CHECK_EQ(406, response.status);
     CRPC_CHECK(!has_header_name(response, "Content-Encoding"));
+    CRPC_CHECK(has_header(response, "Vary", "Accept-Encoding"));
+}
+
+CRPC_TEST(http1_response_merges_existing_vary) {
+    fixture fx;
+    parsed_response response;
+    CRPC_CHECK(round_trip(fx, http1("GET", "/vary", "Accept-Encoding: gzip\r\n"),
+                          response));
+    CRPC_CHECK_EQ(200, response.status);
+    CRPC_CHECK(has_header(response, "Content-Encoding", "gzip"));
+    // The route's Vary: Origin is preserved and Accept-Encoding is merged once.
+    const std::string vary = response.headers;
+    CRPC_CHECK(vary.find("Vary: Origin, Accept-Encoding") != std::string::npos);
+    CRPC_CHECK(vary.find("Vary: Accept-Encoding") == std::string::npos);
 }
 
 CRPC_TEST(http1_response_threshold_skips_small_body) {

@@ -1488,6 +1488,15 @@ struct content_encoder::impl {
                 ++i;
             }
         }
+        // The last two positions are never inserted into the hash chain (a
+        // 3-byte hash needs lookahead), but their bytes MUST still enter the
+        // history ring: a match in the next `write` may extend across the
+        // boundary and read them through `byte_at`. Leaving them stale would
+        // silently corrupt the encoded stream (gzip CRC mismatch).
+        for (std::size_t tail = n >= 2 ? n - 2 : 0; tail < n; ++tail) {
+            window[static_cast<std::size_t>((base + tail) % k_window)] =
+                static_cast<std::uint8_t>(data[tail]);
+        }
         put_code(0, 7, out);     // end of block
         return status{};
     }

@@ -382,17 +382,17 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ### 21.2 响应压缩
 
-启用 `enable_response_coding` 时，响应体按 `Accept-Encoding`（q 值；gzip 优先于 deflate，再优先 identity）协商。即使最终不压缩，也会进行协商，并携带 `Vary: Accept-Encoding`。若客户端拒绝所有支持的编码（`identity;q=0` 且 gzip/deflate 不可接受），返回 `406`。
+启用 `enable_response_coding` 时，响应体按 `Accept-Encoding`（q 值；gzip 优先于 deflate，再优先 identity）协商。即使最终不压缩，也会进行协商，并携带 `Vary: Accept-Encoding`。已有 `Vary`（如 `Origin`）与 `Accept-Encoding` 合并（不重复、不覆盖）。若客户端拒绝所有支持的编码（`identity;q=0` 且 gzip/deflate 不可接受），返回 `406`，该响应同样携带 `Vary: Accept-Encoding`。
 
 仅当以下条件全部满足时才真正编码：选中了压缩编码；体不小于 `coding_limits::min_response_bytes`（默认 1024）；媒体类型不是已压缩类型（`image/*`、`video/*`、`audio/*`、`application/zip|gzip|zstd|br|octet-stream|...`）；状态不是 `204/304/206`；未自带 `Content-Encoding`；且编码后的结果**严格小于** identity 体。否则保持 identity 且**不发送** `Content-Encoding`（禁止静默膨胀）。`Content-Length` 反映线上（编码后）长度；`HEAD` 与 `GET` 采用同一决策，发送相同响应头但不发送体。
 
 ### 21.3 编解码器
 
-编码器输出定长 Huffman deflate 块，内含最小 LZ77 匹配器（3 字节哈希链、32 KiB 环形历史、贪心匹配最长 258 字节；匹配可跨 `write` 边界），并封装为 gzip 或 zlib 容器。其输出可被任何合规解码器解压；解码器以 zlib 向量独立验证，编码器以 Python `zlib`/`gzip` 独立验证。
+编码器输出定长 Huffman deflate 块，内含最小 LZ77 匹配器（3 字节哈希链、32 KiB 环形历史、贪心匹配最长 258 字节；匹配可跨 `write` 边界，且每次 write 的全部字节在下次 write 前已写入历史环），并封装为 gzip 或 zlib 容器。哈希链位置为 32 位，流式输入超过 2 GiB 后退化为字面量（不会损坏数据）。其输出可被任何合规解码器解压；解码器以 zlib 向量独立验证，编码器以 Python `zlib`/`gzip` 独立验证。
 
 ### 21.4 HTTP/2
 
-本切片中 HTTP/2 不使用这些编码：请求携带需要解码的 `Content-Encoding` 返回 `501`；响应协商会选中 gzip/deflate 时返回 `501`（fail-closed，禁止静默降级为 identity）。`Accept-Encoding` 选中 identity（且未拒绝）时正常响应；拒绝 identity 返回 `406`。
+本切片中 HTTP/2 不压缩响应：请求携带需要解码的 `Content-Encoding` 返回 `501`。普通 h2 客户端即使提供 `gzip`/`deflate`，也返回 identity `200`（不压缩）并携带 `Vary: Accept-Encoding`；仅当拒绝 identity（`identity;q=0` 且无可用编码）时返回 `406`，且该响应携带 `Vary`。
 
 ## 22. HTTP 文件下载与 Range（已实现子集） <a id="s22"></a>
 
@@ -400,7 +400,7 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ### 22.1 路由与路径安全
 
-路由注册请求路径前缀 `path` 与文件系统 `root`。剩余部分先做百分号解码，再在 `root` 下解析。空路径、绝对路径、反斜杠、`.`/`..` 段、目录目标、缺失/不可读文件，以及规范化（解析符号链接）后不在规范化 `root` 之下的结果，均返回 `404`。仅服务 `GET` 与 `HEAD`；其他方法返回 `405` 并携带 `Allow: GET, HEAD`。
+路由注册请求路径前缀 `path` 与文件系统 `root`。剩余部分先做百分号解码，再在 `root` 下解析。空路径、绝对路径、反斜杠、`.`/`..` 段、目录目标、缺失/不可读文件，以及规范化（解析符号链接）后不在规范化 `root` 之下的结果，均返回 `404`。仅服务 `GET` 与 `HEAD`；其他方法返回 `405` 并携带 `Allow: GET, HEAD`。`HEAD` 的错误响应（404/405/416）与 `GET` 同头但绝无体，保证 keep-alive 帧同步。路由的 `content_type`（默认 `application/octet-stream`）作为 `Content-Type` 发送，且不影响路径安全规则。stat/open 之间的 TOCTOU 窗口仍是已记录限制，本切片未加固。
 
 ### 22.2 Range 语义
 
@@ -423,7 +423,7 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ### 22.3 流式与存活
 
-响应头为手写（`206` 的长度为所选区间长度），随后按 `download_chunk_bytes`（默认 64 KiB）分块读取，并以已知 `Content-Length` 的普通字节写入（非 chunked）。输出由写完成驱动，并受 `egress_cap_bytes` 限制，慢对端会对文件读取形成背压而不是增长内存。下载保留连接的 idle 截止时间（由写进展刷新），并使用独立的 `output_stall_timeout`（默认 30 秒）：暂存输出在该时间内未排空即关闭连接。该计时器与 SSE 的 stall 截止时间相互独立；与 SSE 不同，下载保留 `idle_timeout`。`HEAD` 发送相同响应头但不发送体（含 `HEAD` + `Range` → `206` 头）。keep-alive 下载完成后，连接可继续服务下一个请求。
+响应头为手写（`206` 的长度为所选区间长度），随后按 `download_chunk_bytes`（默认 64 KiB）分块读取，并以已知 `Content-Length` 的普通字节写入（非 chunked）。输出由写完成驱动，并受 `egress_cap_bytes` 限制，慢对端会对文件读取形成背压而不是增长内存。下载保留连接的 idle 截止时间，并使用独立的 `download_stall_timeout`（默认 30 秒）。stall 死线在每次进展事件（入队一个分块或一次写完成）时刷新，队列空时清零，因此持续缓慢排空的对端不会被误杀；只有整个超时内毫无进展才关闭。该计时器与 SSE 的 stall 截止时间相互独立；与 SSE 不同，下载保留 `idle_timeout`。`HEAD` 发送相同响应头但不发送体（含 `HEAD` + `Range` → `206` 头，以及 HEAD 404/405/416 错误）。keep-alive 下载完成后，连接可继续服务下一个请求。
 
 ### 22.4 HTTP/2
 

@@ -93,6 +93,9 @@ struct sse_options {
 struct download_route {
     std::string path;
     std::filesystem::path root;
+    // Sent as `Content-Type` on 200/206/416. Empty falls back to
+    // `application/octet-stream`.
+    std::string content_type = "application/octet-stream";
 };
 
 // One SSE endpoint. The request may override `topic`, `mode` and `ordered`
