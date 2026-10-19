@@ -16,6 +16,7 @@ languages; the pairs are linked at the top of each file.
 | 5 | [Build and test](building.md) | [构建与测试](building.zh-CN.md) |
 | 6 | [Engineering principles](principles.md) | [工程原则](principles.zh-CN.md) |
 | 7 | [Performance report](performance.md) | [性能报告](performance.zh-CN.md) |
+| 8 | [Release notes](CHANGELOG.md) | [发布说明](CHANGELOG.zh-CN.md) |
 
 All documents in the index are present. Their per-module status is recorded in
 the status matrix of document 3 and in the design specification's chapter 21; a

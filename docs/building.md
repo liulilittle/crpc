@@ -92,9 +92,20 @@ stated so a build without corocc is not mistaken for a broken build.
 | `CRPC_RTTI_DIR` | empty | RTTI checkout root (env fallback) |
 | `CRPC_COROCC_DIR` | empty | corocc checkout root (env fallback) |
 
-`CRPC_WITH_OPENSSL` links `OpenSSL::SSL` and `OpenSSL::Crypto`, but no TLS
-source consumes the macro yet; HTTPS is **specified, not implemented**. Enabling
-the option should not be read as enabling HTTPS.
+`CRPC_WITH_OPENSSL` links `OpenSSL::SSL` and `OpenSSL::Crypto` and defines
+`CRPC_HAVE_OPENSSL`. The TLS decorator is implemented in
+`src/io/tls_openssl.cpp` and exposed through `include/crpc/io/tls.hpp` and
+`http_server::listen_tls`; public headers never include an OpenSSL header. With
+the option off, the same entry points return `tls_errc::ssl_not_available` and
+`test_tls` prints its documented skip line.
+
+Verification status: the guarded branch was built and run under WSL with
+OpenSSL 3.0.13 (8 cases / 80 assertions green, `CRPC_WITH_OPENSSL=ON`). On
+Windows only the unguarded build has been exercised: the OpenSSL branch has not
+been linked or run there, and the source records that it was code-reviewed
+rather than compiled in that environment. Treat Windows HTTPS as unverified.
+Evidence: `.opencode/plan.md` P10, `.opencode/process.md:108-110`,
+`src/io/tls_openssl.cpp:9-11`.
 
 The library is one target, `crpc` (alias `crpc::crpc` and `crpc_core`).
 Sources are globbed recursively from `src` with `CONFIGURE_DEPENDS`, so adding a

@@ -160,8 +160,13 @@ Performance targets:
 | per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.275M RPC/s inproc measured (§2.3) |
 | p99 latency | < 100 µs | **partly met**: 22.6 µs inproc (MSVC); 170.2 µs IOCP loopback; 151.8 µs WSL inproc |
 | cross-shard handoff | 15–30 ns per batched message | budget; not measured |
-| codec, 64-byte message | < 100 ns encode and decode | budget; see `bench/bench_core.cpp` / `docs/benchmarks/` |
+| codec, 64-byte message | < 100 ns encode and decode | **not demonstrated**: `docs/benchmarks/2026-10-19-core-x64-msvc-release.txt` records `codec/binary_encode_small` 218.8 ns and `codec/binary_decode_small` 232.9 ns. The benchmark payload is a small `bench_request` (string/vector fields), not exactly 64 bytes, so the numbers are not directly comparable to the budget; they still show the target is not met. |
 | resilience pipeline | 35–65 ns per successful call | budget; not measured |
+
+The codec budget deserves a direct warning: the recorded microbenchmark above is
+a real measurement, but it is 2.2-2.3x over the `< 100 ns` target and uses a
+different payload than "64-byte message". It should not be read as a passing
+result.
 
 The only defensible statement today is: the transport layer is designed around
 bounded queues and batching, and a raw Windows loopback probe shows that

@@ -15,6 +15,7 @@
 | 5 | [构建与测试](building.zh-CN.md) | [Build and test](building.md) |
 | 6 | [工程原则](principles.zh-CN.md) | [Engineering principles](principles.md) |
 | 7 | [性能报告](performance.zh-CN.md) | [Performance report](performance.md) |
+| 8 | [发布说明](CHANGELOG.zh-CN.md) | [Release notes](CHANGELOG.md) |
 
 索引中的文档均已存在。各模块状态见第 3 份文档的状态矩阵与设计规格第 21 章；
 索引缺项或链接失效视为文档缺陷，不是疏漏。

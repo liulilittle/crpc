@@ -33,7 +33,7 @@ This document describes the layers, the transport contract, the execution model,
 
 ## 1. Scope and status <a id="s1"></a>
 
-CRPC is a C++17 framework for large server systems. Its public surface is header-first: `include/crpc/**` defines every type a consumer names, and `src/**` contains the out-of-line implementation. The project is at v0.1: the modules exist as independently tested building blocks, not as a finished network server. There is no install target and no checked-in CI configuration yet.
+CRPC is a C++17 framework for large server systems. Its public surface is header-first: `include/crpc/**` defines every type a consumer names, and `src/**` contains the out-of-line implementation. The project is at v1.0: the core modules and the CRPC/HTTP server facades are implemented and tested; several distribution and end-to-end features remain primitive-level (§18). There is no install target and no checked-in CI configuration yet.
 
 - **implemented** — code exists, compiles, and has a test suite in `tests/`.
 - **partial** — code exists and is tested, but a documented part is missing.
@@ -99,7 +99,7 @@ Rules that hold today:
 - `io` depends only on `base`; the RPC layer accepts a `backend_factory&` and never tests whether the transport is TCP or in-process.
 - `rpc/client.hpp` includes `frame.hpp`, `io.hpp`, `rpc/call.hpp` and `rpc/dispatcher.hpp`; `rpc/dispatcher.hpp` includes `frame.hpp` and `rpc/call.hpp`.
 - `mvc/router.hpp` includes `http/message.hpp`, `codec.hpp` and `mvc/binding.hpp`; `http2/connection.hpp` includes `http2/frame.hpp`, `http2/hpack.hpp` and `http/message.hpp`.
-- `cluster`, `resilience`, `observability`, `push` and `flow` are independent of `rpc` today. They are primitives, not yet stages inside a call.
+- `cluster`, `push` and `flow` are independent of `rpc` today. `resilience` is only partly integrated: `client_facade` wires load balancing, retry and a per-endpoint breaker, and `rpc::server` wires a per-service breaker and overload limits, but there is no unified pipeline. The observability interceptor chain is not wired.
 - No script enforces these directions. The design's context-dependency rule is a review rule; a build-time dependency check is **specified, not implemented**.
 
 ## 5. Base layer <a id="s5"></a>
@@ -160,24 +160,26 @@ Both network backends own their loop/pump thread. Source callbacks are serialize
 
 ## 8. Shard-per-core thread model <a id="s8"></a>
 
-The target model is one shard per physical core:
+The runtime implements the shard primitive. One `runtime` is:
 
 ```
-n_shards = clamp(physical_cores - 1, 1, 32)
-per shard:
-  1 OS thread
-  1 corocc LOOP runtime
-  1 epoll set or IOCP
-  1 MPSC inbox + 1 doorbell (eventfd / PostQueuedCompletionStatus)
-  1 timer wheel
-  64 long-lived handler coroutines with 64 KiB stacks
+1 OS thread running one corocc LOOP runtime     (CRPC_HAVE_COROCC)
+a bounded cross-shard inbox                     (inbox_capacity, default 65536)
+a bounded handler ready queue                   (ready_capacity, default 65536)
+64 long-lived handler coroutines, 64 KiB stacks (handler_workers / handler_stack_bytes)
+a monotonic timer wheel                         (arm_timer / run_timers)
+a condition-variable doorbell                   (wake / idle wait)
 ```
 
-A shard is the unit of affinity and single-threaded ownership. Its loop polls I/O, expires timers, drains the inbox, and pumps its runtime. A completion owned by another shard is posted to that shard's inbox; no thread pumps another shard's runtime. Cross-thread traffic is MPSC plus one coalesced doorbell ring.
+`runtime::start_thread()` creates the thread and `runtime::run()` drives the loop: drain the inbox, expire timers, pump the corocc runtime, then wait for the next deadline or the doorbell. `post()` and `spawn()` enqueue to the inbox; `submit()` enqueues to the handler ready queue; `arm_timer()` stores a timer keyed by monotonic nanoseconds. A completion owned by another shard is posted to that shard's inbox; no thread pumps another shard's runtime.
 
-**Status: specified, not implemented.** There is no `shard` type, coroutine handler pool or MPSC inbox in the tree. `corocc` is accepted as an optional CMake dependency and linked when `CRPC_COROCC_DIR` is set, but no CRPC translation unit calls `coro_rt_*`. The implemented execution model is: each network backend owns one loop/pump thread; `rpc::client` spawns no thread and must be called from the thread driving its backend; `call<T>::get()` blocks on a condition variable; request dispatch is synchronous on the reader thread.
+When `CRPC_HAVE_COROCC` is undefined the same API runs on the shard thread without coroutines: `post`/`submit` execute the task as a plain call and `spawn` invokes the function directly. This is the nofiber fallback, not a separate API.
 
-This is a staging point, not a different architecture. The single-writer rule, the "no I/O or user callback under a lock" rule, and credit-based backpressure are already in force, so adding a shard does not change the contracts. The timer wheel, handler pool and cross-shard wake path remain **specified, not implemented**.
+`rpc::server` builds on the primitive: `start()` creates `options.shards` runtimes (default 1) and starts each thread; listeners feed an accept sink; accepted connections are assigned round-robin to a shard; the transport source decodes frames and posts a `request_job` through `runtime::submit`; handler coroutines run `rpc::dispatcher` and enqueue responses on a per-connection send queue with at most one backend push in flight.
+
+Still specified, not implemented: the automatic `clamp(physical_cores - 1, 1, 32)` shard count (the caller sets `options.shards`), per-shard ownership of the epoll/IOCP loop (each network backend still owns its own loop/pump thread), and a lock-free inbox/doorbell (the inbox is mutex-protected and woken through a condition variable, not an eventfd or `PostQueuedCompletionStatus`).
+
+Evidence: `include/crpc/runtime.hpp:55-69`, `src/runtime/runtime.cpp:108-118,246,387-440,455-463`, `src/server/server.cpp:206-231,523-563,691-715`.
 
 ## 9. RPC core <a id="s9"></a>
 
@@ -185,9 +187,9 @@ This is a staging point, not a different architecture. The single-writer rule, t
 
 `rpc::dispatcher` is the server half. A `service_registry` maps numeric service ids to services and method ids to type-erased handlers. Registration is single-threaded before `freeze()`; after freeze, lookup reads immutable maps without a lock. `dispatch()` decodes the call envelope, rejects an expired deadline before invoking the handler, admits the method's bulkhead, catches any exception at the handler boundary, and encodes a response payload.
 
-`rpc::method_traits` derives request/response types from a member pointer; the typed trampoline decodes with `call_codec<T>` and encodes the response. `call_codec` has no primary definition for an unsupported type, so a missing specialization is a compile error rather than a silent empty payload. The design's RTTI-driven service macros are **specified, not implemented** in this layer; the RTTI codecs exist separately in `codec.hpp`.
+`rpc::method_traits` derives request/response types from a member pointer; the typed trampoline decodes with `call_codec<T>` and encodes the response. `call_codec` has no primary definition for an unsupported type, so a missing specialization is a compile error rather than a silent empty payload. The typed registration path is implemented (`service_registry::register_service`/`register_method` and `register_typed_method`), and the RTTI-driven declaration macros (`CRPC_ROUTE`, `CRPC_HTTP_*`, `CRPC_FROM_*`) live in `mvc/attributes.hpp` for the MVC/HTTP side. They are macros over an explicitly named controller and member, not a separate code-generation step. Evidence: `include/crpc/rpc/dispatcher.hpp:167-174,226-289,316-322`; `include/crpc/mvc/attributes.hpp:45-90`.
 
-There is no server connection loop in the tree. `dispatcher` is a pure function over one frame; wiring it to `io::source`, a shard and the push hub is **specified, not implemented**.
+The server connection loop is implemented in `src/server/server.cpp`. `server::start()` creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` applies the per-service concurrency cap and circuit breaker, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. Remaining primitive-level gaps are explicit: the server does not handle `PUSH`/`PUSH_ACK` frames, and it does not yet pass calls through the full six-stage resilience pipeline. Evidence: `src/server/server.cpp:206-231,496-563,680-715`; `include/crpc/server.hpp:75-90`.
 
 ## 10. Call state machine <a id="s10"></a>
 
@@ -226,7 +228,7 @@ HTTP/2 is implemented at the protocol layer: a 9-byte big-endian frame codec, HP
 
 MVC is a route table plus binding: `CRPC_ROUTE` and `CRPC_HTTP_*` register entries at static initialization; `router::freeze` compiles patterns, rejects malformed patterns and conflicts, and builds an exact-match table plus a priority-sorted parameter list. Binding fills a reflected DTO from route/query/header/form/file/body sources in a fixed order, with explicit 400 mapping. `router::handle` performs match, Accept negotiation, bind, invoke and response writing.
 
-Missing: HTTP compression wiring into the server path, SSE/long polling, and the CRPC-call-over-HTTP adapter, all **specified, not implemented**.
+Missing: wiring the existing `http/content_coding.hpp` gzip/deflate primitive into the `http_server` response path, SSE/long polling, and the CRPC-call-over-HTTP adapter, all **specified, not implemented** (`src/http/server.cpp` contains no `content_coding`, `file_transfer` or event-stream calls).
 
 `http/server.hpp` implements the server facade that ties those layers together. `http_server` binds one or more `io::backend_factory` listeners, assigns each accepted connection to a shard `runtime`, and touches all protocol state on that single thread: the transport source only copies bytes into a bounded ingress buffer and posts work, so no per-connection thread is created and a full ingress buffer pauses reading (the R1 credit) instead of dropping. Cleartext connections are sniffed -- the HTTP/2 connection preface selects h2c, anything else is HTTP/1.1. A request is dispatched through the MVC router (HEAD runs the GET handler and drops the body) and the serialized response is queued; a per-connection write queue keeps at most one backend push in flight and backpressures the reader when it grows. HTTP/1.1 handles keep-alive, pipelining, `100-continue`, chunked bodies and the 400/404/405/411/413/431/500 paths, and rejects request smuggling through the message layer. HTTP/2 reuses the frame/HPACK/connection layers unchanged: it honours connection and stream windows, parks a response that exceeds the peer window and resumes it on `WINDOW_UPDATE` (with a periodic PING probe when a peer stays at zero, R18), answers PING/SETTINGS/GOAWAY, and maps errors to RST_STREAM for a stream error and GOAWAY for a connection error. `listen_tls` wraps a listener in `io::tls_stream` and routes on the ALPN result (`h2` -> HTTP/2, `http/1.1` -> HTTP/1.1); the public header stays free of OpenSSL types and `listen_tls` returns a clear error when the library is built without `CRPC_HAVE_OPENSSL`. `stop()` stops accepting, sends GOAWAY on HTTP/2, drains in-flight requests up to `drain_timeout`, then closes; it is idempotent. Resource bounds are explicit and per server: `max_connections` (excess accepts are closed and counted, never queued), `idle_timeout` (a silent connection is closed) and `request_timeout` (an incomplete request is answered with 408), so neither a socket flood nor a slowloris client can hold memory or a connection indefinitely. The egress queue is bounded in practice by stopping the HTTP/1.1 parse loop and returning unparsed bytes to the bounded ingress buffer once the cap is crossed, and by parking HTTP/2 responses in the per-stream queue whose cap is enforced. DTO binding needs reflection: a build without RTTI serves routes whose handlers take no reflected request type, and document codecs fall back from JSON to another registered format rather than answering 406 for every request.
 
@@ -250,13 +252,13 @@ Five components are implemented independently:
   backoff and jitter, plus a shared token-bucket budget; `unknown_side_effect`
   is retryable only when idempotent.
 
-The design's fixed six-stage pipeline (`rate_limit -> bulkhead -> breaker -> load_balance -> retry -> deadline`), fallback functions, and integration into `rpc::client` are **specified, not implemented**. The primitives are tested in isolation; a call does not yet pass through them.
+The primitives are not assembled into the design's fixed six-stage pipeline (`rate_limit -> bulkhead -> breaker -> load_balance -> retry -> deadline`), and fallback functions are **specified, not implemented**. Wiring is partial, not absent: a call through `client_facade` passes through load balancing, retry with a shared budget and a per-endpoint circuit breaker; `rpc::server` applies a per-service concurrency cap, a per-service breaker and a per-connection overload response. Rate limiting, bulkhead and fallback are not on a call path. Evidence: `src/client/client_facade.cpp:73,153,335,557-569`; `src/server/server.cpp:345-392,524-546`.
 
 ## 15. Observability <a id="s15"></a>
 
 `obs::trace_context` carries a 16-byte trace id, an 8-byte span id, an 8-byte parent and W3C flags; `parse_traceparent`/`format_traceparent` implement the W3C header, and `baggage` is ordered and bounded. `obs::deadline` is relative (`after(duration)`), as required for cross-machine propagation.
 
-`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**.
+`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:333-337,428-431`), but it is not the observability chain.
 
 `obs::logger` formats into a stack buffer, copies a fixed-size record into a per-thread SPSC ring (8192 records by default), and drains it on one background thread with batched `WriteFile`/`writev`, size/time rotation, redaction and an optional compression hook. Disabled levels cost an atomic load and a compare; above `CRPC_LOG_MAX_LEVEL` the macro expands to nothing.
 
@@ -289,7 +291,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Multiplexed binary frames | `frame.hpp`, `src/frame/frame.cpp` | implemented, tested |
 | crpc-binary codec | `codec.hpp`, `src/codec/codec.cpp` | implemented, tested |
 | RTTI text/schema codecs | `codec.hpp` adapters | implemented, conditionally compiled |
-| Calls and typed stubs | `rpc/call.hpp`, `rpc/client.hpp`, `rpc/dispatcher.hpp` | partial: no coroutine or stub macros |
+| Calls and typed stubs | `rpc/call.hpp`, `rpc/client.hpp`, `rpc/dispatcher.hpp`, `client_facade.hpp` | implemented: callback/poll core plus coroutine `client_facade`; no generated stub macros |
 | Deadline and cancel | `rpc/client.cpp`, `rpc/call.cpp` | implemented, tested |
 | Idempotency key | `rpc/call.hpp` (`call_id`), call envelope | partial: key carried, no dedup table |
 | Ordered lanes | `lane_token` in `rpc/call.hpp` | specified, not implemented |
@@ -304,7 +306,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Push hub/streams | `push/*` | implemented, not wired to frames/HTTP |
 | Tracing/logging/AOP | `observability/*` | implemented, AOP not wired |
 | Flow control | `flow/estimator.hpp` | implemented primitives, not wired |
-| Shard/coroutines/MPSC | design specification §4 | specified, not implemented |
+| Shard/coroutines/MPSC inbox | `runtime.hpp`, `src/runtime/runtime.cpp` | implemented primitive; automatic shard-count policy and per-shard I/O ownership not implemented |
 
 ## 19. Status matrix <a id="s19"></a>
 
@@ -312,7 +314,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 |---|---|---|
 | base, wire, frame | implemented | `test_endian.cpp`, `test_wire.cpp`, `test_frame.cpp` |
 | inproc / epoll / IOCP | implemented | `test_io_inproc.cpp`, `test_io_epoll.cpp`, `test_io_iocp.cpp` |
-| RPC core | partial | `test_rpc_core.cpp`; no server loop, coroutine park or stream integration |
+| RPC core | implemented | `test_rpc_core.cpp`, `test_server_client.cpp`; low-level client is callback/poll based, and PUSH/stream frame integration is missing |
 | codec | implemented | `test_codec.cpp`; text formats depend on RTTI being present |
 | HTTP/1.1, multipart, files | partial | `test_http_message.cpp`, `test_http_server.cpp`; no multipart/file suite |
 | HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
@@ -322,8 +324,8 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | observability | partial | `test_observability.cpp`; AOP not wired, no metrics |
 | push | partial | `test_push.cpp`; no PUSH frame/HTTP integration |
 | flow | partial | `test_flow.cpp`; not wired to transport |
-| shard/coroutines | specified | no `shard` type or `coro_rt_*` call |
-| compression | specified | frame flags defined; no lz4/zstd/gzip implementation |
+| shard/coroutines | implemented | `test_server_client.cpp`; `src/runtime/runtime.cpp` calls `coro_rt_*`; automatic `clamp(cores-1,1,32)` shard count not implemented |
+| compression | partial | HTTP gzip/deflate streaming codec implemented and tested (`test_content_coding.cpp`) but not wired into `http_server`; frame flags carry lz4/zstd/gzip ids, with no lz4/zstd codec on the CRPC path |
 | SSE / long polling | specified | no SSE writer or HTTP push adapter |
 
 ## 20. Verification map <a id="s20"></a>

@@ -19,7 +19,8 @@ MAJOR.MINOR.PATCH
 | Change | Version bump | ABI impact |
 |---|---|---|
 | Remove or rename a public symbol, change a function signature, change a struct layout, change an enum value that crosses the wire | MAJOR | Breaking |
-| Add a new public symbol, add a new enum value at the end, add an optional field at the end of an options struct that is passed by pointer plus a size | MINOR | Compatible |
+| Add a new public symbol, add a new enum value at the end | MINOR | Compatible |
+| Change the layout of any public struct, including adding a field | MAJOR | Breaking (no size-tagged options struct exists yet, §4) |
 | Bug fix with no interface change | PATCH | Compatible |
 
 The wire protocol has its own version (`protocol_version`, currently `1`). It is
@@ -68,28 +69,39 @@ as opaque.
 
 ## 4. Struct layout
 
-Every public struct that crosses the ABI boundary is:
+The rule for a public struct that crosses the ABI boundary is:
 
 1. standard-layout and trivially copyable, or explicitly documented as opaque
    with only pointer/reference access,
-2. covered by `static_assert` on `sizeof` and `alignof` in the header,
-3. free of virtual functions (virtual dispatch is confined to the two transport
+2. free of virtual functions (virtual dispatch is confined to the transport
    interfaces, whose objects are never passed across a library boundary by
    value),
-4. free of conditional members (no `#if` inside a public struct).
+3. free of conditional members (no `#if` inside a public struct).
 
-Options structs follow the size-tag pattern:
+The headers do **not** currently enforce item 1 with layout assertions. None of
+the public record and option structs (for example `frame_header`,
+`io::connect_options`, `rpc::client_options`, `server::options`) has a
+`static_assert(sizeof(...))` or `static_assert(alignof(...))`. The assertions
+that do exist cover other contracts:
 
-```cpp
-struct connect_options {
-    std::uint32_t struct_size;   // = sizeof(connect_options)
-    // ... fields ...
-};
-```
+- `config.hpp:96-102` fixes the integer widths and the IEEE-754 formats;
+- `observability/log.hpp:327` bounds `log_record` to 512 bytes;
+- `rpc/call.hpp:559-566` bounds the inline callback storage.
 
-A newer library reads `struct_size` and only touches fields the caller
-guarantees to be present. This is how a MINOR release adds a field without
-breaking older callers.
+Several public types (`rpc_error`, `buffer`, `endpoint`) contain owning
+standard-library members and are therefore not trivially copyable. They are
+passed by reference, returned as owning CRPC types, or documented as opaque;
+they do not cross the C ABI by value. Adding per-struct `sizeof`/`alignof`
+assertions is planned, not implemented. Until it exists, a change to any public
+struct layout is a MAJOR change (§7), not a MINOR extension.
+
+There is no size-tag pattern today. No public header declares a `struct_size`
+member; `io::connect_options` contains only the timeout, buffer and no-delay
+fields (`include/crpc/io.hpp:186-191`). The `struct_size` assignment at
+`src/runtime/runtime.cpp:101` is on a local `coro_rt_driver_ops` from the corocc
+dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
+planned, not implemented; while it is absent, callers and the library must be
+built from the same headers.
 
 ## 5. Enum values
 
@@ -140,20 +152,21 @@ A binary built against version X must link and run against version Y when:
 Compiler and standard library: CRPC does not promise ABI compatibility across
 different standard libraries (MSVC STL vs libstdc++ vs libc++) or across
 different `_ITERATOR_DEBUG_LEVEL` / `_GLIBCXX_DEBUG` settings. A shared library
-must be built with the same toolchain family and debug setting as its consumer;
-this is stated in the build documentation and checked by a CMake configure-time
-warning when a mismatch is detectable.
+must be built with the same toolchain family and debug setting as its consumer.
+This is stated in the build documentation only: there is no CMake
+configure-time check for such a mismatch, and adding one is not implemented.
 
 ## 8. Change process
 
 1. A change that breaks §2–§5 requires a MAJOR version bump.
-2. The same commit updates this document, the migration guide
-   (`docs/migration.md`), and adds a compatibility shim when feasible.
+2. The same commit updates this document and the changelog
+   ([CHANGELOG.md](CHANGELOG.md)). A migration guide (`docs/migration.md`) does
+   not exist; a compatibility shim is added when feasible.
 3. The changelog states explicitly: "ABI breaking: <symbol> changed from … to …".
-4. CI runs the ABI check job (`scripts/abi_check.ps1` / `.sh`), which compares
-   the exported symbol list and the layout assertions of the current build
-   against the previous release. A mismatch fails the build unless the commit
-   carries the MAJOR bump marker.
+4. No ABI checker is implemented: `scripts/abi_check.ps1` and
+   `scripts/abi_check.sh` do not exist, and CI does not compare exported symbols
+   or layout assertions. Until such a job exists, the comparison is a manual
+   review of the diff against the previous release.
 
 ## 9. What is not guaranteed
 
