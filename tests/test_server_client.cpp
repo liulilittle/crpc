@@ -785,6 +785,11 @@ CRPC_TEST(facade_destroy_client_with_armed_timer_no_crash) {
 
     // Destroy the client while the deadline timer could still be armed on the
     // shard. Without the fix the timer fires against the freed client.
+    //
+    // NOTE: `try_get` above already finalized the attempt and cancelled the
+    // timer, so this test alone would still pass if `finalize_active` were
+    // removed entirely. The uncovered cases are the two tests below, which
+    // never consume the call and let the handle outlive the client.
     f.cli.reset();
     std::this_thread::sleep_for(500ms);
     CRPC_CHECK(f.srv->running());
@@ -827,6 +832,261 @@ CRPC_TEST(facade_handle_destroy_races_completion) {
     CRPC_CHECK_EQ(0, failed);
     // Give any in-flight callbacks time to finish before the client dies.
     std::this_thread::sleep_for(100ms);
+}
+
+// --- NEW-1 / R1 / R2: a handle that outlives its client; a start racing a
+// concurrent close; and a blocked get() woken by close(). All three share a
+// fake backend whose writes never complete, so the attempt stays in flight
+// without a server and without touching the real in-process backend. ---
+
+namespace {
+
+struct stalled_source final : crpc::io::source {
+    std::size_t on_data(crpc::span<const std::byte>) noexcept override { return 0; }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+};
+
+struct stalled_sink final : crpc::io::sink {
+    // Accept and never complete: the low-level call stays "sent", keeping the
+    // deadline timer armed until it fires or is cancelled.
+    void push(crpc::span<const std::byte>, crpc::io::completion*) noexcept override {}
+};
+
+struct stalled_connection final : crpc::connection {
+    stalled_source source_;
+    stalled_sink sink_;
+    std::atomic<bool> open{true};
+
+    crpc::io::source& source() noexcept override { return source_; }
+    crpc::io::sink& sink() noexcept override { return sink_; }
+    void bind_source(crpc::io::source*) noexcept override {}
+    void resume_read() noexcept override {}
+    void close() noexcept override { open.store(false, std::memory_order_release); }
+    [[nodiscard]] bool is_open() const noexcept override {
+        return open.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] crpc::endpoint remote() const override {
+        return crpc::endpoint::inproc("stalled");
+    }
+};
+
+struct stalled_backend final : crpc::backend_factory {
+    std::unique_ptr<crpc::connection> connect(const crpc::endpoint&,
+                                              const crpc::connect_options&) override {
+        return std::make_unique<stalled_connection>();
+    }
+    std::unique_ptr<crpc::listener> listen(const crpc::endpoint&,
+                                           const crpc::listen_options&) override {
+        return nullptr;
+    }
+};
+
+struct racing_start_job {
+    crpc::client* cli = nullptr;
+    std::vector<std::unique_ptr<crpc::client::call<int>>>* out = nullptr;
+    std::atomic<bool> go{false};
+    std::atomic<bool> done{false};
+    bool started_ok = false;
+};
+
+void racing_start_entry(void* ctx) {
+    auto* job = static_cast<racing_start_job*>(ctx);
+    auto stub = job->cli->service<int, int>(1, 1);
+    job->go.store(true, std::memory_order_release);
+    auto started = stub.call(1);
+    if (started.ok()) {
+        job->out->emplace_back(
+            std::make_unique<crpc::client::call<int>>(std::move(started).value()));
+        job->started_ok = true;
+    }
+    job->done.store(true, std::memory_order_release);
+}
+
+} // namespace
+
+CRPC_TEST(facade_destroy_client_handle_outlives_timer) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    cb.pool_size(1);
+    // Long enough that the attempt is genuinely in flight even under a slow
+    // sanitizer; the defect is independent of the exact deadline.
+    cb.default_deadline(200ms);
+    cb.on_shard(shard);
+
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    // The handle is moved to the test scope so it outlives the client. The
+    // call is never consumed: the attempt is still active when the client dies.
+    std::unique_ptr<crpc::client::call<int>> held;
+    int code = -1;
+    const bool ran = run_on_shard(shard, [&] {
+        auto stub = cli->service<int, int>(1, 1);
+        auto started = stub.call(1);
+        if (!started.ok()) {
+            code = static_cast<int>(started.code());
+            return;
+        }
+        held = std::make_unique<crpc::client::call<int>>(std::move(started).value());
+    });
+    CRPC_CHECK(ran);
+    CRPC_CHECK(held != nullptr);
+    if (held == nullptr) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    // Destroy the client while the deadline timer is armed. Without the
+    // finalize_active fix the freed connection pool dangles under `held`.
+    cli.reset();
+    // Run the shard past the deadline: a surviving timer would call
+    // deadline_thunk() on the freed client.
+    std::this_thread::sleep_for(300ms);
+    CRPC_CHECK(shard.running());
+
+    // Now destroy the handle whose low-level call slot is still backed by the
+    // retained connection (NEW-1). This must not touch a freed pool.
+    held.reset();
+
+    shard.stop();
+    shard.join();
+}
+
+CRPC_TEST(facade_racing_start_and_close_leaves_no_timer) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    // A wide least-inflight scan makes the admission window (closed-check ->
+    // registration) large enough that the concurrent close below regularly
+    // lands inside it; under ASan this reproduced the freed-client timer.
+    for (int e = 0; e < 2048; ++e) {
+        cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    }
+    cb.load_balancer(crpc::resilience::lb_strategy::least_inflight);
+    cb.pool_size(1);
+    cb.default_deadline(20ms);
+    cb.on_shard(shard);
+
+    constexpr int kIterations = 400;
+    std::vector<std::unique_ptr<crpc::client::call<int>>> held;
+    held.reserve(kIterations);
+    int started = 0;
+    int refused = 0;
+    for (int i = 0; i < kIterations; ++i) {
+        auto cli = cb.build();
+        if (!cli) {
+            break;
+        }
+        racing_start_job job;
+        job.cli = cli.get();
+        job.out = &held;
+        if (!shard.spawn(&racing_start_entry, &job)) {
+            break;
+        }
+        while (!job.go.load(std::memory_order_acquire)) {
+            // Busy-spin: a yield() deschedules the closer for a full quantum,
+            // past the window.
+        }
+        // Race the close against the attempt's registration + timer arm.
+        cli->close();
+        const bool done = crpc_test::wait_for(
+            [&job] { return job.done.load(std::memory_order_acquire); }, 2000);
+        CRPC_CHECK(done);
+        if (!done) {
+            break;
+        }
+        if (job.started_ok) {
+            ++started;
+        } else {
+            ++refused;
+        }
+        cli.reset();
+    }
+    // Any timer armed after close() on a now-freed client fires in this window.
+    std::this_thread::sleep_for(100ms);
+    held.clear();
+    shard.stop();
+    shard.join();
+    CRPC_CHECK_EQ(kIterations, started + refused);
+}
+
+CRPC_TEST(facade_close_wakes_blocked_get) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(10s);
+    cb.plain_thread_timeout(5s);
+    cb.on_shard(shard);
+
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    std::atomic<bool> in_get{false};
+    int code = -1;
+    std::thread closer([&] {
+        (void)crpc_test::wait_for([&] { return in_get.load(std::memory_order_acquire); },
+                                  2000);
+        // Give the coroutine time to park inside get().
+        std::this_thread::sleep_for(20ms);
+        cli->close();
+    });
+
+    const auto begin = clock_type::now();
+    const bool ran = run_on_shard(
+        shard,
+        [&] {
+            auto stub = cli->service<int, int>(1, 1);
+            auto started = stub.call(1);
+            if (!started.ok()) {
+                code = static_cast<int>(started.code());
+                return;
+            }
+            auto handle = std::move(started).value();
+            in_get.store(true, std::memory_order_release);
+            auto result = handle.get();
+            code = result.ok() ? 0 : static_cast<int>(result.code());
+        },
+        2000);
+    closer.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             clock_type::now() - begin)
+                             .count();
+    // R2: close() must finalize with `shutting_down` and notify, not let the
+    // blocking wait time out.
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::shutting_down), code);
+    CRPC_CHECK(elapsed < 1000);
+
+    shard.stop();
+    shard.join();
 }
 
 // --- A-3: a client without a shard must still enforce the call deadline. ---

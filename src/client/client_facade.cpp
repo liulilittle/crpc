@@ -126,8 +126,18 @@ client::~client() {
 }
 
 void client::close() noexcept {
-    if (closed_.exchange(true, std::memory_order_acq_rel)) {
-        return;
+    // Setting `closed_` and snapshotting the live cores happen in one critical
+    // section. `register_core_if_open()` takes the same mutex, so a concurrent
+    // attempt is either inserted before this snapshot (and is finalized below)
+    // or observes `closed_` and never arms a timer (R1).
+    std::vector<client_detail::call_core*> active;
+    {
+        std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+        if (closed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        active.assign(impl_->active_calls.begin(), impl_->active_calls.end());
+        impl_->active_calls.clear();
     }
     for (std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
         std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
@@ -146,12 +156,20 @@ void client::close() noexcept {
     // Cancel the deadline timer and release the slot for every attempt that is
     // still active; detach its owner so a handle that outlives the client can
     // never call back into it.
-    finalize_active();
+    finalize_active(active);
 }
 
-void client::register_core(client_detail::call_core& core) noexcept {
+bool client::register_core_if_open(client_detail::call_core& core) noexcept {
+    // The closed decision and the insertion are one atomic step under
+    // `calls_mutex` (R1). close() sets `closed_` and snapshots `active_calls`
+    // under the same mutex, so an attempt is either visible to finalize_active
+    // (and has its timer cancelled) or rejected here before it can arm one.
     std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+    if (closed_.load(std::memory_order_acquire)) {
+        return false;
+    }
     impl_->active_calls.insert(&core);
+    return true;
 }
 
 void client::unregister_core(client_detail::call_core& core) noexcept {
@@ -159,13 +177,7 @@ void client::unregister_core(client_detail::call_core& core) noexcept {
     impl_->active_calls.erase(&core);
 }
 
-void client::finalize_active() noexcept {
-    std::vector<client_detail::call_core*> active;
-    {
-        std::lock_guard<std::mutex> lk(impl_->calls_mutex);
-        active.assign(impl_->active_calls.begin(), impl_->active_calls.end());
-        impl_->active_calls.clear();
-    }
+void client::finalize_active(std::vector<client_detail::call_core*>& active) noexcept {
     for (client_detail::call_core* core : active) {
         // A concurrent finish_attempt/abandon_attempt must win exactly once;
         // only the winner releases the timer and slot.
@@ -177,8 +189,28 @@ void client::finalize_active() noexcept {
         }
         core->permit = resilience::breaker_permit{};
         if (core->slot) {
+            // Release the in-flight accounting exactly once, but keep the
+            // `shared_ptr` in `core->slot` (NEW-1). The owning handle still
+            // holds `st->inner`, a low-level rpc::call with a raw call_slot*
+            // into the connection's pool; dropping the last connection_slot
+            // here would free that pool while the handle can still outlive the
+            // client. `release()` resets `inner` before the core is destroyed,
+            // and because `inner` is declared after `core` it also runs before
+            // the retained `shared_ptr` is released.
             release_slot(core->slot, rpc_code::shutting_down);
-            core->slot.reset();
+        }
+        // R2: wake a blocked get() promptly with `shutting_down` instead of
+        // letting it sit until the plain-thread timeout or a cancelled timer.
+        core->error = rpc_error(rpc_code::shutting_down, "client is closed");
+        core->terminal.store(rpc_code::shutting_down, std::memory_order_release);
+        core->done.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(core->mutex);
+        }
+        core->cv.notify_all();
+        client* const who = core->owner.load(std::memory_order_acquire);
+        if (who != nullptr) {
+            who->notify_waiter();
         }
         core->owner.store(nullptr, std::memory_order_release);
     }
@@ -207,10 +239,6 @@ client::statistics client::stats() const noexcept {
 // --- admission and pools -----------------------------------------------------
 
 bool client::begin_attempt(client_detail::call_core& core, rpc_error& failure) {
-    if (closed_.load(std::memory_order_acquire)) {
-        failure = rpc_error(rpc_code::shutting_down, "client is closed");
-        return false;
-    }
     const auto now = steady_now();
     if (core.has_deadline && now >= core.deadline) {
         failure = rpc_error(rpc_code::deadline_exceeded, "deadline already passed");
@@ -240,19 +268,32 @@ bool client::begin_attempt(client_detail::call_core& core, rpc_error& failure) {
     }
     core.permit = std::move(permit);
     core.pool = &pool;
+    // The closed decision and the tracking insertion are one atomic step
+    // (R1). If close()/``~client`` already set `closed_` (or will do so before
+    // this returns), either the insert wins and the snapshot in close() sees
+    // the core, or this returns false and no timer is ever armed.
+    if (!register_core_if_open(core)) {
+        core.permit = resilience::breaker_permit{};
+        core.pool = nullptr;
+        failure = rpc_error(rpc_code::shutting_down, "client is closed");
+        return false;
+    }
     core.attempts += 1;
     calls_started_.fetch_add(1, std::memory_order_relaxed);
-    // Track the attempt before arming the timer so close()/~client can always
-    // see and cancel it.
-    register_core(core);
     if (options_.shard != nullptr && core.has_deadline) {
         const std::uint64_t deadline_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 core.deadline.time_since_epoch())
                 .count());
         (void)options_.shard->arm_timer(&core, deadline_ns, &client::deadline_thunk, this);
+        // Ordering: close() sets `finalized` (via finalize_active) and cancels
+        // the timer under `calls_mutex`; register_core_if_open() inserts under
+        // the same mutex. So the attempt is in exactly one of two states here:
+        // either close() snapshotted the core and its finalize_active either
+        // cancelled this timer or will run next, or it set `finalized` before
+        // this arm, in which case the exchange below cancels the timer. There
+        // is no interleaving that leaves a timer pointing at a freed client.
         if (core.finalized.load(std::memory_order_acquire)) {
-            // close()/~client won the race while the timer was being armed.
             (void)options_.shard->cancel_timer(&core);
         }
     }

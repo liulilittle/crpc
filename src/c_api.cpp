@@ -54,6 +54,11 @@ thread_local std::string g_last_error;
 
 void set_error(std::string message) { g_last_error = std::move(message); }
 
+// Every status-returning entry point clears the thread-local error first, so a
+// successful call always leaves `crpc_last_error_message()` empty (R4a). Fail
+// paths re-populate it through `fail()`/`set_error()`.
+void clear_error() { g_last_error.clear(); }
+
 crpc_status fail(crpc_status status, std::string message) {
     set_error(std::move(message));
     return status;
@@ -223,6 +228,13 @@ struct crpc_server {
     std::set<std::pair<std::uint64_t, std::uint64_t>> registered;
     std::set<std::uint64_t> services;
     bool listening = false;
+    // `facade` is built before `start()` is attempted, so its presence alone
+    // must not mean "running". Track the real outcome and replay a stored
+    // failure on a retry (R4b).
+    bool started = false;
+    bool start_attempted = false;
+    crpc_status start_status = CRPC_STATUS_OK;
+    std::string start_message;
 };
 
 extern "C" {
@@ -232,6 +244,7 @@ const char* crpc_version_string(void) { return "0.1.0"; }
 const char* crpc_last_error_message(void) { return g_last_error.c_str(); }
 
 crpc_client* crpc_client_create(const char* endpoint, size_t endpoint_len) {
+    clear_error();
     try {
         bool inproc = false;
         std::string host;
@@ -282,6 +295,7 @@ crpc_client* crpc_client_create(const char* endpoint, size_t endpoint_len) {
 }
 
 crpc_status crpc_client_set_deadline_ms(crpc_client* client, uint32_t deadline_ms) {
+    clear_error();
     if (client == nullptr || !client->facade) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid client");
     }
@@ -290,6 +304,7 @@ crpc_status crpc_client_set_deadline_ms(crpc_client* client, uint32_t deadline_m
 }
 
 crpc_status crpc_client_set_max_in_flight(crpc_client* client, uint32_t max_in_flight) {
+    clear_error();
     if (client == nullptr || !client->facade) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid client");
     }
@@ -301,6 +316,7 @@ crpc_status crpc_client_call(crpc_client* client, uint64_t service_id, uint64_t 
                              crpc_bytes request, crpc_mutable_bytes* response,
                              uint32_t deadline_ms, uint64_t* call_id) {
     (void)response; // filled by crpc_client_wait, per the header contract
+    clear_error();
     if (client == nullptr || !client->facade) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid client");
     }
@@ -346,6 +362,7 @@ crpc_status crpc_client_call(crpc_client* client, uint64_t service_id, uint64_t 
 
 crpc_status crpc_client_wait(crpc_client* client, uint64_t call_id,
                              crpc_mutable_bytes* response) {
+    clear_error();
     if (client == nullptr || !client->facade) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid client");
     }
@@ -396,6 +413,7 @@ crpc_status crpc_client_wait(crpc_client* client, uint64_t call_id,
 }
 
 crpc_status crpc_client_cancel(crpc_client* client, uint64_t call_id) {
+    clear_error();
     if (client == nullptr || !client->facade) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid client");
     }
@@ -430,6 +448,7 @@ void crpc_client_destroy(crpc_client* client) {
 }
 
 crpc_server* crpc_server_create(void) {
+    clear_error();
     try {
         std::unique_ptr<crpc_server> handle(new (std::nothrow) crpc_server());
         if (!handle) {
@@ -446,6 +465,7 @@ crpc_server* crpc_server_create(void) {
 
 crpc_status crpc_server_listen_tcp(crpc_server* server, const char* host, size_t host_len,
                                    uint16_t port) {
+    clear_error();
     if (server == nullptr || !server->builder) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid server");
     }
@@ -474,6 +494,7 @@ crpc_status crpc_server_listen_tcp(crpc_server* server, const char* host, size_t
 
 crpc_status crpc_server_register(crpc_server* server, uint64_t service_id,
                                  uint64_t method_id, crpc_handler_fn fn, void* user) {
+    clear_error();
     if (server == nullptr || !server->builder) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid server");
     }
@@ -507,11 +528,17 @@ crpc_status crpc_server_register(crpc_server* server, uint64_t service_id,
 }
 
 crpc_status crpc_server_start(crpc_server* server) {
+    clear_error();
     if (server == nullptr || !server->builder) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "invalid server");
     }
-    if (server->facade) {
+    if (server->started) {
         return CRPC_STATUS_OK; // idempotent
+    }
+    if (server->start_attempted && server->start_status != CRPC_STATUS_OK) {
+        // A previous start failed after the facade was built. Report the same
+        // failure instead of the facade's presence masking it as OK (R4b).
+        return fail(server->start_status, server->start_message);
     }
     if (!server->listening) {
         return fail(CRPC_STATUS_INVALID_ARGUMENT, "no listener configured");
@@ -522,19 +549,30 @@ crpc_status crpc_server_start(crpc_server* server) {
         server->builder->drain_timeout(std::chrono::milliseconds(0));
         server->facade = server->builder->build();
         if (!server->facade) {
-            return fail(CRPC_STATUS_INTERNAL, "could not build the server");
+            server->start_attempted = true;
+            server->start_status = CRPC_STATUS_INTERNAL;
+            server->start_message = "could not build the server";
+            return fail(server->start_status, server->start_message);
         }
         const crpc::status started = server->facade->start();
         if (!started.ok()) {
-            return fail(from_rpc(started.code()), started.message());
+            server->start_attempted = true;
+            server->start_status = from_rpc(started.code());
+            server->start_message = started.message();
+            return fail(server->start_status, server->start_message);
         }
+        server->started = true;
         return CRPC_STATUS_OK;
     } catch (...) {
-        return fail(CRPC_STATUS_INTERNAL, "internal error");
+        server->start_attempted = true;
+        server->start_status = CRPC_STATUS_INTERNAL;
+        server->start_message = "internal error";
+        return fail(server->start_status, server->start_message);
     }
 }
 
 crpc_status crpc_server_stop(crpc_server* server, uint32_t drain_ms) {
+    clear_error();
     if (server == nullptr) {
         return CRPC_STATUS_OK;
     }

@@ -94,6 +94,33 @@ int main(void) {
         return 5;
     }
 
+    /* R4a: every successful call must leave the thread-local error empty. */
+    if (crpc_client_wait(NULL, 0, NULL) != CRPC_STATUS_INVALID_ARGUMENT) {
+        fprintf(stderr, "expected invalid_argument for a null client\n");
+        crpc_client_destroy(client);
+        crpc_server_destroy(server);
+        return 13;
+    }
+    if (crpc_last_error_message()[0] == '\0') {
+        fprintf(stderr, "expected an error message after a failure\n");
+        crpc_client_destroy(client);
+        crpc_server_destroy(server);
+        return 13;
+    }
+    if (crpc_client_set_deadline_ms(client, 2000) != CRPC_STATUS_OK) {
+        fprintf(stderr, "could not reconfigure client\n");
+        crpc_client_destroy(client);
+        crpc_server_destroy(server);
+        return 13;
+    }
+    if (crpc_last_error_message()[0] != '\0') {
+        fprintf(stderr, "stale error after a successful call: %s\n",
+                crpc_last_error_message());
+        crpc_client_destroy(client);
+        crpc_server_destroy(server);
+        return 13;
+    }
+
     const uint8_t payload[] = {1, 2, 3, 4, 5};
     uint8_t buffer[32];
     memset(buffer, 0, sizeof(buffer));
@@ -156,6 +183,12 @@ int main(void) {
         return 11;
     }
     crpc_client_release_call(client, call_id);
+    if (crpc_last_error_message()[0] != '\0') {
+        fprintf(stderr, "stale error after a successful wait\n");
+        crpc_client_destroy(client);
+        crpc_server_destroy(server);
+        return 14;
+    }
 
     crpc_client_destroy(client);
     if (crpc_server_stop(server, 1000) != CRPC_STATUS_OK) {
@@ -164,6 +197,37 @@ int main(void) {
         return 12;
     }
     crpc_server_destroy(server);
+
+    /* R4b: a start that failed must not report OK on a retry. Bind to an
+     * address that cannot be local, so `start` fails deterministically. */
+    {
+        crpc_server* broken = crpc_server_create();
+        if (broken == NULL) {
+            fprintf(stderr, "could not create the broken server\n");
+            return 15;
+        }
+        if (crpc_server_listen_tcp(broken, "192.0.2.1", 9, 45678) != CRPC_STATUS_OK ||
+            crpc_server_register(broken, 100, 1, &echo_handler, NULL) !=
+                CRPC_STATUS_OK) {
+            fprintf(stderr, "could not configure the broken server\n");
+            crpc_server_destroy(broken);
+            return 15;
+        }
+        const crpc_status first = crpc_server_start(broken);
+        if (first == CRPC_STATUS_OK) {
+            fprintf(stderr, "unexpected successful bind to 192.0.2.1\n");
+            crpc_server_destroy(broken);
+            return 16;
+        }
+        const crpc_status second = crpc_server_start(broken);
+        if (second != first || crpc_last_error_message()[0] == '\0') {
+            fprintf(stderr, "retry after a failed start returned %d instead of %d\n",
+                    (int)second, (int)first);
+            crpc_server_destroy(broken);
+            return 16;
+        }
+        crpc_server_destroy(broken);
+    }
 
     /* NULL handles are documented no-ops. */
     crpc_client_destroy(NULL);

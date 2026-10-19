@@ -254,10 +254,29 @@ public:
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
             }
             std::shared_ptr<client_detail::call_state<Resp>> st = state_;
-            client* const owner = st->core.owner.load(std::memory_order_acquire);
             for (;;) {
+                // Re-read the owner every turn: close()/``~client`` detaches it
+                // in finalize_active(), so a cached pointer would be stale (R1
+                // follow-up). A detached attempt reports `shutting_down`
+                // delivered by close() rather than touching the freed client.
+                client* const owner = st->core.owner.load(std::memory_order_acquire);
+                if (owner == nullptr) {
+                    return rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::shutting_down, "client is closed"));
+                }
                 if (st->inner != nullptr) {
                     const status waited = owner->wait_ready(st->core);
+                    client* const current =
+                        st->core.owner.load(std::memory_order_acquire);
+                    if (current == nullptr) {
+                        // close() finalized and detached the attempt while we
+                        // waited; `inner` is reset here (before the retained
+                        // connection slot is dropped) so the low-level handle
+                        // never outlives its call-slot pool.
+                        release();
+                        return rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::shutting_down, "client is closed"));
+                    }
                     if (!waited.ok()) {
                         rpc_error failure(rpc_code::deadline_exceeded,
                                           "call did not complete in time");
@@ -274,15 +293,15 @@ public:
                     const bool decoded = st->inner->try_get(result);
                     const rpc_code code = st->inner->code();
                     st->inner.reset();
-                    owner->finish_attempt(st->core, code);
+                    current->finish_attempt(st->core, code);
                     if (decoded && code == rpc_code::ok) {
                         return result;
                     }
                     std::chrono::nanoseconds delay{0};
-                    if (!owner->should_retry(st->core, code, delay)) {
+                    if (!current->should_retry(st->core, code, delay)) {
                         return result;
                     }
-                    owner->sleep_for(st->core, delay);
+                    current->sleep_for(st->core, delay);
                     st->core.reset_for_attempt();
                     continue;
                 }
@@ -445,9 +464,10 @@ private:
     // Idempotent counterpart to finish_attempt for paths that end an attempt
     // without a result (handle destruction, try_get, cancel, close).
     void abandon_attempt(client_detail::call_core& core) noexcept;
-    void register_core(client_detail::call_core& core) noexcept;
+    // Atomic ("closed" check, insert) pair under `impl_->calls_mutex` (R1).
+    [[nodiscard]] bool register_core_if_open(client_detail::call_core& core) noexcept;
     void unregister_core(client_detail::call_core& core) noexcept;
-    void finalize_active() noexcept;
+    void finalize_active(std::vector<client_detail::call_core*>& active) noexcept;
     [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
                                     std::chrono::nanoseconds& delay) noexcept;
     [[nodiscard]] status wait_ready(client_detail::call_core& core) const;
@@ -481,6 +501,15 @@ status client::issue(client_detail::call_state<Resp>& st, rpc_error& failure) {
     std::shared_ptr<client_detail::connection_slot> slot = acquire_slot(core, failure);
     if (!slot) {
         finish_attempt(core, failure.code);
+        return status{failure};
+    }
+    // close() may have finalized the attempt between the registration and this
+    // point. finalize_active() then saw a null `core.slot` and could not
+    // release it, so release the freshly acquired slot here and do not start a
+    // call against a closed client.
+    if (core.finalized.load(std::memory_order_acquire)) {
+        release_slot(slot, rpc_code::shutting_down);
+        failure = rpc_error(rpc_code::shutting_down, "client is closed");
         return status{failure};
     }
     core.slot = slot;
