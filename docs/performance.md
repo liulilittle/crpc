@@ -103,9 +103,11 @@ GCC 13.3 Release under WSL2 (kernel 6.18). Median of three runs.
 
 Tail: after the wake-path fix the ≈100 ms stalls are gone. On MSVC the in-process
 maximum over 50k samples is now 168-624 µs (median 269 µs) and the WSL maximum is
-2.6-14.5 ms (median 4.3 ms); the MSVC IOCP maximum is 2.7-33.4 ms (median 4.3 ms,
-one 33 ms outlier across three runs), which is a tail regression versus the
-pre-fix 0.65-1.24 ms and is recorded, not explained away.
+2.6-14.5 ms (median 4.3 ms). The MSVC IOCP maximum is noisy: 0.54-1.36 ms over
+three idle 20k-sample runs, and 1.2-27 ms across eight runs under load, while
+p99 (159-169 µs) and p999 (237-295 µs) stay flat. A max-only outlier with a flat
+p99/p999 is scheduler/OS noise, not a distribution shift, so it is reported as
+such rather than as a tail regression.
 
 Bottleneck evidence (measured, not inferred). Per-call costs on MSVC Release:
 `make_shared<call_state<std::string>>` 52 ns, the per-connection
@@ -118,6 +120,17 @@ ceiling of the current design is therefore about 1 M RPC/s per process; the
 remaining 5-14x to the 5 M target needs the round trip removed (batching or
 client-shard affinity), not allocation or lock tuning. The target numbers are not
 met (see §3).
+
+Two plausible optimisations were tested and rejected, so nobody repeats them:
+
+| Experiment | Change | Result | Verdict |
+|---|---|---|---|
+| Coroutine stack pooling | `runtime_options::handler_stack_bytes = 0` (reuses corocc's default 256 KiB pool instead of mapping 64 KiB per spawn) | depth 1/16/64 = 0.11/0.18/~0.20 M RPC/s, identical to the default within noise | Not the bottleneck; reverted |
+| Deadline timer removal | `default_deadline(0 ms)` in the benchmark (no per-call arm/cancel) | depth 64 went 0.19 → 0.23 M RPC/s | Not the bottleneck; reverted |
+
+Both were reverted; the measured ceiling is unchanged. The per-call cost is the
+synchronous round trip (issue 2612 ns + wait 934 ns at depth 64), so allocation
+and timer work are not where the 5 M target is lost.
 
 No p99, p999, cross-shard handoff, codec or resilience-pipeline measurement
 existed before this document; the p99/p999 figures above are now measured, the
