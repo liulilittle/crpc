@@ -278,6 +278,7 @@ private:
     void queue_write_complete(bool ok) noexcept;
 
     static void process_trampoline(void* ctx) noexcept;
+    static void drop_trampoline(void* ctx) noexcept;
     static void probe_trampoline(void* ctx) noexcept;
     static void arm_trampoline(void* ctx) noexcept;
 
@@ -543,7 +544,9 @@ void session::start() {
     std::shared_ptr<session> self = weak_from_this().lock();
     if (self) {
         auto* holder = new (std::nothrow) std::shared_ptr<session>(std::move(self));
-        if (holder != nullptr && !shard_->post(&session::arm_trampoline, holder)) {
+        if (holder != nullptr &&
+            !shard_->post(&session::arm_trampoline, holder,
+                          &session::drop_trampoline)) {
             delete holder;
         }
     }
@@ -631,7 +634,11 @@ void session::schedule() noexcept {
     if (holder == nullptr) {
         return;
     }
-    if (!shard_->post(&session::process_trampoline, holder)) {
+    // If the shard stops before running the task, the runtime calls the drop
+    // hook instead: without it the holder (and the session it keeps alive)
+    // leaked whenever a wakeup was queued during shutdown.
+    if (!shard_->post(&session::process_trampoline, holder,
+                      &session::drop_trampoline)) {
         delete holder;
     }
 }
@@ -640,6 +647,12 @@ void session::process_trampoline(void* ctx) noexcept {
     std::unique_ptr<std::shared_ptr<session>> holder(
         static_cast<std::shared_ptr<session>*>(ctx));
     (*holder)->process();
+}
+
+void session::drop_trampoline(void* ctx) noexcept {
+    // The task will never run: release the holder (and the session reference it
+    // owns) without touching the session itself.
+    delete static_cast<std::shared_ptr<session>*>(ctx);
 }
 
 void session::probe_trampoline(void* ctx) noexcept {

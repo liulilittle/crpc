@@ -73,6 +73,11 @@ struct client::impl {
     std::unordered_map<client_detail::call_core*,
                        std::shared_ptr<client_detail::call_state_base>>
         active_calls;
+
+    // Shared with every call this client issues; expires when the client is
+    // destroyed so a handle that outlives it never calls into freed memory.
+    std::shared_ptr<client_detail::client_liveness> liveness =
+        std::make_shared<client_detail::client_liveness>();
 };
 
 // --- call_core ---------------------------------------------------------------
@@ -126,6 +131,9 @@ client::client(options opt, std::vector<endpoint_config> endpoints)
 
 client::~client() {
     close();
+    // Every handle still alive must observe a dead owner rather than call into
+    // this destroyed object; close() only detaches registered calls.
+    impl_->liveness->alive.store(false, std::memory_order_release);
 }
 
 void client::close() noexcept {
@@ -165,7 +173,11 @@ void client::close() noexcept {
     // still active; detach its owner so a handle that outlives the client can
     // never call back into it.
     finalize_active(active);
-    finalize_active(active);
+}
+
+std::shared_ptr<client_detail::client_liveness>
+client::liveness_token() const noexcept {
+    return impl_->liveness;
 }
 
 bool client::register_core_if_open(

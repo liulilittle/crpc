@@ -112,13 +112,26 @@ public:
 
     [[nodiscard]] std::uint64_t now_ns() const noexcept;
 
+    // Called for a queued task whose context will never be run, because the
+    // shard stopped first. Without it a task posted during shutdown would leak
+    // whatever `ctx` owns (the HTTP server hit exactly that: a
+    // `new shared_ptr<session>` per scheduled wakeup).
+    using drop_fn = void (*)(void* ctx) noexcept;
+
     // Cross-shard submission. Runs `fn(ctx)` inline on the shard thread.
     // Returns false when the inbox is full.
     [[nodiscard]] bool post(task_fn fn, void* ctx) noexcept;
 
+    // Same, but `drop(ctx)` releases the context if the shard stops before the
+    // task runs. It must not run `fn`: the owner may already be torn down.
+    [[nodiscard]] bool post(task_fn fn, void* ctx, drop_fn drop) noexcept;
+
     // Handler-pool submission. Runs `fn(ctx)` on a worker coroutine, which may
     // suspend without blocking the reader. Returns false when the queue is full.
     [[nodiscard]] bool submit(task_fn fn, void* ctx) noexcept;
+
+    // Same, with a `drop(ctx)` for the shutdown case (see `post`).
+    [[nodiscard]] bool submit(task_fn fn, void* ctx, drop_fn drop) noexcept;
 
     // Spawns a coroutine on this shard. Returns false when the inbox is full.
     [[nodiscard]] bool spawn(spawn_fn fn, void* ctx) noexcept;

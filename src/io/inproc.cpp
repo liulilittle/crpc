@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -65,6 +66,16 @@ struct chunk_node {
 // One direction of flow: the writer at endpoint k sends to the reader at
 // endpoint 1-k.
 struct channel {
+    // `reader` points at the peer connection's built-in adapter, so the peer's
+    // destructor must not run while a callback is executing on another thread
+    // (that was a real vptr race: ~source vs drain's on_eof). `delivering`
+    // counts callbacks currently running into that adapter; the destructor
+    // clears `reader` and waits for it to reach zero. Both transitions happen
+    // under the state mutex, and no lock is held while the callback runs, so
+    // this cannot invert against a mutex the callback itself takes.
+    int delivering = 0;
+    std::condition_variable delivery_cv;
+
     chunk_node* head = nullptr;
     chunk_node* tail = nullptr;
     std::size_t queued_bytes = 0;
@@ -316,30 +327,47 @@ void drain(inproc_state& st) noexcept {
                         work = true;
                     }
                 }
+                // Announce the delivery while still under the state mutex: the
+                // peer's destructor clears `reader` under this same lock, so
+                // either it sees this count and waits, or the callback below
+                // sees a null reader and is skipped. No lock is held while the
+                // callback runs, so it cannot invert against a mutex the
+                // callback takes (the previous design did exactly that).
+                if (src != nullptr) {
+                    ++ch.delivering;
+                }
             }
 
-            if (act == action::error) {
-                if (src != nullptr) {
+            std::size_t consumed = 0;
+            if (src != nullptr) {
+                if (act == action::error) {
                     src->on_error(ec);
-                }
-            } else if (act == action::eof) {
-                if (src != nullptr) {
+                } else if (act == action::eof) {
                     src->on_eof();
-                }
-            } else if (act == action::data) {
-                std::size_t consumed = 0;
-                if (src != nullptr) {
+                } else if (act == action::data) {
                     consumed = src->on_data(span<const std::byte>(
                         node->data.get() + node->offset, offered));
                     if (consumed > offered) {
                         consumed = offered; // I9: clamp, never read out of bounds
                     }
                 }
+            }
+            if (act != action::data) {
+                if (src != nullptr) {
+                    std::lock_guard<std::mutex> lk(st.mutex);
+                    if (--ch.delivering == 0) {
+                        ch.delivery_cv.notify_all();
+                    }
+                }
+            } else {
 
                 io::completion* done = nullptr;
                 io::io_result done_result{};
                 {
                     std::lock_guard<std::mutex> lk(st.mutex);
+                    if (src != nullptr && --ch.delivering == 0) {
+                        ch.delivery_cv.notify_all();
+                    }
                     node->offset += consumed;
                     const bool terminal = ch.dead || ch.reader_closed ||
                                           ch.eof_pending || ch.error_pending;
@@ -557,7 +585,15 @@ inproc_connection::inproc_connection(std::shared_ptr<inproc_state> state,
 }
 
 inproc_connection::~inproc_connection() {
+    // The peer's drain loop calls into `source_adapter_` through a raw pointer
+    // in the channel. Retire it under the state mutex (so no new delivery can
+    // pick it up) and then wait for the deliveries already announced to
+    // finish; otherwise the object could be destroyed mid-callback.
     close();
+    std::unique_lock<std::mutex> lk(state_->mutex);
+    channel& in = state_->dir[1 - index_];
+    in.reader = nullptr;
+    in.delivery_cv.wait(lk, [&in] { return in.delivering == 0; });
 }
 
 void inproc_connection::bind_source(io::source* source) noexcept {

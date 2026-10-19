@@ -102,11 +102,23 @@ struct connection_slot {
     void* pool = nullptr;
 };
 
+// Liveness token shared by a client and the calls it issued. A handle may
+// outlive the client (cancel() then destroy the client, then destroy the
+// handle); the weak token lets that path detect the death instead of calling a
+// member function on a freed client.
+struct client_liveness {
+    std::atomic<bool> alive{true};
+};
+
 // Type-independent per-call state.
 struct call_core {
     // Atomic: the completion callback may read it on a backend thread while
     // close()/~client detaches it (CF-1).
     std::atomic<client*> owner{nullptr};
+    // Expires when the client is destroyed. Always test it before using
+    // `owner`: an abandoned call is not in the client's registry, so close()
+    // never nulls its `owner`.
+    std::weak_ptr<client_liveness> owner_liveness;
     u64 service_id = 0;
     u64 method_id = 0;
     buffer request;
@@ -153,6 +165,18 @@ struct call_state final : call_state_base {
 
     [[nodiscard]] call_core& core_ref() noexcept override { return core; }
 };
+
+// Returns the owner only while the client is alive. `core.owner` alone is not
+// enough: an abandoned call leaves the registry, so a destroyed client never
+// nulls that pointer, and a handle released afterwards would call a member
+// function on freed memory.
+[[nodiscard]] inline client* live_owner(const call_core& core) noexcept {
+    const std::shared_ptr<client_liveness> live = core.owner_liveness.lock();
+    if (!live || !live->alive.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    return core.owner.load(std::memory_order_acquire);
+}
 
 template <typename Resp>
 struct wake_functor {
@@ -260,7 +284,7 @@ public:
         // the decoded value, or the last error when retries are exhausted.
         [[nodiscard]] rpc::rpc_result<Resp> get() {
             if (state_ == nullptr ||
-                state_->core.owner.load(std::memory_order_acquire) == nullptr) {
+                client_detail::live_owner(state_->core) == nullptr) {
                 return rpc::rpc_result<Resp>(
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
             }
@@ -270,15 +294,14 @@ public:
                 // in finalize_active(), so a cached pointer would be stale (R1
                 // follow-up). A detached attempt reports `shutting_down`
                 // delivered by close() rather than touching the freed client.
-                client* const owner = st->core.owner.load(std::memory_order_acquire);
+                client* const owner = client_detail::live_owner(st->core);
                 if (owner == nullptr) {
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::shutting_down, "client is closed"));
                 }
                 if (st->inner != nullptr) {
                     const status waited = owner->wait_ready(st->core);
-                    client* const current =
-                        st->core.owner.load(std::memory_order_acquire);
+                    client* const current = client_detail::live_owner(st->core);
                     if (current == nullptr) {
                         // close() finalized and detached the attempt while we
                         // waited; `inner` is reset here (before the retained
@@ -350,7 +373,7 @@ public:
                 state_->inner->cancel();
                 // Release the attempt's timer and slot now; `inner` is kept so
                 // a subsequent get()/try_get() can still observe `canceled`.
-                client* const owner = state_->core.owner.load(std::memory_order_acquire);
+                client* const owner = client_detail::live_owner(state_->core);
                 if (owner != nullptr) {
                     owner->abandon_attempt(state_->core);
                 }
@@ -374,7 +397,7 @@ public:
                 // the connection lock before the call_state can be freed.
                 st->inner.reset();
             }
-            client* const owner = st->core.owner.load(std::memory_order_acquire);
+            client* const owner = client_detail::live_owner(st->core);
             if (owner != nullptr) {
                 owner->abandon_attempt(st->core);
             }
@@ -436,6 +459,7 @@ public:
         auto st = std::make_shared<client_detail::call_state<Resp>>();
         client_detail::call_core& core = st->core;
         core.owner.store(this, std::memory_order_release);
+        core.owner_liveness = liveness_token();
         core.service_id = service_id;
         core.method_id = method_id;
         if (!core.request.append(request_body)) {
@@ -487,6 +511,8 @@ private:
         std::vector<std::shared_ptr<client_detail::call_state_base>>& active) noexcept;
     [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
                                     std::chrono::nanoseconds& delay) noexcept;
+    [[nodiscard]] std::shared_ptr<client_detail::client_liveness>
+    liveness_token() const noexcept;
     [[nodiscard]] status wait_ready(client_detail::call_core& core) const;
     void sleep_for(client_detail::call_core& core, std::chrono::nanoseconds delay) noexcept;
     void notify_waiter() noexcept;

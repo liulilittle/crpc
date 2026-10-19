@@ -965,6 +965,64 @@ CRPC_TEST(facade_destroy_client_handle_outlives_timer) {
     shard.join();
 }
 
+// A cancelled call leaves the client's registry (abandon_attempt), so close()
+// never nulls its `owner`. A handle that outlives the client therefore still
+// holds a pointer into freed memory. The liveness token makes that path observe
+// a dead owner instead of calling into it.
+//
+// This is coverage of the contract, not a red-to-green regression test: in the
+// cancel-then-destroy order the call is already complete, so the old code
+// happened to return before dereferencing the client. The dangling call was
+// real but unobservable, and the token closes it by construction, not by timing.
+CRPC_TEST(facade_release_after_client_destroyed_is_safe) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5000ms);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    // Issue a call that never completes, then cancel it: cancel() abandons the
+    // attempt, which removes it from the client's active set.
+    std::unique_ptr<crpc::client::call<int>> held;
+    const bool ran = run_on_shard(shard, [&] {
+        auto stub = cli->service<int, int>(1, 1);
+        auto started = stub.call(1);
+        if (!started.ok()) {
+            return;
+        }
+        held = std::make_unique<crpc::client::call<int>>(std::move(started).value());
+        held->cancel();
+    });
+    CRPC_CHECK(ran);
+    CRPC_CHECK(held != nullptr);
+    if (held == nullptr) {
+        cli.reset();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    // The client dies first; the handle is released afterwards.
+    cli.reset();
+    held.reset();
+
+    shard.stop();
+    shard.join();
+}
+
 CRPC_TEST(facade_racing_start_and_close_leaves_no_timer) {
     stalled_backend backend;
     crpc::runtime_options ro;

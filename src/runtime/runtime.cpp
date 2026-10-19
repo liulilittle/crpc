@@ -21,6 +21,7 @@ namespace {
 struct task_slot {
     runtime::task_fn fn = nullptr;
     void* ctx = nullptr;
+    runtime::drop_fn drop = nullptr;
 };
 
 struct inbox_entry {
@@ -29,6 +30,8 @@ struct inbox_entry {
     runtime::task_fn task = nullptr;
     runtime::spawn_fn spawn = nullptr;
     void* ctx = nullptr;
+    // Releases `ctx` when the shard stops before running the entry.
+    runtime::drop_fn drop = nullptr;
 };
 
 struct timer_entry {
@@ -208,7 +211,9 @@ struct runtime::impl {
 
     [[nodiscard]] bool pop_ready(task_slot& out) noexcept {
         std::lock_guard<std::mutex> lk(ready_mutex);
-        if (ready.empty()) {
+        // The shutdown discard takes the same lock. Refusing here closes the
+        // window where a handler pops a slot after its context was released.
+        if (ready.empty() || stop_requested.load(std::memory_order_acquire)) {
             return false;
         }
         out = ready.front();
@@ -310,6 +315,32 @@ struct runtime::impl {
         static_cast<impl*>(ctx)->handler_main();
     }
 
+    // Releases every queued context that will never run. Called once, after
+    // the loop has exited, so no other thread can consume these entries: the
+    // inbox rejects new pushes once `stop_requested` is set.
+    void discard_pending() noexcept {
+        std::deque<inbox_entry> dropped;
+        {
+            std::lock_guard<std::mutex> lk(inbox_mutex);
+            dropped.swap(inbox);
+        }
+        for (inbox_entry& entry : dropped) {
+            if (entry.drop != nullptr) {
+                entry.drop(entry.ctx);
+            }
+        }
+        std::deque<task_slot> dropped_ready;
+        {
+            std::lock_guard<std::mutex> lk(ready_mutex);
+            dropped_ready.swap(ready);
+        }
+        for (task_slot& slot : dropped_ready) {
+            if (slot.drop != nullptr) {
+                slot.drop(slot.ctx);
+            }
+        }
+    }
+
     void quiesce() noexcept {
         // Release the handler coroutines: each one observes `stop_requested`
         // after its next wake and returns.
@@ -396,6 +427,11 @@ struct runtime::impl {
         }
 
         quiesce();
+        // Anything queued after the last drain would otherwise be lost: the
+        // entries (and whatever their `ctx` owns) would leak. Run the drop
+        // hooks, never the tasks themselves -- their owners may already be
+        // torn down.
+        discard_pending();
         running.store(false, std::memory_order_release);
         destroy_native();
     }
@@ -455,6 +491,10 @@ std::uint64_t runtime::now_ns() const noexcept {
 }
 
 bool runtime::post(task_fn fn, void* ctx) noexcept {
+    return post(fn, ctx, nullptr);
+}
+
+bool runtime::post(task_fn fn, void* ctx, drop_fn drop) noexcept {
     if (fn == nullptr) {
         return false;
     }
@@ -462,10 +502,15 @@ bool runtime::post(task_fn fn, void* ctx) noexcept {
     entry.k = inbox_entry::kind::task;
     entry.task = fn;
     entry.ctx = ctx;
+    entry.drop = drop;
     return impl_->push_inbox(entry);
 }
 
 bool runtime::submit(task_fn fn, void* ctx) noexcept {
+    return submit(fn, ctx, nullptr);
+}
+
+bool runtime::submit(task_fn fn, void* ctx, drop_fn drop) noexcept {
 #if defined(CRPC_HAVE_COROCC)
     if (fn == nullptr) {
         return false;
@@ -473,11 +518,12 @@ bool runtime::submit(task_fn fn, void* ctx) noexcept {
     task_slot slot;
     slot.fn = fn;
     slot.ctx = ctx;
+    slot.drop = drop;
     return impl_->push_ready(slot);
 #else
     // Thread-per-shard fallback: no handler coroutines exist, so run the task
     // on the shard thread through the inbox.
-    return post(fn, ctx);
+    return post(fn, ctx, drop);
 #endif
 }
 
