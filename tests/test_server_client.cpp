@@ -273,6 +273,57 @@ CRPC_TEST(runtime_post_submit_timer_and_stop) {
     CRPC_CHECK(!shard.cancel_timer(&fired));
 }
 
+// Every queued task is disposed exactly once: either it runs, or the shard
+// stops first and the drop hook releases its context. Zero or two would mean a
+// leak or a double free, both of which happened in this area (the HTTP server
+// leaked a holder per wakeup queued during stop()).
+CRPC_TEST(runtime_drops_queued_tasks_exactly_once) {
+    crpc::runtime_options options;
+    options.start_handler_pool = true;
+    options.handler_workers = 2;
+    options.handler_stack_bytes = 64 * 1024;
+    if (coro_stack_bytes_override() != 0) {
+        options.handler_stack_bytes = coro_stack_bytes_override();
+    }
+    crpc::runtime shard(options);
+    shard.start_thread();
+
+    constexpr int kTasks = 2000;
+    struct tally {
+        std::atomic<int> ran{0};
+        std::atomic<int> dropped{0};
+    } counts;
+
+    // The handler sleeps, so the shard is busy and a good share of these
+    // entries is still queued when stop() lands. Both outcomes are legal; the
+    // invariant is that each task takes exactly one of them.
+    auto run_slow = [](void* ctx) noexcept {
+        auto* t = static_cast<tally*>(ctx);
+        t->ran.fetch_add(1, std::memory_order_relaxed);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    };
+    auto drop_count = [](void* ctx) noexcept {
+        static_cast<tally*>(ctx)->dropped.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    int accepted = 0;
+    for (int i = 0; i < kTasks; ++i) {
+        if (shard.submit(run_slow, &counts, drop_count)) {
+            ++accepted;
+        }
+    }
+    CRPC_CHECK(accepted > 0);
+
+    shard.stop();
+    shard.join();
+
+    // A submit rejected because the queue was full or the shard was already
+    // stopping is not a queued task; only accepted ones must be disposed.
+    const int disposed = counts.ran.load() + counts.dropped.load();
+    CRPC_CHECK_EQ(accepted, disposed);
+    CRPC_CHECK(counts.dropped.load() > 0);
+}
+
 // --- tests -------------------------------------------------------------------
 
 CRPC_TEST(inproc_echo) {
@@ -502,6 +553,49 @@ CRPC_TEST(graceful_shutdown_drains_and_rejects) {
     });
     CRPC_CHECK(ran);
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::shutting_down), after_code);
+}
+
+CRPC_TEST(server_drops_queued_jobs_and_zeroes_in_flight) {
+    // Shutdown must dispose of queued request jobs: the ones that never reach a
+    // handler are dropped (their drop hook returns the in-flight accounting),
+    // and the ones already running finish. Either way the server's in-flight
+    // counter must end at zero, or drain bookkeeping stays stuck forever.
+    fixture f;
+    fixture_config cfg;
+    cfg.server_workers = 1;      // one handler, so the rest queue up
+    cfg.per_connection = 32;
+    cfg.drain = 1ms;             // force the drop path instead of a clean drain
+    cfg.default_deadline = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    // Three calls: the first occupies the only handler (200 ms), the other two
+    // are still in the ready queue when stop() gives up waiting.
+    std::vector<std::unique_ptr<crpc::client::call<int>>> held;
+    const bool ran = run_on_shard(*f.shard, [&] {
+        for (int i = 0; i < 3; ++i) {
+            auto stub = f.cli->service<int, int>(kService, kSlow);
+            auto started = stub.call(i);
+            if (!started.ok()) {
+                continue;
+            }
+            held.push_back(
+                std::make_unique<crpc::client::call<int>>(std::move(started).value()));
+        }
+    });
+    CRPC_CHECK(ran);
+    CRPC_CHECK(!held.empty());
+
+    // Let the requests reach the server and fill the handler slot.
+    std::this_thread::sleep_for(50ms);
+    const std::size_t before = f.srv->stats().in_flight_calls;
+    CRPC_CHECK(before > 0);
+
+    f.srv->stop();
+
+    // The drop hook returns the accounting for jobs that never ran; the running
+    // handler finishes before the shard joins. Nothing may be left behind.
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), f.srv->stats().in_flight_calls);
+    held.clear();
 }
 
 CRPC_TEST(retry_idempotent_only) {

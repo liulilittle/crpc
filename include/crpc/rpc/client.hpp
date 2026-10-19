@@ -196,6 +196,8 @@ private:
     // any callback already running, so the caller may then recycle the slot
     // safely (CF-1).
     void detach_slot(call_slot& slot) noexcept;
+    // Returns a finished slot to the pool under `mutex_` (see owner_release).
+    void release_slot_under_lock(call_slot* slot) noexcept;
     void fail_all(rpc_code code, std::string message);
     void protocol_failure();
     void remove_in_flight(call_slot& slot);
@@ -205,6 +207,7 @@ private:
     static bool in_flight_probe(void* ctx, u32 id) noexcept;
     static void cancel_thunk(void* ctx, call_slot* slot) noexcept;
     static void detach_thunk(void* ctx, call_slot* slot) noexcept;
+    static void release_thunk(void* ctx, call_slot* slot) noexcept;
     static rpc_code map_error(std::error_code ec) noexcept;
 
     std::unique_ptr<connection> conn_;

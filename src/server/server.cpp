@@ -445,6 +445,16 @@ struct server::impl {
         }
     }
 
+    // The shard stopped before the job ran. Release the job and give back the
+    // in-flight accounting it took, so shutdown neither leaks nor leaves the
+    // server's drain counter stuck above zero.
+    static void drop_job(void* ctx) noexcept {
+        std::unique_ptr<request_job> job(static_cast<request_job*>(ctx));
+        if (job->counted && job->conn && job->conn->owner != nullptr) {
+            job->conn->owner->complete_call(job->conn, true);
+        }
+    }
+
     void send_goaway() noexcept {
         std::vector<std::shared_ptr<server_connection>> snapshot;
         {
@@ -518,7 +528,9 @@ void server_connection::submit(frame& request) noexcept {
                 reject->forced_error = true;
                 reject->forced_code = rpc_code::overload;
                 reject->forced_retry_after = owner->opt.overload_retry_after;
-                if (reject->conn && !shard->submit(&server::impl::run_job, reject)) {
+                if (reject->conn &&
+                    !shard->submit(&server::impl::run_job, reject,
+                                  &server::impl::drop_job)) {
                     delete reject;
                 }
             }
@@ -536,7 +548,8 @@ void server_connection::submit(frame& request) noexcept {
     job->conn = self.lock();
     job->header = request.header;
     job->counted = true;
-    if (!job->conn || !shard->submit(&server::impl::run_job, job)) {
+    if (!job->conn ||
+        !shard->submit(&server::impl::run_job, job, &server::impl::drop_job)) {
         delete job;
         complete_call_safe();
     }

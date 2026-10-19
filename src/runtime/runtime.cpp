@@ -172,12 +172,13 @@ struct runtime::impl {
     }
 
     bool push_inbox(inbox_entry entry) noexcept {
-        if (stop_requested.load(std::memory_order_acquire)) {
-            return false;
-        }
         {
             std::lock_guard<std::mutex> lk(inbox_mutex);
-            if (inbox.size() >= opt.inbox_capacity) {
+            // Re-check under the lock: discard_pending() swaps the queue under
+            // this same mutex at shutdown. Checking only before the lock would
+            // let a push land after the discard and leak its context.
+            if (stop_requested.load(std::memory_order_acquire) ||
+                inbox.size() >= opt.inbox_capacity) {
                 return false;
             }
             inbox.push_back(entry);
@@ -187,12 +188,11 @@ struct runtime::impl {
     }
 
     bool push_ready(task_slot slot) noexcept {
-        if (stop_requested.load(std::memory_order_acquire)) {
-            return false;
-        }
         {
             std::lock_guard<std::mutex> lk(ready_mutex);
-            if (ready.size() >= opt.ready_capacity) {
+            // Same window as push_inbox: the discard runs under this mutex.
+            if (stop_requested.load(std::memory_order_acquire) ||
+                ready.size() >= opt.ready_capacity) {
                 return false;
             }
             ready.push_back(slot);

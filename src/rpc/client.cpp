@@ -311,6 +311,7 @@ call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context&
     slot->owner = this;
     slot->owner_cancel = &client::cancel_thunk;
     slot->owner_detach = &client::detach_thunk;
+    slot->owner_release = &client::release_thunk;
     set_state(*slot, call_state::queued);
     return slot;
 }
@@ -506,6 +507,22 @@ void client::detach_slot(call_slot& slot) noexcept {
 
 void client::detach_thunk(void* ctx, call_slot* slot) noexcept {
     static_cast<client*>(ctx)->detach_slot(*slot);
+}
+
+void client::release_thunk(void* ctx, call_slot* slot) noexcept {
+    static_cast<client*>(ctx)->release_slot_under_lock(slot);
+}
+
+void client::release_slot_under_lock(call_slot* slot) noexcept {
+    if (slot == nullptr) {
+        return;
+    }
+    // The response thread reads slot.stream_id/has_deadline under this lock
+    // (handle_response -> finish -> remove_in_flight). Resetting outside it let
+    // the two run concurrently on the same slot (TSan, pre-existing).
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    remove_in_flight(*slot);
+    pool_.release(slot);
 }
 
 rpc_code client::map_error(std::error_code ec) noexcept {

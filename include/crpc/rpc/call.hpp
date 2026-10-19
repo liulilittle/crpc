@@ -314,6 +314,11 @@ public:
     // unconditionally when the handle is destroyed, so the slot can be recycled
     // only after no callback can still touch the handle.
     void (*owner_detach)(void* owner, call_slot* slot) noexcept = nullptr;
+    // Optional: returns the slot to its owner's pool. When set, it runs instead
+    // of `call_slot_pool::release` so the reset happens under the owner's lock:
+    // a response thread finalizing the same slot holds that lock while it reads
+    // `stream_id`/`has_deadline`, and an unguarded reset raced with it.
+    void (*owner_release)(void* owner, call_slot* slot) noexcept = nullptr;
 };
 
 // Loads the state word with acquire ordering.
@@ -628,7 +633,9 @@ private:
         if (!result_ready(*slot) && slot->owner_cancel != nullptr) {
             slot->owner_cancel(slot->owner, slot);
         }
-        if (pool != nullptr) {
+        if (slot->owner_release != nullptr) {
+            slot->owner_release(slot->owner, slot);
+        } else if (pool != nullptr) {
             pool->release(slot);
         }
     }
