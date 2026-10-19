@@ -261,6 +261,27 @@ inline const char*& current_case() {
     return name;
 }
 
+inline int& skip_count() {
+    static int count = 0;
+    return count;
+}
+
+// Thrown by skip(). It deliberately does not derive from std::exception so the
+// generic "uncaught exception" handler in run_all() cannot turn a skip into a
+// failure.
+struct skipped_case {};
+
+// Marks the current case as skipped: prints one visible SKIP line containing the
+// reason, then unwinds to run_all(), which counts the case as passed (exit code
+// is unaffected) and includes it in the skipped total.
+[[noreturn]] inline void skip(const char* reason) {
+    ++skip_count();
+    std::printf("SKIP %s: %s\n", current_case(),
+                reason != nullptr ? reason : "no reason given");
+    std::fflush(stdout);
+    throw skipped_case{};
+}
+
 struct registrar {
     registrar(const char* name, void (*fn)()) { registry().push_back({name, fn}); }
 };
@@ -363,16 +384,21 @@ inline int run_all(int argc, char** argv) {
         const int before = failure_count();
         try {
             entry.fn();
+        } catch (const skipped_case&) {
+            // skip() already reported the case; it is not a failure.
         } catch (const std::exception& ex) {
             report_failure(entry.name, 0, "uncaught exception", ex.what());
         } catch (...) {
             report_failure(entry.name, 0, "uncaught exception", "unknown exception type");
         }
         ++ran;
-        std::printf("%s %s\n", failure_count() == before ? "PASS" : "FAIL", entry.name);
+        // A skipped case counts as passed; skip() already printed the visible
+        // "SKIP <case>: <reason>" line, so the per-case stream stays uniform.
+        std::printf("%s %s\n", failure_count() == before ? "PASS" : "FAIL",
+                    entry.name);
     }
-    std::printf("\n%d case(s), %d check(s), %d failure(s)\n", ran, check_count(),
-                failure_count());
+    std::printf("\n%d case(s), %d check(s), %d failure(s), %d skipped\n", ran,
+                check_count(), failure_count(), skip_count());
     return failure_count() == 0 ? 0 : 1;
 }
 

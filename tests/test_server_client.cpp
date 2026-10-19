@@ -237,7 +237,27 @@ void set_timer_flag(void* ctx) noexcept {
     static_cast<std::atomic<bool>*>(ctx)->store(true, std::memory_order_release);
 }
 
+// These cases assert coroutine-loop semantics (loop_mode(), park()). In a
+// build without CRPC_HAVE_COROCC the runtime is the thread-per-shard fallback:
+// loop_mode() is always false and park() always returns failed_precondition, so
+// the assertions cannot hold. Skip explicitly rather than weakening them.
+// The check reads the build capability, not loop_mode() itself, so a corocc
+// build still runs (and asserts) the full original body.
+bool coroutine_loop_available() {
+#if defined(CRPC_HAVE_COROCC)
+    return true;
+#else
+    return false;
+#endif
+}
+
+constexpr const char* kNoCoroutineLoop =
+    "requires CRPC_HAVE_COROCC (nofiber runtime has no loop_mode()/park())";
+
 CRPC_TEST(runtime_post_submit_timer_and_stop) {
+    if (!coroutine_loop_available()) {
+        crpc_test::skip(kNoCoroutineLoop);
+    }
     crpc::runtime_options options;
     options.start_handler_pool = true;
     options.handler_workers = 2;
@@ -327,6 +347,9 @@ CRPC_TEST(runtime_drops_queued_tasks_exactly_once) {
 // --- tests -------------------------------------------------------------------
 
 CRPC_TEST(inproc_echo) {
+    if (!coroutine_loop_available()) {
+        crpc_test::skip(kNoCoroutineLoop);
+    }
     fixture f;
     fixture_config cfg;
     CRPC_CHECK(start_inproc(f, cfg));
@@ -760,6 +783,9 @@ CRPC_TEST(no_leak_after_close) {
 // cancel the deadline timer, not leave it armed on a destroyed client. ---
 
 CRPC_TEST(facade_try_get_releases_connection_slot) {
+    if (!coroutine_loop_available()) {
+        crpc_test::skip(kNoCoroutineLoop);
+    }
     fixture f;
     fixture_config cfg;
     cfg.pool_size = 1;
@@ -845,6 +871,9 @@ CRPC_TEST(facade_destroyed_handle_releases_connection_slot) {
 }
 
 CRPC_TEST(facade_destroy_client_with_armed_timer_no_crash) {
+    if (!coroutine_loop_available()) {
+        crpc_test::skip(kNoCoroutineLoop);
+    }
     fixture f;
     fixture_config cfg;
     cfg.pool_size = 1;
