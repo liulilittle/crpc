@@ -117,6 +117,13 @@ struct overlapped_op {
     OVERLAPPED ov;
     op_kind kind;
     void* owner; // conn_state*, accept_slot* ...
+    // Registry id of the owning connection (0 for accept operations). Stored
+    // here because `owner` may already be freed when the completion is
+    // dispatched: an earlier completion ran a user callback that closed and
+    // unregistered the connection, leaving later queued completions pointing at
+    // freed memory. The id is a plain value, so it stays readable, and it lets
+    // `dispatch` take a strong reference before touching the state.
+    std::uint64_t conn_id;
     std::size_t got;
     unsigned long error;
 };
@@ -214,6 +221,13 @@ struct conn_state {
     overlapped_op* disc_op = nullptr;
 
     std::atomic<bool> delivering{false};
+
+    // Set while a send completion is still owned by the backend (posted but its
+    // user callback has not run yet). `close()` waits for it so a caller that
+    // destroys the completion object after close() returns can never race the
+    // callback: the backend borrows the completion, it does not own it.
+    std::condition_variable delivery_cv;
+    bool send_delivery_done = true;
 };
 
 // --- Listener state ----------------------------------------------------------
@@ -441,12 +455,14 @@ namespace {
 void initiate_close(conn_state* st) noexcept {
     std::vector<io::completion*> canceled;
     bool need_finalize = false;
+    bool had_inflight_send = false;
     {
         std::lock_guard<std::mutex> lk(st->m);
         if (st->phase != conn_phase::open) {
             return;
         }
         st->phase = conn_phase::closing;
+        had_inflight_send = st->send_inflight;
         if (st->send_inflight) {
             // Keep the chunk whose WSASend is outstanding; complete the rest.
             while (st->sendq.size() > 1) {
@@ -475,6 +491,29 @@ void initiate_close(conn_state* st) noexcept {
                 io::io_result{std::make_error_code(std::errc::operation_canceled), 0});
         }
     }
+
+    // The completion passed to `push` is borrowed, not owned, so a caller may
+    // destroy it as soon as `close()` returns. The pump clears `send_inflight`
+    // before it runs the user callback, so without this wait `close()` could
+    // return while the callback is still about to run on a completion the caller
+    // already freed (a real access violation, reproduced once per ~30 runs).
+    //
+    // The wait is skipped on the pump thread itself, where a completion callback
+    // may legitimately close the connection; it is bounded only while the backend
+    // is shutting down, because the pump may have exited without delivering.
+    if (had_inflight_send && st->backend != nullptr) {
+        const DWORD self = ::GetCurrentThreadId();
+        if (self != st->backend->pump_tid.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lk(st->m);
+            if (st->backend->stopping.load(std::memory_order_acquire)) {
+                st->delivery_cv.wait_for(lk, std::chrono::milliseconds(2000),
+                                         [st] { return st->send_delivery_done; });
+            } else {
+                st->delivery_cv.wait(lk, [st] { return st->send_delivery_done; });
+            }
+        }
+    }
+
     if (need_finalize) {
         finalize_close(st);
     }
@@ -518,6 +557,7 @@ void finalize_close(conn_state* st) noexcept {
         st->disc_op->ov = OVERLAPPED{};
         st->disc_op->kind = op_kind::disconnect;
         st->disc_op->owner = st;
+        st->disc_op->conn_id = st->id;
         const BOOL ok = be->disconnect_ex(st->sock, &st->disc_op->ov,
                                           TF_REUSE_SOCKET, 0);
         if (!ok) {
@@ -562,6 +602,7 @@ bool post_recv(conn_state* st) noexcept {
         st->recv_op->ov = OVERLAPPED{};
         st->recv_op->kind = op_kind::recv;
         st->recv_op->owner = st;
+        st->recv_op->conn_id = st->id;
     }
 
     WSABUF wsb{};
@@ -605,6 +646,8 @@ bool post_send(conn_state* st) noexcept {
         st->send_op->ov = OVERLAPPED{};
         st->send_op->kind = op_kind::send;
         st->send_op->owner = st;
+        st->send_op->conn_id = st->id;
+        st->send_delivery_done = false;
     }
 
     DWORD sent = 0;
@@ -816,6 +859,12 @@ void handle_send_complete(overlapped_op* op, std::size_t bytes,
             outcome.first->complete(outcome.second);
         }
     }
+    {
+        // The completion callbacks have run: close() may now return safely.
+        std::lock_guard<std::mutex> lk(st->m);
+        st->send_delivery_done = true;
+    }
+    st->delivery_cv.notify_all();
     if (post_next) {
         post_send(st);
     }
@@ -1455,53 +1504,52 @@ void iocp_backend::impl::dispatch(OVERLAPPED_ENTRY& entry) noexcept {
         return;
     }
     overlapped_op* op = CONTAINING_RECORD(entry.lpOverlapped, overlapped_op, ov);
-    switch (op->kind) {
-    case op_kind::recv: {
-        conn_state* raw = static_cast<conn_state*>(op->owner);
-        // Hold a reference for the whole handler: a user callback it invokes may
-        // close the connection, which unregisters (and would otherwise free) the
-        // state this handler still touches afterwards.
-        std::shared_ptr<conn_state> keep = retain_conn(raw->id);
+    // Every connection completion carries the registry id, and the id is read
+    // from the operation record rather than from the connection, so it stays
+    // readable even when an earlier completion already closed and released the
+    // connection. The strong reference below keeps the state alive for the
+    // whole handler, including the finalisation step that runs after the user
+    // completion callbacks.
+    if (op->kind == op_kind::recv || op->kind == op_kind::send ||
+        op->kind == op_kind::disconnect) {
+        std::shared_ptr<conn_state> keep = retain_conn(op->conn_id);
         if (!keep) {
-            break;
+            return;
         }
-        SOCKET sock;
-        {
-            std::lock_guard<std::mutex> lk(raw->m);
-            sock = raw->sock;
+        switch (op->kind) {
+        case op_kind::recv: {
+            SOCKET sock;
+            {
+                std::lock_guard<std::mutex> lk(keep->m);
+                sock = keep->sock;
+            }
+            std::size_t bytes = 0;
+            unsigned long error = 0;
+            read_op_result(sock, op, entry.dwNumberOfBytesTransferred, &bytes, &error);
+            handle_recv_complete(op, bytes, error);
+            return;
         }
-        std::size_t bytes = 0;
-        unsigned long error = 0;
-        read_op_result(sock, op, entry.dwNumberOfBytesTransferred, &bytes, &error);
-        handle_recv_complete(op, bytes, error);
-        break;
+        case op_kind::send: {
+            SOCKET sock;
+            {
+                std::lock_guard<std::mutex> lk(keep->m);
+                sock = keep->sock;
+            }
+            std::size_t bytes = 0;
+            unsigned long error = 0;
+            read_op_result(sock, op, entry.dwNumberOfBytesTransferred, &bytes, &error);
+            handle_send_complete(op, bytes, error);
+            return;
+        }
+        case op_kind::disconnect:
+            handle_disconnect_complete(op);
+            return;
+        default:
+            return;
+        }
     }
-    case op_kind::send: {
-        conn_state* raw = static_cast<conn_state*>(op->owner);
-        std::shared_ptr<conn_state> keep = retain_conn(raw->id);
-        if (!keep) {
-            break;
-        }
-        SOCKET sock;
-        {
-            std::lock_guard<std::mutex> lk(raw->m);
-            sock = raw->sock;
-        }
-        std::size_t bytes = 0;
-        unsigned long error = 0;
-        read_op_result(sock, op, entry.dwNumberOfBytesTransferred, &bytes, &error);
-        handle_send_complete(op, bytes, error);
-        break;
-    }
-    case op_kind::disconnect:
-        handle_disconnect_complete(op);
-        break;
-    case op_kind::accept:
+    if (op->kind == op_kind::accept) {
         handle_accept(op);
-        break;
-    case op_kind::none:
-    default:
-        break;
     }
 }
 
@@ -1576,6 +1624,12 @@ bool iocp_backend::impl::do_cancel_timer(std::uint64_t id) noexcept {
 }
 
 void iocp_backend::impl::timer_loop() noexcept {
+    // This thread exists only to sleep until the nearest deadline, so a short
+    // deadline must not be delayed by ordinary work on a loaded machine (the
+    // 500 us timer test once measured >20 ms while the box was compiling).
+    // Raising the priority cannot starve anything: the thread wakes only when a
+    // timer is due and does no work beyond handing expired slots to the pump.
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     std::unique_lock<std::mutex> lk(tmutex);
     while (!timer_stopping.load(std::memory_order_acquire)) {
         const std::uint64_t now = monotonic_now_ns();
