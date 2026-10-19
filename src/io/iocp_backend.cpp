@@ -425,6 +425,11 @@ struct iocp_backend::impl {
     void timer_loop() noexcept;
     void drain_timers() noexcept;
 
+    // Returns a strong reference to the connection state, or null when it is
+    // already gone. Completion handlers take one for their whole run so a user
+    // callback that closes the connection cannot free the state the handler is
+    // still using (the callbacks run before the finalisation step).
+    [[nodiscard]] std::shared_ptr<conn_state> retain_conn(std::uint64_t id) noexcept;
     void unregister_conn(std::uint64_t id) noexcept;
     void unregister_listener(std::uint64_t id) noexcept;
 };
@@ -1402,6 +1407,16 @@ std::unique_ptr<listener> iocp_backend::impl::do_listen(
         new (std::nothrow) iocp_listener(std::move(ls)));
 }
 
+std::shared_ptr<conn_state> iocp_backend::impl::retain_conn(
+    std::uint64_t id) noexcept {
+    std::lock_guard<std::mutex> lk(registry_mutex);
+    const auto it = conns.find(id);
+    if (it == conns.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
 void iocp_backend::impl::unregister_conn(std::uint64_t id) noexcept {
     std::lock_guard<std::mutex> lk(registry_mutex);
     conns.erase(id);
@@ -1442,11 +1457,18 @@ void iocp_backend::impl::dispatch(OVERLAPPED_ENTRY& entry) noexcept {
     overlapped_op* op = CONTAINING_RECORD(entry.lpOverlapped, overlapped_op, ov);
     switch (op->kind) {
     case op_kind::recv: {
-        conn_state* st = static_cast<conn_state*>(op->owner);
+        conn_state* raw = static_cast<conn_state*>(op->owner);
+        // Hold a reference for the whole handler: a user callback it invokes may
+        // close the connection, which unregisters (and would otherwise free) the
+        // state this handler still touches afterwards.
+        std::shared_ptr<conn_state> keep = retain_conn(raw->id);
+        if (!keep) {
+            break;
+        }
         SOCKET sock;
         {
-            std::lock_guard<std::mutex> lk(st->m);
-            sock = st->sock;
+            std::lock_guard<std::mutex> lk(raw->m);
+            sock = raw->sock;
         }
         std::size_t bytes = 0;
         unsigned long error = 0;
@@ -1455,11 +1477,15 @@ void iocp_backend::impl::dispatch(OVERLAPPED_ENTRY& entry) noexcept {
         break;
     }
     case op_kind::send: {
-        conn_state* st = static_cast<conn_state*>(op->owner);
+        conn_state* raw = static_cast<conn_state*>(op->owner);
+        std::shared_ptr<conn_state> keep = retain_conn(raw->id);
+        if (!keep) {
+            break;
+        }
         SOCKET sock;
         {
-            std::lock_guard<std::mutex> lk(st->m);
-            sock = st->sock;
+            std::lock_guard<std::mutex> lk(raw->m);
+            sock = raw->sock;
         }
         std::size_t bytes = 0;
         unsigned long error = 0;
