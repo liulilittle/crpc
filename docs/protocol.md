@@ -29,6 +29,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [17](#s17) | HTTP/2 mapping |
 | [18](#s18) | Versioning and verification |
 | [19](#s19) | Push delivery (implemented subset) |
+| [20](#s20) | HTTP/1.1 Server-Sent Events (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -304,8 +305,8 @@ Verification is in `tests/test_frame.cpp` (header and ordered/ping golden bytes,
 
 This section is normative for the implemented single-shard, in-process subset.
 PUSH travels on the same connection as REQUEST/RESPONSE. Cross-shard routing,
-ordered/gap handling, HTTP SSE and `stream_transport` integration are outside
-this subset.
+ordered/gap handling and `stream_transport` integration are outside this subset;
+HTTP SSE has its own subset in section 20.
 
 ### 19.1 PUSH envelope
 
@@ -373,3 +374,64 @@ a dead connection. Subscriptions survive detach so a reconnect with the same
 `hub::tick` slow-subscriber detection is not wired in this subset: the
 `slow_subscriber` event is not emitted, and memory is bounded by the hub's
 per-subscription queues and their overflow policy instead.
+
+## 20. HTTP/1.1 Server-Sent Events (implemented subset) <a id="s20"></a>
+
+This section is normative for the implemented SSE subset: HTTP/1.1, a single
+shard, in process. Long polling, HTTP/2 SSE, cross-shard publish, authentication
+and `content_coding` are outside this subset. The framing helpers live in
+`include/crpc/http/sse.hpp` / `src/http/sse.cpp`; the server wiring lives in
+`src/http/server.cpp`.
+
+### 20.1 Request
+
+`GET <sse-path>`; `Accept: text/event-stream` is optional. Query parameters
+override the registered route: `topic` (must be non-empty), `mode`
+(`reliable` or `unreliable`), `ordered` (`0`/`1` or `false`/`true`) and
+`subscriber` (a non-zero u64; a fresh id is allocated when absent). An optional
+`Last-Event-ID: <epoch>:<seq>` resumes a subscription. Routes are registered
+with `http_server::builder::add_sse_route()`. SSE requires
+`http_server_options::shards == 1`; `start()` fails with `failed_precondition`
+otherwise.
+
+### 20.2 Response and events
+
+The response is `200` with `Content-Type: text/event-stream; charset=utf-8`,
+`Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no` and
+`Transfer-Encoding: chunked` (there is no `Content-Length`; the response uses a
+hand-written head because `http::serialize` always appends the terminating
+chunk). Event frames are `id: <epoch>:<seq>\ndata: <payload>\n\n`. A payload
+that is not valid UTF-8 text is base64 encoded and marked `data: b64:<...>`;
+only binary events carry the `b64:` prefix. A comment-only heartbeat `:hb\n\n`
+is emitted every `sse_options::heartbeat` (default 15 s; zero disables). A
+configured `retry:` hint is sent once at the start.
+
+### 20.3 Delivery, backpressure and close
+
+An open SSE response owns its connection: HTTP/1.1 pipelining is not used and
+the idle deadline is disabled. Liveness comes from the heartbeat write (a failed
+write closes the session) and from `sse_options::slow_timeout`, which closes a
+peer that stops draining while staged output is non-empty. Staged output (the
+write queue plus the in-flight write) is bounded by
+`sse_options::egress_cap_bytes` (default
+`http_server_options::egress_cap_bytes`, 1 MiB). At the bound the pump stops
+calling `try_take` and parks the already-taken message instead of dropping it;
+the hub's `subscribe_options` (`max_messages`, `max_bytes`, `overflow_policy`)
+makes every drop decision, and `http_server::publish()` never blocks. Closing
+detaches from the hub before the transport and its token are destroyed; the
+terminating chunk is bound to the close, not emitted between events.
+
+### 20.4 Reconnect and replay
+
+A reconnect with the same `subscriber` reuses the existing subscription: the
+server never re-subscribes. It clamps the `Last-Event-ID` sequence to the
+highest sequence it has delivered for that (subscriber, topic), then calls
+`hub.ack(cursor)` (cumulative) and `hub.attach()`, which replays the
+unacknowledged reliable messages. A cursor whose epoch differs from the current
+server epoch is not acknowledged. The event id therefore carries both epoch and
+sequence, and a client must de-duplicate on the `(epoch, seq)` pair.
+
+### 20.5 HTTP/2
+
+SSE is not implemented over HTTP/2 in this subset. A request whose path matches
+an SSE route is answered with a complete `501` response; no stream is opened.

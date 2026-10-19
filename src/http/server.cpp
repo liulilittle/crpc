@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -31,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <crpc/http/sse.hpp>
 #include <crpc/http2/connection.hpp>
 #include <crpc/http2/frame.hpp>
 #include <crpc/http2/hpack.hpp>
@@ -149,6 +151,79 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
     return response;
 }
 
+// SSE route lookup. The list is immutable once the server is built.
+[[nodiscard]] const sse_route* find_sse_route(const std::vector<sse_route>& routes,
+                                              std::string_view path) noexcept {
+    for (const sse_route& route : routes) {
+        if (route.path == path) {
+            return &route;
+        }
+    }
+    return nullptr;
+}
+
+enum class query_result : u8 { missing, ok, invalid };
+
+// Extracts one raw query parameter (percent decoding the value). The query is
+// everything after the first '?', already split by the message layer.
+[[nodiscard]] query_result query_param(std::string_view query,
+                                       std::string_view name,
+                                       std::string& out) {
+    if (query.empty()) {
+        return query_result::missing;
+    }
+    std::size_t pos = 0;
+    for (;;) {
+        const std::size_t amp = query.find('&', pos);
+        const std::string_view item =
+            amp == std::string_view::npos ? query.substr(pos)
+                                          : query.substr(pos, amp - pos);
+        const std::size_t eq = item.find('=');
+        const std::string_view key = item.substr(0, eq);
+        if (key == name) {
+            const std::string_view raw =
+                eq == std::string_view::npos ? std::string_view{} : item.substr(eq + 1);
+            return http::percent_decode(raw, out).ok() ? query_result::ok
+                                                       : query_result::invalid;
+        }
+        if (amp == std::string_view::npos) {
+            return query_result::missing;
+        }
+        pos = amp + 1;
+    }
+}
+
+[[nodiscard]] bool parse_u64_text(std::string_view text, u64& value) noexcept {
+    if (text.empty()) {
+        return false;
+    }
+    u64 result = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        const u64 digit = static_cast<u64>(c - '0');
+        if (result > (~static_cast<u64>(0) - digit) / 10) {
+            return false;
+        }
+        result = result * 10 + digit;
+    }
+    value = result;
+    return true;
+}
+
+[[nodiscard]] bool parse_bool_text(std::string_view text, bool& value) noexcept {
+    if (text == "1" || text == "true") {
+        value = true;
+        return true;
+    }
+    if (text == "0" || text == "false") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
 // PUT and PATCH carry a representation and must be framed. A POST without a
 // body is meaningful (an empty trigger), so it is routed rather than rejected;
 // the 411 path exists for the methods that cannot infer an empty body.
@@ -229,6 +304,10 @@ public:
     // Write completion (any thread).
     void note_write_complete(bool ok) noexcept;
 
+    // Wakes the SSE pump. Safe from any thread: it only posts a shard task, so
+    // `http_server::publish()` never touches shard-only state directly.
+    void wake_sse() noexcept;
+
     [[nodiscard]] runtime* shard() const noexcept { return shard_; }
 
 private:
@@ -273,6 +352,27 @@ private:
     [[nodiscard]] bool keep_alive(const http::request& request) const noexcept;
     void send_http1_error(int status_code, std::string_view detail,
                           const http::request& request, bool keep);
+
+    // Server-Sent Events. `sse_open` runs on the shard after the request has
+    // been parsed and takes ownership of the response (the connection is
+    // dedicated to the event stream).
+    void sse_open(http::request request, const sse_route& route);
+    // The single event pump. Idempotent/re-entrancy safe; honors the per-session
+    // staged-byte bound and parks one taken message instead of dropping it.
+    void sse_pump();
+    void sse_send_heartbeat();
+    void sse_mark_output();
+    void sse_clear_stall_if_drained();
+    [[nodiscard]] std::size_t sse_staged_bytes() const noexcept;
+    [[nodiscard]] std::size_t sse_egress_cap() const noexcept;
+    // Detaches from the hub. Must run before the connection/token is destroyed;
+    // idempotent.
+    void sse_detach() noexcept;
+    // Graceful close: detach, then emit the chunked terminator and let the
+    // write queue drain. `finish_now()` is the hard close.
+    void sse_close(bool graceful) noexcept;
+    // Hard close after detach; used for stall detection and write failures.
+    void sse_abort() noexcept;
 
     // Completion publishing helper (called under `mu_`).
     void queue_write_complete(bool ok) noexcept;
@@ -335,6 +435,27 @@ private:
     bool close_when_drained_ = false;
     std::atomic<bool> shutdown_requested_{false};
     bool finished_ = false;
+
+    // SSE state. All of this is shard-only except `sse_token_`, which is only
+    // touched on the shard and always under `server_state::hub_mutex`.
+    http::chunked_encoder sse_encoder_{};
+    std::atomic<bool> sse_active_{false};
+    bool sse_pumping_ = false;
+    push::subscriber_id sse_subscriber_ = 0;
+    push::hub::connection_id sse_token_ = 0;
+    std::string sse_topic_;
+    // Highest sequence handed to this subscriber (across reconnects). A
+    // Last-Event-ID cursor is clamped to it before `hub.ack`, so a client
+    // cannot acknowledge an event the server never delivered.
+    u64 sse_delivered_high_water_ = 0;
+    // A message taken from the hub that did not fit under the egress bound.
+    // It stays here (not in the hub, not dropped) until the queue drains.
+    push::push_message sse_pending_{};
+    std::size_t sse_pending_bytes_ = 0;
+    bool sse_has_pending_ = false;
+    u64 sse_heartbeat_ns_ = 0;
+    // Non-zero while staged output has not drained; fires `slow_timeout`.
+    u64 sse_stall_deadline_ns_ = 0;
 };
 
 // --- Server state ------------------------------------------------------------
@@ -342,6 +463,20 @@ private:
 struct server_state {
     http_server_options options;
     const mvc::router* router = nullptr;
+
+    // HTTP SSE (single-shard subset). The hub is owned by the facade but every
+    // access is serialized by `hub_mutex`: publishes arrive from arbitrary
+    // threads while sessions pump on their shard. No hub method blocks.
+    std::vector<sse_route> sse_routes;
+    std::recursive_mutex hub_mutex;
+    std::unique_ptr<push::hub> hub;
+    // Per (subscriber, topic) high water: the largest seq ever handed to that
+    // subscriber. Reconnect cursors are clamped to this value before acking.
+    std::map<std::pair<u64, std::string>, u64> sse_delivered;
+    std::atomic<u64> next_sse_subscriber{1};
+    std::atomic<std::size_t> sse_connections{0};
+    std::atomic<std::size_t> sse_events_delivered{0};
+    std::atomic<std::size_t> sse_slow_closes{0};
 
     std::vector<std::unique_ptr<runtime>> shards;
     std::atomic<std::size_t> next_shard{0};
@@ -675,28 +810,52 @@ void session::process() {
     for (;;) {
         std::string input;
         std::deque<bool> completions;
+        bool peer_closed = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             input.swap(ingress_);
             completions.swap(write_completions_);
+            peer_closed = input_closed_;
         }
+        bool sse_write_failed = false;
         for (const bool ok : completions) {
             write_in_flight_ = false;
             if (!ok) {
                 write_failed_ = true;
                 close_when_drained_ = true;
                 stop_reading_ = true;
+                if (sse_active_.load(std::memory_order_acquire)) {
+                    sse_write_failed = true;
+                }
             }
         }
-        if (!input.empty()) {
+        if (sse_write_failed) {
+            // A failed heartbeat/event write is the primary dead-peer signal
+            // for an idle SSE stream. Detach before the transport goes away.
+            sse_abort();
+            return;
+        }
+        if (!input.empty() && !sse_active_.load(std::memory_order_acquire)) {
+            // Once the response is an event stream the connection is dedicated
+            // to it: later bytes are not a pipelined request (HTTP/1.1 cannot
+            // answer them in order) and must not be parsed.
             note_activity();
             consume(std::move(input));
             arm_probe();
+        }
+        if (peer_closed && sse_active_.load(std::memory_order_acquire)) {
+            sse_close(false);
+        }
+        if (sse_active_.load(std::memory_order_acquire)) {
+            sse_pump();
         }
         const bool shutdown =
             shutdown_requested_.load(std::memory_order_acquire);
         if (shutdown) {
             stop_reading_ = true;
+            if (sse_active_.load(std::memory_order_acquire)) {
+                sse_close(true);
+            }
             if (phase_ == phase::h2) {
                 h2_send_goaway(h2::error_code::no_error);
             }
@@ -706,6 +865,10 @@ void session::process() {
         maybe_finish();
         if (finished_) {
             return;
+        }
+        if (sse_active_.load(std::memory_order_acquire)) {
+            sse_clear_stall_if_drained();
+            arm_probe();
         }
         bool resume = false;
         bool over_egress = false;
@@ -945,6 +1108,24 @@ void session::handle_http1_request(http::request request) {
             return;
         }
     } else {
+        const sse_route* sse = find_sse_route(state_.sse_routes, request.path);
+        if (sse != nullptr) {
+            // SSE is a long-lived, unbounded response. It is only defined for
+            // HTTP/1.1 over a single shard; anything else fails closed rather
+            // than producing a half-stream.
+            if (request.method != http::method::get) {
+                state_.bad.fetch_add(1, std::memory_order_relaxed);
+                send_http1_error(405, "SSE requires GET", request, keep);
+                return;
+            }
+            if (request.version != http_version::http_1_1) {
+                state_.bad.fetch_add(1, std::memory_order_relaxed);
+                send_http1_error(400, "SSE requires HTTP/1.1", request, false);
+                return;
+            }
+            sse_open(std::move(request), *sse);
+            return;
+        }
         http::request routed = std::move(request);
         if (head_only) {
             routed.method = http::method::get;
@@ -983,6 +1164,406 @@ void session::handle_http1_request(http::request request) {
             return;
         }
     }
+}
+
+// --- session: Server-Sent Events --------------------------------------------
+
+std::size_t session::sse_egress_cap() const noexcept {
+    const std::size_t configured = state_.options.sse.egress_cap_bytes;
+    return configured != 0 ? configured : state_.options.egress_cap_bytes;
+}
+
+std::size_t session::sse_staged_bytes() const noexcept {
+    return out_bytes_ + (write_in_flight_ ? in_flight_.size() : 0);
+}
+
+void session::wake_sse() noexcept {
+    if (!sse_active_.load(std::memory_order_acquire)) {
+        return;
+    }
+    schedule();
+}
+
+void session::sse_mark_output() {
+    if (sse_stall_deadline_ns_ != 0 || shard_ == nullptr ||
+        state_.options.sse.slow_timeout.count() <= 0) {
+        return;
+    }
+    sse_stall_deadline_ns_ =
+        shard_->now_ns() +
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             state_.options.sse.slow_timeout)
+                             .count());
+}
+
+void session::sse_clear_stall_if_drained() {
+    if (sse_staged_bytes() == 0) {
+        sse_stall_deadline_ns_ = 0;
+    }
+}
+
+void session::sse_detach() noexcept {
+    sse_active_.store(false, std::memory_order_release);
+    sse_has_pending_ = false;
+    sse_pending_bytes_ = 0;
+    sse_pending_ = push::push_message{};
+    sse_heartbeat_ns_ = 0;
+    sse_stall_deadline_ns_ = 0;
+    const push::hub::connection_id token = sse_token_;
+    sse_token_ = 0;
+    if (token == 0) {
+        return;
+    }
+    // MUST happen before the session/transport (and this token) is destroyed:
+    // a detached token can no longer receive a delivery or acknowledge a late
+    // write. The subscription itself survives so a reconnect can replay.
+    std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+    if (state_.hub) {
+        (void)state_.hub->detach(token);
+    }
+    state_.sse_connections.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void session::sse_abort() noexcept {
+    const bool was_active = sse_active_.exchange(false);
+    if (!was_active) {
+        sse_detach();
+        return;
+    }
+    sse_detach();
+    sse_pending_ = push::push_message{};
+    sse_has_pending_ = false;
+    close_when_drained_ = true;
+    stop_reading_ = true;
+    // The peer is gone or wedged: do not wait for a queued write to complete.
+    finish_now();
+}
+
+void session::sse_close(bool graceful) noexcept {
+    if (!sse_active_.exchange(false)) {
+        sse_detach();
+        return;
+    }
+    sse_detach();
+    if (graceful && !write_failed_) {
+        // The terminating chunk is bound to the response close, never emitted
+        // between events (mirrors maybe_finish's drain rule).
+        std::string terminator;
+        if (sse_encoder_.finish(terminator).ok()) {
+            enqueue(std::move(terminator));
+        }
+    }
+    close_when_drained_ = true;
+    stop_reading_ = true;
+    flush_writes();
+}
+
+void session::sse_open(http::request request, const sse_route& route) {
+    std::string topic = route.topic;
+    std::string value;
+    switch (query_param(request.query, "topic", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(400, "invalid topic parameter", request, false);
+        return;
+    case query_result::ok:
+        topic = std::move(value);
+        break;
+    case query_result::missing:
+        break;
+    }
+    if (topic.empty()) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(400, "SSE route requires a topic", request, false);
+        return;
+    }
+
+    push::delivery_mode mode = route.mode;
+    switch (query_param(request.query, "mode", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(400, "invalid mode parameter", request, false);
+        return;
+    case query_result::ok:
+        if (value == "reliable") {
+            mode = push::delivery_mode::reliable;
+        } else if (value == "unreliable") {
+            mode = push::delivery_mode::unreliable;
+        } else {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(400, "mode must be reliable or unreliable", request,
+                             false);
+            return;
+        }
+        break;
+    case query_result::missing:
+        break;
+    }
+
+    bool ordered = route.ordered;
+    switch (query_param(request.query, "ordered", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(400, "invalid ordered parameter", request, false);
+        return;
+    case query_result::ok:
+        if (!parse_bool_text(value, ordered)) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(400, "ordered must be 0/1 or false/true", request,
+                             false);
+            return;
+        }
+        break;
+    case query_result::missing:
+        break;
+    }
+
+    u64 subscriber = 0;
+    switch (query_param(request.query, "subscriber", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(400, "invalid subscriber parameter", request, false);
+        return;
+    case query_result::ok:
+        if (!parse_u64_text(value, subscriber) || subscriber == 0) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(400, "subscriber must be a non-zero u64", request,
+                             false);
+            return;
+        }
+        break;
+    case query_result::missing:
+        subscriber =
+            state_.next_sse_subscriber.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+
+    bool have_cursor = false;
+    sse::event_id cursor{};
+    if (const std::string* field = request.headers.find("last-event-id")) {
+        if (!sse::parse_last_event_id(*field, cursor).ok()) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(400, "invalid Last-Event-ID", request, false);
+            return;
+        }
+        have_cursor = true;
+    }
+
+    if (state_.options.shards != 1) {
+        send_http1_error(503, "SSE requires a single shard", request, false);
+        return;
+    }
+
+    status failure;
+    {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        push::hub* hub = state_.hub.get();
+        if (hub == nullptr) {
+            failure = status{rpc_error(rpc_code::unavailable,
+                                       "push hub is not running")};
+        } else {
+            const status subscribed =
+                hub->subscribe(topic, subscriber, mode, ordered,
+                               state_.options.sse.subscribe);
+            if (!subscribed.ok() &&
+                subscribed.code() != rpc_code::failed_precondition) {
+                failure = subscribed;
+            } else {
+                // Reconnect order: clamp the client cursor to the highest seq
+                // this server ever delivered for (subscriber, topic), then
+                // ack, then attach. Ack-only: a re-subscribe would fail with
+                // failed_precondition and must never create a new subscriber.
+                u64 accepted = 0;
+                if (have_cursor && mode == push::delivery_mode::reliable &&
+                    cursor.epoch == state_.options.sse.epoch) {
+                    const auto high =
+                        state_.sse_delivered.find({subscriber, topic});
+                    const u64 delivered =
+                        high == state_.sse_delivered.end() ? 0 : high->second;
+                    accepted = std::min(cursor.seq, delivered);
+                }
+                if (accepted != 0) {
+                    (void)hub->ack(subscriber, topic, accepted);
+                }
+                const push::hub::connection_id token = hub->attach(subscriber);
+                if (token == push::hub::invalid_connection) {
+                    failure = status{rpc_error(rpc_code::unavailable,
+                                               "SSE attach failed")};
+                } else {
+                    sse_subscriber_ = subscriber;
+                    sse_token_ = token;
+                    sse_topic_ = topic;
+                    const auto high =
+                        state_.sse_delivered.find({subscriber, topic});
+                    sse_delivered_high_water_ =
+                        high == state_.sse_delivered.end() ? 0 : high->second;
+                    sse_active_.store(true, std::memory_order_release);
+                    state_.sse_connections.fetch_add(1,
+                                                     std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    if (!failure.ok()) {
+        send_http1_error(503, failure.error().message, request, false);
+        return;
+    }
+
+    // Hand-written streaming head: no Content-Length and no terminal chunk.
+    // `http::serialize` always appends the zero chunk, so it cannot be used
+    // for this response (see message.cpp serialize()).
+    std::string head;
+    head.reserve(192);
+    head += "HTTP/1.1 200 OK\r\n";
+    head += "Content-Type: text/event-stream; charset=utf-8\r\n";
+    head += "Cache-Control: no-cache\r\n";
+    head += "Connection: keep-alive\r\n";
+    head += "X-Accel-Buffering: no\r\n";
+    head += "Transfer-Encoding: chunked\r\n\r\n";
+    enqueue(std::move(head));
+
+    if (state_.options.sse.retry.count() > 0) {
+        const std::string hint =
+            sse::retry_hint(state_.options.sse.retry);
+        std::string chunk;
+        if (!hint.empty()) {
+            (void)sse_encoder_.append(as_bytes(hint), chunk);
+            enqueue(std::move(chunk));
+            sse_mark_output();
+        }
+    }
+
+    state_.handled.fetch_add(1, std::memory_order_relaxed);
+    state_.responded.fetch_add(1, std::memory_order_relaxed);
+
+    // An SSE response has no inbound liveness signal. The idle and request
+    // deadlines are therefore disabled; heartbeats and the slow-read stall
+    // bound are the liveness checks instead.
+    idle_deadline_ns_ = 0;
+    request_deadline_ns_ = 0;
+    stop_reading_ = true;
+    if (state_.options.sse.heartbeat.count() > 0 && shard_ != nullptr) {
+        sse_heartbeat_ns_ =
+            shard_->now_ns() +
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 state_.options.sse.heartbeat)
+                                 .count());
+    }
+
+    sse_pump();
+    flush_writes();
+    arm_probe();
+}
+
+void session::sse_pump() {
+    if (!sse_active_.load(std::memory_order_acquire) || finished_ ||
+        sse_pumping_) {
+        return;
+    }
+    sse_pumping_ = true;
+    {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        push::hub* hub = state_.hub.get();
+        if (hub == nullptr || sse_token_ == 0) {
+            sse_pumping_ = false;
+            return;
+        }
+        const std::size_t cap = sse_egress_cap();
+        for (;;) {
+            if (finished_ || write_failed_ || !sse_active_.load()) {
+                break;
+            }
+            const std::size_t staged = sse_staged_bytes();
+            if (sse_has_pending_) {
+                // A single message larger than the bound still makes progress:
+                // the bound pauses the pump, it never refuses a message.
+                if (cap != 0 && staged != 0 &&
+                    staged + sse_pending_bytes_ > cap) {
+                    break;
+                }
+                std::string frame;
+                const bool reliable =
+                    sse_pending_.mode == push::delivery_mode::reliable;
+                const sse::event_id id{
+                    sse_pending_.epoch, reliable ? sse_pending_.seq
+                                                 : sse_pending_.topic_seq};
+                if (!sse::encode_event(id, sse_pending_.data(), frame).ok()) {
+                    sse_has_pending_ = false;
+                    sse_pending_bytes_ = 0;
+                    sse_pending_ = push::push_message{};
+                    break;
+                }
+                sse_pending_ = push::push_message{};
+                sse_has_pending_ = false;
+                sse_pending_bytes_ = 0;
+                std::string chunk;
+                if (!sse_encoder_.append(as_bytes(frame), chunk).ok()) {
+                    break;
+                }
+                enqueue(std::move(chunk));
+                sse_mark_output();
+                if (reliable && id.seq > sse_delivered_high_water_) {
+                    sse_delivered_high_water_ = id.seq;
+                    state_.sse_delivered[{sse_subscriber_, sse_topic_}] = id.seq;
+                }
+                state_.sse_events_delivered.fetch_add(1,
+                                                      std::memory_order_relaxed);
+                continue;
+            }
+            if (cap != 0 && staged >= cap) {
+                break;
+            }
+            push::push_message message;
+            if (!hub->try_take(sse_token_, sse_topic_, message)) {
+                break;
+            }
+            const sse::event_id id{
+                message.epoch,
+                message.mode == push::delivery_mode::reliable ? message.seq
+                                                              : message.topic_seq};
+            std::string frame;
+            if (!sse::encode_event(id, message.data(), frame).ok()) {
+                continue;
+            }
+            if (cap != 0 && staged != 0 && staged + frame.size() > cap) {
+                sse_pending_ = std::move(message);
+                sse_pending_bytes_ = frame.size();
+                sse_has_pending_ = true;
+                break;
+            }
+            std::string chunk;
+            if (!sse_encoder_.append(as_bytes(frame), chunk).ok()) {
+                break;
+            }
+            enqueue(std::move(chunk));
+            sse_mark_output();
+            if (message.mode == push::delivery_mode::reliable &&
+                id.seq > sse_delivered_high_water_) {
+                sse_delivered_high_water_ = id.seq;
+                state_.sse_delivered[{sse_subscriber_, sse_topic_}] = id.seq;
+            }
+            state_.sse_events_delivered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    sse_pumping_ = false;
+}
+
+void session::sse_send_heartbeat() {
+    if (!sse_active_.load(std::memory_order_acquire) || finished_) {
+        return;
+    }
+    if (sse_staged_bytes() != 0) {
+        // The peer is still draining an earlier write. Skip this tick instead
+        // of growing the queue; the stall deadline closes a peer that never
+        // drains.
+        return;
+    }
+    std::string chunk;
+    if (!sse_encoder_.append(as_bytes(sse::heartbeat()), chunk).ok()) {
+        return;
+    }
+    enqueue(std::move(chunk));
+    sse_mark_output();
 }
 
 // --- session: HTTP/2 ---------------------------------------------------------
@@ -1174,6 +1755,19 @@ void session::dispatch_h2(u32 stream_id) {
     if (head_only) {
         routed.method = http::method::get;
         routed.method_token = "GET";
+    }
+    // SSE is not implemented over HTTP/2 in this slice. A matching route must
+    // fail closed with a complete, non-streaming response rather than pretend
+    // to open a stream.
+    if (find_sse_route(state_.sse_routes, routed.path) != nullptr) {
+        http::response response;
+        response.status_code = 501;
+        response.reason = "Not Implemented";
+        response.headers.add("Content-Type", "text/plain; charset=utf-8");
+        response.body = "SSE is not supported over HTTP/2\n";
+        state_.handled.fetch_add(1, std::memory_order_relaxed);
+        send_h2_response(stream_id, response, head_only);
+        return;
     }
     http::response response;
     if (state_.router != nullptr) {
@@ -1619,6 +2213,10 @@ void session::finish_now() {
         return;
     }
     finished_ = true;
+    // Detach BEFORE the transport and the hub token are destroyed. This is the
+    // same ordering the push control path requires; a token that outlives its
+    // connection would receive deliveries into a dead session.
+    sse_detach();
     close_when_drained_ = true;
     stop_reading_ = true;
     if (shard_ != nullptr) {
@@ -1640,6 +2238,11 @@ void session::finish_now() {
 }
 
 void session::note_activity() noexcept {
+    if (sse_active_.load(std::memory_order_relaxed)) {
+        // An SSE response is intentionally long-lived and has no inbound
+        // traffic of its own; the idle deadline must not be re-armed.
+        return;
+    }
     if (shard_ == nullptr || state_.options.idle_timeout.count() <= 0) {
         return;
     }
@@ -1680,6 +2283,18 @@ void session::arm_probe() {
         (deadline == 0 || request_deadline_ns_ < deadline)) {
         deadline = request_deadline_ns_;
     }
+    // An open SSE response replaces the idle/request timers with a heartbeat
+    // and a slow-read stall deadline (idle_deadline_ns_ is zeroed on open).
+    if (sse_active_.load(std::memory_order_relaxed)) {
+        if (sse_heartbeat_ns_ != 0 &&
+            (deadline == 0 || sse_heartbeat_ns_ < deadline)) {
+            deadline = sse_heartbeat_ns_;
+        }
+        if (sse_stall_deadline_ns_ != 0 &&
+            (deadline == 0 || sse_stall_deadline_ns_ < deadline)) {
+            deadline = sse_stall_deadline_ns_;
+        }
+    }
     // HTTP/2 bounds each open stream separately: one stream trickling bytes must
     // not keep another stream's request alive forever.
     for (const auto& item : h2_streams_) {
@@ -1718,6 +2333,29 @@ void session::on_probe() {
         return;
     }
     const u64 now = shard_->now_ns();
+    if (sse_active_.load(std::memory_order_acquire)) {
+        if (sse_stall_deadline_ns_ != 0 && now >= sse_stall_deadline_ns_) {
+            // The peer is connected but stopped draining; staying open would
+            // accumulate an unbounded queue behind TCP. This is the backstop
+            // for a half-open connection whose writes never fail.
+            sse_stall_deadline_ns_ = 0;
+            state_.sse_slow_closes.fetch_add(1, std::memory_order_relaxed);
+            sse_abort();
+            return;
+        }
+        if (sse_heartbeat_ns_ != 0 && now >= sse_heartbeat_ns_) {
+            sse_heartbeat_ns_ =
+                now +
+                static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        state_.options.sse.heartbeat)
+                        .count());
+            sse_send_heartbeat();
+            flush_writes();
+        }
+        arm_probe();
+        return;
+    }
     if (request_deadline_ns_ != 0 && now >= request_deadline_ns_) {
         // A request that never completes must fail explicitly instead of
         // occupying the connection forever (No-stall rule).
@@ -1821,9 +2459,15 @@ http_server::builder& http_server::builder::drain_timeout(
     return *this;
 }
 
+http_server::builder& http_server::builder::add_sse_route(sse_route route) {
+    sse_routes_.push_back(std::move(route));
+    return *this;
+}
+
 std::unique_ptr<http_server> http_server::builder::build() {
     auto result = std::unique_ptr<http_server>(new http_server(options_));
     result->impl_->state.router = router_;
+    result->impl_->state.sse_routes = sse_routes_;
     for (const listener_config& config : listeners_) {
         server_state::pending_listener pending;
         pending.ep = config.ep;
@@ -1897,6 +2541,28 @@ status http_server::start() {
                                 "the MVC router must be frozen before start()")};
     }
 
+    // SSE is defined only for the single-shard, in-process subset. Reject the
+    // configuration up front rather than streaming from a hub owned by the
+    // wrong thread.
+    const std::size_t shard_count =
+        state.options.shards == 0 ? 1 : state.options.shards;
+    if (!state.sse_routes.empty() && shard_count != 1) {
+        return status{rpc_error(rpc_code::failed_precondition,
+                                "SSE requires http_server_options::shards == 1")};
+    }
+    for (std::size_t i = 0; i < state.sse_routes.size(); ++i) {
+        if (state.sse_routes[i].path.empty()) {
+            return status{rpc_error(rpc_code::invalid_argument,
+                                    "an SSE route requires a path")};
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (state.sse_routes[j].path == state.sse_routes[i].path) {
+                return status{rpc_error(rpc_code::invalid_argument,
+                                        "duplicate SSE route path")};
+            }
+        }
+    }
+
     if (state.has_tls) {
 #if defined(CRPC_HAVE_OPENSSL)
         std::error_code ec;
@@ -1913,7 +2579,16 @@ status http_server::start() {
     }
 
     try {
-        const std::size_t count = state.options.shards == 0 ? 1 : state.options.shards;
+        const std::size_t count = shard_count;
+        if (count == 1) {
+            std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
+            push::hub_options hub_options;
+            hub_options.shard_count = 1;
+            hub_options.shard_index = 0;
+            hub_options.epoch = state.options.sse.epoch;
+            state.hub = std::make_unique<push::hub>(hub_options);
+            state.sse_delivered.clear();
+        }
         for (std::size_t i = 0; i < count; ++i) {
             runtime_options options = state.options.runtime;
             options.start_handler_pool = true;
@@ -1973,6 +2648,12 @@ void http_server::stop() noexcept {
             std::lock_guard<std::mutex> lk(state.sessions_mutex);
             state.sessions.clear();
         }
+        {
+            std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
+            state.hub.reset();
+            state.sse_delivered.clear();
+            state.sse_connections.store(0, std::memory_order_relaxed);
+        }
         state.acceptors.clear();
         return;
     }
@@ -2007,6 +2688,12 @@ void http_server::stop() noexcept {
         std::lock_guard<std::mutex> lk(state.sessions_mutex);
         state.sessions.clear();
     }
+    {
+        std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
+        state.hub.reset();
+        state.sse_delivered.clear();
+        state.sse_connections.store(0, std::memory_order_relaxed);
+    }
     state.shards.clear();
     state.pending_listeners.clear();
     state.tls_context.reset();
@@ -2032,7 +2719,57 @@ http_statistics http_server::stats() const noexcept {
     out.tls_connections = impl_->state.tls_connections.load(std::memory_order_relaxed);
     out.rejected_connections = impl_->state.rejected.load(std::memory_order_relaxed);
     out.timed_out_connections = impl_->state.timed_out.load(std::memory_order_relaxed);
+    out.sse_connections =
+        impl_->state.sse_connections.load(std::memory_order_relaxed);
+    out.sse_events_delivered =
+        impl_->state.sse_events_delivered.load(std::memory_order_relaxed);
+    out.sse_slow_closes =
+        impl_->state.sse_slow_closes.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::recursive_mutex> lk(impl_->state.hub_mutex);
+        if (impl_->state.hub) {
+            const push::hub_stats counters = impl_->state.hub->stats();
+            out.sse_hub_published = static_cast<std::size_t>(counters.published);
+            out.sse_hub_delivered = static_cast<std::size_t>(counters.delivered);
+            out.sse_hub_queued = static_cast<std::size_t>(counters.queued_messages);
+            out.sse_hub_dropped = static_cast<std::size_t>(
+                counters.dropped_overflow + counters.dropped_unreliable +
+                counters.dropped_disconnected + counters.dropped_allocation);
+        }
+    }
     return out;
+}
+
+bool http_server::publish(std::string_view topic, span<const std::byte> body,
+                          push::delivery_mode mode) noexcept {
+    server_state& state = impl_->state;
+    if (topic.empty() || state.options.shards != 1 ||
+        !state.accepting.load(std::memory_order_acquire)) {
+        return false;
+    }
+    try {
+        std::vector<std::shared_ptr<session>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(state.sessions_mutex);
+            snapshot = state.sessions;
+        }
+        {
+            std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
+            if (!state.hub) {
+                return false;
+            }
+            state.hub->publish(topic, body, mode);
+        }
+        // Wake every SSE session on the shard. `wake_sse` only posts a task, so
+        // this thread never touches shard-only session state or the write
+        // queue, and a slow subscriber cannot block the publisher.
+        for (const std::shared_ptr<session>& value : snapshot) {
+            value->wake_sse();
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace http

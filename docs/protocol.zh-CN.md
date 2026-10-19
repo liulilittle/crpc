@@ -29,6 +29,7 @@
 | [17](#s17) | HTTP/2 映射 |
 | [18](#s18) | 版本与验证 |
 | [19](#s19) | 推送投递（已实现子集） |
+| [20](#s20) | HTTP/1.1 Server-Sent Events（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -302,7 +303,7 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ## 19. 推送投递（已实现子集） <a id="s19"></a>
 
-本节对已实现的单分片、进程内子集具有规范效力。PUSH 与 REQUEST/RESPONSE 走同一条连接。跨分片路由、ordered/gap 处理、HTTP SSE 与 `stream_transport` 集成不属于本子集。
+本节对已实现的单分片、进程内子集具有规范效力。PUSH 与 REQUEST/RESPONSE 走同一条连接。跨分片路由、ordered/gap 处理与 `stream_transport` 集成不属于本子集；HTTP SSE 见第 20 节。
 
 ### 19.1 PUSH 信封
 
@@ -344,3 +345,27 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 关闭连接时，必须在销毁连接及其推送令牌之前先 `hub.detach`，使迟到的 `PUSH_ACK` 不可能指向已死连接。订阅在 detach 后保留，因此使用同一 `subscriber_id` 重连时会重放未确认的可靠消息并继续投递。
 
 本子集未接 `hub::tick` 的慢订阅检测：不产生 `slow_subscriber` 事件，内存由 hub 的每订阅有界队列及其溢出策略兜底。
+
+## 20. HTTP/1.1 Server-Sent Events（已实现子集） <a id="s20"></a>
+
+本节对已实现的 SSE 子集具有规范效力：HTTP/1.1、单分片、进程内。长轮询、HTTP/2 SSE、跨分片发布、鉴权与 `content_coding` 不属于本子集。分帧辅助位于 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`；服务端接线位于 `src/http/server.cpp`。
+
+### 20.1 请求
+
+`GET <sse-path>`；`Accept: text/event-stream` 可选。查询参数覆盖已注册路由：`topic`（必须非空）、`mode`（`reliable` 或 `unreliable`）、`ordered`（`0`/`1` 或 `false`/`true`）与 `subscriber`（非零 u64；缺省时分配新 id）。可选的 `Last-Event-ID: <epoch>:<seq>` 用于续订。路由通过 `http_server::builder::add_sse_route()` 注册。SSE 要求 `http_server_options::shards == 1`，否则 `start()` 以 `failed_precondition` 失败。
+
+### 20.2 响应与事件
+
+响应为 `200`，携带 `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no` 与 `Transfer-Encoding: chunked`（没有 `Content-Length`；响应头为手写，因为 `http::serialize` 总会追加终止块）。事件帧为 `id: <epoch>:<seq>\ndata: <payload>\n\n`。非合法 UTF-8 文本的负载会做 base64 编码并标记为 `data: b64:<...>`；只有二进制事件带 `b64:` 前缀。每 `sse_options::heartbeat`（默认 15 秒，0 关闭）发送一次注释心跳 `:hb\n\n`。配置的 `retry:` 提示仅在开头发送一次。
+
+### 20.3 投递、背压与关闭
+
+已打开的 SSE 响应独占其连接：不使用 HTTP/1.1 流水线，且禁用 idle 截止时间。存活检测来自心跳写（写失败即关闭会话）以及 `sse_options::slow_timeout`：当暂存输出非空而对端停止排空时关闭。暂存输出（写队列加在途写）由 `sse_options::egress_cap_bytes` 限制（默认取 `http_server_options::egress_cap_bytes`，1 MiB）。达到上限时泵停止调用 `try_take`，并把已取出的消息停靠（而非丢弃）；所有丢弃决策由 hub 的 `subscribe_options`（`max_messages`、`max_bytes`、`overflow_policy`）作出，`http_server::publish()` 永不阻塞。关闭时必须在传输与其令牌被销毁之前先从 hub detach；终止块与关闭绑定，不在事件之间发送。
+
+### 20.4 重连与重放
+
+以同一 `subscriber` 重连会复用既有订阅：服务端绝不重复订阅。服务端把 `Last-Event-ID` 序号 clamp 到它为该 (subscriber, topic) 已交付过的最高序号，然后调用 `hub.ack(cursor)`（累积）与 `hub.attach()`，后者重放未确认的可靠消息。epoch 与当前服务端 epoch 不一致的游标不会被确认。因此事件 id 同时携带 epoch 与序号，客户端必须以 `(epoch, seq)` 去重。
+
+### 20.5 HTTP/2
+
+本子集不支持 HTTP/2 SSE。命中 SSE 路由的请求会收到一个完整的 `501` 响应，不会打开流。

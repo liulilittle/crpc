@@ -42,7 +42,9 @@
 #include <crpc/http/message.hpp>
 #include <crpc/io.hpp>
 #include <crpc/io/tls.hpp>
+#include <crpc/push/hub.hpp>
 #include <crpc/runtime.hpp>
+#include <crpc/span.hpp>
 
 namespace crpc {
 namespace mvc {
@@ -50,6 +52,46 @@ class router;
 } // namespace mvc
 
 namespace http {
+
+// Server-Sent Events subset. SSE is available over HTTP/1.1 only, with a
+// single shard, in process. A request is attached to the server's push hub
+// under `?subscriber=<u64>` (optional; a fresh id is allocated when absent) and
+// resumes the same subscription when it reconnects with `Last-Event-ID`.
+struct sse_options {
+    // Comment-only heartbeat period. Zero disables the heartbeat; the idle
+    // timeout is always exempted for an open SSE response.
+    std::chrono::milliseconds heartbeat{15000};
+
+    // Optional `retry:` hint sent once at the start of the stream.
+    std::chrono::milliseconds retry{0};
+
+    // Per-session bound on staged SSE bytes (write queue plus the in-flight
+    // write). Zero reuses `http_server_options::egress_cap_bytes`.
+    std::size_t egress_cap_bytes = 0;
+
+    // A peer that stops draining for this long is closed (0 disables the
+    // check). This is the backstop for a half-open connection that never fails
+    // a heartbeat write.
+    std::chrono::milliseconds slow_timeout{30000};
+
+    // Epoch stamped into every event id and into the hub. A reconnect whose
+    // Last-Event-ID carries a different epoch is not acknowledged.
+    u64 epoch = 1;
+
+    // Hub subscription bounds and overflow policy. The hub makes every drop
+    // decision; a `disconnect_subscriber` policy ends delivery to that
+    // subscriber. The replay window bounds reconnect replay.
+    push::subscribe_options subscribe{};
+};
+
+// One SSE endpoint. The request may override `topic`, `mode` and `ordered`
+// with the query parameters of the same names.
+struct sse_route {
+    std::string path;
+    std::string topic;
+    push::delivery_mode mode = push::delivery_mode::reliable;
+    bool ordered = false;
+};
 
 // Tunables. Every field is a plain value: the facade has no process-global
 // configuration, and a caller can change any limit per server instance.
@@ -97,6 +139,10 @@ struct http_server_options {
     // An incomplete request (headers or body) older than this is answered with
     // 408 and the connection is closed. Zero disables the request bound.
     std::chrono::milliseconds request_timeout{30000};
+
+    // Server-Sent Events (HTTP/1.1, single shard) options. SSE routes are
+    // registered on the builder with `sse_route()`.
+    sse_options sse{};
 };
 
 struct http_statistics {
@@ -111,6 +157,18 @@ struct http_statistics {
     std::size_t rejected_connections = 0;
     // Connections closed by the idle or request deadline.
     std::size_t timed_out_connections = 0;
+    // Live HTTP/1.1 SSE responses.
+    std::size_t sse_connections = 0;
+    // Event frames emitted onto SSE connections since start().
+    std::size_t sse_events_delivered = 0;
+    // SSE sessions closed because the peer stopped draining.
+    std::size_t sse_slow_closes = 0;
+    // Hub counters, so a test or operator can verify the drop accounting:
+    // published == delivered + queued + drops (one subscriber).
+    std::size_t sse_hub_published = 0;
+    std::size_t sse_hub_delivered = 0;
+    std::size_t sse_hub_queued = 0;
+    std::size_t sse_hub_dropped = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with
@@ -138,12 +196,17 @@ public:
         builder& options(const http_server_options& value);
         builder& set_parser_limits(const parser_limits& limits);
         builder& drain_timeout(std::chrono::milliseconds value);
+        // Registers an SSE endpoint. SSE requires `shards == 1`; `start()`
+        // fails with `failed_precondition` otherwise. An HTTP/2 request that
+        // targets an SSE path is answered with 501 (fail-closed, no stream).
+        builder& add_sse_route(sse_route route);
 
         [[nodiscard]] std::unique_ptr<http_server> build();
 
     private:
         http_server_options options_{};
         std::vector<listener_config> listeners_;
+        std::vector<sse_route> sse_routes_;
         const mvc::router* router_ = nullptr;
     };
 
@@ -168,6 +231,15 @@ public:
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] http_statistics stats() const noexcept;
+
+    // Publishes one payload to every SSE subscriber of `topic`. Single shard
+    // only. The call never blocks on a slow subscriber: the hub's bounds and
+    // overflow policy make every drop decision, and each attached SSE pump is
+    // woken after the publish. Returns false when the server is not running,
+    // has more than one shard, or `topic` is empty.
+    [[nodiscard]] bool publish(std::string_view topic, span<const std::byte> body,
+                               push::delivery_mode mode =
+                                   push::delivery_mode::reliable) noexcept;
 
     struct impl;
 
