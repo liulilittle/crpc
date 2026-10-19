@@ -193,11 +193,15 @@ struct fixture {
     std::filesystem::path root;
     std::unique_ptr<http::http_server> server;
 
-    explicit fixture(http::http_server_options options = http::http_server_options{}) {
+    explicit fixture(
+        http::http_server_options options = http::http_server_options{},
+        std::string content_type = "application/octet-stream") {
         root = test_root();
         write_file(root / "small.txt", "0123456789");
         write_file(root / "big.bin", big_payload());
-        write_file(root / "slow.bin", big_payload().substr(0, 16384));
+        // Larger than the inproc peer queue (64 KiB) so a non-draining peer
+        // actually defers the server's in-flight write.
+        write_file(root / "slow.bin", big_payload().substr(0, 80000));
         write_file(root.parent_path() / "crpc_dl_secret.txt", "SECRET");
         mvc::route_entry entry;
         entry.method = http::method::get;
@@ -210,6 +214,7 @@ struct fixture {
         http::download_route route;
         route.path = "/files";
         route.root = root;
+        route.content_type = std::move(content_type);
         http::http_server::builder builder;
         builder.add_listener(endpoint::inproc("download-test"), backend);
         builder.router(router);
@@ -439,6 +444,15 @@ CRPC_TEST(download_full_file_200) {
                   response.header("Content-Type"));
 }
 
+CRPC_TEST(download_empty_content_type_falls_back) {
+    fixture fx(http::http_server_options{}, "");
+    parsed_response response;
+    CRPC_CHECK(round_trip(fx, http1("GET", "/files/small.txt"), response));
+    CRPC_CHECK_EQ(200, response.status);
+    CRPC_CHECK_EQ(std::string("application/octet-stream"),
+                  response.header("Content-Type"));
+}
+
 CRPC_TEST(download_range_returns_206_exact_bytes) {
     fixture fx;
     parsed_response response;
@@ -650,12 +664,13 @@ CRPC_TEST(download_head_404_has_no_body) {
 // timeout: every write completion refreshes the deadline.
 CRPC_TEST(download_slow_progress_survives_stall_timeout) {
     http::http_server_options options;
-    options.download_chunk_bytes = 4096;
-    options.egress_cap_bytes = 8192;
-    options.download_stall_timeout = std::chrono::milliseconds(200);
+    options.download_chunk_bytes = 8192;
+    options.egress_cap_bytes = 32u * 1024u;
+    options.download_stall_timeout = std::chrono::milliseconds(100);
     fixture fx(options);
 
     slow_source capture;
+    capture.budget = 8192;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
     client->bind_source(&capture);
@@ -681,8 +696,30 @@ CRPC_TEST(download_slow_progress_survives_stall_timeout) {
     CRPC_CHECK(ok);
     CRPC_CHECK(complete);
     CRPC_CHECK_EQ(200, response.status);
-    CRPC_CHECK_EQ(std::string("16384"), response.header("Content-Length"));
-    CRPC_CHECK_EQ(big_payload().substr(0, 16384), response.body);
+    CRPC_CHECK_EQ(std::string("80000"), response.header("Content-Length"));
+    CRPC_CHECK_EQ(big_payload().substr(0, 80000), response.body);
+}
+
+// A peer that drains nothing at all must be closed at the stall deadline; the
+// download cannot make progress and the connection is reaped, not held open.
+CRPC_TEST(download_no_progress_is_killed_by_stall) {
+    http::http_server_options options;
+    options.download_chunk_bytes = 8192;
+    options.egress_cap_bytes = 32u * 1024u;
+    options.download_stall_timeout = std::chrono::milliseconds(100);
+    fixture fx(options);
+
+    slow_source capture;
+    capture.budget = 0;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+    send_raw(*client, http1("GET", "/files/big.bin"));
+
+    const bool killed = crpc_test::wait_for(
+        [&] { return fx.server->stats().timed_out_connections >= 1; }, 5000);
+    CRPC_CHECK(killed);
+    CRPC_CHECK(capture.snapshot().empty());
 }
 
 CRPC_TEST(download_206_never_content_coded) {

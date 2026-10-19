@@ -1451,7 +1451,12 @@ struct content_encoder::impl {
                         break;
                     }
                     const std::uint64_t distance = here - position;
-                    if (distance > k_window) {
+                    // A distance of exactly k_window aliases the slot that was
+                    // just overwritten by `here` (and by `prev[here & mask]`),
+                    // so it cannot be represented by the ring. Cap the maximum
+                    // distance at k_window - 1 (32767); this is the same
+                    // conservative bound zlib uses near the window edge.
+                    if (distance >= k_window) {
                         break;
                     }
                     std::uint32_t length = 0;

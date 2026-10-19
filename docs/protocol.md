@@ -485,7 +485,9 @@ The encoder emits fixed-Huffman deflate blocks with a minimal LZ77 matcher
 matches may cross `write` boundaries and every input byte enters the history
 ring before the next write) wrapped in a gzip or zlib container. Hash-chain
 positions are 32-bit, so after 2 GiB of streamed input matching degrades to
-literals (no corruption). Its
+literals (no corruption). The maximum match distance is 32767 bytes: a distance
+of exactly 32768 aliases the ring slot just written for the current position and
+is therefore never selected. Its
 output is valid for any conforming decoder; the decoder is independently
 verified against zlib vectors and the encoder against Python `zlib`/`gzip`.
 
@@ -513,8 +515,9 @@ file, and any result whose canonical (symlink-resolved) path is not under the
 canonical root are answered with `404`. `GET` and `HEAD` are served; every
 other method is `405` with `Allow: GET, HEAD`. A `HEAD` error response (404/405/
 416) has the same headers as `GET` but never a body, so keep-alive framing stays
-in sync. The route's `content_type` (default `application/octet-stream`) is
-sent as `Content-Type`; it never overrides the path-safety rules. A stat/open
+in sync. The route's `content_type` (default and empty-string fallback
+`application/octet-stream`) is sent as `Content-Type`; it never overrides the
+path-safety rules. A stat/open
 TOCTOU window remains (documented limitation, not hardened in this slice).
 
 ### 22.2 Range semantics

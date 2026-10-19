@@ -550,6 +550,24 @@ CRPC_TEST(content_coding_minimal_two_write_boundary) {
 CRPC_TEST(content_coding_split_fuzz_round_trip) {
     std::uint32_t state = 0x12345678u;
     for (int round = 0; round < 200; ++round) {
+        if (round % 10 == 0) {
+            // A repeat block exactly 32768 bytes behind a write boundary: the
+            // first byte differs only in a bit masked out of the 3-byte hash.
+            std::string block;
+            block.reserve(33000);
+            for (std::size_t i = 0; i < 33000; ++i) {
+                block.push_back(static_cast<char>(next_random(state) & 0xffu));
+            }
+            std::string tail = block.substr(232, 600);
+            tail[0] = static_cast<char>(tail[0] ^ 0x20);
+            const std::string data = block + tail;
+            const std::vector<std::size_t> cuts{block.size()};
+            for (const content_coding coding : {content_coding::gzip,
+                                                content_coding::deflate}) {
+                check_split_round_trip(coding, data, cuts);
+            }
+            continue;
+        }
         std::string data;
         const std::size_t size =
             1 + static_cast<std::size_t>(next_random(state) % 5000u);
@@ -576,6 +594,103 @@ CRPC_TEST(content_coding_split_fuzz_round_trip) {
         for (const content_coding coding : {content_coding::gzip,
                                             content_coding::deflate}) {
             check_split_round_trip(coding, data, cuts);
+        }
+    }
+}
+
+// Exact distance boundary. A distance of 32768 aliases the ring slot just
+// written for `here`, so it must not be used; 32767 is the largest legal
+// distance. The d=32768 case is audit A's probe3 (first byte differs only in a
+// hash-masked bit).
+CRPC_TEST(content_coding_distance_window_boundary) {
+    const auto make_block = [](std::size_t size) {
+        std::string block(size, '\xAA');
+        if (size > 2) {
+            block[0] = '\x00';
+            block[1] = '\x02';
+            block[2] = '\x03';
+        }
+        return block;
+    };
+
+    // d == 32768: hashes collide after masking; the candidate must be rejected.
+    {
+        const std::string first = make_block(32768);
+        std::string second(1, '\x20');
+        second.push_back('\x02');
+        second.push_back('\x03');
+        second.append(600, '\xAA');
+        for (const content_coding coding : {content_coding::gzip,
+                                            content_coding::deflate}) {
+            content_encoder encoder(coding);
+            std::string encoded;
+            CRPC_CHECK(encoder.start(encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+            CRPC_CHECK(encoder.finish(encoded).ok());
+            coding_limits limits;
+            limits.max_compression_ratio = 0;
+            auto decoded =
+                crpc::http::decompress_all(coding, as_span(encoded), limits);
+            CRPC_CHECK(decoded.ok());
+            if (decoded.ok()) {
+                CRPC_CHECK_EQ(first + second, decoded.value());
+            }
+        }
+    }
+
+    // d == 32767: the candidate at index 1 is legal and should be matched.
+    {
+        const std::string first = make_block(32768);
+        std::string second;
+        second.push_back('\x02');
+        second.push_back('\x03');
+        second.append(600, '\xAA');
+        for (const content_coding coding : {content_coding::gzip,
+                                            content_coding::deflate}) {
+            content_encoder encoder(coding);
+            std::string encoded;
+            CRPC_CHECK(encoder.start(encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+            CRPC_CHECK(encoder.finish(encoded).ok());
+            coding_limits limits;
+            limits.max_compression_ratio = 0;
+            auto decoded =
+                crpc::http::decompress_all(coding, as_span(encoded), limits);
+            CRPC_CHECK(decoded.ok());
+            if (decoded.ok()) {
+                CRPC_CHECK_EQ(first + second, decoded.value());
+            }
+            // A long match at distance 32767 must actually be used.
+            CRPC_CHECK(encoded.size() < 2000);
+        }
+    }
+
+    // d == 32769: beyond the window; correctness must still hold.
+    {
+        std::string first = make_block(32769);
+        first[32768] = '\xBB';
+        std::string second(1, '\x00');
+        second.push_back('\x02');
+        second.push_back('\x03');
+        second.append(600, '\xAA');
+        for (const content_coding coding : {content_coding::gzip,
+                                            content_coding::deflate}) {
+            content_encoder encoder(coding);
+            std::string encoded;
+            CRPC_CHECK(encoder.start(encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+            CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+            CRPC_CHECK(encoder.finish(encoded).ok());
+            coding_limits limits;
+            limits.max_compression_ratio = 0;
+            auto decoded =
+                crpc::http::decompress_all(coding, as_span(encoded), limits);
+            CRPC_CHECK(decoded.ok());
+            if (decoded.ok()) {
+                CRPC_CHECK_EQ(first + second, decoded.value());
+            }
         }
     }
 }

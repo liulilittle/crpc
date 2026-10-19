@@ -1702,11 +1702,10 @@ void session::download_open(http::request& request, const download_route& route,
     head += " ";
     head += local_reason(code);
     head += "\r\n";
-    if (!route.content_type.empty()) {
-        head += "Content-Type: ";
-        head += route.content_type;
-        head += "\r\n";
-    }
+    head += "Content-Type: ";
+    head += route.content_type.empty() ? "application/octet-stream"
+                                       : route.content_type;
+    head += "\r\n";
     if (code == 416) {
         head += "Content-Range: ";
         head += download_->content_range();
