@@ -798,6 +798,85 @@ CRPC_TEST(h2c_peer_goaway_is_answered) {
     CRPC_CHECK(answered);
 }
 
+// --- Resource bounds ---------------------------------------------------------
+
+CRPC_TEST(connection_cap_rejects_the_excess) {
+    http::http_server_options options;
+    options.max_connections = 2;
+    fixture fx(options);
+
+    auto first = fx.connect();
+    auto second = fx.connect();
+    CRPC_CHECK(first != nullptr);
+    CRPC_CHECK(second != nullptr);
+
+    capture_source c1;
+    capture_source c2;
+    first->bind_source(&c1);
+    second->bind_source(&c2);
+    send_raw(*first, http1("GET", "/root", ""));
+    send_raw(*second, http1("GET", "/root", ""));
+    const bool both = crpc_test::wait_for(
+        [&] {
+            return c1.snapshot().find("200 OK") != std::string::npos &&
+                   c2.snapshot().find("200 OK") != std::string::npos;
+        },
+        5000);
+    CRPC_CHECK(both);
+
+    // The third connection is accepted by the transport but the server closes
+    // it immediately: no session is created and no request is answered. The
+    // close may happen before the test binds its source, so the durable
+    // evidence is the rejection counter plus the absence of a response.
+    auto third = fx.connect();
+    CRPC_CHECK(third != nullptr);
+    capture_source c3;
+    third->bind_source(&c3);
+    send_raw(*third, http1("GET", "/root", ""));
+    const bool counted = crpc_test::wait_for(
+        [&] { return fx.server->stats().rejected_connections >= 1; }, 5000);
+    CRPC_CHECK(counted);
+    (void)crpc_test::wait_for([&] { return c3.closed(); }, 500);
+    CRPC_CHECK(c3.snapshot().find("200 OK") == std::string::npos);
+}
+
+CRPC_TEST(idle_timeout_closes_a_silent_connection) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(150);
+    options.request_timeout = std::chrono::milliseconds(0);
+    fixture fx(options);
+
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    capture_source capture;
+    client->bind_source(&capture);
+
+    // Send nothing. The idle bound must close the connection instead of
+    // keeping a silent peer forever (No-stall rule).
+    const bool closed = crpc_test::wait_for([&] { return capture.closed(); }, 5000);
+    CRPC_CHECK(closed);
+    CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
+}
+
+CRPC_TEST(request_timeout_answers_408_for_a_partial_request) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(150);
+    fixture fx(options);
+
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    capture_source capture;
+    client->bind_source(&capture);
+
+    // A request that never completes: headers only, no terminating blank line.
+    send_raw(*client, "GET /root HTTP/1.1\r\nHost: test\r\n");
+    const bool answered = crpc_test::wait_for(
+        [&] { return capture.snapshot().find("408") != std::string::npos; }, 5000);
+    CRPC_CHECK(answered);
+    CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
+}
+
 // --- TLS test ----------------------------------------------------------------
 
 CRPC_TEST(tls_alpn_routing_or_skip) {

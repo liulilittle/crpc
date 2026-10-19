@@ -84,6 +84,19 @@ struct http_server_options {
     // shard retries the flush and, if still blocked, emits a PING so a dead
     // peer is detected instead of waited on forever.
     std::chrono::milliseconds h2_probe_interval{1000};
+
+    // Hard bound on concurrently served connections. An accepted connection
+    // beyond this is closed immediately instead of growing the session table;
+    // a server must never be pushed into unbounded memory by opening sockets.
+    std::size_t max_connections = 10000;
+
+    // A connection that sends no bytes for this long is closed. Zero disables
+    // the idle bound.
+    std::chrono::milliseconds idle_timeout{60000};
+
+    // An incomplete request (headers or body) older than this is answered with
+    // 408 and the connection is closed. Zero disables the request bound.
+    std::chrono::milliseconds request_timeout{30000};
 };
 
 struct http_statistics {
@@ -94,6 +107,10 @@ struct http_statistics {
     std::size_t bad_requests = 0;
     std::size_t h2_connections = 0;
     std::size_t tls_connections = 0;
+    // Connections closed because `max_connections` was reached.
+    std::size_t rejected_connections = 0;
+    // Connections closed by the idle or request deadline.
+    std::size_t timed_out_connections = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with

@@ -261,11 +261,31 @@ void write_problem(http::response& response, int status_code,
     response.body = problem_body(status_code, detail, instance);
 }
 
+// Codecs that can stand in for JSON when the client sends no preference (or
+// `*/*`). JSON is preferred because it is the documented default; the rest keep
+// the facade usable in a build without the JSON adapter (for example when RTTI
+// is disabled). The order is deliberate: a text format first, binary last.
+const codec_id fallback_codecs[] = {
+    codec_id::json,        codec_id::xml,      codec_id::toml,
+    codec_id::ini,         codec_id::protobuf, codec_id::flatbuffers,
+    codec_id::crpc_binary,
+};
+
+const codec* preferred_codec(const codec_registry& registry) {
+    for (const codec_id id : fallback_codecs) {
+        const codec* found = registry.find(id);
+        if (found != nullptr) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 const codec* negotiate_response(const http::request& request,
                                 const codec_registry& registry) {
     const std::string* accept = request.headers.find("accept");
     if (accept == nullptr || accept->empty()) {
-        return registry.find(codec_id::json);
+        return preferred_codec(registry);
     }
     const std::string_view text(*accept);
     std::size_t pos = 0;
@@ -281,9 +301,9 @@ const codec* negotiate_response(const http::request& request,
         token = trim(token);
         if (!token.empty()) {
             if (token == "*/*" || token == "application/*") {
-                const codec* json = registry.find(codec_id::json);
-                if (json != nullptr) {
-                    return json;
+                const codec* fallback = preferred_codec(registry);
+                if (fallback != nullptr) {
+                    return fallback;
                 }
             }
             const codec* found = registry.find(token);

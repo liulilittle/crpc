@@ -551,6 +551,15 @@ h2_error connection::open_peer_stream(u32 stream_id) {
         return stream_error(stream_id, error_code::refused_stream);
     }
     last_peer_stream_id_ = stream_id;
+    // A long-lived connection would otherwise keep one closed record per
+    // request forever. Prune before inserting so the map stays bounded by the
+    // concurrency limit plus one batch of recently closed streams; a record is
+    // kept while a parked response still refers to it.
+    const std::size_t prune_threshold =
+        std::max<std::size_t>(64, 2u * local_settings_.max_concurrent_streams);
+    if (streams_.size() >= prune_threshold) {
+        prune_closed_streams();
+    }
     stream_entry entry;
     entry.id = stream_id;
     entry.state = stream_state::open;

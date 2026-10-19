@@ -256,8 +256,13 @@ private:
     void maybe_finish();
     void finish_now();
     void schedule() noexcept;
+    // Arms the single session timer for the nearest of: an HTTP/2 parked
+    // response probe, the idle deadline, and the request deadline. One timer
+    // per session because `runtime::arm_timer` is keyed by the session address.
     void arm_probe();
     void on_probe();
+    void note_activity() noexcept;
+    void note_request_progress() noexcept;
 
     // HTTP/1.1 helpers.
     [[nodiscard]] bool keep_alive(const http::request& request) const noexcept;
@@ -269,6 +274,7 @@ private:
 
     static void process_trampoline(void* ctx) noexcept;
     static void probe_trampoline(void* ctx) noexcept;
+    static void arm_trampoline(void* ctx) noexcept;
 
     server_state& state_;
     runtime* shard_ = nullptr;
@@ -303,6 +309,11 @@ private:
     bool h2_goaway_sent_ = false;
     bool h2_settings_sent_ = false;
     bool probe_armed_ = false;
+    // Absolute monotonic deadlines in nanoseconds (0 = not armed). The idle
+    // deadline bounds a connection that sends nothing; the request deadline
+    // bounds an incomplete request (slowloris, No-stall rule).
+    u64 idle_deadline_ns_ = 0;
+    u64 request_deadline_ns_ = 0;
 
     std::deque<std::string> out_;
     std::size_t out_bytes_ = 0;
@@ -334,6 +345,8 @@ struct server_state {
     std::atomic<std::size_t> bad{0};
     std::atomic<std::size_t> h2_connections{0};
     std::atomic<std::size_t> tls_connections{0};
+    std::atomic<std::size_t> rejected{0};
+    std::atomic<std::size_t> timed_out{0};
 
     struct pending_listener {
         endpoint ep;
@@ -382,7 +395,18 @@ struct server_state {
                                                    use_tls);
             {
                 std::lock_guard<std::mutex> lk(sessions_mutex);
-                sessions.push_back(value);
+                // The bound is checked and the session inserted under one lock,
+                // so concurrent accepts cannot overshoot it.
+                if (options.max_connections != 0 &&
+                    sessions.size() >= options.max_connections) {
+                    rejected.fetch_add(1, std::memory_order_relaxed);
+                    value.reset();
+                } else {
+                    sessions.push_back(value);
+                }
+            }
+            if (!value) {
+                return;
             }
             accepted.fetch_add(1, std::memory_order_relaxed);
             if (use_tls) {
@@ -505,6 +529,15 @@ void session::start() {
         out_sink_ = &transport_->sink();
         transport_->bind_source(source_.get());
     }
+    // The idle bound is armed on the owning shard: session deadlines are
+    // shard-only state, and start() runs on the accept thread.
+    std::shared_ptr<session> self = weak_from_this().lock();
+    if (self) {
+        auto* holder = new (std::nothrow) std::shared_ptr<session>(std::move(self));
+        if (holder != nullptr && !shard_->post(&session::arm_trampoline, holder)) {
+            delete holder;
+        }
+    }
 }
 
 void session::request_shutdown() noexcept {
@@ -605,6 +638,14 @@ void session::probe_trampoline(void* ctx) noexcept {
     self->on_probe();
 }
 
+void session::arm_trampoline(void* ctx) noexcept {
+    std::unique_ptr<std::shared_ptr<session>> holder(
+        static_cast<std::shared_ptr<session>*>(ctx));
+    session& self = **holder;
+    self.note_activity();
+    self.arm_probe();
+}
+
 void session::process() {
     if (finished_) {
         return;
@@ -626,7 +667,9 @@ void session::process() {
             }
         }
         if (!input.empty()) {
+            note_activity();
             consume(std::move(input));
+            arm_probe();
         }
         const bool shutdown =
             shutdown_requested_.load(std::memory_order_acquire);
@@ -788,9 +831,13 @@ void session::process_http1(std::string input) {
         parser_.feed(as_bytes(input));
     for (;;) {
         if (status == http::parse_status::need_more) {
+            // A request that has started but not completed is bounded by
+            // `request_timeout` (slowloris, No-stall rule).
+            note_request_progress();
             return;
         }
         if (status == http::parse_status::headers_complete) {
+            note_request_progress();
             if (parser_.expect_100_continue() && !sent_100_) {
                 sent_100_ = true;
                 enqueue("HTTP/1.1 100 Continue\r\n\r\n");
@@ -823,9 +870,24 @@ void session::process_http1(std::string input) {
                             rest.size());
         parser_.reset();
         sent_100_ = false;
+        request_deadline_ns_ = 0;
 
         handle_http1_request(std::move(request));
         if (stop_reading_ || pending.empty()) {
+            return;
+        }
+        // Hard egress bound (H-4): a batch of pipelined requests must not be
+        // answered into an unbounded write queue. Once the queue is over the
+        // cap, the unparsed bytes go back to the ingress buffer and the reader
+        // stays paused until the queue drains. Nothing is dropped: the bytes
+        // are bounded by `ingress_cap_bytes` and are parsed on a later turn.
+        if (state_.options.egress_cap_bytes != 0 &&
+            out_bytes_ > state_.options.egress_cap_bytes) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                ingress_.insert(0, pending);
+                read_paused_ = true;
+            }
             return;
         }
         status = parser_.feed(as_bytes(pending));
@@ -1531,15 +1593,51 @@ void session::finish_now() {
     state_.remove_session(shared_from_this());
 }
 
+void session::note_activity() noexcept {
+    if (shard_ == nullptr || state_.options.idle_timeout.count() <= 0) {
+        return;
+    }
+    idle_deadline_ns_ =
+        shard_->now_ns() +
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             state_.options.idle_timeout)
+                             .count());
+}
+
+void session::note_request_progress() noexcept {
+    if (shard_ == nullptr || state_.options.request_timeout.count() <= 0 ||
+        request_deadline_ns_ != 0) {
+        return;
+    }
+    request_deadline_ns_ =
+        shard_->now_ns() +
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             state_.options.request_timeout)
+                             .count());
+}
+
 void session::arm_probe() {
     if (probe_armed_ || finished_ || shard_ == nullptr) {
         return;
     }
+    u64 deadline = 0;
+    if (phase_ == phase::h2 && h2_.has_parked()) {
+        deadline = shard_->now_ns() +
+                   static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        state_.options.h2_probe_interval)
+                                        .count());
+    }
+    if (idle_deadline_ns_ != 0 && (deadline == 0 || idle_deadline_ns_ < deadline)) {
+        deadline = idle_deadline_ns_;
+    }
+    if (request_deadline_ns_ != 0 &&
+        (deadline == 0 || request_deadline_ns_ < deadline)) {
+        deadline = request_deadline_ns_;
+    }
+    if (deadline == 0) {
+        return;
+    }
     probe_armed_ = true;
-    const auto interval = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        state_.options.h2_probe_interval);
-    const u64 deadline = shard_->now_ns() +
-                         static_cast<u64>(interval.count());
     if (!shard_->arm_timer(this, deadline, &session::probe_trampoline, this)) {
         probe_armed_ = false;
     }
@@ -1547,20 +1645,45 @@ void session::arm_probe() {
 
 void session::on_probe() {
     probe_armed_ = false;
-    if (finished_ || close_when_drained_ || phase_ != phase::h2 ||
-        shutdown_requested_.load(std::memory_order_acquire)) {
+    if (finished_ || shutdown_requested_.load(std::memory_order_acquire) ||
+        shard_ == nullptr) {
         return;
     }
-    if (!h2_.has_parked()) {
+    const u64 now = shard_->now_ns();
+    if (request_deadline_ns_ != 0 && now >= request_deadline_ns_) {
+        // A request that never completes must fail explicitly instead of
+        // occupying the connection forever (No-stall rule).
+        request_deadline_ns_ = 0;
+        state_.timed_out.fetch_add(1, std::memory_order_relaxed);
+        if (phase_ == phase::h2) {
+            h2_send_goaway(h2::error_code::no_error);
+        } else {
+            http::request partial = parser_.get_request();
+            send_http1_error(408, "request timeout", partial, false);
+        }
+        close_when_drained_ = true;
+        stop_reading_ = true;
+        flush_writes();
         return;
     }
-    h2_resume_parked();
-    if (h2_.has_parked()) {
-        // A peer that never sends WINDOW_UPDATE must not stall the connection
-        // silently: probe it so a dead peer is eventually observed (R18).
-        h2_send_ping();
-        arm_probe();
+    if (idle_deadline_ns_ != 0 && now >= idle_deadline_ns_) {
+        idle_deadline_ns_ = 0;
+        state_.timed_out.fetch_add(1, std::memory_order_relaxed);
+        close_when_drained_ = true;
+        stop_reading_ = true;
+        flush_writes();
+        maybe_finish();
+        return;
     }
+    if (phase_ == phase::h2 && h2_.has_parked()) {
+        h2_resume_parked();
+        if (h2_.has_parked()) {
+            // A peer that never sends WINDOW_UPDATE must not stall the
+            // connection silently: probe it so a dead peer is observed (R18).
+            h2_send_ping();
+        }
+    }
+    arm_probe();
 }
 
 } // namespace
@@ -1821,6 +1944,8 @@ http_statistics http_server::stats() const noexcept {
     out.bad_requests = impl_->state.bad.load(std::memory_order_relaxed);
     out.h2_connections = impl_->state.h2_connections.load(std::memory_order_relaxed);
     out.tls_connections = impl_->state.tls_connections.load(std::memory_order_relaxed);
+    out.rejected_connections = impl_->state.rejected.load(std::memory_order_relaxed);
+    out.timed_out_connections = impl_->state.timed_out.load(std::memory_order_relaxed);
     return out;
 }
 

@@ -457,8 +457,14 @@ void client::abandon_attempt(client_detail::call_core& core) noexcept {
     // An abandoned attempt records no breaker outcome; just drop the permit.
     core.permit = resilience::breaker_permit{};
     if (core.slot) {
+        // Release the in-flight accounting but keep the connection slot alive
+        // (NEW-1, cancel path). `call::cancel()` keeps the low-level call so a
+        // later get()/try_get() can still observe `canceled`; that call holds a
+        // raw pointer into the connection slot pool. Dropping the last
+        // connection_slot here would free the pool before the handle resets the
+        // inner call. The shared_ptr is released with the core, after `inner`
+        // has been destroyed (declaration order in call_state).
         release_slot(core.slot, rpc_code::canceled);
-        core.slot.reset();
     }
     unregister_core(core);
 }
