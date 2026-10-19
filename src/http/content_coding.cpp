@@ -1329,9 +1329,10 @@ struct content_encoder::impl {
                                        span<const std::byte> current,
                                        std::uint64_t current_start) const noexcept {
         if (position >= current_start) {
-            return static_cast<std::uint8_t>(current[position - current_start]);
+            return static_cast<std::uint8_t>(
+                current[static_cast<std::size_t>(position - current_start)]);
         }
-        return window[position % k_window];
+        return window[static_cast<std::size_t>(position % k_window)];
     }
 
     [[nodiscard]] static std::size_t hash3(std::uint8_t a, std::uint8_t b,
@@ -1350,9 +1351,11 @@ struct content_encoder::impl {
         const std::uint8_t b = byte_at(position + 1, current, current_start);
         const std::uint8_t c = byte_at(position + 2, current, current_start);
         const std::size_t slot = hash3(a, b, c);
-        prev[position % k_window] = head[slot];
+        const std::size_t offset =
+            static_cast<std::size_t>(position % k_window);
+        prev[offset] = head[slot];
         head[slot] = static_cast<std::int32_t>(position);
-        window[position % k_window] = a;
+        window[offset] = a;
     }
 
     void update_checksums(span<const std::byte> data) noexcept {
@@ -1431,10 +1434,11 @@ struct content_encoder::impl {
                     static_cast<std::uint8_t>(data[i + 1]),
                     static_cast<std::uint8_t>(data[i + 2]));
                 std::int32_t candidate = head[slot];
-                prev[(base + i) % k_window] = candidate;
+                const std::size_t here_offset =
+                    static_cast<std::size_t>((base + i) % k_window);
+                prev[here_offset] = candidate;
                 head[slot] = static_cast<std::int32_t>(base + i);
-                window[(base + i) % k_window] =
-                    static_cast<std::uint8_t>(data[i]);
+                window[here_offset] = static_cast<std::uint8_t>(data[i]);
 
                 const std::uint64_t here = base + i;
                 const std::uint32_t max_length = static_cast<std::uint32_t>(
@@ -1464,7 +1468,8 @@ struct content_encoder::impl {
                             break;
                         }
                     }
-                    candidate = prev[position % k_window];
+                    candidate = prev[static_cast<std::size_t>(
+                        position % k_window)];
                     ++chain;
                 }
             }

@@ -120,8 +120,8 @@ bool parse_response(const std::string& data, parsed_response& out,
     std::size_t content_length = 0;
     const std::size_t cl = out.header("Content-Length").size();
     if (cl != 0) {
-        content_length = std::strtoull(out.header("Content-Length").c_str(),
-                                       nullptr, 10);
+        content_length = static_cast<std::size_t>(
+            std::strtoull(out.header("Content-Length").c_str(), nullptr, 10));
     }
     const std::size_t body_start = head_end + 4;
     if (data.size() < body_start + content_length) {
