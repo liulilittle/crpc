@@ -885,8 +885,9 @@ struct server::impl {
 
         buffer response;
         bool has_response = false;
-        const status dispatched =
-            dispatch->dispatch(request, response, has_response, steady_now());
+        bool handler_ran = false;
+        const status dispatched = dispatch->dispatch(request, response, has_response,
+                                                     steady_now(), handler_ran);
 
         rpc_code outcome_code = rpc_code::ok;
         if (!dispatched.ok()) {
@@ -900,10 +901,35 @@ struct server::impl {
             }
         }
         if (permit.allowed()) {
-            if (outcome_code == rpc_code::ok) {
+            switch (outcome_code) {
+            case rpc_code::ok:
                 permit.success();
-            } else {
+                break;
+            case rpc_code::deadline_exceeded:
+                // The dispatcher refuses an expired wire deadline before the
+                // handler starts; a handler can also report one while running.
+                // `handler_ran` is the explicit signal for that difference:
+                // a pre-execution refusal says nothing about the service, while
+                // one produced by a running handler is a slow call.
+                if (handler_ran) {
+                    permit.slow();
+                } else {
+                    permit.ignore();
+                }
+                break;
+            case rpc_code::internal:
+            case rpc_code::unavailable:
+            case rpc_code::not_acknowledged:
                 permit.failure();
+                break;
+            default:
+                // Local admission and application outcomes (not_found,
+                // no_such_method, invalid_argument, failed_precondition,
+                // decode_error, protocol_error, canceled, shutting_down,
+                // overload, resource_exhausted, application, ...) are not
+                // dependency failures and must not open the service breaker.
+                permit.ignore();
+                break;
             }
         }
         if (!dispatched.ok()) {

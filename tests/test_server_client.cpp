@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -46,6 +47,8 @@ constexpr crpc::u64 kEcho = 1;
 constexpr crpc::u64 kSlow = 2;
 constexpr crpc::u64 kFlaky = 3;
 constexpr crpc::u64 kFail = 4;
+constexpr crpc::u64 kReturnCode = 5;
+constexpr crpc::u64 kSlowDeadline = 6;
 
 // Diagnostic override for the coroutine stack size. Unset (or <= 0) keeps the
 // library default. It exists so the TSan matrix can test whether the
@@ -111,6 +114,30 @@ struct service_state {
         state->fail_calls.fetch_add(1, std::memory_order_relaxed);
         return crpc::status{crpc::rpc_error(crpc::rpc_code::unavailable, "always")};
     }
+
+    // Returns whatever rpc_code the request carries, so one handler can
+    // exercise every server-side breaker classification branch.
+    static crpc::status raw_return_code(void*, const crpc::call_envelope&,
+                                        crpc::span<const std::byte> body, crpc::buffer&,
+                                        crpc::rpc::call_context&) {
+        int code = 0;
+        const crpc::status decoded = crpc::rpc::call_codec<int>::decode(body, code);
+        if (!decoded.ok() || code == 0) {
+            return decoded;
+        }
+        return crpc::status{
+            crpc::rpc_error(static_cast<crpc::rpc_code>(code), "scripted outcome")};
+    }
+
+    // Deadline failure produced while the handler runs (not the dispatcher's
+    // pre-execution refusal).
+    static crpc::status raw_slow_deadline(void*, const crpc::call_envelope&,
+                                          crpc::span<const std::byte>, crpc::buffer&,
+                                          crpc::rpc::call_context&) {
+        std::this_thread::sleep_for(5ms);
+        return crpc::status{
+            crpc::rpc_error(crpc::rpc_code::deadline_exceeded, "expired while running")};
+    }
 };
 
 using clock_type = std::chrono::steady_clock;
@@ -125,6 +152,10 @@ void register_services(crpc::server::builder& builder, service_state& service) {
                            &service);
     builder.add_raw_method(kService, kFail, "fail", &service_state::raw_fail,
                            &service);
+    builder.add_raw_method(kService, kReturnCode, "return_code",
+                           &service_state::raw_return_code, &service);
+    builder.add_raw_method(kService, kSlowDeadline, "slow_deadline",
+                           &service_state::raw_slow_deadline, &service);
 }
 
 struct fixture_config {
@@ -289,6 +320,60 @@ bool run_on_shard(crpc::runtime& shard, std::function<void()> body,
         [job] { return job->done.load(std::memory_order_acquire); }, timeout_ms);
     delete job;
     return finished;
+}
+
+// One isolated server-breaker observation: send a single scripted request (or
+// an unknown method) and then a number of healthy echo calls to the same
+// service on a fresh server. Healthy calls must keep succeeding while the
+// breaker stays closed.
+struct server_breaker_probe_result {
+    bool ran = false;
+    int first = -1;
+    std::vector<int> echoes;
+};
+
+server_breaker_probe_result probe_server_breaker(
+    crpc::u64 first_method, int first_argument,
+    const crpc::resilience::breaker_config& breaker, int echo_calls) {
+    server_breaker_probe_result out;
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.configure_server_breaker = true;
+    cfg.server_breaker = breaker;
+    if (!start_inproc(f, cfg)) {
+        return out;
+    }
+    out.ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto first = f.cli->service<int, int>(kService, first_method);
+            auto started = first.call(first_argument);
+            if (!started.ok()) {
+                out.first = static_cast<int>(started.code());
+            } else {
+                auto handle = std::move(started).value();
+                auto result = handle.get();
+                out.first = result.ok() ? 0 : static_cast<int>(result.code());
+            }
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            for (int i = 0; i < echo_calls; ++i) {
+                auto echo_started = echo.call(1);
+                if (!echo_started.ok()) {
+                    out.echoes.push_back(static_cast<int>(echo_started.code()));
+                    continue;
+                }
+                auto handle = std::move(echo_started).value();
+                auto result = handle.get();
+                if (result.ok()) {
+                    out.echoes.push_back(result.value() == 2 ? 0 : -1);
+                } else {
+                    out.echoes.push_back(static_cast<int>(result.code()));
+                }
+            }
+        },
+        10000);
+    return out;
 }
 
 // --- runtime primitives ------------------------------------------------------
@@ -843,6 +928,169 @@ CRPC_TEST(unknown_service_ids_do_not_create_server_guards) {
     }
 }
 
+CRPC_TEST(server_breaker_ignores_client_side_outcomes_single_shot) {
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.0;
+    breaker.open_duration = 5s;
+
+    // Known service, unknown method. A fresh server isolates this outcome.
+    {
+        const auto probe = probe_server_breaker(999, 1, breaker, 1);
+        CRPC_CHECK(probe.ran);
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::no_such_method), probe.first);
+        CRPC_CHECK_EQ(static_cast<std::size_t>(1), probe.echoes.size());
+        if (!probe.echoes.empty()) {
+            CRPC_CHECK_EQ(0, probe.echoes[0]);
+        }
+    }
+
+    // deadline_exceeded is not here: it is classified by whether the handler
+    // ran (see the two tests below).
+    const crpc::rpc_code ignored[] = {
+        crpc::rpc_code::not_found,           crpc::rpc_code::invalid_argument,
+        crpc::rpc_code::failed_precondition, crpc::rpc_code::decode_error,
+        crpc::rpc_code::protocol_error,      crpc::rpc_code::canceled,
+        crpc::rpc_code::overload,            crpc::rpc_code::resource_exhausted};
+    for (const crpc::rpc_code code : ignored) {
+        // One application result must not open the breaker even with
+        // min_requests=1 and a zero failure ratio.
+        const auto probe =
+            probe_server_breaker(kReturnCode, static_cast<int>(code), breaker, 1);
+        CRPC_CHECK(probe.ran);
+        CRPC_CHECK_EQ(static_cast<int>(code), probe.first);
+        CRPC_CHECK_EQ(static_cast<std::size_t>(1), probe.echoes.size());
+        if (!probe.echoes.empty()) {
+            CRPC_CHECK_EQ(0, probe.echoes[0]);
+        }
+    }
+}
+
+CRPC_TEST(server_breaker_counts_dependency_failures_single_shot) {
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.0;
+    breaker.open_duration = 5s;
+
+    const crpc::rpc_code failures[] = {crpc::rpc_code::internal,
+                                       crpc::rpc_code::unavailable,
+                                       crpc::rpc_code::not_acknowledged};
+    for (const crpc::rpc_code code : failures) {
+        // A single dependency failure opens the breaker, so the next healthy
+        // call is rejected.
+        const auto probe =
+            probe_server_breaker(kReturnCode, static_cast<int>(code), breaker, 1);
+        CRPC_CHECK(probe.ran);
+        CRPC_CHECK_EQ(static_cast<int>(code), probe.first);
+        CRPC_CHECK_EQ(static_cast<std::size_t>(1), probe.echoes.size());
+        if (!probe.echoes.empty()) {
+            CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                          probe.echoes[0]);
+        }
+    }
+}
+
+CRPC_TEST(server_breaker_marks_handler_deadline_as_slow) {
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 2;
+    // A single failure among two is below this threshold...
+    breaker.failure_ratio_threshold = 1.0;
+    // ...while one slow out of two reaches this one.
+    breaker.slow_call_ratio_threshold = 0.5;
+    breaker.slow_call_threshold = 100ms;
+    breaker.open_duration = 5s;
+
+    // The handler returns deadline_exceeded immediately, but it did run, so
+    // the explicit handler-ran signal records it as slow (not ignored, not a
+    // failure). The first echo completes the min_requests window and the slow
+    // ratio opens the breaker; the second echo must be rejected. A failure or
+    // ignore classification would leave the breaker closed.
+    const auto probe = probe_server_breaker(
+        kReturnCode, static_cast<int>(crpc::rpc_code::deadline_exceeded), breaker, 2);
+    CRPC_CHECK(probe.ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded), probe.first);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(2), probe.echoes.size());
+    if (probe.echoes.size() == 2) {
+        CRPC_CHECK_EQ(0, probe.echoes[0]);
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), probe.echoes[1]);
+    }
+}
+
+CRPC_TEST(server_breaker_ignores_pre_execution_deadline) {
+    crpc::inproc_backend backend;
+    service_state service;
+    const std::string name = "crpc-pre-deadline";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(name), backend);
+    register_services(sb, service);
+    sb.handler_workers(8);
+    sb.drain_timeout(2000ms);
+    crpc::resilience::breaker_config server_breaker;
+    server_breaker.min_requests = 1;
+    server_breaker.failure_ratio_threshold = 0.0;
+    server_breaker.open_duration = 5s;
+    sb.breaker(server_breaker);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    // A low-level client has no local wait timer: the deadline only travels on
+    // the wire, so the server's pre-execution refusal is what completes this
+    // call (a facade timer could otherwise race it).
+    auto conn = backend.connect(crpc::endpoint::inproc(name), crpc::connect_options{});
+    CRPC_CHECK(conn != nullptr);
+    if (!conn) {
+        srv->stop();
+        return;
+    }
+    crpc::rpc::client_options co;
+    co.slot_capacity = 8;
+    co.default_timeout = std::chrono::nanoseconds{0};
+    crpc::rpc::client raw(std::move(conn), co);
+
+    crpc::buffer body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, body).ok());
+    crpc::rpc::call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = clock_type::now() + 900us;
+    auto started = raw.start_call<int>(kService, kEcho, body.readable(), ctx);
+    CRPC_CHECK(started.ok());
+    int code = -1;
+    std::string message;
+    if (started.ok()) {
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        code = result.ok() ? 0 : static_cast<int>(result.code());
+        message = result.error().message;
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded), code);
+    // The dispatcher's pre-execution message, not a handler result.
+    CRPC_CHECK_EQ(std::string("deadline already passed"), message);
+    // The handler never ran for that request.
+    CRPC_CHECK_EQ(0, service.echo_calls.load());
+
+    // A pre-execution refusal says nothing about the service, so the breaker
+    // stays closed and the healthy call succeeds.
+    auto echo_started = raw.start_call<int>(kService, kEcho, body.readable());
+    CRPC_CHECK(echo_started.ok());
+    int echo_code = -1;
+    if (echo_started.ok()) {
+        auto handle = std::move(echo_started).value();
+        auto result = handle.get();
+        echo_code = result.ok() && result.value() == 2
+                        ? 0
+                        : (result.ok() ? -1 : static_cast<int>(result.code()));
+    }
+    CRPC_CHECK_EQ(0, echo_code);
+    CRPC_CHECK_EQ(1, service.echo_calls.load());
+
+    srv->stop();
+}
+
 CRPC_TEST(breaker_records_logical_call_not_attempts) {
     fixture f;
     fixture_config cfg;
@@ -936,6 +1184,59 @@ CRPC_TEST(breaker_ignores_application_errors) {
     CRPC_CHECK_EQ(20, not_found);
     CRPC_CHECK_EQ(0, echo_code);
     CRPC_CHECK_EQ(static_cast<std::size_t>(0), f.cli->stats().breaker_rejections);
+}
+
+CRPC_TEST(client_breaker_counts_internal_failures) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.configure_breaker = true;
+    cfg.breaker.min_requests = 2;
+    cfg.breaker.failure_ratio_threshold = 0.5;
+    cfg.breaker.open_duration = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    const crpc::rpc_code failures[] = {crpc::rpc_code::internal,
+                                       crpc::rpc_code::not_acknowledged};
+    constexpr std::size_t failure_count = sizeof(failures) / sizeof(failures[0]);
+    std::vector<int> observed;
+    int echo_code = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto coded = f.cli->service<int, int>(kService, kReturnCode);
+            for (std::size_t i = 0; i < failure_count; ++i) {
+                auto started = coded.call(static_cast<int>(failures[i]));
+                if (!started.ok()) {
+                    observed.push_back(static_cast<int>(started.code()));
+                    continue;
+                }
+                auto handle = std::move(started).value();
+                auto result = handle.get();
+                observed.push_back(result.ok() ? 0 : static_cast<int>(result.code()));
+            }
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto started = echo.call(1);
+            if (!started.ok()) {
+                echo_code = static_cast<int>(started.code());
+                return;
+            }
+            auto handle = std::move(started).value();
+            auto result = handle.get();
+            echo_code = result.ok() ? 0 : static_cast<int>(result.code());
+        },
+        10000);
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(failure_count, observed.size());
+    if (observed.size() == failure_count) {
+        for (std::size_t i = 0; i < failure_count; ++i) {
+            CRPC_CHECK_EQ(static_cast<int>(failures[i]), observed[i]);
+        }
+    }
+    // A server internal error and an unacknowledged call are dependency
+    // failures on the client side too, so the endpoint breaker opens.
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), echo_code);
+    CRPC_CHECK(f.cli->stats().breaker_rejections >= 1);
 }
 
 CRPC_TEST(breaker_counts_async_try_get_results) {
@@ -1120,6 +1421,79 @@ CRPC_TEST(breaker_ignores_caller_cancellation) {
     CRPC_CHECK_EQ(static_cast<std::size_t>(0), f.cli->stats().breaker_rejections);
 }
 
+// Regression: a retry whose re-issue fails locally (the next endpoint cannot
+// be connected) must reset the facade attempt before trying again. Without the
+// reset the next issue observes the finalized attempt and reports
+// shutting_down instead of retrying against the healthy endpoint.
+CRPC_TEST(client_retries_after_local_admission_failure) {
+    crpc::inproc_backend backend;
+    service_state service;
+    const std::string live_name = "crpc-retry-live";
+    const std::string dead_name = "crpc-retry-dead";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(live_name), backend);
+    register_services(sb, service);
+    sb.handler_workers(8);
+    sb.drain_timeout(2000ms);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::client::builder cb;
+    // Round robin: attempt 1 and 3 pick the live endpoint, attempt 2 picks the
+    // dead one (no listener), whose connect fails with connection_refused.
+    cb.add_endpoint(crpc::endpoint::inproc(live_name), backend);
+    cb.add_endpoint(crpc::endpoint::inproc(dead_name), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5s);
+    cb.plain_thread_timeout(5s);
+    crpc::resilience::retry_policy retry;
+    retry.max_attempts = 3;
+    retry.initial_backoff = 1ms;
+    retry.max_backoff = 5ms;
+    retry.retry_budget = 10.0;
+    cb.retry(retry);
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        srv->stop();
+        return;
+    }
+
+    service.flaky_failures_remaining.store(1);
+    auto stub = cli->service<int, int>(kService, kFlaky);
+    crpc::rpc::call_context ctx;
+    ctx.idempotent = true;
+    auto started = stub.call(7, ctx);
+    int code = -1;
+    int value = -1;
+    crpc::u32 attempts = 0;
+    if (!started.ok()) {
+        code = static_cast<int>(started.code());
+    } else {
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        code = result.ok() ? 0 : static_cast<int>(result.code());
+        if (result.ok()) {
+            value = result.value();
+        }
+        attempts = handle.attempts();
+    }
+
+    CRPC_CHECK_EQ(0, code);
+    CRPC_CHECK_EQ(42, value);
+    CRPC_CHECK_EQ(static_cast<crpc::u32>(3), attempts);
+    // The first and last attempts reached the server; the middle one failed at
+    // connect time and never did.
+    CRPC_CHECK_EQ(2, service.flaky_calls.load());
+
+    cli->close();
+    srv->stop();
+}
 CRPC_TEST(pool_exhaustion_does_not_stall) {
     fixture f;
     fixture_config cfg;

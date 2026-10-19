@@ -27,8 +27,9 @@ namespace {
 // Only dependency/transport failures count against an endpoint breaker.
 // Application results (not_found, no_such_method, invalid_argument,
 // decode_error, a server-reported deadline_exceeded, cancellation) say nothing
-// about the endpoint's health and must not open it. A locally observed timeout
-// is recorded by its call site as a failure before reaching this classifier.
+// about the endpoint's health and must not open it, while internal errors and
+// unacknowledged calls are dependency failures. A locally observed timeout is
+// recorded by its call site as a failure before reaching this classifier.
 [[nodiscard]] bool counts_as_breaker_failure(rpc_code code) noexcept {
     switch (code) {
     case rpc_code::connection_refused:
@@ -38,6 +39,8 @@ namespace {
     case rpc_code::unavailable:
     case rpc_code::overload:
     case rpc_code::resource_exhausted:
+    case rpc_code::internal:
+    case rpc_code::not_acknowledged:
         return true;
     default:
         return false;

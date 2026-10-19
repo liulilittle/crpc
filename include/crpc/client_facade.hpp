@@ -451,6 +451,11 @@ public:
                     return rpc::rpc_result<Resp>(std::move(failure));
                 }
                 owner->sleep_for(st->core, delay);
+                // The failed issue finalized this attempt (and dropped its
+                // permit); re-arm it for the next one, as the decoded path
+                // above does. Without this the next issue sees `finalized`
+                // and reports shutting_down instead of retrying.
+                st->core.reset_for_attempt();
             }
         }
 

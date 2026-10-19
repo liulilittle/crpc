@@ -212,6 +212,15 @@ public:
     [[nodiscard]] status dispatch(const frame& request, buffer& response_out, bool& has_response,
                                   std::chrono::steady_clock::time_point now) noexcept;
 
+    // Same as above, but reports whether the handler was invoked. `handler_ran`
+    // is set to false first and to true right before the handler runs, so a
+    // caller can tell a pre-execution refusal (unknown service/method,
+    // exhausted admission, expired wire deadline) apart from a result produced
+    // while running the handler.
+    [[nodiscard]] status dispatch(const frame& request, buffer& response_out, bool& has_response,
+                                  std::chrono::steady_clock::time_point now,
+                                  bool& handler_ran) noexcept;
+
     [[nodiscard]] const service_registry& registry() const noexcept { return *registry_; }
 
 private:

@@ -306,8 +306,16 @@ std::size_t service_registry::method_count() const noexcept {
 
 status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
                             std::chrono::steady_clock::time_point now) noexcept {
+    bool handler_ran = false;
+    return dispatch(request, response_out, has_response, now, handler_ran);
+}
+
+status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
+                            std::chrono::steady_clock::time_point now,
+                            bool& handler_ran) noexcept {
     has_response = false;
     response_out.clear();
+    handler_ran = false;
 
     const bool one_way = request.header.type == frame_type::one_way;
     if (request.header.type != frame_type::request && !one_way) {
@@ -354,6 +362,7 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
     call_context ctx = build_context(envelope, now);
     buffer body_out;
     status handler_status;
+    handler_ran = true;
     try {
         handler_status = method->invoke(envelope, envelope.body, body_out, ctx);
     } catch (const std::exception& ex) {
