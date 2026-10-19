@@ -1,4 +1,4 @@
-// CRPC -- MVC declaration macros (R8).
+﻿// CRPC -- MVC declaration macros (R8).
 //
 // C++17 cannot infer a member pointer from a string, so every action macro
 // carries the controller type and the member name explicitly. The macro then
@@ -30,14 +30,13 @@
 #include <crpc/http/message.hpp>
 #include <crpc/mvc/router.hpp>
 
+// `crpc/codec.hpp` (included through mvc/router.hpp) defines CRPC_HAVE_RTTI to
+// 1 or 0 and includes the RTTI header when it is 1. The test must be numeric:
+// `defined(CRPC_HAVE_RTTI)` is also true for the value 0, which used to define
+// CRPC_MVC_HAVE_RTTI_ATTRS without the macros behind it existing.
 #if !defined(CRPC_MVC_HAVE_RTTI_ATTRS)
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 #define CRPC_MVC_HAVE_RTTI_ATTRS 1
-#elif defined(__has_include)
-#if __has_include(<rtti/reflection.hpp>)
-#include <rtti/reflection.hpp>
-#define CRPC_MVC_HAVE_RTTI_ATTRS 1
-#endif
 #endif
 #endif
 
@@ -87,3 +86,4 @@
 #endif
 
 #endif // CRPC_MVC_ATTRIBUTES_HPP
+

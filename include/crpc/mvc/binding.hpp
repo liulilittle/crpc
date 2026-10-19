@@ -32,6 +32,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -44,15 +45,11 @@
 #include <crpc/http/message.hpp>
 #include <crpc/span.hpp>
 
-#if !defined(CRPC_HAVE_RTTI)
-#if defined(__has_include)
-#if __has_include(<rtti/reflection.hpp>)
-#define CRPC_HAVE_RTTI 1
-#endif
-#endif
-#endif
-
-#if defined(CRPC_HAVE_RTTI)
+// `crpc/codec.hpp` (included above) is the single authority: it defines
+// CRPC_HAVE_RTTI to 1 or 0. A numeric test is required because `defined()` is
+// true for the value 0 as well, which used to pull in <rtti/reflection.hpp> in
+// builds without RTTI and fail with a missing header.
+#if CRPC_HAVE_RTTI
 #include <rtti/reflection.hpp>
 #endif
 
@@ -151,7 +148,7 @@ inline bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
     return true;
 }
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 template <typename E, typename = void>
 struct enum_registered : std::false_type {};
 template <typename E>
@@ -202,7 +199,7 @@ template <typename T>
         }
         return false;
     } else if constexpr (std::is_enum_v<T>) {
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
         return detail::convert_enum<T>(text, out);
 #else
         (void)text;
@@ -241,6 +238,14 @@ template <typename T>
 
 namespace detail {
 
+// `std::optional` detection that does not depend on the RTTI library: the
+// binder must compile (and degrade to "no optional field" behaviour) when CRPC
+// is built without RTTI.
+template <typename T>
+struct is_optional : std::false_type {};
+template <typename T>
+struct is_optional<std::optional<T>> : std::true_type {};
+
 [[nodiscard]] inline status missing_field(std::string_view name) {
     return status{rpc_error(rpc_code::invalid_argument,
                             "missing required field: " + std::string(name))};
@@ -254,7 +259,7 @@ namespace detail {
 template <typename F>
 [[nodiscard]] status assign_value(F& field, const std::string* found,
                                   std::string_view field_name) {
-    if constexpr (rtti::is_optional<F>::value) {
+    if constexpr (detail::is_optional<F>::value) {
         using element = typename F::value_type;
         if (found == nullptr) {
             return status{};
@@ -283,6 +288,7 @@ struct is_file_part : std::false_type {};
 template <>
 struct is_file_part<file_part> : std::true_type {};
 
+
 // SFINAE-safe `F::value_type` so a compound condition can name it for any F.
 template <typename F, typename = void>
 struct optional_value {
@@ -303,7 +309,7 @@ template <typename F>
 constexpr bool is_file_like() noexcept {
     if constexpr (is_file_part<F>::value) {
         return true;
-    } else if constexpr (rtti::is_optional<F>::value &&
+    } else if constexpr (detail::is_optional<F>::value &&
                          is_file_part<typename optional_value<F>::type>::value) {
         return true;
     } else {
@@ -314,6 +320,10 @@ constexpr bool is_file_like() noexcept {
 // True when any field of Req is a file field. Such a DTO is populated from a
 // multipart body and is never document-decoded, because a file part has no
 // codec representation.
+// Detecting the fields of `Req` needs reflection, so without RTTI there is no
+// file-field detection: every DTO takes the document-decoding path. That is the
+// documented behaviour of a no-RTTI build (see codec.hpp).
+#if CRPC_HAVE_RTTI
 template <typename Req, std::size_t... I>
 constexpr bool has_file_field_impl(std::index_sequence<I...>) noexcept {
     return (is_file_like<std::remove_cv_t<std::remove_reference_t<
@@ -327,6 +337,12 @@ constexpr bool has_file_field() noexcept {
     return has_file_field_impl<Req>(
         std::make_index_sequence<rtti::field_count<Req>()>{});
 }
+#else
+template <typename Req>
+constexpr bool has_file_field() noexcept {
+    return false;
+}
+#endif
 
 template <typename F>
 [[nodiscard]] status assign_file(F& field, std::string_view name,
@@ -338,7 +354,7 @@ template <typename F>
         }
         field = *part;
         return status{};
-    } else if constexpr (rtti::is_optional<F>::value &&
+    } else if constexpr (detail::is_optional<F>::value &&
                          is_file_part<typename optional_value<F>::type>::value) {
         const file_part* part = find_file(files, name);
         if (part != nullptr) {
@@ -358,7 +374,7 @@ template <typename F>
     }
 }
 
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
 template <typename Req, std::size_t I>
 void bind_field(const http::request& request, const route_params& route,
                 const route_params& query, const route_params& form,
@@ -419,7 +435,7 @@ template <typename Req>
                                   const route_params& route,
                                   const codec_registry& registry,
                                   const binding_limits& limits, Req& out) {
-#if defined(CRPC_HAVE_RTTI)
+#if CRPC_HAVE_RTTI
     if constexpr (!rtti::is_reflected<Req>::value) {
         (void)request;
         (void)route;
@@ -522,3 +538,5 @@ template <typename Req>
 } // namespace crpc::mvc
 
 #endif // CRPC_MVC_BINDING_HPP
+
+
