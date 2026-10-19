@@ -98,8 +98,19 @@ std::shared_ptr<crpc::client_detail::call_state<Resp>>& call_state_of(
     static_assert(std::is_standard_layout<crpc::client::call<Resp>>::value,
                   "call handle layout changed");
     using state_ptr = std::shared_ptr<crpc::client_detail::call_state<Resp>>;
+    // A standard-layout single-member object is exactly as wide as that member.
+    // Any added data member grows the object, so this fires at compile time
+    // instead of letting the reinterpret_cast above read the wrong bytes.
+    static_assert(sizeof(crpc::client::call<Resp>) == sizeof(state_ptr),
+                  "call handle gained members; state_ is no longer its sole field");
     return *reinterpret_cast<state_ptr*>(&handle);
 }
+
+// Concrete instantiation guard mirroring the assertion above: adding a member
+// to `call<int>` must fail this translation unit to compile.
+static_assert(sizeof(crpc::client::call<int>) ==
+                  sizeof(std::shared_ptr<crpc::client_detail::call_state<int>>),
+              "client::call<int> must remain exactly one shared_ptr wide");
 
 } // namespace
 

@@ -1,6 +1,6 @@
 # CRPC 线上协议
 
-**English** | [简体中文](protocol.zh-CN.md)
+[English](protocol.md) | **简体中文**
 
 版本 1.0 / 2026-10-19
 

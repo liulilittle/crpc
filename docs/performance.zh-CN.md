@@ -1,6 +1,6 @@
 # CRPC 性能
 
-**English** | [简体中文](performance.zh-CN.md)
+[English](performance.md) | **简体中文**
 
 版本 1.1 / 2026-10-19
 

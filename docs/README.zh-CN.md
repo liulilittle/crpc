@@ -1,6 +1,6 @@
 # CRPC 文档
 
-**English** | [简体中文](README.zh-CN.md)
+[English](README.md) | **简体中文**
 
 这里是 CRPC 全部文档的入口。每份文档都有中英两个版本，成对文件在各自顶部互相链接。
 

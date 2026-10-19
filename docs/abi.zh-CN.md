@@ -1,6 +1,6 @@
 # CRPC ABI 策略
 
-**English** | [简体中文](abi.zh-CN.md)
+[English](abi.md) | **简体中文**
 
 版本 1.0 / 2026-10-19
 

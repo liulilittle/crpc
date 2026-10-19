@@ -1,6 +1,6 @@
 # CRPC 工程原则
 
-**English** | [简体中文](principles.zh-CN.md)
+[English](principles.md) | **简体中文**
 
 版本 1.0 / 2026-10-19
 

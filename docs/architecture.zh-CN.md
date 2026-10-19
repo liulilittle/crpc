@@ -1,6 +1,6 @@
 # CRPC 架构
 
-**English** | [简体中文](architecture.zh-CN.md)
+[English](architecture.md) | **简体中文**
 
 版本 1.0 / 2026-10-19
 

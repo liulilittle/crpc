@@ -1,6 +1,6 @@
 # CRPC 构建与测试
 
-**English** | [简体中文](building.zh-CN.md)
+[English](building.md) | **简体中文**
 
 版本 1.0 / 2026-10-19
 
