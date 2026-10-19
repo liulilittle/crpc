@@ -137,10 +137,21 @@ struct call_core {
     }
 };
 
+// Type-erased owner for one call. The client keeps a strong reference to it
+// while the attempt is registered, so close() can finalize an attempt without
+// racing the handle that is dropping the same state on another thread (a raw
+// pointer snapshot used to leave close() writing into a freed core).
+struct call_state_base {
+    virtual ~call_state_base() = default;
+    [[nodiscard]] virtual call_core& core_ref() noexcept = 0;
+};
+
 template <typename Resp>
-struct call_state {
+struct call_state final : call_state_base {
     call_core core;
     std::unique_ptr<rpc::call<Resp>> inner;
+
+    [[nodiscard]] call_core& core_ref() noexcept override { return core; }
 };
 
 template <typename Resp>
@@ -307,7 +318,7 @@ public:
                 }
 
                 rpc_error failure;
-                const status issued = owner->issue(*st, failure);
+                const status issued = owner->issue(st, failure);
                 if (issued.ok()) {
                     continue;
                 }
@@ -435,7 +446,7 @@ public:
         budget_.on_request();
 
         rpc_error failure;
-        const status issued = issue(*st, failure);
+        const status issued = issue(st, failure);
         if (!issued.ok()) {
             return rpc::rpc_result<client::call<Resp>>(std::move(failure));
         }
@@ -452,10 +463,13 @@ private:
     client(options opt, std::vector<endpoint_config> endpoints);
 
     template <typename Resp>
-    status issue(client_detail::call_state<Resp>& st, rpc_error& failure);
+    status issue(const std::shared_ptr<client_detail::call_state<Resp>>& st,
+                 rpc_error& failure);
 
     void normalize_context(client_detail::call_core& core, const rpc::call_context& ctx);
-    bool begin_attempt(client_detail::call_core& core, rpc_error& failure);
+    bool begin_attempt(client_detail::call_core& core,
+                      const std::shared_ptr<client_detail::call_state_base>& keep,
+                      rpc_error& failure);
     std::shared_ptr<client_detail::connection_slot> acquire_slot(
         client_detail::call_core& core, rpc_error& failure);
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
@@ -465,9 +479,12 @@ private:
     // without a result (handle destruction, try_get, cancel, close).
     void abandon_attempt(client_detail::call_core& core) noexcept;
     // Atomic ("closed" check, insert) pair under `impl_->calls_mutex` (R1).
-    [[nodiscard]] bool register_core_if_open(client_detail::call_core& core) noexcept;
+    [[nodiscard]] bool register_core_if_open(
+        client_detail::call_core& core,
+        const std::shared_ptr<client_detail::call_state_base>& keep) noexcept;
     void unregister_core(client_detail::call_core& core) noexcept;
-    void finalize_active(std::vector<client_detail::call_core*>& active) noexcept;
+    void finalize_active(
+        std::vector<std::shared_ptr<client_detail::call_state_base>>& active) noexcept;
     [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
                                     std::chrono::nanoseconds& delay) noexcept;
     [[nodiscard]] status wait_ready(client_detail::call_core& core) const;
@@ -493,9 +510,13 @@ private:
 // --- Template implementations ------------------------------------------------
 
 template <typename Resp>
-status client::issue(client_detail::call_state<Resp>& st, rpc_error& failure) {
-    client_detail::call_core& core = st.core;
-    if (!begin_attempt(core, failure)) {
+status client::issue(
+    const std::shared_ptr<client_detail::call_state<Resp>>& st,
+    rpc_error& failure) {
+    client_detail::call_core& core = st->core;
+    // The registration keeps `st` alive until the attempt is finalized, so
+    // close() can walk its snapshot without racing this handle's destructor.
+    if (!begin_attempt(core, st, failure)) {
         return status{failure};
     }
     std::shared_ptr<client_detail::connection_slot> slot = acquire_slot(core, failure);
@@ -529,8 +550,8 @@ status client::issue(client_detail::call_state<Resp>& st, rpc_error& failure) {
         finish_attempt(core, failure.code);
         return status{failure};
     }
-    st.inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
-    st.inner->then(client_detail::wake_functor<Resp>{&core});
+    st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+    st->inner->then(client_detail::wake_functor<Resp>{&core});
     return status{};
 }
 

@@ -403,8 +403,8 @@ CRPC_TEST(http1_header_and_request_line_limits) {
 
     // Header block over the limit -> 431.
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         std::string extra = "X-Big: ";
         extra += std::string(200, 'a');
@@ -415,8 +415,8 @@ CRPC_TEST(http1_header_and_request_line_limits) {
     }
     // Request line over the limit -> 400.
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         std::string path = "/";
         path += std::string(80, 'p');
@@ -428,8 +428,8 @@ CRPC_TEST(http1_header_and_request_line_limits) {
 
 CRPC_TEST(http1_expect_100_continue) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     send_raw(*client,
@@ -446,8 +446,8 @@ CRPC_TEST(http1_expect_100_continue) {
 
 CRPC_TEST(http1_head_runs_get_and_drops_body) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     send_raw(*client, http1("HEAD", "/root", ""));
@@ -462,9 +462,9 @@ CRPC_TEST(http1_head_runs_get_and_drops_body) {
 
 CRPC_TEST(http1_get_and_keep_alive) {
     fixture fx;
+    capture_source capture;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    capture_source capture;
     client->bind_source(&capture);
 
     send_raw(*client, http1("GET", "/root", ""));
@@ -485,8 +485,8 @@ CRPC_TEST(http1_get_and_keep_alive) {
 
 CRPC_TEST(http1_post_with_body) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     const std::string body = "{\"name\":\"crpc\"}";
@@ -504,8 +504,8 @@ CRPC_TEST(http1_post_with_body) {
 
 CRPC_TEST(http1_chunked_upload) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     std::string request = http1("POST", "/echo", "Transfer-Encoding: chunked\r\n");
@@ -522,8 +522,8 @@ CRPC_TEST(http1_chunked_upload) {
 
 CRPC_TEST(http1_pipelining_preserves_order) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     std::string requests = http1("GET", "/root", "");
@@ -547,8 +547,8 @@ CRPC_TEST(http1_status_paths) {
     fixture fx;
     // 404
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("GET", "/nope", ""));
         CRPC_CHECK(crpc_test::wait_for(
@@ -556,8 +556,8 @@ CRPC_TEST(http1_status_paths) {
     }
     // 405 (POST to a GET-only route)
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("POST", "/root", "Content-Length: 0\r\n"));
         CRPC_CHECK(crpc_test::wait_for(
@@ -565,8 +565,8 @@ CRPC_TEST(http1_status_paths) {
     }
     // 411 (PUT with no framing)
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("PUT", "/echo", ""));
         CRPC_CHECK(crpc_test::wait_for(
@@ -574,8 +574,8 @@ CRPC_TEST(http1_status_paths) {
     }
     // 500 (handler throws)
     {
-        auto client = fx.connect();
         capture_source capture;
+        auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("GET", "/boom", ""));
         CRPC_CHECK(crpc_test::wait_for(
@@ -587,8 +587,8 @@ CRPC_TEST(http1_body_limit_is_413) {
     http::http_server_options options;
     options.limits.body_bytes = 64;
     fixture fx(options);
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     std::string request = http1("POST", "/echo", "Content-Length: 4096\r\n");
@@ -601,8 +601,8 @@ CRPC_TEST(http1_body_limit_is_413) {
 
 CRPC_TEST(http1_missing_host_is_400) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     send_raw(*client, "GET /root HTTP/1.1\r\n\r\n");
@@ -612,8 +612,8 @@ CRPC_TEST(http1_missing_host_is_400) {
 
 CRPC_TEST(http1_request_smuggling_is_400) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     // Content-Length plus Transfer-Encoding must be rejected.
@@ -629,8 +629,8 @@ CRPC_TEST(http1_request_smuggling_is_400) {
 
 CRPC_TEST(h2c_headers_and_data_round_trip) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -661,8 +661,8 @@ CRPC_TEST(h2c_headers_and_data_round_trip) {
 
 CRPC_TEST(h2c_post_body_round_trip) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -692,8 +692,8 @@ CRPC_TEST(h2c_post_body_round_trip) {
 
 CRPC_TEST(h2c_flow_control_parks_then_resumes) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -744,8 +744,8 @@ CRPC_TEST(h2c_send_queue_cap_is_rst_stream) {
     // below the 200000-byte response so the stream is rejected.
     options.h2_max_send_queue_bytes = 1024;
     fixture fx(options);
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -772,8 +772,8 @@ CRPC_TEST(h2c_send_queue_cap_is_rst_stream) {
 
 CRPC_TEST(h2c_peer_goaway_is_answered) {
     fixture fx;
-    auto client = fx.connect();
     capture_source capture;
+    auto client = fx.connect();
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -805,13 +805,12 @@ CRPC_TEST(connection_cap_rejects_the_excess) {
     options.max_connections = 2;
     fixture fx(options);
 
+    capture_source c1;
+    capture_source c2;
     auto first = fx.connect();
     auto second = fx.connect();
     CRPC_CHECK(first != nullptr);
     CRPC_CHECK(second != nullptr);
-
-    capture_source c1;
-    capture_source c2;
     first->bind_source(&c1);
     second->bind_source(&c2);
     send_raw(*first, http1("GET", "/root", ""));
@@ -828,9 +827,9 @@ CRPC_TEST(connection_cap_rejects_the_excess) {
     // it immediately: no session is created and no request is answered. The
     // close may happen before the test binds its source, so the durable
     // evidence is the rejection counter plus the absence of a response.
+    capture_source c3;
     auto third = fx.connect();
     CRPC_CHECK(third != nullptr);
-    capture_source c3;
     third->bind_source(&c3);
     send_raw(*third, http1("GET", "/root", ""));
     const bool counted = crpc_test::wait_for(
@@ -846,9 +845,9 @@ CRPC_TEST(idle_timeout_closes_a_silent_connection) {
     options.request_timeout = std::chrono::milliseconds(0);
     fixture fx(options);
 
+    capture_source capture;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    capture_source capture;
     client->bind_source(&capture);
 
     // Send nothing. The idle bound must close the connection instead of
@@ -864,9 +863,9 @@ CRPC_TEST(request_timeout_answers_408_for_a_partial_request) {
     options.request_timeout = std::chrono::milliseconds(150);
     fixture fx(options);
 
+    capture_source capture;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    capture_source capture;
     client->bind_source(&capture);
 
     // A request that never completes: headers only, no terminating blank line.
@@ -883,9 +882,9 @@ CRPC_TEST(h2c_incomplete_request_is_reset_at_the_deadline) {
     options.idle_timeout = std::chrono::milliseconds(0);
     fixture fx(options);
 
+    capture_source capture;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    capture_source capture;
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -942,9 +941,9 @@ CRPC_TEST(egress_cap_stops_the_parse_loop_and_loses_nothing) {
     options.egress_cap_bytes = 4096;
     fixture fx(options);
 
+    gated_source gate;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    gated_source gate;
     client->bind_source(&gate);
 
     // 40 pipelined requests whose responses are 200 KB each: answering them all
@@ -984,9 +983,9 @@ CRPC_TEST(request_timeout_is_not_starved_by_the_idle_timer) {
     options.request_timeout = std::chrono::milliseconds(300);
     fixture fx(options);
 
+    capture_source capture;
     auto client = fx.connect();
     CRPC_CHECK(client != nullptr);
-    capture_source capture;
     client->bind_source(&capture);
 
     const auto start = std::chrono::steady_clock::now();
