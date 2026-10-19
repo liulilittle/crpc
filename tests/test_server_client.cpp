@@ -1221,6 +1221,284 @@ CRPC_TEST(iocp_echo_when_available) {
 }
 #endif
 
+// --- A transport that enforces the one-in-flight-push contract ---------------
+//
+// epoll and inproc both refuse a second push while one is still in flight
+// (operation_not_supported). The server must therefore serialise its own
+// pushes instead of assuming the transport queues them. This wrapper makes the
+// rule observable on every platform: it holds the first push until the test
+// releases it and refuses anything that arrives meanwhile, exactly like the
+// real backends do.
+
+class holding_sink final : public crpc::io::sink {
+public:
+    explicit holding_sink(crpc::io::sink& inner) noexcept : inner_(inner) {}
+
+    void push(crpc::span<const std::byte> data,
+              crpc::io::completion* c) noexcept override {
+        std::vector<std::byte> held;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (holding_ && !held_) {
+                held_ = true;
+                held_c_ = c;
+                held_bytes_.assign(data.begin(), data.end());
+                return;
+            }
+            if (held_) {
+                // The real backends' behaviour: refuse, do not queue.
+                rejected_.fetch_add(1, std::memory_order_relaxed);
+                c->complete(crpc::io::io_result{
+                    std::make_error_code(std::errc::operation_not_supported), 0});
+                return;
+            }
+        }
+        forward(data, c);
+    }
+
+    bool wait_held(int timeout_ms) {
+        return crpc_test::wait_for(
+            [this] {
+                std::lock_guard<std::mutex> lk(m_);
+                return held_;
+            },
+            timeout_ms);
+    }
+
+    void release() {
+        crpc::io::completion* c = nullptr;
+        std::vector<std::byte> bytes;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (!held_) {
+                return;
+            }
+            c = held_c_;
+            held_c_ = nullptr;
+            bytes = std::move(held_bytes_);
+            held_bytes_.clear();
+            held_ = false;
+            holding_ = false;
+        }
+        forward(crpc::span<const std::byte>(bytes.data(), bytes.size()), c);
+    }
+
+    int rejected() const { return rejected_.load(std::memory_order_relaxed); }
+
+private:
+    // The transport contract keeps the span valid until `complete`, so the
+    // bytes travel with a completion that owns them.
+    struct owned_completion final : crpc::io::completion {
+        std::vector<std::byte> bytes;
+        crpc::io::completion* inner = nullptr;
+        void complete(crpc::io::io_result result) noexcept override {
+            inner->complete(result);
+            delete this;
+        }
+    };
+
+    void forward(crpc::span<const std::byte> data,
+                 crpc::io::completion* c) noexcept {
+        owned_completion* oc = new (std::nothrow) owned_completion();
+        if (oc == nullptr) {
+            c->complete(crpc::io::io_result{
+                std::make_error_code(std::errc::not_enough_memory), 0});
+            return;
+        }
+        oc->bytes.assign(data.begin(), data.end());
+        oc->inner = c;
+        inner_.push(crpc::span<const std::byte>(oc->bytes.data(), oc->bytes.size()),
+                    oc);
+    }
+
+    crpc::io::sink& inner_;
+    std::mutex m_;
+    bool holding_ = true;
+    bool held_ = false;
+    crpc::io::completion* held_c_ = nullptr;
+    std::vector<std::byte> held_bytes_;
+    std::atomic<int> rejected_{0};
+};
+
+class holding_connection final : public crpc::connection {
+public:
+    explicit holding_connection(std::unique_ptr<crpc::connection> inner)
+        : inner_(std::move(inner)), sink_(inner_->sink()) {}
+
+    crpc::io::source& source() noexcept override { return inner_->source(); }
+    crpc::io::sink& sink() noexcept override { return sink_; }
+    void bind_source(crpc::io::source* s) noexcept override {
+        inner_->bind_source(s);
+    }
+    void resume_read() noexcept override { inner_->resume_read(); }
+    void close() noexcept override { inner_->close(); }
+    bool is_open() const noexcept override { return inner_->is_open(); }
+    crpc::endpoint remote() const override { return inner_->remote(); }
+
+    holding_sink& holding() noexcept { return sink_; }
+
+private:
+    std::unique_ptr<crpc::connection> inner_;
+    holding_sink sink_;
+};
+
+class holding_backend final : public crpc::backend_factory {
+public:
+    explicit holding_backend(crpc::backend_factory& inner) : inner_(inner) {}
+
+    std::unique_ptr<crpc::connection> connect(
+        const crpc::endpoint& ep, const crpc::connect_options& opt) override {
+        return inner_.connect(ep, opt);
+    }
+
+    std::unique_ptr<crpc::listener> listen(
+        const crpc::endpoint& ep, const crpc::listen_options& opt) override;
+
+    void note(holding_connection* c) noexcept {
+        std::lock_guard<std::mutex> lk(m_);
+        last_ = c;
+    }
+
+    holding_connection* last() noexcept {
+        std::lock_guard<std::mutex> lk(m_);
+        return last_;
+    }
+
+private:
+    struct acceptor final : crpc::accept_sink {
+        crpc::accept_sink* target = nullptr;
+        holding_backend* owner = nullptr;
+        void on_accept(std::unique_ptr<crpc::connection> c) noexcept override {
+            auto wrapped =
+                std::unique_ptr<holding_connection>(
+                    new (std::nothrow) holding_connection(std::move(c)));
+            if (!wrapped) {
+                return;
+            }
+            owner->note(wrapped.get());
+            target->on_accept(std::move(wrapped));
+        }
+    };
+
+    struct listener_impl final : crpc::listener {
+        std::unique_ptr<crpc::listener> inner;
+        acceptor sink;
+        void start(crpc::accept_sink* target) override {
+            sink.target = target;
+            inner->start(&sink);
+        }
+        void stop() noexcept override { inner->stop(); }
+    };
+
+    crpc::backend_factory& inner_;
+    std::mutex m_;
+    holding_connection* last_ = nullptr;
+};
+
+std::unique_ptr<crpc::listener> holding_backend::listen(
+    const crpc::endpoint& ep, const crpc::listen_options& opt) {
+    auto inner = inner_.listen(ep, opt);
+    if (!inner) {
+        return nullptr;
+    }
+    auto wrapper = std::unique_ptr<listener_impl>(new (std::nothrow) listener_impl());
+    if (!wrapper) {
+        return nullptr;
+    }
+    wrapper->inner = std::move(inner);
+    wrapper->sink.owner = this;
+    return wrapper;
+}
+
+CRPC_TEST(server_queues_a_response_while_one_push_is_in_flight) {
+    // Two pipelined requests on one connection: the first response cannot be
+    // written yet (the peer is slow), so the second must be queued by the
+    // server. Pushing it straight into the transport violates the one-in-flight
+    // rule, and the transport reports operation_not_supported -- which used to
+    // make the server close the connection and lose both responses.
+    fixture f;
+    fixture_config cfg;
+    cfg.per_connection = 8;
+    cfg.max_inflight = 8;
+    holding_backend holding(f.backend);
+
+    {
+        crpc::server::builder sb;
+        sb.add_listener(crpc::endpoint::inproc(f.name), holding);
+        register_services(sb, f.service);
+        sb.handler_workers(cfg.server_workers);
+        sb.per_connection_inflight(cfg.per_connection);
+        sb.per_service_inflight(cfg.per_service);
+        sb.drain_timeout(cfg.drain);
+        sb.overload_retry_after(cfg.overload_retry);
+        f.srv = sb.build();
+        CRPC_CHECK(f.srv != nullptr);
+        if (!f.srv) {
+            return;
+        }
+        CRPC_CHECK(f.srv->start().ok());
+    }
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    f.shard = std::make_unique<crpc::runtime>(ro);
+    f.shard->start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc(f.name), f.backend);
+    cb.pool_size(1);
+    cb.max_inflight_per_connection(cfg.max_inflight);
+    cb.default_deadline(cfg.default_deadline);
+    cb.on_shard(*f.shard);
+    f.cli = cb.build();
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+
+    auto first = f.cli->service<int, int>(kService, kEcho).call(1);
+    CRPC_CHECK(first.ok());
+    if (!first.ok()) {
+        return;
+    }
+    auto first_call = std::move(first).value();
+
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return holding.last() != nullptr; }, 5000));
+    holding_connection* hc = holding.last();
+    CRPC_CHECK(hc != nullptr);
+    if (hc == nullptr) {
+        return;
+    }
+    // The first response is now held: the server has an outstanding push.
+    CRPC_CHECK(hc->holding().wait_held(5000));
+
+    auto second = f.cli->service<int, int>(kService, kEcho).call(2);
+    CRPC_CHECK(second.ok());
+    if (!second.ok()) {
+        return;
+    }
+    auto second_call = std::move(second).value();
+
+    // Let the server try to write the second response while the first is still
+    // in flight.
+    std::this_thread::sleep_for(150ms);
+
+    hc->holding().release();
+
+    auto r1 = first_call.get();
+    auto r2 = second_call.get();
+    CRPC_CHECK(r1.ok());
+    CRPC_CHECK(r2.ok());
+    if (r1.ok()) {
+        CRPC_CHECK_EQ(2, r1.value());
+    }
+    if (r2.ok()) {
+        CRPC_CHECK_EQ(3, r2.value());
+    }
+    CRPC_CHECK_EQ(0, hc->holding().rejected());
+}
+
 } // namespace
 
 CRPC_TEST_MAIN()

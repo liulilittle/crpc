@@ -2,6 +2,8 @@
 #include <crpc/server.hpp>
 
 #include <algorithm>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -29,6 +31,10 @@ struct server_connection;
 // type below; a failure must never leave the peer waiting silently (R18).
 void report_send_failure(server_connection* sc, std::error_code ec) noexcept;
 
+// Finishes one outgoing frame and starts the next queued one. Defined after the
+// connection type below.
+void finish_send(server_connection* sc, io::io_result result) noexcept;
+
 // Owns the bytes of one outgoing frame until the backend completes the write.
 struct send_op final : io::completion {
     std::unique_ptr<std::byte[]> bytes;
@@ -36,8 +42,11 @@ struct send_op final : io::completion {
     std::shared_ptr<server_connection> keep_alive;
 
     void complete(io::io_result result) noexcept override {
-        if (!result.ok() && keep_alive) {
-            report_send_failure(keep_alive.get(), result.ec);
+        // Keep the connection alive across the hand-off to the next frame: the
+        // completion may be the last owner once this object is gone.
+        std::shared_ptr<server_connection> keep = keep_alive;
+        if (keep) {
+            finish_send(keep.get(), result);
         }
         delete this;
     }
@@ -63,6 +72,15 @@ struct server_connection {
     std::atomic<std::uint32_t> in_flight{0};
     std::atomic<bool> closed{false};
     std::weak_ptr<server_connection> self;
+
+    // The transport contract allows exactly one outstanding push per connection
+    // (a second push while one is in flight is refused with
+    // operation_not_supported by both epoll and inproc). Responses are therefore
+    // queued here and handed to the sink one at a time. The queue is bounded by
+    // per_connection_inflight: a handler sends at most one response.
+    std::mutex send_mutex;
+    std::deque<std::unique_ptr<send_op>> send_queue;
+    bool send_busy = false;
 
     struct reader_source final : io::source {
         explicit reader_source(server_connection* owner) noexcept : owner(owner) {}
@@ -104,6 +122,35 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
     // visible to the client instead of disappearing silently (R18).
     if (sc->conn) {
         sc->conn->close();
+    }
+}
+
+void finish_send(server_connection* sc, io::io_result result) noexcept {
+    if (sc == nullptr) {
+        return;
+    }
+    if (!result.ok()) {
+        report_send_failure(sc, result.ec);
+    }
+    send_op* next = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(sc->send_mutex);
+        sc->send_busy = false;
+        if (!sc->closed.load(std::memory_order_acquire) &&
+            !sc->send_queue.empty()) {
+            std::unique_ptr<send_op> head = std::move(sc->send_queue.front());
+            sc->send_queue.pop_front();
+            sc->send_busy = true;
+            next = head.release();
+        } else if (sc->closed.load(std::memory_order_acquire)) {
+            // The peer is gone: nobody can consume these frames.
+            sc->send_queue.clear();
+        }
+    }
+    // Push outside the lock: a synchronous completion re-enters finish_send.
+    if (next != nullptr && sc->conn) {
+        sc->conn->sink().push(
+            span<const std::byte>(next->bytes.get(), next->size), next);
     }
 }
 
@@ -197,8 +244,8 @@ struct server::impl {
         if (sc->closed.load(std::memory_order_acquire) || !sc->conn) {
             return;
         }
-        send_op* op = new (std::nothrow) send_op();
-        if (op == nullptr) {
+        std::unique_ptr<send_op> op(new (std::nothrow) send_op());
+        if (!op) {
             return;
         }
         frame value;
@@ -208,19 +255,34 @@ struct server::impl {
         const std::size_t size = encoded_frame_size(value);
         op->bytes.reset(new (std::nothrow) std::byte[size]);
         if (!op->bytes) {
-            delete op;
             return;
         }
         std::size_t written = 0;
         const status encoded =
             encode_frame(span<std::byte>(op->bytes.get(), size), value, written);
         if (!encoded.ok()) {
-            delete op;
             return;
         }
         op->size = written;
         op->keep_alive = sc;
-        sc->conn->sink().push(span<const std::byte>(op->bytes.get(), op->size), op);
+
+        send_op* ready = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(sc->send_mutex);
+            if (sc->closed.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (sc->send_busy) {
+                // One push is already outstanding: hold this frame until its
+                // completion arrives. The transport refuses a second push.
+                sc->send_queue.push_back(std::move(op));
+                return;
+            }
+            sc->send_busy = true;
+            ready = op.release();
+        }
+        sc->conn->sink().push(
+            span<const std::byte>(ready->bytes.get(), ready->size), ready);
     }
 
     void send_error(const std::shared_ptr<server_connection>& sc, std::uint32_t stream_id,
