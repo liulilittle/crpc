@@ -826,7 +826,15 @@ struct server::impl {
             return;
         }
 
-        if (decoded && opt.per_service_inflight != 0) {
+        // Validate the service id against the frozen registry before touching
+        // any per-service guard table. An arbitrary client-chosen id must not
+        // allocate a cap slot or a breaker: those maps are keyed by wire input
+        // and would otherwise grow without bound. The dispatcher still runs for
+        // an unknown id so it produces the canonical `not_found` response.
+        const bool guarded =
+            decoded && registry.find_service(service_id) != nullptr;
+
+        if (guarded && opt.per_service_inflight != 0) {
             bool over = false;
             {
                 std::lock_guard<std::mutex> lk(service_mutex);
@@ -846,14 +854,14 @@ struct server::impl {
                 complete_call(sc, job.counted);
                 return;
             }
-        } else if (decoded) {
+        } else if (guarded) {
             std::lock_guard<std::mutex> lk(service_mutex);
             ++service_in_flight[service_id];
         }
 
         resilience::circuit_breaker* breaker = nullptr;
         resilience::breaker_permit permit;
-        if (decoded) {
+        if (guarded) {
             std::lock_guard<std::mutex> lk(service_mutex);
             std::unique_ptr<resilience::circuit_breaker>& slot = breakers[service_id];
             if (!slot) {
@@ -869,7 +877,7 @@ struct server::impl {
                     send_error(sc, job.header.stream_id, rpc_code::unavailable,
                                permit.retry_after(), "service circuit breaker is open");
                 }
-                release_service(decoded, service_id);
+                release_service(guarded, service_id);
                 complete_call(sc, job.counted);
                 return;
             }
@@ -916,7 +924,7 @@ struct server::impl {
             }
         }
         handled.fetch_add(1, std::memory_order_relaxed);
-        release_service(decoded, service_id);
+        release_service(guarded, service_id);
         complete_call(sc, job.counted);
     }
 

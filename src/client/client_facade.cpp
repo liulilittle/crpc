@@ -24,6 +24,26 @@ namespace {
            code == rpc_code::eof || code == rpc_code::connection_refused;
 }
 
+// Only dependency/transport failures count against an endpoint breaker.
+// Application results (not_found, no_such_method, invalid_argument,
+// decode_error, a server-reported deadline_exceeded, cancellation) say nothing
+// about the endpoint's health and must not open it. A locally observed timeout
+// is recorded by its call site as a failure before reaching this classifier.
+[[nodiscard]] bool counts_as_breaker_failure(rpc_code code) noexcept {
+    switch (code) {
+    case rpc_code::connection_refused:
+    case rpc_code::connection_reset:
+    case rpc_code::broken_pipe:
+    case rpc_code::eof:
+    case rpc_code::unavailable:
+    case rpc_code::overload:
+    case rpc_code::resource_exhausted:
+        return true;
+    default:
+        return false;
+    }
+}
+
 [[nodiscard]] std::uint64_t mix64(std::uint64_t value) noexcept {
     value += 0x9E3779B97F4A7C15ull;
     value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -510,7 +530,8 @@ void client::release_slot(
     }
 }
 
-void client::finish_attempt(client_detail::call_core& core, rpc_code code) noexcept {
+void client::finish_attempt(client_detail::call_core& core, rpc_code code,
+                            client_detail::breaker_record record) noexcept {
     if (core.finalized.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -518,10 +539,22 @@ void client::finish_attempt(client_detail::call_core& core, rpc_code code) noexc
         (void)options_.shard->cancel_timer(&core);
     }
     if (core.permit.allowed()) {
-        if (code == rpc_code::ok) {
-            core.permit.success();
-        } else {
+        switch (record) {
+        case client_detail::breaker_record::ignore:
+            core.permit.ignore();
+            break;
+        case client_detail::breaker_record::failure:
             core.permit.failure();
+            break;
+        case client_detail::breaker_record::by_code:
+            if (code == rpc_code::ok) {
+                core.permit.success();
+            } else if (counts_as_breaker_failure(code)) {
+                core.permit.failure();
+            } else {
+                core.permit.ignore();
+            }
+            break;
         }
     }
     core.permit = resilience::breaker_permit{};

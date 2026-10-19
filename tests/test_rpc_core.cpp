@@ -752,6 +752,30 @@ CRPC_TEST(dispatcher_duplicate_registration) {
     CRPC_CHECK(reg.find_service(4) == nullptr);
 }
 
+CRPC_TEST(method_slot_leave_does_not_underflow) {
+    service_registry reg;
+    (void)reg.register_service(1, "svc");
+    (void)reg.register_method(1, 1, "echo", &echo_body, nullptr);
+    (void)reg.freeze();
+    const method_slot* method = reg.find_method(1, 1);
+    CRPC_CHECK(method != nullptr);
+    if (method == nullptr) {
+        return;
+    }
+    CRPC_CHECK(method->enter());
+    CRPC_CHECK_EQ(1u, method->in_flight());
+    method->leave();
+    CRPC_CHECK_EQ(0u, method->in_flight());
+    // A stray second leave must not wrap the counter to UINT32_MAX and reject
+    // the method forever.
+    method->leave();
+    CRPC_CHECK_EQ(0u, method->in_flight());
+    CRPC_CHECK(method->enter());
+    CRPC_CHECK_EQ(1u, method->in_flight());
+    method->leave();
+    CRPC_CHECK_EQ(0u, method->in_flight());
+}
+
 CRPC_TEST(dispatcher_decode_error) {
     service_registry reg;
     register_echo(reg);

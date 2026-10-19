@@ -212,7 +212,12 @@ bool method_slot::enter() const noexcept {
 }
 
 void method_slot::leave() const noexcept {
-    in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    u32 current = in_flight_.load(std::memory_order_relaxed);
+    while (current != 0 &&
+           !in_flight_.compare_exchange_weak(current, current - 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
+    }
 }
 
 status method_slot::invoke(const call_envelope& envelope, span<const std::byte> body,

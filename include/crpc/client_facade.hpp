@@ -250,6 +250,16 @@ struct call_state final : call_state_base {
     return core.owner.load(std::memory_order_acquire);
 }
 
+// How a finished attempt feeds the endpoint breaker. A logical call records
+// exactly one outcome: intermediate attempts of a retry are ignored, and the
+// terminal result is classified or, for a locally observed timeout, recorded as
+// a failure. Caller cancellations and abandoned handles are ignored.
+enum class breaker_record : u8 {
+    ignore,
+    by_code,
+    failure
+};
+
 template <typename Resp>
 struct wake_functor {
     call_core* core = nullptr;
@@ -389,9 +399,15 @@ public:
                         if (waited.code() == rpc_code::failed_precondition) {
                             failure = waited.error();
                         }
-                        // The attempt is over: cancel the timer and release the
-                        // connection slot before returning without a finalize.
-                        release();
+                        // A locally observed timeout is a dependency failure,
+                        // even though a server-produced `deadline_exceeded`
+                        // application result is ignored by `by_code`.
+                        const client_detail::breaker_record record =
+                            failure.code == rpc_code::deadline_exceeded
+                                ? client_detail::breaker_record::failure
+                                : client_detail::breaker_record::by_code;
+                        st->inner.reset();
+                        current->finish_attempt(st->core, failure.code, record);
                         return rpc::rpc_result<Resp>(std::move(failure));
                     }
                     rpc::rpc_result<Resp> result(
@@ -399,12 +415,20 @@ public:
                     const bool decoded = st->inner->try_get(result);
                     const rpc_code code = st->inner->code();
                     st->inner.reset();
-                    current->finish_attempt(st->core, code);
+                    std::chrono::nanoseconds delay{0};
+                    const bool retry =
+                        !(decoded && code == rpc_code::ok) &&
+                        current->should_retry(st->core, code, delay);
+                    // One logical call feeds the breaker once: a retried
+                    // attempt is ignored and only the terminal result counts.
+                    current->finish_attempt(
+                        st->core, code,
+                        retry ? client_detail::breaker_record::ignore
+                              : client_detail::breaker_record::by_code);
                     if (decoded && code == rpc_code::ok) {
                         return result;
                     }
-                    std::chrono::nanoseconds delay{0};
-                    if (!current->should_retry(st->core, code, delay)) {
+                    if (!retry) {
                         return result;
                     }
                     current->sleep_for(st->core, delay);
@@ -418,7 +442,12 @@ public:
                     continue;
                 }
                 std::chrono::nanoseconds delay{0};
-                if (!owner->should_retry(st->core, failure.code, delay)) {
+                const bool retry = owner->should_retry(st->core, failure.code, delay);
+                owner->finish_attempt(
+                    st->core, failure.code,
+                    retry ? client_detail::breaker_record::ignore
+                          : client_detail::breaker_record::by_code);
+                if (!retry) {
                     return rpc::rpc_result<Resp>(std::move(failure));
                 }
                 owner->sleep_for(st->core, delay);
@@ -432,9 +461,16 @@ public:
             }
             const bool decoded = state_->inner->try_get(out);
             if (decoded) {
-                // The handle has delivered its terminal result: finalize the
-                // attempt so the timer and slot are released.
-                release();
+                // The handle has delivered its terminal result: record it once
+                // and release the timer and slot.
+                const rpc_code code = state_->inner->code();
+                std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
+                st->inner.reset();
+                client* const owner = client_detail::live_owner(st->core);
+                if (owner != nullptr) {
+                    owner->finish_attempt(st->core, code,
+                                          client_detail::breaker_record::by_code);
+                }
             }
             return decoded;
         }
@@ -544,6 +580,9 @@ public:
         rpc_error failure;
         const status issued = issue(st, failure);
         if (!issued.ok()) {
+            // `issue` leaves the attempt for its caller to finalize, so the
+            // initial (and here terminal) failure is recorded exactly once.
+            finish_attempt(core, failure.code, client_detail::breaker_record::by_code);
             return rpc::rpc_result<client::call<Resp>>(std::move(failure));
         }
         call<Resp> handle;
@@ -570,7 +609,8 @@ private:
         client_detail::call_core& core, rpc_error& failure);
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
                       rpc_code code) noexcept;
-    void finish_attempt(client_detail::call_core& core, rpc_code code) noexcept;
+    void finish_attempt(client_detail::call_core& core, rpc_code code,
+                        client_detail::breaker_record record) noexcept;
     // Idempotent counterpart to finish_attempt for paths that end an attempt
     // without a result (handle destruction, try_get, cancel, close).
     void abandon_attempt(client_detail::call_core& core) noexcept;
@@ -628,9 +668,11 @@ status client::issue(
     if (!begin_attempt(core, st, failure)) {
         return status{failure};
     }
+    // On every failure below the attempt is left registered with its permit
+    // held; the caller (get() or start_encoded()) decides whether it is a
+    // retried attempt (ignore) or the terminal result (record once).
     std::shared_ptr<client_detail::connection_slot> slot = acquire_slot(core, failure);
     if (!slot) {
-        finish_attempt(core, failure.code);
         return status{failure};
     }
     // close() may have finalized the attempt between the registration and this
@@ -649,14 +691,12 @@ status client::issue(
         !slot->conn->is_open()) {
         rpc_error unavailable(rpc_code::unavailable, "connection is not usable");
         failure = unavailable;
-        finish_attempt(core, unavailable.code);
         return status{failure};
     }
     rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
         core.service_id, core.method_id, core.request.readable(), core.ctx);
     if (!started.ok()) {
         failure = started.error();
-        finish_attempt(core, failure.code);
         return status{failure};
     }
     st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
