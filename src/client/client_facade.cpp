@@ -33,6 +33,13 @@ namespace {
 
 } // namespace
 
+namespace {
+
+// The client whose timer callback is running on this thread, if any.
+thread_local const client* timer_thread_local = nullptr;
+
+} // namespace
+
 struct client::impl {
     struct endpoint_pool {
         endpoint_pool(endpoint ep, backend_factory* backend,
@@ -130,10 +137,19 @@ client::client(options opt, std::vector<endpoint_config> endpoints)
 }
 
 client::~client() {
+    // A deadline timer may be running `tick_poll()` on the shard thread right
+    // now. Block new callbacks, wait for the running one, then tear down. A
+    // callback that destroys its own client (same thread) is exempt: it is the
+    // last user of the object and waiting would deadlock.
+    {
+        std::lock_guard<std::mutex> lk(timer_mutex_);
+        timer_stopping_ = true;
+    }
+    if (timer_thread_local != this) {
+        std::unique_lock<std::mutex> lk(timer_mutex_);
+        timer_cv_.wait(lk, [this] { return timers_in_flight_ == 0; });
+    }
     close();
-    // Every handle still alive must observe a dead owner rather than call into
-    // this destroyed object; close() only detaches registered calls.
-    impl_->liveness->alive.store(false, std::memory_order_release);
 }
 
 void client::close() noexcept {
@@ -422,6 +438,7 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     co.client_epoch = 1;
     slot->conn = std::make_unique<rpc::client>(std::move(raw), co);
     slot->guarded = std::make_unique<client_detail::connection_slot::guarded_source>(slot.get());
+    slot->guarded->detach(slot->conn.get());
     raw_ptr->bind_source(slot->guarded.get());
     slot->in_flight.store(1, std::memory_order_release);
     pool->slots.push_back(slot);
@@ -631,7 +648,26 @@ void client::normalize_context(client_detail::call_core& core,
 // --- deadline tick -----------------------------------------------------------
 
 void client::deadline_thunk(void* ctx) noexcept {
-    static_cast<client*>(ctx)->tick_poll();
+    client* self = static_cast<client*>(ctx);
+    {
+        std::lock_guard<std::mutex> lk(self->timer_mutex_);
+        if (self->timer_stopping_) {
+            return;
+        }
+        ++self->timers_in_flight_;
+    }
+    // Marks this thread as being inside a timer callback, so a destructor that
+    // runs from here does not wait for itself.
+    const client* const previous = timer_thread_local;
+    timer_thread_local = self;
+    self->tick_poll();
+    timer_thread_local = previous;
+    {
+        std::lock_guard<std::mutex> lk(self->timer_mutex_);
+        if (--self->timers_in_flight_ == 0) {
+            self->timer_cv_.notify_all();
+        }
+    }
 }
 
 void client::tick_poll() noexcept {

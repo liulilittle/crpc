@@ -74,24 +74,96 @@ struct connection_slot {
         // `connection_slot::mutex` here: an in-process push can synchronously
         // deliver queued bytes back into this source while the writer already
         // holds that lock, which would invert the lock order (CF-1 follow-up).
-        // `self->conn` is installed once and never replaced, so it is safe to
-        // read without a lock.
+        //
+        // The transport keeps a raw pointer to this object and may call it from
+        // another thread, including while the slot is being destroyed. `active`
+        // counts calls in progress and `stopping` closes the gate; the slot
+        // destructor waits for `active` to reach zero before it releases
+        // anything the callbacks use. Reading `self->conn` directly was a real
+        // data race with `conn.reset()` (TSan: ~connection_slot vs on_data).
         std::size_t on_data(span<const std::byte> data) noexcept override {
-            return self->conn ? self->conn->source().on_data(data) : 0;
+            if (!enter()) {
+                return 0;
+            }
+            rpc::client* target = conn.load(std::memory_order_acquire);
+            const std::size_t used =
+                target != nullptr ? target->source().on_data(data) : 0;
+            leave();
+            return used;
         }
         void on_eof() noexcept override {
-            if (self->conn) {
-                self->conn->source().on_eof();
+            if (!enter()) {
+                return;
             }
+            rpc::client* target = conn.load(std::memory_order_acquire);
+            if (target != nullptr) {
+                target->source().on_eof();
+            }
+            leave();
         }
         void on_error(std::error_code ec) noexcept override {
-            if (self->conn) {
-                self->conn->source().on_error(ec);
+            if (!enter()) {
+                return;
             }
+            rpc::client* target = conn.load(std::memory_order_acquire);
+            if (target != nullptr) {
+                target->source().on_error(ec);
+            }
+            leave();
+        }
+
+        // Blocks new calls, then waits for the ones already running.
+        void retire() noexcept {
+            {
+                std::lock_guard<std::mutex> lk(gate);
+                stopping = true;
+            }
+            std::unique_lock<std::mutex> lk(gate);
+            idle.wait(lk, [this] { return active == 0; });
+        }
+
+        void detach(rpc::client* target) noexcept {
+            conn.store(target, std::memory_order_release);
         }
 
         connection_slot* self;
+
+    private:
+        bool enter() noexcept {
+            std::lock_guard<std::mutex> lk(gate);
+            if (stopping) {
+                return false;
+            }
+            ++active;
+            return true;
+        }
+
+        void leave() noexcept {
+            std::lock_guard<std::mutex> lk(gate);
+            if (--active == 0) {
+                idle.notify_all();
+            }
+        }
+
+        std::atomic<rpc::client*> conn{nullptr};
+        std::mutex gate;
+        std::condition_variable idle;
+        int active = 0;
+        bool stopping = false;
     };
+
+    // The transport holds a raw pointer to `guarded` (bind_source) and may be
+    // calling it from another thread right now. Retire it first (blocks new
+    // calls and waits for running ones), then destroy the connection and the
+    // adapter. Destroying in the other order raced `conn.reset()` against a
+    // concurrent `on_data`.
+    ~connection_slot() {
+        if (guarded) {
+            guarded->retire();
+        }
+        conn.reset();
+        guarded.reset();
+    }
 
     std::unique_ptr<rpc::client> conn;
     std::unique_ptr<guarded_source> guarded;
@@ -520,6 +592,16 @@ private:
     void tick_poll() noexcept;
     void evict_idle() noexcept;
     static void deadline_thunk(void* ctx) noexcept;
+
+    // A deadline timer runs on the shard thread and calls back into this
+    // client. The destructor must not free the client while such a callback is
+    // executing (TSan: ~client vs tick_poll). `timers_in_flight_` counts them
+    // and `timer_cv_` publishes their completion; both are guarded by
+    // `timer_mutex_`.
+    std::mutex timer_mutex_;
+    std::condition_variable timer_cv_;
+    int timers_in_flight_ = 0;
+    bool timer_stopping_ = false;
 
     options options_;
     std::vector<endpoint_config> endpoints_;

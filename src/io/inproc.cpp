@@ -105,7 +105,17 @@ struct channel {
 };
 
 struct endpoint_slot {
-    std::atomic<io::source*> bound{nullptr};
+    // `bound` is the user's source (installed with bind_source). The transport
+    // calls into it from whichever thread drives the drain, while the owner may
+    // destroy it on another thread -- bind_source explicitly does not take
+    // ownership. `delivering` counts calls in progress and `delivery_cv`
+    // publishes their completion, both under `inproc_state::mutex`;
+    // bind_source (including bind_source(nullptr)) waits for the count to drain
+    // before it returns. Without this, `~source` raced the virtual call (TSan,
+    // both the HTTP session's reader_source and the facade's guarded_source).
+    io::source* bound = nullptr;
+    int delivering = 0;
+    std::condition_variable delivery_cv;
     bool closed = false;
     inproc_faults faults;
 };
@@ -573,6 +583,40 @@ void resume_read_impl(inproc_state& st, int index) noexcept {
 
 } // namespace
 
+
+namespace {
+
+// The endpoint this thread is currently delivering into, if any. bind_source
+// must not wait for its own delivery: a callback that unbinds would otherwise
+// wait for itself forever.
+thread_local const endpoint_slot* delivering_on = nullptr;
+
+// Announces one call into a bound source. Returns null when no source is bound
+// (or the endpoint is closing); the caller must call leave_bound() with the
+// same endpoint after the call. Both run under the state mutex, and no lock is
+// held while the user callback executes.
+io::source* enter_bound(inproc_state& st, int index) noexcept {
+    std::lock_guard<std::mutex> lk(st.mutex);
+    endpoint_slot& ep = st.ep[index];
+    if (ep.bound == nullptr || ep.closed) {
+        return nullptr;
+    }
+    ++ep.delivering;
+    delivering_on = &ep;
+    return ep.bound;
+}
+
+void leave_bound(inproc_state& st, int index) noexcept {
+    std::lock_guard<std::mutex> lk(st.mutex);
+    endpoint_slot& ep = st.ep[index];
+    delivering_on = nullptr;
+    if (--ep.delivering == 0) {
+        ep.delivery_cv.notify_all();
+    }
+}
+
+} // namespace
+
 // --- inproc_connection -------------------------------------------------------
 
 inproc_connection::inproc_connection(std::shared_ptr<inproc_state> state,
@@ -597,17 +641,30 @@ inproc_connection::~inproc_connection() {
 }
 
 void inproc_connection::bind_source(io::source* source) noexcept {
-    state_->ep[index_].bound.store(source, std::memory_order_release);
-    if (source != nullptr) {
-        {
-            std::lock_guard<std::mutex> lk(state_->mutex);
-            channel& in = state_->dir[1 - index_];
-            if (!in.dead && !in.reader_closed) {
-                in.reader_paused = false;
-            }
+    {
+        std::unique_lock<std::mutex> lk(state_->mutex);
+        endpoint_slot& ep = state_->ep[index_];
+        if (ep.bound == source) {
+            return;
         }
-        drain(*state_);
+        // Unbinding (or replacing) must wait for calls already running into the
+        // old source: the caller may free it as soon as this returns. The wait
+        // releases the mutex, so an in-flight callback can finish its own
+        // leave_bound. A callback that unbinds its own endpoint is exempt (it
+        // would otherwise wait for itself).
+        ep.bound = source;
+        if (delivering_on != &ep) {
+            ep.delivery_cv.wait(lk, [&ep] { return ep.delivering == 0; });
+        }
+        if (source == nullptr) {
+            return;
+        }
+        channel& in = state_->dir[1 - index_];
+        if (!in.dead && !in.reader_closed) {
+            in.reader_paused = false;
+        }
     }
+    drain(*state_);
 }
 
 void inproc_connection::resume_read() noexcept {
@@ -640,25 +697,31 @@ void inproc_connection::flush_delayed() noexcept {
 }
 
 std::size_t inproc_connection::forward_data(span<const std::byte> data) noexcept {
-    io::source* s = state_->ep[index_].bound.load(std::memory_order_acquire);
+    io::source* s = enter_bound(*state_, index_);
     if (s == nullptr) {
         return 0;
     }
-    return s->on_data(data);
+    const std::size_t used = s->on_data(data);
+    leave_bound(*state_, index_);
+    return used;
 }
 
 void inproc_connection::forward_eof() noexcept {
-    io::source* s = state_->ep[index_].bound.load(std::memory_order_acquire);
-    if (s != nullptr) {
-        s->on_eof();
+    io::source* s = enter_bound(*state_, index_);
+    if (s == nullptr) {
+        return;
     }
+    s->on_eof();
+    leave_bound(*state_, index_);
 }
 
 void inproc_connection::forward_error(std::error_code ec) noexcept {
-    io::source* s = state_->ep[index_].bound.load(std::memory_order_acquire);
-    if (s != nullptr) {
-        s->on_error(ec);
+    io::source* s = enter_bound(*state_, index_);
+    if (s == nullptr) {
+        return;
     }
+    s->on_error(ec);
+    leave_bound(*state_, index_);
 }
 
 std::size_t inproc_connection::source_adapter::on_data(
