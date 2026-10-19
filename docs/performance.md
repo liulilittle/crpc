@@ -91,34 +91,33 @@ GCC 13.3 Release under WSL2 (kernel 6.18). Median of three runs.
 
 | Case | depth | MSVC inproc | GCC/WSL inproc | MSVC IOCP loopback |
 |---|---:|---|---|---|
-| sync latency p50 | 1 | 2.90 µs | 54.4 µs | 103.9 µs |
-| sync latency p90 | 1 | 4.30 µs | 91.6 µs | 145.3 µs |
-| sync latency p99 | 1 | **29.1 µs** | 139.7 µs | 194.1 µs |
-| sync latency p999 | 1 | 56.3 µs | 232 µs | 247.9 µs |
-| throughput | 1 | 0.106 M RPC/s | 0.087 M RPC/s | 0.0095 M RPC/s |
-| throughput | 16 | 0.170 M RPC/s | 0.361 M RPC/s | 0.0215 M RPC/s |
-| throughput | 64 | 0.203 M RPC/s | 0.854 M RPC/s | not run |
-| multi-shard 1/2/4 | 16 | 0.159 / 0.152 / 0.153 M | 0.289 / 0.293 / 0.294 M | n/a |
+| sync latency p50 | 1 | 2.80 µs | 60.4 µs | 86.2 µs |
+| sync latency p90 | 1 | 4.20 µs | 95.8 µs | 123.8 µs |
+| sync latency p99 | 1 | **22.6 µs** | 151.8 µs | 170.2 µs |
+| sync latency p999 | 1 | 49.0 µs | 286 µs | 343.7 µs |
+| sync latency max | 1 | 269 µs | 4.30 ms | 4.35 ms |
+| throughput | 1 | 0.157 M RPC/s | 0.0085 M RPC/s | 0.013 M RPC/s |
+| throughput | 16 | 0.241 M RPC/s | 0.034 M RPC/s | 0.024 M RPC/s |
+| throughput | 64 | 0.275 M RPC/s | 0.076 M RPC/s | not run |
+| multi-shard 1/2/4 | 16 | 0.217 / 0.196 / 0.193 M | 0.0275 / 0.0274 / 0.0275 M | n/a |
 
-Tail warning: the in-process maximum latency reaches ≈100 ms occasionally on
-both toolchains (MSVC 100.2/113.2/101.1 ms; GCC 100.2 ms), which matches the
-100 ms `runtime_options::idle_wait` default. `runtime::wake()` sets `wake_flag`
-outside `wait_mutex` while the shard loop evaluates that flag as a
-`wait_for` predicate under the same mutex, so a wake that lands between the
-predicate check and the block is lost and the shard sleeps the full idle
-interval. This is a defect in the wait path, not a codec or scheduling cost.
+Tail: after the wake-path fix the ≈100 ms stalls are gone. On MSVC the in-process
+maximum over 50k samples is now 168-624 µs (median 269 µs) and the WSL maximum is
+2.6-14.5 ms (median 4.3 ms); the MSVC IOCP maximum is 2.7-33.4 ms (median 4.3 ms,
+one 33 ms outlier across three runs), which is a tail regression versus the
+pre-fix 0.65-1.24 ms and is recorded, not explained away.
 
 Bottleneck evidence (measured, not inferred). Per-call costs on MSVC Release:
-`make_shared<call_state<std::string>>` 55 ns (≈1.8 % of a 3.07 µs call), the
-per-connection `std::recursive_mutex` 11 ns (≈0.4 %), string codec encode plus
-decode 15 ns (≈0.5 %). A phase split at depth 64 over 200k calls gives issue
-2033 ns + wait 1040 ns; only 0.8 % of calls are already complete at issue, so the
-time is the round trip itself, not the bookkeeping. Multi-client threads against
-multi-shard: 1/2/4/8 threads → 0.353/0.459/0.597/0.728 M RPC/s (1→8 is 2.06x,
-saturating at 0.7-0.9 M). The measured ceiling of the current design is therefore
-about 1 M RPC/s per process; the remaining 5-14x to the 5 M target needs the
-round trip removed (batching or client-shard affinity), not allocation or lock
-tuning. The target numbers are not met (see §3).
+`make_shared<call_state<std::string>>` 52 ns, the per-connection
+`std::recursive_mutex` 8 ns, string codec encode plus decode 17 ns. A phase split
+at depth 64 over 200k calls gives issue 2612 ns + wait 934 ns; only 0.6 % of calls
+are already complete at issue, so the time is the round trip itself, not the
+bookkeeping. Multi-client threads against multi-shard: 1/2/4/8 threads →
+0.227/0.382/0.526/0.773 M RPC/s (1→8 is 3.4x, saturating near 0.8 M). The measured
+ceiling of the current design is therefore about 1 M RPC/s per process; the
+remaining 5-14x to the 5 M target needs the round trip removed (batching or
+client-shard affinity), not allocation or lock tuning. The target numbers are not
+met (see §3).
 
 No p99, p999, cross-shard handoff, codec or resilience-pipeline measurement
 existed before this document; the p99/p999 figures above are now measured, the
@@ -144,9 +143,9 @@ Performance targets:
 
 | Metric | Target | Status |
 |---|---|---|
-| aggregate throughput | 5M RPC/s | **not met**: 0.203M RPC/s best measured (inproc, MSVC, depth 64); 0.0215M over IOCP loopback |
-| per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.203M RPC/s inproc measured (§2.3) |
-| p99 latency | < 100 µs | **partly met**: 29.1 µs inproc (MSVC); 194 µs IOCP loopback; 139.7 µs WSL inproc |
+| aggregate throughput | 5M RPC/s | **not met**: 0.275M RPC/s best measured (inproc, MSVC, depth 64); 0.024M over IOCP loopback |
+| per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.275M RPC/s inproc measured (§2.3) |
+| p99 latency | < 100 µs | **partly met**: 22.6 µs inproc (MSVC); 170.2 µs IOCP loopback; 151.8 µs WSL inproc |
 | cross-shard handoff | 15–30 ns per batched message | budget; not measured |
 | codec, 64-byte message | < 100 ns encode and decode | budget; see `bench/bench_core.cpp` / `docs/benchmarks/` |
 | resilience pipeline | 35–65 ns per successful call | budget; not measured |
@@ -205,9 +204,10 @@ were disabled (sanitizers, tracing, logging). If a target is missed, the report
 states the measured value and the gap; it does not replace a missing measurement
 with a projection.
 
-Current status: the library has functional test coverage, an in-process and IOCP
-end-to-end RPC benchmark (§2.3) and a wire/codec microbenchmark. The 5M RPC/s
-and IOCP p99 targets are **not met** (measured 0.203M RPC/s inproc and 194 µs
-p99 over IOCP); the in-process p99 target is met at 29.1 µs on MSVC. The 128-byte
-call-slot budget remains **unmet** at 440 bytes on the measured toolchain. The
-verification matrix, defect list and raw logs are in `.opencode/verify-round.md`.
+Current status: the library has functional test coverage, an HTTP server facade,
+an in-process and IOCP end-to-end RPC benchmark (§2.3) and a wire/codec
+microbenchmark. The 5M RPC/s and IOCP p99 targets are **not met** (measured
+0.275M RPC/s inproc and 170 µs p99 over IOCP); the in-process p99 target is met
+at 22.6 µs on MSVC. The 128-byte call-slot budget remains **unmet** at 440 bytes
+on the measured toolchain. The verification matrix, defect list and raw logs are
+in `.opencode/verify-round.md`.

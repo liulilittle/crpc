@@ -1587,7 +1587,16 @@ void session::maybe_finish() {
     if (!drained) {
         return;
     }
-    if (close_when_drained_ || input_closed_) {
+    // `input_closed_` is written by whichever thread observes EOF or an error
+    // (reader_source::on_eof/on_error) under `mu_`; read it the same way. Reading
+    // the plain bool here raced with those writers (TSan: maybe_finish vs
+    // handle_eof), and a torn/stale read would leave a drained session open.
+    bool input_closed = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        input_closed = input_closed_;
+    }
+    if (close_when_drained_ || input_closed) {
         finish_now();
     }
 }
