@@ -914,6 +914,93 @@ CRPC_TEST(h2c_incomplete_request_is_reset_at_the_deadline) {
     CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
 }
 
+// A source that refuses credit until the test opens the gate, modelling a peer
+// that stops reading.
+struct gated_source final : io::source {
+    std::mutex mu;
+    std::string data;
+    std::atomic<bool> open{false};
+
+    std::size_t on_data(span<const std::byte> bytes) noexcept override {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!open.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        data.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        return bytes.size();
+    }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+    [[nodiscard]] std::string snapshot() {
+        std::lock_guard<std::mutex> lk(mu);
+        return data;
+    }
+};
+
+CRPC_TEST(egress_cap_stops_the_parse_loop_and_loses_nothing) {
+    http::http_server_options options;
+    options.egress_cap_bytes = 4096;
+    fixture fx(options);
+
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    gated_source gate;
+    client->bind_source(&gate);
+
+    // 40 pipelined requests whose responses are 200 KB each: answering them all
+    // in one drain would build an ~8 MB write queue.
+    std::string batch;
+    for (int i = 0; i < 40; ++i) {
+        batch += http1("GET", "/big", "");
+    }
+    send_raw(*client, batch);
+
+    // The peer reads nothing, so the queue crosses the cap and parsing must
+    // stop: only a couple of responses can have been produced.
+    crpc_test::wait_for([&] { return fx.server->stats().responses_written > 0; }, 5000);
+    const std::size_t produced = fx.server->stats().responses_written;
+    CRPC_CHECK(produced < 40);
+
+    // Open the gate: the queue drains, parsing resumes, and every response
+    // arrives in order. Nothing is dropped.
+    gate.open.store(true, std::memory_order_release);
+    client->resume_read();
+    const bool all = crpc_test::wait_for(
+        [&] {
+            const std::string data = gate.snapshot();
+            return count_substring(data, "HTTP/1.1 200 OK") >= 40;
+        },
+        20000);
+    CRPC_CHECK(all);
+}
+
+CRPC_TEST(request_timeout_is_not_starved_by_the_idle_timer) {
+    // The idle deadline is armed when the connection starts, so it is armed
+    // before any request deadline exists. A request that starts later must still
+    // fire at its own (earlier) deadline: the session timer is re-armed when the
+    // new nearest deadline is earlier than the armed one.
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(3000);
+    options.request_timeout = std::chrono::milliseconds(300);
+    fixture fx(options);
+
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    capture_source capture;
+    client->bind_source(&capture);
+
+    const auto start = std::chrono::steady_clock::now();
+    send_raw(*client, "GET /root HTTP/1.1\r\nHost: test\r\n");
+    const bool answered = crpc_test::wait_for(
+        [&] { return capture.snapshot().find("408") != std::string::npos; }, 5000);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    CRPC_CHECK(answered);
+    // Well before the 3 s idle deadline, and not much after the 300 ms request
+    // deadline.
+    CRPC_CHECK(elapsed < std::chrono::milliseconds(1500));
+}
+
 // --- TLS test ----------------------------------------------------------------
 
 CRPC_TEST(tls_alpn_routing_or_skip) {

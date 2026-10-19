@@ -314,6 +314,10 @@ private:
     bool h2_goaway_sent_ = false;
     bool h2_settings_sent_ = false;
     bool probe_armed_ = false;
+    // The deadline the armed timer actually carries. A later arm request whose
+    // nearest deadline is earlier must re-arm, otherwise an idle deadline armed
+    // at accept time starves a request deadline that starts afterwards.
+    u64 armed_deadline_ns_ = 0;
     // Absolute monotonic deadlines in nanoseconds (0 = not armed). The idle
     // deadline bounds a connection that sends nothing; the request deadline
     // bounds an incomplete request (slowloris, No-stall rule).
@@ -691,6 +695,7 @@ void session::process() {
             return;
         }
         bool resume = false;
+        bool over_egress = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (read_paused_ && ingress_.empty() && !close_when_drained_ &&
@@ -699,7 +704,13 @@ void session::process() {
                 read_paused_ = false;
                 resume = true;
             }
-            if (ingress_.empty()) {
+            // Bytes were put back into the ingress buffer because the write
+            // queue crossed its cap. Keep them there until a completion drains
+            // the queue: looping now would re-parse the whole batch and rebuild
+            // the unbounded queue the cap exists to prevent.
+            over_egress = state_.options.egress_cap_bytes != 0 &&
+                          out_bytes_ > state_.options.egress_cap_bytes;
+            if (ingress_.empty() || over_egress) {
                 break;
             }
         }
@@ -1592,6 +1603,7 @@ void session::finish_now() {
         (void)shard_->cancel_timer(this);
     }
     probe_armed_ = false;
+    armed_deadline_ns_ = 0;
     out_.clear();
     out_bytes_ = 0;
     in_flight_.clear();
@@ -1629,7 +1641,7 @@ void session::note_request_progress() noexcept {
 }
 
 void session::arm_probe() {
-    if (probe_armed_ || finished_ || shard_ == nullptr) {
+    if (finished_ || shard_ == nullptr) {
         return;
     }
     u64 deadline = 0;
@@ -1657,14 +1669,23 @@ void session::arm_probe() {
     if (deadline == 0) {
         return;
     }
+    if (probe_armed_ && armed_deadline_ns_ != 0 && armed_deadline_ns_ <= deadline) {
+        // The armed timer already fires no later than this deadline; let it.
+        return;
+    }
+    // `runtime::arm_timer` is keyed by the session address, so re-arming
+    // replaces the pending entry rather than adding a second one.
     probe_armed_ = true;
+    armed_deadline_ns_ = deadline;
     if (!shard_->arm_timer(this, deadline, &session::probe_trampoline, this)) {
         probe_armed_ = false;
+        armed_deadline_ns_ = 0;
     }
 }
 
 void session::on_probe() {
     probe_armed_ = false;
+    armed_deadline_ns_ = 0;
     if (finished_ || shutdown_requested_.load(std::memory_order_acquire) ||
         shard_ == nullptr) {
         return;
