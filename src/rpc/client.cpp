@@ -65,14 +65,23 @@ bool client::is_open() const noexcept {
 }
 
 void client::close() noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    if (closed_) {
-        return;
+    std::unique_ptr<connection> closing;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mutex_);
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        fail_all(rpc_code::shutting_down, "client closed");
+        // Move the transport out and close it without holding this lock. A
+        // synchronous in-process close calls the peer's terminal hook, which
+        // may take the server's push lock; holding this lock there would invert
+        // against the server send path (push lock -> this lock), a potential
+        // deadlock TSan reports. The local owner closes after the unlock.
+        closing = std::move(conn_);
     }
-    closed_ = true;
-    fail_all(rpc_code::shutting_down, "client closed");
-    if (conn_) {
-        conn_->close();
+    if (closing) {
+        closing->close();
     }
 }
 
@@ -128,6 +137,12 @@ void client::handle_frame(const frame& value) {
     case frame_type::goaway:
         handle_goaway(value);
         break;
+    case frame_type::push:
+        handle_push(value);
+        break;
+    case frame_type::push_ack:
+        handle_push_ack(value);
+        break;
     default:
         break;
     }
@@ -150,6 +165,99 @@ void client::handle_response(const frame& value) {
         return;
     }
     finish(*slot, call_state::completed, code, std::move(error), body);
+}
+
+void client::handle_push(const frame& value) {
+    push::push_envelope envelope;
+    if (!push::decode_push_envelope(value.payload, envelope).ok()) {
+        protocol_failure();
+        return;
+    }
+
+    if (envelope.mode == push::delivery_mode::reliable) {
+        const auto known = push_ack_upto_.find(value.header.stream_id);
+        if (known != push_ack_upto_.end() && envelope.seq <= known->second) {
+            // A replayed or stale reliable message: at-least-once delivery is
+            // made at-most-once here by the monotonic per-stream sequence.
+            return;
+        }
+        try {
+            push_ack_upto_[value.header.stream_id] = envelope.seq;
+        } catch (...) {
+            protocol_failure();
+            return;
+        }
+    }
+
+    if (push_sink_ != nullptr) {
+        push::push_message_view message;
+        message.stream_id = value.header.stream_id;
+        message.topic_id = envelope.topic_id;
+        message.mode = envelope.mode;
+        message.publisher_id = envelope.publisher_id;
+        message.epoch = envelope.epoch;
+        message.seq = envelope.seq;
+        message.topic_seq = envelope.topic_seq;
+        message.body = envelope.body;
+        push_sink_(push_sink_ctx_, message);
+    }
+
+    if (envelope.mode == push::delivery_mode::reliable) {
+        send_push_ack(value.header.stream_id, envelope.seq);
+    }
+}
+
+void client::handle_push_ack(const frame&) {
+    // This client only receives PUSH acknowledgements when it is the publisher;
+    // the minimal slice publishes from the server side, so there is nothing to
+    // match here. The branch exists so a future bidirectional implementation
+    // does not silently fall into `default`.
+}
+
+void client::set_push_sink(push::push_sink_fn sink, void* ctx) noexcept {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    push_sink_ = sink;
+    push_sink_ctx_ = ctx;
+}
+
+rpc_result<push::push_subscription> client::subscribe_push(std::string_view topic,
+                                                           u64 subscriber_id,
+                                                           push::delivery_mode mode,
+                                                           bool ordered) {
+    push::subscribe_request request;
+    request.subscriber_id = subscriber_id;
+    request.mode = mode;
+    request.ordered = ordered;
+    request.topic.assign(topic.data(), topic.size());
+
+    const std::size_t body_size = push::encoded_subscribe_request_size(request);
+    std::vector<std::byte> body(body_size);
+    std::size_t written = 0;
+    const status encoded = push::encode_subscribe_request(
+        span<std::byte>(body.data(), body.size()), request, written);
+    if (!encoded.ok()) {
+        return rpc_result<push::push_subscription>(encoded.error());
+    }
+
+    auto started = start_call<std::vector<std::byte>>(
+        push::push_control_service_id, push::push_control_method_subscribe,
+        span<const std::byte>(body.data(), written));
+    if (!started.ok()) {
+        return rpc_result<push::push_subscription>(started.error());
+    }
+
+    rpc_result<std::vector<std::byte>> reply = started.value().get();
+    if (!reply.ok()) {
+        return rpc_result<push::push_subscription>(reply.error());
+    }
+    const std::vector<std::byte>& bytes = reply.value();
+    push::push_subscription subscription;
+    if (!push::decode_push_subscription(
+             span<const std::byte>(bytes.data(), bytes.size()), subscription)
+             .ok()) {
+        return rpc_result<push::push_subscription>(rpc_code::decode_error);
+    }
+    return rpc_result<push::push_subscription>(std::move(subscription));
 }
 
 void client::handle_ping(const frame& value) {
@@ -266,6 +374,26 @@ void client::send_rst(u32 stream_id, rpc_code code) {
     }
     std::size_t written = 0;
     if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), rst, written).ok()) {
+        return;
+    }
+    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    flush_write();
+}
+
+void client::send_push_ack(u32 stream_id, u64 seq) {
+    std::byte payload[push::push_ack_size];
+    endian::store_le64(payload, seq);
+    frame ack;
+    ack.header.type = frame_type::push_ack;
+    ack.header.stream_id = stream_id;
+    ack.payload = span<const std::byte>(payload, sizeof(payload));
+    const std::size_t size = encoded_frame_size(ack);
+    frame_scratch_.clear();
+    if (!frame_scratch_.reserve(size)) {
+        return;
+    }
+    std::size_t written = 0;
+    if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), ack, written).ok()) {
         return;
     }
     enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));

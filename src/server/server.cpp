@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -35,21 +36,22 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept;
 // connection type below.
 void finish_send(server_connection* sc, io::io_result result) noexcept;
 
+// Resumes the push pump after a PUSH frame leaves the connection's staging
+// queue. Defined after `server::impl` (it needs the full type).
+void wake_push_pump(server_connection* sc) noexcept;
+
+// Queues the hub detach on the connection's shard. Defined after
+// `server::impl` (it needs the full type).
+void schedule_detach_connection(server_connection* sc) noexcept;
+
 // Owns the bytes of one outgoing frame until the backend completes the write.
 struct send_op final : io::completion {
     std::unique_ptr<std::byte[]> bytes;
     std::size_t size = 0;
+    bool is_push = false;
     std::shared_ptr<server_connection> keep_alive;
 
-    void complete(io::io_result result) noexcept override {
-        // Keep the connection alive across the hand-off to the next frame: the
-        // completion may be the last owner once this object is gone.
-        std::shared_ptr<server_connection> keep = keep_alive;
-        if (keep) {
-            finish_send(keep.get(), result);
-        }
-        delete this;
-    }
+    void complete(io::io_result result) noexcept override;
 };
 
 // One decoded request waiting for a handler coroutine.
@@ -100,16 +102,46 @@ struct server_connection {
     std::deque<std::unique_ptr<send_op>> send_queue;
     bool send_busy = false;
 
-    server_connection() = default;
-    ~server_connection() {
-        if (conn) {
-            conn->bind_source(nullptr);
-        }
-    }
+    // Bytes of PUSH frames staged for the transport (in-flight plus queued).
+    // Bounded by `options::push_egress_max_bytes`; the pump stops taking from
+    // the hub when it reaches the bound. Responses are not counted: their bound
+    // is the existing per-connection in-flight cap.
+    std::atomic<std::size_t> push_egress_bytes{0};
 
-    void on_terminal() noexcept {
-        closed.store(true, std::memory_order_release);
-    }
+    // --- push state ---------------------------------------------------------
+    // Everything below is guarded by `server::impl::push_mutex`, which also
+    // serializes every call into the single-threaded hub. The group deliberately
+    // covers the caller thread (publish), the shard thread (subscribe), the
+    // reader thread (PUSH_ACK) and the control thread (close/detach).
+    u64 push_token = 0;      // hub::connection_id; 0 when detached
+    u64 push_subscriber = 0;
+    bool push_draining = false;
+    std::atomic<bool> detach_scheduled{false};
+
+    struct push_stream_state {
+        u32 stream_id = 0;
+        std::string topic;
+        u16 topic_id = 0;
+        push::delivery_mode mode = push::delivery_mode::reliable;
+        bool ordered = false;
+    };
+
+    // One message already taken from the hub that did not fit under the egress
+    // bound. Holding it here (rather than dropping it in the server) is what
+    // lets the pump pause without losing a message.
+    struct pending_message {
+        push::push_message message;
+        u32 stream_id = 0;
+    };
+
+    std::unordered_map<u32, push_stream_state> push_streams;
+    std::unordered_map<std::string, u32> push_stream_by_topic;
+    std::optional<pending_message> pending_push;
+    buffer push_scratch;
+
+    server_connection() = default;
+    ~server_connection();
+    void on_terminal() noexcept;
 
     std::size_t on_data(span<const std::byte> data) noexcept;
     void submit(frame& request) noexcept;
@@ -128,6 +160,7 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
     // A lost response would otherwise strand the peer until its deadline. Close
     // explicitly so every in-flight call observes EOF/failure; the drop is then
     // visible to the client instead of disappearing silently (R18).
+    schedule_detach_connection(sc);
     if (sc->conn) {
         sc->conn->close();
     }
@@ -192,6 +225,30 @@ struct server::impl {
     std::unordered_map<u64, std::size_t> service_in_flight;
     std::unordered_map<u64, std::unique_ptr<resilience::circuit_breaker>> breakers;
 
+    // --- push ---------------------------------------------------------------
+    // One hub for the (single) shard. The hub itself has no internal locking;
+    // `push_mutex` is the single lock every access goes through. It is
+    // recursive because a synchronous in-process send can re-enter the server
+    // through the peer's PUSH_ACK before the sending call returns.
+    //
+    // Lock order: push_mutex may be held while taking send_mutex (send_payload).
+    // No path takes push_mutex while holding send_mutex: finish_send releases
+    // it before resuming the pump.
+    std::recursive_mutex push_mutex;
+    std::unique_ptr<push::hub> push_hub;
+    std::unordered_map<std::string, u16> push_topic_ids;
+    u16 next_push_topic_id = 1;
+    u32 next_push_stream_id = 1;
+
+    std::atomic<u64> push_published{0};
+    std::atomic<u64> push_delivered{0};
+    std::atomic<u64> push_overflow_dropped{0};
+    std::atomic<u64> push_queued_messages{0};
+    std::atomic<u64> push_queued_bytes{0};
+    std::atomic<u64> push_active_connections{0};
+    std::atomic<std::size_t> push_egress_high_water{0};
+    std::atomic<u64> push_acks{0};
+
     struct acceptor final : accept_sink {
         explicit acceptor(impl* owner) noexcept : owner(owner) {}
         void on_accept(std::unique_ptr<connection> c) noexcept override {
@@ -247,14 +304,20 @@ struct server::impl {
         }
     }
 
-    void send_payload(const std::shared_ptr<server_connection>& sc, std::uint32_t stream_id,
-                      frame_type type, span<const std::byte> payload) noexcept {
+    // Returns true when the frame was accepted into the staging pipeline (handed
+    // to the sink or queued). A false return means the caller must keep its
+    // message (the pump parks it in `pending_push`) or that the connection is
+    // gone. `is_push` charges the byte count against the PUSH egress bound.
+    [[nodiscard]] bool send_payload(const std::shared_ptr<server_connection>& sc,
+                                     std::uint32_t stream_id, frame_type type,
+                                     span<const std::byte> payload,
+                                     bool is_push = false) noexcept {
         if (sc->closed.load(std::memory_order_acquire) || !sc->conn) {
-            return;
+            return false;
         }
         std::unique_ptr<send_op> op(new (std::nothrow) send_op());
         if (!op) {
-            return;
+            return false;
         }
         frame value;
         value.header.type = type;
@@ -263,34 +326,421 @@ struct server::impl {
         const std::size_t size = encoded_frame_size(value);
         op->bytes.reset(new (std::nothrow) std::byte[size]);
         if (!op->bytes) {
-            return;
+            return false;
         }
         std::size_t written = 0;
         const status encoded =
             encode_frame(span<std::byte>(op->bytes.get(), size), value, written);
         if (!encoded.ok()) {
-            return;
+            return false;
         }
         op->size = written;
+        op->is_push = is_push;
         op->keep_alive = sc;
+
+        if (is_push) {
+            const std::size_t total =
+                sc->push_egress_bytes.fetch_add(op->size, std::memory_order_acq_rel) +
+                op->size;
+            std::size_t high = push_egress_high_water.load(std::memory_order_relaxed);
+            while (high < total &&
+                   !push_egress_high_water.compare_exchange_weak(
+                       high, total, std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
+            }
+        }
 
         send_op* ready = nullptr;
         {
             std::lock_guard<std::mutex> lk(sc->send_mutex);
             if (sc->closed.load(std::memory_order_acquire)) {
-                return;
+                if (is_push) {
+                    sc->push_egress_bytes.fetch_sub(op->size);
+                }
+                return false;
             }
             if (sc->send_busy) {
                 // One push is already outstanding: hold this frame until its
                 // completion arrives. The transport refuses a second push.
                 sc->send_queue.push_back(std::move(op));
-                return;
+                return true;
             }
             sc->send_busy = true;
             ready = op.release();
         }
         sc->conn->sink().push(
             span<const std::byte>(ready->bytes.get(), ready->size), ready);
+        return true;
+    }
+
+    // --- push helpers (all called with push_mutex held) ---------------------
+
+    [[nodiscard]] u32 next_push_stream_locked() noexcept {
+        const u32 id = next_push_stream_id;
+        ++next_push_stream_id;
+        if (next_push_stream_id == 0 || next_push_stream_id > max_stream_id) {
+            next_push_stream_id = 1;
+        }
+        return id;
+    }
+
+    [[nodiscard]] u16 topic_id_locked(const std::string& topic) {
+        const auto known = push_topic_ids.find(topic);
+        if (known != push_topic_ids.end()) {
+            return known->second;
+        }
+        const u16 id = next_push_topic_id;
+        ++next_push_topic_id;
+        if (next_push_topic_id == 0) {
+            next_push_topic_id = 1;
+        }
+        push_topic_ids.emplace(topic, id);
+        return id;
+    }
+
+    void refresh_push_stats_locked() noexcept {
+        if (!push_hub) {
+            push_published.store(0, std::memory_order_relaxed);
+            push_delivered.store(0, std::memory_order_relaxed);
+            push_overflow_dropped.store(0, std::memory_order_relaxed);
+            push_queued_messages.store(0, std::memory_order_relaxed);
+            push_queued_bytes.store(0, std::memory_order_relaxed);
+            push_active_connections.store(0, std::memory_order_relaxed);
+            return;
+        }
+        const push::hub_stats counters = push_hub->stats();
+        push_published.store(counters.published, std::memory_order_relaxed);
+        push_delivered.store(counters.delivered, std::memory_order_relaxed);
+        push_overflow_dropped.store(counters.dropped_overflow,
+                                    std::memory_order_relaxed);
+        push_queued_messages.store(counters.queued_messages,
+                                   std::memory_order_relaxed);
+        push_queued_bytes.store(counters.queued_bytes, std::memory_order_relaxed);
+        push_active_connections.store(counters.active_connections,
+                                      std::memory_order_relaxed);
+    }
+
+    static push::push_envelope make_push_envelope(const push::push_message& message,
+                                                  u16 topic_id) noexcept {
+        push::push_envelope envelope;
+        envelope.version = push::push_wire_version;
+        envelope.mode = message.mode;
+        envelope.topic_id = topic_id;
+        envelope.publisher_id = message.publisher_id;
+        envelope.epoch = message.epoch;
+        envelope.seq = message.seq;
+        envelope.topic_seq = message.topic_seq;
+        envelope.body = message.data();
+        return envelope;
+    }
+
+    [[nodiscard]] static std::size_t push_frame_size(
+        const push::push_message& message, u16 topic_id) noexcept {
+        return frame_header_size +
+               push::encoded_push_envelope_size(make_push_envelope(message, topic_id));
+    }
+
+    [[nodiscard]] bool send_push_locked(
+        const std::shared_ptr<server_connection>& sc,
+        const push::push_message& message,
+        const server_connection::push_stream_state& stream) noexcept {
+        const push::push_envelope envelope =
+            make_push_envelope(message, stream.topic_id);
+        const std::size_t size = push::encoded_push_envelope_size(envelope);
+        sc->push_scratch.clear();
+        if (!sc->push_scratch.reserve(size)) {
+            return false;
+        }
+        std::size_t written = 0;
+        if (!push::encode_push_envelope(
+                 span<std::byte>(sc->push_scratch.data(), size), envelope, written)
+                 .ok()) {
+            return false;
+        }
+        return send_payload(
+            sc, stream.stream_id, frame_type::push,
+            span<const std::byte>(sc->push_scratch.data(), written), true);
+    }
+
+    [[nodiscard]] bool flush_pending_push_locked(
+        const std::shared_ptr<server_connection>& sc) noexcept {
+        if (!sc->pending_push.has_value()) {
+            return true;
+        }
+        server_connection::pending_message& pending = *sc->pending_push;
+        const auto stream = sc->push_streams.find(pending.stream_id);
+        if (stream == sc->push_streams.end()) {
+            sc->pending_push.reset();
+            return true;
+        }
+        const std::size_t frame =
+            push_frame_size(pending.message, stream->second.topic_id);
+        const std::size_t egress =
+            sc->push_egress_bytes.load(std::memory_order_relaxed);
+        if (opt.push_egress_max_bytes != 0 && egress != 0 &&
+            egress + frame > opt.push_egress_max_bytes) {
+            return false;
+        }
+        if (!send_push_locked(sc, pending.message, stream->second)) {
+            return false;
+        }
+        sc->pending_push.reset();
+        return true;
+    }
+
+    // Takes messages from the hub while the connection has PUSH egress
+    // headroom. The loop is the only place `try_take` is called, so reaching
+    // the bound really does stop the pump rather than dropping in this layer.
+    void drain_connection_locked(
+        const std::shared_ptr<server_connection>& sc) noexcept {
+        if (!sc || !push_hub || sc->closed.load(std::memory_order_acquire) ||
+            sc->push_token == 0) {
+            return;
+        }
+        if (sc->push_draining) {
+            // A synchronous completion re-entered while the outer pump is
+            // running; the outer loop re-evaluates the bound itself.
+            return;
+        }
+        sc->push_draining = true;
+        for (;;) {
+            if (sc->closed.load(std::memory_order_acquire) || sc->push_token == 0) {
+                break;
+            }
+            if (sc->pending_push.has_value()) {
+                if (!flush_pending_push_locked(sc)) {
+                    break;
+                }
+                continue;
+            }
+            if (opt.push_egress_max_bytes != 0 &&
+                sc->push_egress_bytes.load(std::memory_order_relaxed) >=
+                    opt.push_egress_max_bytes) {
+                break;
+            }
+            push::push_message message;
+            if (!push_hub->try_take(sc->push_token, message)) {
+                break;
+            }
+            const auto by_topic = sc->push_stream_by_topic.find(message.topic);
+            if (by_topic == sc->push_stream_by_topic.end()) {
+                continue;
+            }
+            const auto stream = sc->push_streams.find(by_topic->second);
+            if (stream == sc->push_streams.end()) {
+                continue;
+            }
+            const std::size_t frame =
+                push_frame_size(message, stream->second.topic_id);
+            const std::size_t egress =
+                sc->push_egress_bytes.load(std::memory_order_relaxed);
+            // A single message larger than the bound still makes progress; the
+            // bound pauses the pump, it never refuses a message outright.
+            if (opt.push_egress_max_bytes != 0 && egress != 0 &&
+                egress + frame > opt.push_egress_max_bytes) {
+                sc->pending_push =
+                    server_connection::pending_message{std::move(message),
+                                                       stream->second.stream_id};
+                break;
+            }
+            if (!send_push_locked(sc, message, stream->second)) {
+                sc->pending_push =
+                    server_connection::pending_message{std::move(message),
+                                                       stream->second.stream_id};
+                break;
+            }
+        }
+        sc->push_draining = false;
+        refresh_push_stats_locked();
+    }
+
+    void wake_push_pump(server_connection* raw) noexcept {
+        if (raw == nullptr) {
+            return;
+        }
+        std::shared_ptr<server_connection> sc = raw->self.lock();
+        if (!sc) {
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> lk(push_mutex);
+        if (sc->push_draining) {
+            return;
+        }
+        drain_connection_locked(sc);
+    }
+
+    // Idempotent. Called from the terminal path, the destructor and close_all;
+    // detaching here (before the connection and its token disappear) is the
+    // order the hub contract requires.
+    void detach_connection(server_connection* sc) noexcept {
+        if (sc == nullptr) {
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> lk(push_mutex);
+        if (sc->push_token != 0) {
+            if (push_hub) {
+                (void)push_hub->detach(sc->push_token);
+            }
+            sc->push_token = 0;
+            sc->push_subscriber = 0;
+        }
+        sc->pending_push.reset();
+        sc->push_streams.clear();
+        sc->push_stream_by_topic.clear();
+        refresh_push_stats_locked();
+    }
+
+    void handle_push_ack_locked(const std::shared_ptr<server_connection>& sc,
+                                u32 stream_id, u64 seq) noexcept {
+        if (!sc || !push_hub || sc->push_token == 0) {
+            return;
+        }
+        const auto stream = sc->push_streams.find(stream_id);
+        if (stream == sc->push_streams.end()) {
+            return;
+        }
+        if (push_hub->ack(sc->push_subscriber, stream->second.topic, seq).ok()) {
+            push_acks.fetch_add(1, std::memory_order_relaxed);
+        }
+        refresh_push_stats_locked();
+        drain_connection_locked(sc);
+    }
+
+    void handle_push_ack(const std::shared_ptr<server_connection>& sc,
+                         u32 stream_id, u64 seq) noexcept {
+        std::lock_guard<std::recursive_mutex> lk(push_mutex);
+        handle_push_ack_locked(sc, stream_id, seq);
+    }
+
+    struct detach_task {
+        impl* owner = nullptr;
+        std::shared_ptr<server_connection> conn;
+    };
+    static void run_detach_task(void* ctx) noexcept;
+    static void drop_detach_task(void* ctx) noexcept;
+
+    // Schedules the detach on the shard instead of taking push_mutex on the
+    // closing thread. The client destructor holds its own mutex while closing
+    // the transport; taking push_mutex there would invert against the send path
+    // (push_mutex -> client mutex), which TSan reports as a potential deadlock.
+    // The task keeps the connection alive, so the hub detach still happens
+    // before the connection object is destroyed.
+    void schedule_detach(server_connection* sc) noexcept {
+        if (sc == nullptr || sc->owner == nullptr) {
+            return;
+        }
+        if (sc->detach_scheduled.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::shared_ptr<server_connection> keep = sc->self.lock();
+        if (!keep) {
+            sc->detach_scheduled.store(false, std::memory_order_release);
+            return;
+        }
+        auto* task = new (std::nothrow) detach_task{this, std::move(keep)};
+        if (task == nullptr || sc->shard == nullptr ||
+            !sc->shard->post(&run_detach_task, task, &drop_detach_task)) {
+            delete task;
+            sc->detach_scheduled.store(false, std::memory_order_release);
+        }
+    }
+
+    // Handles the reserved push control REQUEST and fills `response` with an
+    // encoded RESPONSE payload. Returns the outcome code.
+    rpc_code handle_push_control_locked(request_job& job,
+                                        const call_envelope& envelope,
+                                        buffer& response) noexcept {
+        rpc_code code = rpc_code::ok;
+        rpc_error error;
+        std::vector<std::byte> body;
+        try {
+            if (opt.shards != 1 || !push_hub) {
+                code = rpc_code::unavailable;
+                error = rpc_error(code, "push requires a single-shard server");
+            } else if (envelope.method_id != push::push_control_method_subscribe) {
+                code = rpc_code::no_such_method;
+                error = rpc_error(code, "unknown push control method");
+            } else {
+                push::subscribe_request request;
+                if (!push::decode_subscribe_request(envelope.body, request).ok()) {
+                    code = rpc_code::protocol_error;
+                    error = rpc_error(code, "malformed subscribe request");
+                } else {
+                    const status subscribed = push_hub->subscribe(
+                        request.topic, request.subscriber_id, request.mode,
+                        request.ordered, opt.push_subscribe);
+                    if (!subscribed.ok() &&
+                        subscribed.code() != rpc_code::failed_precondition) {
+                        code = subscribed.code();
+                        error = subscribed.error();
+                    } else {
+                        const push::hub::connection_id token =
+                            push_hub->attach(request.subscriber_id);
+                        server_connection* sc = job.conn.get();
+                        if (token == push::hub::invalid_connection || sc == nullptr) {
+                            code = rpc_code::resource_exhausted;
+                            error = rpc_error(code, "push attach failed");
+                        } else {
+                            u32 stream_id = 0;
+                            const auto existing =
+                                sc->push_stream_by_topic.find(request.topic);
+                            if (existing != sc->push_stream_by_topic.end()) {
+                                stream_id = existing->second;
+                            } else {
+                                stream_id = next_push_stream_locked();
+                                server_connection::push_stream_state stream;
+                                stream.stream_id = stream_id;
+                                stream.topic = request.topic;
+                                stream.topic_id = topic_id_locked(request.topic);
+                                stream.mode = request.mode;
+                                stream.ordered = request.ordered;
+                                sc->push_streams[stream_id] = std::move(stream);
+                                sc->push_stream_by_topic[request.topic] = stream_id;
+                            }
+                            sc->push_token = token;
+                            sc->push_subscriber = request.subscriber_id;
+
+                            const server_connection::push_stream_state& state =
+                                sc->push_streams.at(stream_id);
+                            push::push_subscription reply;
+                            reply.stream_id = stream_id;
+                            reply.topic_id = state.topic_id;
+                            reply.mode = state.mode;
+                            reply.ordered = state.ordered;
+                            reply.topic = request.topic;
+                            const std::size_t size =
+                                push::encoded_push_subscription_size(reply);
+                            body.resize(size);
+                            std::size_t written = 0;
+                            const status encoded = push::encode_push_subscription(
+                                span<std::byte>(body.data(), body.size()), reply,
+                                written);
+                            if (!encoded.ok()) {
+                                code = encoded.code();
+                                error = encoded.error();
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            code = rpc_code::internal;
+            error = rpc_error(code, "push control allocation failed");
+        }
+
+        const status encoded =
+            code == rpc_code::ok
+                ? rpc::encode_response(
+                      rpc_code::ok, rpc_error{},
+                      span<const std::byte>(body.data(), body.size()), response)
+                : rpc::encode_response(code, error, span<const std::byte>(),
+                                       response);
+        if (!encoded.ok()) {
+            code = rpc_code::encode_error;
+            response.clear();
+        }
+        refresh_push_stats_locked();
+        return code;
     }
 
     void send_error(const std::shared_ptr<server_connection>& sc, std::uint32_t stream_id,
@@ -303,7 +753,7 @@ struct server::impl {
         if (!rpc::encode_response(code, error, span<const std::byte>(), payload).ok()) {
             return;
         }
-        send_payload(sc, stream_id, frame_type::response, payload.readable());
+        (void)send_payload(sc, stream_id, frame_type::response, payload.readable());
     }
 
     void handle_request(request_job& job) noexcept {
@@ -341,6 +791,40 @@ struct server::impl {
         call_envelope envelope;
         const bool decoded = decode_call_envelope(request.payload, envelope).ok();
         const u64 service_id = decoded ? envelope.service_id : 0;
+
+        if (decoded && service_id == push::push_control_service_id) {
+            buffer response;
+            rpc_code outcome = rpc_code::ok;
+            {
+                // The push lock also orders the subscription reply before the
+                // first replayed PUSH on this connection.
+                std::lock_guard<std::recursive_mutex> lk(push_mutex);
+                outcome = handle_push_control_locked(job, envelope, response);
+                if (wants_response) {
+                    if (response.empty()) {
+                        send_error(sc, job.header.stream_id, rpc_code::internal,
+                                   std::chrono::milliseconds(0),
+                                   "push control response encoding failed");
+                    } else {
+                        (void)send_payload(sc, job.header.stream_id,
+                                           frame_type::response, response.readable());
+                    }
+                }
+                if (outcome == rpc_code::ok) {
+                    if (std::shared_ptr<server_connection> keep = sc->self.lock()) {
+                        drain_connection_locked(keep);
+                    }
+                }
+            }
+            for (server_interceptor* interceptor : interceptors) {
+                if (interceptor != nullptr) {
+                    interceptor->on_response(outcome);
+                }
+            }
+            handled.fetch_add(1, std::memory_order_relaxed);
+            complete_call(sc, job.counted);
+            return;
+        }
 
         if (decoded && opt.per_service_inflight != 0) {
             bool over = false;
@@ -419,7 +903,8 @@ struct server::impl {
         }
 
         if (has_response && wants_response) {
-            send_payload(sc, job.header.stream_id, frame_type::response, response.readable());
+            (void)send_payload(sc, job.header.stream_id, frame_type::response,
+                               response.readable());
         } else if (!dispatched.ok() && wants_response) {
             send_error(sc, job.header.stream_id, dispatched.code(),
                        std::chrono::milliseconds(0), "dispatch failed");
@@ -473,7 +958,7 @@ struct server::impl {
         endian::store_le32(payload, 0);
         endian::store_le32(payload + 4, static_cast<u32>(rpc_code::shutting_down));
         for (const std::shared_ptr<server_connection>& sc : snapshot) {
-            send_payload(sc, 0, frame_type::goaway,
+            (void)send_payload(sc, 0, frame_type::goaway,
                          span<const std::byte>(payload, sizeof(payload)));
         }
     }
@@ -486,12 +971,100 @@ struct server::impl {
         }
         for (const std::shared_ptr<server_connection>& sc : snapshot) {
             sc->closed.store(true, std::memory_order_release);
+            sc->detach_scheduled.store(true, std::memory_order_release);
+            // Detach first: the hub must never target a connection that is
+            // about to be closed (and later destroyed). The control thread
+            // holds no client mutex here, so a synchronous detach is safe.
+            detach_connection(sc.get());
             if (sc->conn) {
                 sc->conn->close();
             }
         }
     }
 };
+
+struct push_ack_task {
+    server::impl* owner = nullptr;
+    std::shared_ptr<server_connection> conn;
+    u32 stream_id = 0;
+    u64 seq = 0;
+};
+
+void run_push_ack_task(void* ctx) noexcept {
+    std::unique_ptr<push_ack_task> task(static_cast<push_ack_task*>(ctx));
+    if (task->owner != nullptr) {
+        task->owner->handle_push_ack(task->conn, task->stream_id, task->seq);
+    }
+}
+
+void drop_push_ack_task(void* ctx) noexcept {
+    delete static_cast<push_ack_task*>(ctx);
+}
+
+void server::impl::run_detach_task(void* ctx) noexcept {
+    std::unique_ptr<detach_task> task(static_cast<detach_task*>(ctx));
+    if (task->owner != nullptr && task->conn) {
+        task->owner->detach_connection(task->conn.get());
+    }
+}
+
+void server::impl::drop_detach_task(void* ctx) noexcept {
+    delete static_cast<detach_task*>(ctx);
+}
+
+void send_op::complete(io::io_result result) noexcept {
+    // Keep the connection alive across the hand-off to the next frame: the
+    // completion may be the last owner once this object is gone.
+    std::shared_ptr<server_connection> keep = keep_alive;
+    if (keep && is_push) {
+        // Release the per-connection PUSH egress budget before the pump is
+        // allowed to take another message.
+        keep->push_egress_bytes.fetch_sub(size, std::memory_order_acq_rel);
+    }
+    if (keep) {
+        finish_send(keep.get(), result);
+        if (keep->owner != nullptr) {
+            wake_push_pump(keep.get());
+        }
+    }
+    delete this;
+}
+
+server_connection::~server_connection() {
+    // Connection teardown order is part of the contract: detach from the hub
+    // before the connection and its push token can disappear. The detach is
+    // synchronous under push_mutex; a no-op when the terminal path already ran.
+    if (owner != nullptr) {
+        owner->detach_connection(this);
+    }
+    if (conn) {
+        conn->bind_source(nullptr);
+    }
+}
+
+void server_connection::on_terminal() noexcept {
+    if (closed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // The detach is queued on the shard. It holds this connection alive until
+    // it runs, so the hub detach still precedes destruction; the closed flag
+    // already stops the pump from targeting this connection in the meantime.
+    if (owner != nullptr) {
+        owner->schedule_detach(this);
+    }
+}
+
+void wake_push_pump(server_connection* sc) noexcept {
+    if (sc != nullptr && sc->owner != nullptr) {
+        sc->owner->wake_push_pump(sc);
+    }
+}
+
+void schedule_detach_connection(server_connection* sc) noexcept {
+    if (sc != nullptr && sc->owner != nullptr) {
+        sc->owner->schedule_detach(sc);
+    }
+}
 
 std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
     if (closed.load(std::memory_order_acquire)) {
@@ -515,6 +1088,34 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
         if (value.header.type == frame_type::request ||
             value.header.type == frame_type::one_way) {
             submit(value);
+        } else if (value.header.type == frame_type::push_ack) {
+            if (value.payload.size() != push::push_ack_size) {
+                // A wrong-sized acknowledgement is a protocol violation; fail
+                // closed instead of acknowledging a guessed sequence.
+                on_terminal();
+                if (conn) {
+                    conn->close();
+                }
+                break;
+            }
+            if (shard != nullptr) {
+                push_ack_task* task = new (std::nothrow) push_ack_task();
+                const std::shared_ptr<server_connection> keep = self.lock();
+                if (task == nullptr || !keep) {
+                    delete task;
+                } else {
+                    task->owner = owner;
+                    task->conn = keep;
+                    task->stream_id = value.header.stream_id;
+                    task->seq = endian::load_le64(value.payload.data());
+                    // The hub is not thread-safe: the acknowledgement is
+                    // applied on the shard thread, never on the reader.
+                    if (!shard->post(&run_push_ack_task, task,
+                                     &drop_push_ack_task)) {
+                        delete task;
+                    }
+                }
+            }
         }
     }
     return data.size();
@@ -645,6 +1246,17 @@ server::builder& server::builder::breaker(resilience::breaker_config config) {
     return *this;
 }
 
+server::builder& server::builder::push_egress_max_bytes(std::size_t bytes) {
+    options_.push_egress_max_bytes = bytes;
+    return *this;
+}
+
+server::builder& server::builder::push_subscribe_options(
+    push::subscribe_options options) {
+    options_.push_subscribe = options;
+    return *this;
+}
+
 std::unique_ptr<server> server::builder::build() {
     auto result = std::unique_ptr<server>(new server(options_));
     impl& state = *result->impl_;
@@ -688,6 +1300,16 @@ status server::start() {
     }
 
     try {
+        {
+            std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
+            impl_->push_hub = std::make_unique<push::hub>(push::hub_options{});
+            impl_->push_topic_ids.clear();
+            impl_->next_push_topic_id = 1;
+            impl_->next_push_stream_id = 1;
+            impl_->push_egress_high_water.store(0, std::memory_order_relaxed);
+            impl_->push_acks.store(0, std::memory_order_relaxed);
+            impl_->refresh_push_stats_locked();
+        }
         for (std::size_t i = 0; i < impl_->opt.shards; ++i) {
             runtime_options ro = impl_->opt.runtime;
             ro.start_handler_pool = true;
@@ -729,6 +1351,13 @@ void server::stop() noexcept {
             impl_->shards[i]->stop();
             impl_->shards[i]->join();
         }
+        {
+            std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
+            impl_->push_hub.reset();
+            impl_->push_topic_ids.clear();
+            impl_->push_acks.store(0, std::memory_order_relaxed);
+            impl_->refresh_push_stats_locked();
+        }
         return;
     }
 
@@ -763,6 +1392,13 @@ void server::stop() noexcept {
     }
     impl_->shards.clear();
     impl_->pending_listeners.clear();
+    {
+        std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
+        impl_->push_hub.reset();
+        impl_->push_topic_ids.clear();
+        impl_->push_acks.store(0, std::memory_order_relaxed);
+        impl_->refresh_push_stats_locked();
+    }
 }
 
 bool server::running() const noexcept {
@@ -774,13 +1410,58 @@ server::statistics server::stats() const noexcept {
     {
         std::lock_guard<std::mutex> lk(impl_->connections_mutex);
         out.active_connections = impl_->connections.size();
+        for (const std::shared_ptr<server_connection>& sc : impl_->connections) {
+            out.push_egress_bytes +=
+                sc->push_egress_bytes.load(std::memory_order_relaxed);
+        }
     }
     out.in_flight_calls = impl_->in_flight.load(std::memory_order_acquire);
     out.accepted_connections = impl_->accepted.load(std::memory_order_relaxed);
     out.requests_handled = impl_->handled.load(std::memory_order_relaxed);
     out.rejected_overload = impl_->rejected.load(std::memory_order_relaxed);
     out.handler_failures = impl_->failures.load(std::memory_order_relaxed);
+    out.push_active_connections = static_cast<std::size_t>(
+        impl_->push_active_connections.load(std::memory_order_relaxed));
+    out.push_queued_messages = static_cast<std::size_t>(
+        impl_->push_queued_messages.load(std::memory_order_relaxed));
+    out.push_queued_bytes = static_cast<std::size_t>(
+        impl_->push_queued_bytes.load(std::memory_order_relaxed));
+    out.push_egress_high_water =
+        impl_->push_egress_high_water.load(std::memory_order_relaxed);
+    out.push_dropped_overflow = static_cast<std::size_t>(
+        impl_->push_overflow_dropped.load(std::memory_order_relaxed));
+    out.push_acks = static_cast<std::size_t>(
+        impl_->push_acks.load(std::memory_order_relaxed));
     return out;
+}
+
+bool server::publish(std::string_view topic, span<const std::byte> body,
+                     push::delivery_mode mode) noexcept {
+    if (topic.empty() || impl_->opt.shards != 1 ||
+        !impl_->running.load(std::memory_order_acquire)) {
+        return false;
+    }
+    try {
+        std::vector<std::shared_ptr<server_connection>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(impl_->connections_mutex);
+            snapshot = impl_->connections;
+        }
+        std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
+        if (!impl_->push_hub) {
+            return false;
+        }
+        impl_->push_hub->publish(topic, body, mode);
+        impl_->refresh_push_stats_locked();
+        for (const std::shared_ptr<server_connection>& sc : snapshot) {
+            if (!sc->closed.load(std::memory_order_acquire)) {
+                impl_->drain_connection_locked(sc);
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace crpc

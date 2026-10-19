@@ -43,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -50,6 +51,7 @@
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/io.hpp>
+#include <crpc/push/wire.hpp>
 #include <crpc/rpc/call.hpp>
 #include <crpc/rpc/dispatcher.hpp>
 #include <crpc/span.hpp>
@@ -135,6 +137,26 @@ public:
         return rpc_result<call<Resp>>(std::move(handle));
     }
 
+    // Installs the PUSH sink. The sink runs on the reader thread (the thread
+    // that delivered the frame), with `body` valid only for the call; it must
+    // not block and must not destroy this client. Passing nullptr removes it.
+    // A reliable PUSH is acknowledged after the sink returns; a duplicate or
+    // stale sequence (seq <= the last acknowledged seq on that stream) is
+    // dropped without invoking the sink.
+    void set_push_sink(push::push_sink_fn sink, void* ctx) noexcept;
+
+    // Subscribes to `topic` over the ordinary REQUEST path. Returns the
+    // stream_id/topic_id mapping carried by the subscription reply.
+    //
+    // This is the in-process/synchronous helper: it waits for the reply on the
+    // calling thread, which is what the single-threaded in-process backend
+    // guarantees. An asynchronous deployment uses the control service directly
+    // instead of blocking a reader thread.
+    [[nodiscard]] rpc_result<push::push_subscription> subscribe_push(
+        std::string_view topic, u64 subscriber_id,
+        push::delivery_mode mode = push::delivery_mode::reliable,
+        bool ordered = false);
+
     // Advances the injected clock and expires overdue calls. Idempotent; a
     // client with no deadlines does nothing.
     void poll() noexcept;
@@ -177,12 +199,15 @@ private:
     void handle_response(const frame& value);
     void handle_ping(const frame& value);
     void handle_goaway(const frame& value);
+    void handle_push(const frame& value);
+    void handle_push_ack(const frame& value);
 
     // --- writer ---
     void on_write_complete(io::io_result result) noexcept;
     void flush_write();
     void enqueue_raw(span<const std::byte> bytes);
     void send_rst(u32 stream_id, rpc_code code);
+    void send_push_ack(u32 stream_id, u64 seq);
 
     // --- call lifecycle ---
     call_slot* begin_call(u64 service_id, u64 method_id, const call_context& ctx,
@@ -230,6 +255,11 @@ private:
     u64 seq_ = 0;
     std::unordered_map<u32, call_slot*> in_flight_;
     std::multimap<std::chrono::steady_clock::time_point, call_slot*> deadlines_;
+    push::push_sink_fn push_sink_ = nullptr;
+    void* push_sink_ctx_ = nullptr;
+    // Highest reliable push sequence accepted per push stream. A PUSH at or
+    // below it is a replay duplicate and is not delivered again.
+    std::unordered_map<u32, u64> push_ack_upto_;
     write_completion completion_;
     reader_source source_;
     // Guards the mutating entry points against a backend-thread completion.

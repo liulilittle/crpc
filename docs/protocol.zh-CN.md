@@ -28,6 +28,7 @@
 | [16](#s16) | 会话握手 |
 | [17](#s17) | HTTP/2 映射 |
 | [18](#s18) | 版本与验证 |
+| [19](#s19) | 推送投递（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -77,10 +78,10 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 | `0x08` | `PONG` | 零 | 8 个不透明字节 |
 | `0x09` | `GOAWAY` | 零 | `last_stream_id` `u32` + `rpc_code` `u32` |
 | `0x0A` | `WINDOW_UPDATE` | 零或非零 | `increment` `u32` |
-| `0x0B` | `PUSH` | 非零 | 推送信封 + 正文（设计） |
+| `0x0B` | `PUSH` | 非零 | 推送信封 + 正文（第 19 节） |
 | `0x0C` | `PUSH_ACK` | 非零 | `push_seq` `u64` |
 
-帧编解码器校验头部和每种类型的作用域，但不解析 `SETTINGS`、`GOAWAY`、`WINDOW_UPDATE` 的负载；这些负载语义在这一层属于**已设计，未实现**。客户端实现 `REQUEST`/`ONE_WAY` 写出、`RESPONSE` 解码、`PING`/`PONG` 回显与 `GOAWAY` 处理；不处理 `PUSH`/`PUSH_ACK`。
+帧编解码器校验头部和每种类型的作用域，但不解析 `SETTINGS`、`GOAWAY`、`WINDOW_UPDATE` 的负载；这些负载语义在这一层属于**已设计，未实现**。客户端实现 `REQUEST`/`ONE_WAY` 写出、`RESPONSE` 解码、`PING`/`PONG` 回显、`GOAWAY` 处理，并在第 19 节的单分片子集中投递 `PUSH`、对可靠消息回 `PUSH_ACK`；客户端收到的 `PUSH_ACK` 会被忽略，因为本切片只由服务器推送。
 
 ## 5. 帧标志 <a id="s5"></a>
 
@@ -298,3 +299,48 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 线上协议有自己的版本 `protocol_version = 1`，独立于库版本。帧类型、标志、codec id 与 `rpc_code` 数值永久固定；新值追加在末尾，未知值被拒绝而不是映射为默认值。线上变更需要提升协议版本并附带迁移说明；ABI 策略是另一份文档（[ABI 策略](abi.zh-CN.md)）。
 
 验证位于 `tests/test_frame.cpp`（帧头与有序/PING 黄金字节、CRC32C、fail-closed 规则、信封往返）、`tests/test_wire.cpp`（varint/zigzag 边界）、`tests/test_http2.cpp`（h2 帧、HPACK RFC 向量、流状态、流控）以及 `tests/test_rpc_core.cpp`（请求、响应、取消、超时路径）。无法按本文精确解码字段的读者必须拒绝该帧；不存在“尽力而为”的解码路径。
+
+## 19. 推送投递（已实现子集） <a id="s19"></a>
+
+本节对已实现的单分片、进程内子集具有规范效力。PUSH 与 REQUEST/RESPONSE 走同一条连接。跨分片路由、ordered/gap 处理、HTTP SSE 与 `stream_transport` 集成不属于本子集。
+
+### 19.1 PUSH 信封
+
+`PUSH`（类型 `0x0B`）的 `stream_id` 必须非零；每个订阅分配一条推送流。负载如下：
+
+| 偏移 | 宽度 | 字段 | 类型 | 语义 |
+|---|---|---|---|---|
+| 0 | 1 | `version` | `u8` | 必须为 `1` |
+| 1 | 1 | `mode` | `u8` | 0 可靠，1 不可靠 |
+| 2 | 2 | `topic_id` | `u16` | 服务器分配，非零 |
+| 4 | 8 | `publisher_id` | `u64` | 发布者标识 |
+| 12 | 8 | `epoch` | `u64` | 发布者 epoch |
+| 20 | 8 | `seq` | `u64` | 每订阅可靠序号；不可靠时为 0 |
+| 28 | 8 | `topic_seq` | `u64` | 每 topic 单调序号 |
+| 36 | 4 | `body_len` | `u32` | 必须等于剩余负载长度 |
+| 40 | `body_len` | `body` | 字节 | 应用负载 |
+
+未知 version、未知 mode、`topic_id = 0`、可靠信封却 `seq = 0`、固定字段被截断，或 `body_len` 与剩余字节数不符，都是协议错误，必须在投递前拒绝。
+
+### 19.2 订阅控制与流映射
+
+推送控制复用普通 REQUEST 路径而不是新帧类型，保留 `service_id = 0xFFFFFFFFFFFFFFFF`、`method_id = 1`（subscribe）：
+
+```
+请求：u64 subscriber_id, u8 mode, u8 ordered, u16 topic_len, topic 字节
+应答：u32 stream_id, u16 topic_id, u8 mode, u8 ordered, u16 topic_len, topic
+```
+
+应答就是 `stream_id`/`topic_id` 映射。每个订阅独占一个非零推送 `stream_id`，因此 `PUSH_ACK` 可以保持第 4 节冻结的格式不变：类型 `0x0C`、订阅的 `stream_id`、负载 `push_seq` `u64`（累积确认）。服务器维护 `stream_id → (subscriber_id, topic, mode, ordered)` 映射，并用 `hub.ack(subscriber_id, topic, seq)` 应用确认。
+
+### 19.3 客户端行为
+
+收到格式正确的 PUSH 后，客户端调用已注册的 push sink。对可靠消息，客户端按推送流记录已接受的最大 `seq`，并丢弃 `seq` 不大于它的帧（至少一次的重放因此在 sink 处变为至多一次投递）。可靠帧在 sink 返回后回 `PUSH_ACK`；不可靠帧（`seq = 0`）不回确认。信封非法则按协议失败处理。
+
+### 19.4 服务器泵与出站上限
+
+每条连接沿用既有发送队列暂存 PUSH 帧。暂存的 PUSH 字节（在途加排队）由 `server::options::push_egress_max_bytes` 限制（默认 1 MiB），与响应在途上限相互独立。达到上限时泵停止调用 `try_take`；已经取出的消息停靠在连接上而不是被丢弃。因此所有丢弃决策都由 hub 的每订阅 `max_messages` / `max_bytes` 与 `overflow_policy` 作出，`publish()` 永不因慢订阅者阻塞。
+
+关闭连接时，必须在销毁连接及其推送令牌之前先 `hub.detach`，使迟到的 `PUSH_ACK` 不可能指向已死连接。订阅在 detach 后保留，因此使用同一 `subscriber_id` 重连时会重放未确认的可靠消息并继续投递。
+
+本子集未接 `hub::tick` 的慢订阅检测：不产生 `slow_subscriber` 事件，内存由 hub 的每订阅有界队列及其溢出策略兜底。

@@ -28,6 +28,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [16](#s16) | Session handshake |
 | [17](#s17) | HTTP/2 mapping |
 | [18](#s18) | Versioning and verification |
+| [19](#s19) | Push delivery (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -77,10 +78,10 @@ Numeric values are fixed forever; a change is a wire break.
 | `0x08` | `PONG` | zero | 8 opaque bytes |
 | `0x09` | `GOAWAY` | zero | `last_stream_id` `u32` + `rpc_code` `u32` |
 | `0x0A` | `WINDOW_UPDATE` | zero or non-zero | `increment` `u32` |
-| `0x0B` | `PUSH` | non-zero | push envelope + body (design) |
+| `0x0B` | `PUSH` | non-zero | push envelope + body (section 19) |
 | `0x0C` | `PUSH_ACK` | non-zero | `push_seq` `u64` |
 
-The frame codec validates the header and the scope of every type. It does not parse `SETTINGS`, `GOAWAY` or `WINDOW_UPDATE` payloads; those semantics are **specified, not implemented** at this layer. The client implements `REQUEST`/`ONE_WAY` writing, `RESPONSE` decoding, `PING`/`PONG` echo and `GOAWAY`; it does not handle `PUSH`/`PUSH_ACK`.
+The frame codec validates the header and the scope of every type. It does not parse `SETTINGS`, `GOAWAY` or `WINDOW_UPDATE` payloads; those semantics are **specified, not implemented** at this layer. The client implements `REQUEST`/`ONE_WAY` writing, `RESPONSE` decoding, `PING`/`PONG` echo, `GOAWAY`, and (in the single-shard subset of section 19) `PUSH` delivery with `PUSH_ACK` for reliable messages. `PUSH_ACK` received by a client is ignored because this slice only pushes from the server.
 
 ## 5. Frame flags <a id="s5"></a>
 
@@ -298,3 +299,77 @@ The HTTP server facade (`http/server.hpp`) implements the HTTP/1.1, h2c and h2 t
 The wire protocol has its own version, `protocol_version = 1`, independent of the library version. Frame types, flags, codec ids and `rpc_code` values are fixed forever; new values are appended, and an unknown value is rejected rather than mapped to a default. A wire change requires a protocol version bump and a migration note; the ABI policy is separate ([ABI policy](abi.md)).
 
 Verification is in `tests/test_frame.cpp` (header and ordered/ping golden bytes, CRC32C, fail-closed rules, envelope round trip), `tests/test_wire.cpp` (varint/zigzag boundaries), `tests/test_http2.cpp` (h2 framing, HPACK RFC vectors, stream state, flow control) and `tests/test_rpc_core.cpp` (request, response, cancel and timeout). A reader that cannot decode a field exactly as specified must reject the frame; there is no "best effort" decoding path.
+
+## 19. Push delivery (implemented subset) <a id="s19"></a>
+
+This section is normative for the implemented single-shard, in-process subset.
+PUSH travels on the same connection as REQUEST/RESPONSE. Cross-shard routing,
+ordered/gap handling, HTTP SSE and `stream_transport` integration are outside
+this subset.
+
+### 19.1 PUSH envelope
+
+`PUSH` (type `0x0B`) requires a non-zero `stream_id`; one push stream is
+allocated per subscription. The payload is:
+
+| Offset | Width | Field | Type | Semantics |
+|---|---|---|---|---|
+| 0 | 1 | `version` | `u8` | must be `1` |
+| 1 | 1 | `mode` | `u8` | 0 reliable, 1 unreliable |
+| 2 | 2 | `topic_id` | `u16` | server-assigned, non-zero |
+| 4 | 8 | `publisher_id` | `u64` | publisher identity |
+| 12 | 8 | `epoch` | `u64` | publisher epoch |
+| 20 | 8 | `seq` | `u64` | per-subscription reliable sequence; 0 when unreliable |
+| 28 | 8 | `topic_seq` | `u64` | per-topic monotonic sequence |
+| 36 | 4 | `body_len` | `u32` | must equal the remaining payload length |
+| 40 | `body_len` | `body` | bytes | application payload |
+
+An unknown version, an unknown mode, `topic_id = 0`, a reliable envelope with
+`seq = 0`, a truncated fixed field, or a `body_len` that differs from the
+remaining bytes is a protocol error and is rejected before delivery.
+
+### 19.2 Subscription control and stream mapping
+
+Push control uses the ordinary REQUEST path, not a new frame type, with the
+reserved `service_id = 0xFFFFFFFFFFFFFFFF` and `method_id = 1` (subscribe):
+
+```
+request:  u64 subscriber_id, u8 mode, u8 ordered, u16 topic_len, topic bytes
+reply:    u32 stream_id, u16 topic_id, u8 mode, u8 ordered, u16 topic_len, topic
+```
+
+The reply is the `stream_id`/`topic_id` mapping. Every subscription owns one
+non-zero push `stream_id`, which is what lets `PUSH_ACK` stay exactly as frozen
+in section 4: type `0x0C`, the subscription's `stream_id`, payload `push_seq`
+`u64` (cumulative). The server maps `stream_id` to `(subscriber_id, topic, mode,
+ordered)` and applies the acknowledgement with `hub.ack(subscriber_id, topic,
+seq)`.
+
+### 19.3 Client behaviour
+
+On a well-formed PUSH the client invokes the registered push sink. For reliable
+messages it keeps the highest accepted `seq` per push stream and drops a frame
+whose `seq` is not greater than it (at-least-once replay becomes at-most-once
+delivery at the sink). A reliable frame is acknowledged after the sink returns;
+an unreliable frame (`seq = 0`) is not acknowledged. A malformed envelope is a
+protocol failure.
+
+### 19.4 Server pump and egress bound
+
+Each connection stages PUSH frames in the existing send queue. The staged PUSH
+bytes (in-flight plus queued) are bounded by
+`server::options::push_egress_max_bytes` (default 1 MiB), independently of the
+response in-flight bound. At the bound the pump stops calling `try_take`; a
+message already taken is parked on the connection rather than dropped. The
+hub's per-subscription `max_messages` / `max_bytes` and `overflow_policy`
+therefore make every drop decision, and `publish()` never blocks on a slow
+subscriber.
+
+Closing a connection detaches it from the hub (`hub.detach`) before the
+connection and its push token are destroyed, so a late `PUSH_ACK` cannot target
+a dead connection. Subscriptions survive detach so a reconnect with the same
+`subscriber_id` resumes with the unacknowledged reliable messages replayed.
+
+`hub::tick` slow-subscriber detection is not wired in this subset: the
+`slow_subscriber` event is not emitted, and memory is bounded by the hub's
+per-subscription queues and their overflow policy instead.

@@ -42,12 +42,15 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/io.hpp>
+#include <crpc/push/hub.hpp>
+#include <crpc/push/wire.hpp>
 #include <crpc/resilience/circuit_breaker.hpp>
 #include <crpc/rpc/dispatcher.hpp>
 #include <crpc/runtime.hpp>
@@ -89,6 +92,15 @@ public:
         // activity ever opens it.
         resilience::breaker_config breaker{};
         bool send_goaway_on_stop = true;
+
+        // Per-connection bound on PUSH bytes staged for the transport (the
+        // in-flight push plus the send queue), independent of the response
+        // in-flight bound. When it is reached the push pump stops calling
+        // `try_take`; messages stay in the hub's bounded per-subscription queue
+        // and its overflow policy decides. Zero disables the bound.
+        std::size_t push_egress_max_bytes = 1u << 20; // 1 MiB
+        // Bounds and overflow policy applied to every PUSH subscription.
+        push::subscribe_options push_subscribe{};
     };
 
     struct statistics {
@@ -98,6 +110,15 @@ public:
         std::size_t requests_handled = 0;
         std::size_t rejected_overload = 0;
         std::size_t handler_failures = 0;
+        // Push counters. They are snapshots published under the push lock, so a
+        // reader never touches the single-threaded hub.
+        std::size_t push_active_connections = 0;
+        std::size_t push_queued_messages = 0;
+        std::size_t push_queued_bytes = 0;
+        std::size_t push_egress_bytes = 0;
+        std::size_t push_egress_high_water = 0;
+        std::size_t push_dropped_overflow = 0;
+        std::size_t push_acks = 0;
     };
 
     class builder {
@@ -130,6 +151,8 @@ public:
         builder& drain_timeout(std::chrono::milliseconds value);
         builder& overload_retry_after(std::chrono::milliseconds value);
         builder& breaker(resilience::breaker_config config);
+        builder& push_egress_max_bytes(std::size_t bytes);
+        builder& push_subscribe_options(push::subscribe_options options);
 
         [[nodiscard]] std::unique_ptr<server> build();
 
@@ -154,6 +177,16 @@ public:
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
+
+    // Publishes one message to `topic` and drains every connection on the
+    // shard. Never blocks on a subscriber: a slow connection stops the pump at
+    // `push_egress_max_bytes` and the hub queue bounds take over. Returns false
+    // when this server is not in the supported single-shard configuration or
+    // the shard is not running. The call copies the body; the caller's span may
+    // be released when it returns.
+    [[nodiscard]] bool publish(std::string_view topic, span<const std::byte> body,
+                               push::delivery_mode mode =
+                                   push::delivery_mode::reliable) noexcept;
 
     struct impl;
 
