@@ -586,10 +586,44 @@ void resume_read_impl(inproc_state& st, int index) noexcept {
 
 namespace {
 
-// The endpoint this thread is currently delivering into, if any. bind_source
-// must not wait for its own delivery: a callback that unbinds would otherwise
-// wait for itself forever.
-thread_local const endpoint_slot* delivering_on = nullptr;
+// The endpoints this thread is currently delivering into, innermost last.
+// bind_source must not wait for its own delivery: a callback that unbinds
+// would otherwise wait for itself forever. A stack (rather than a single slot)
+// preserves the outer marker when delivery nests across endpoints.
+constexpr std::size_t kMaxDeliveryDepth = 16;
+thread_local const endpoint_slot* delivery_stack[kMaxDeliveryDepth] = {};
+thread_local std::size_t delivery_depth = 0;
+thread_local std::size_t delivery_overflow = 0;
+
+void push_delivery(const endpoint_slot* ep) noexcept {
+    if (delivery_depth < kMaxDeliveryDepth) {
+        delivery_stack[delivery_depth++] = ep;
+    } else {
+        ++delivery_overflow;
+    }
+}
+
+void pop_delivery() noexcept {
+    if (delivery_overflow > 0) {
+        --delivery_overflow;
+    } else if (delivery_depth > 0) {
+        --delivery_depth;
+    }
+}
+
+bool is_delivering_on(const endpoint_slot* ep) noexcept {
+    if (delivery_overflow > 0) {
+        // Pathological nesting beyond the fixed stack: conservatively treat
+        // this thread as delivering so a self-unbind cannot deadlock.
+        return true;
+    }
+    for (std::size_t i = 0; i < delivery_depth; ++i) {
+        if (delivery_stack[i] == ep) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Announces one call into a bound source. Returns null when no source is bound
 // (or the endpoint is closing); the caller must call leave_bound() with the
@@ -602,14 +636,14 @@ io::source* enter_bound(inproc_state& st, int index) noexcept {
         return nullptr;
     }
     ++ep.delivering;
-    delivering_on = &ep;
+    push_delivery(&ep);
     return ep.bound;
 }
 
 void leave_bound(inproc_state& st, int index) noexcept {
     std::lock_guard<std::mutex> lk(st.mutex);
     endpoint_slot& ep = st.ep[index];
-    delivering_on = nullptr;
+    pop_delivery();
     if (--ep.delivering == 0) {
         ep.delivery_cv.notify_all();
     }
@@ -653,7 +687,7 @@ void inproc_connection::bind_source(io::source* source) noexcept {
         // leave_bound. A callback that unbinds its own endpoint is exempt (it
         // would otherwise wait for itself).
         ep.bound = source;
-        if (delivering_on != &ep) {
+        if (!is_delivering_on(&ep)) {
             ep.delivery_cv.wait(lk, [&ep] { return ep.delivering == 0; });
         }
         if (source == nullptr) {

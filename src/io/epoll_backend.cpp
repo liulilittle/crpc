@@ -276,17 +276,15 @@ public:
         if (src == nullptr) {
             return;
         }
-        bool was_paused = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            was_paused = read_paused_;
-            if (was_paused) {
-                read_paused_ = false;
-            }
+            read_paused_ = false;
         }
-        if (was_paused) {
-            schedule();
-        }
+        // Schedule unconditionally. A level-triggered edge may already have
+        // been consumed by read_loop() while no source was bound; in
+        // edge-triggered mode no further edge arrives for the buffered bytes,
+        // so pausing by itself would stall delivery forever.
+        schedule();
     }
 
     void resume_read() noexcept override {

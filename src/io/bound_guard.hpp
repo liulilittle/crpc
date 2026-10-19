@@ -17,6 +17,7 @@
 #define CRPC_IO_BOUND_GUARD_HPP
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 
 namespace crpc {
@@ -40,14 +41,14 @@ public:
             return nullptr;
         }
         ++in_flight_;
-        delivering_on = this;
+        push_delivery(this);
         return target_;
     }
 
     // Announces that the call started by `enter()` has returned.
     void leave() noexcept {
         std::lock_guard<std::mutex> lk(m_);
-        delivering_on = nullptr;
+        pop_delivery();
         if (--in_flight_ == 0) {
             cv_.notify_all();
         }
@@ -61,7 +62,7 @@ public:
         std::unique_lock<std::mutex> lk(m_);
         target_ = s;
         retired_ = (s == nullptr);
-        if (delivering_on != this) {
+        if (!is_delivering_on(this)) {
             cv_.wait(lk, [this] { return in_flight_ == 0; });
         }
     }
@@ -75,8 +76,49 @@ public:
     }
 
 private:
-    // The guard this thread is currently delivering into, if any.
-    static thread_local const bound_guard* delivering_on;
+    // Delivery markers are a stack: nested delivery on one thread (A calls
+    // into B) must restore A's marker when B's call returns. A single slot
+    // would clear the outer marker and turn a later self-unbind into a
+    // self-deadlock.
+    static constexpr std::size_t kMaxDeliveryDepth = 16;
+    struct delivery_stack {
+        const bound_guard* slots[kMaxDeliveryDepth] = {};
+        std::size_t depth = 0;
+        // Entries beyond the capacity are not recorded. Any rebind on this
+        // thread then conservatively skips its wait (a deep nesting is
+        // pathological; avoiding a self-deadlock matters more than delaying a
+        // return in that case).
+        std::size_t overflow = 0;
+    };
+    static thread_local delivery_stack delivery_;
+
+    static void push_delivery(const bound_guard* guard) noexcept {
+        if (delivery_.depth < kMaxDeliveryDepth) {
+            delivery_.slots[delivery_.depth++] = guard;
+        } else {
+            ++delivery_.overflow;
+        }
+    }
+
+    static void pop_delivery() noexcept {
+        if (delivery_.overflow > 0) {
+            --delivery_.overflow;
+        } else if (delivery_.depth > 0) {
+            --delivery_.depth;
+        }
+    }
+
+    static bool is_delivering_on(const bound_guard* guard) noexcept {
+        if (delivery_.overflow > 0) {
+            return true;
+        }
+        for (std::size_t i = 0; i < delivery_.depth; ++i) {
+            if (delivery_.slots[i] == guard) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     mutable std::mutex m_;
     std::condition_variable cv_;
@@ -85,7 +127,7 @@ private:
     bool retired_ = false;
 };
 
-inline thread_local const bound_guard* bound_guard::delivering_on = nullptr;
+inline thread_local bound_guard::delivery_stack bound_guard::delivery_ = {};
 
 } // namespace detail
 } // namespace io

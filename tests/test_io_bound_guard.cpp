@@ -152,4 +152,52 @@ CRPC_TEST(bound_guard_self_rebind_is_exempt) {
     CRPC_CHECK(guard.enter() == nullptr);
 }
 
+// Nested delivery across two guards: the inner leave must restore the outer
+// marker, otherwise the outer self-unbind would wait for itself.
+CRPC_TEST(bound_guard_nested_self_rebind_is_exempt) {
+    crpc::io::detail::bound_guard outer;
+    crpc::io::detail::bound_guard inner;
+    dummy_source outer_source;
+    dummy_source inner_source;
+    outer.rebind(&outer_source);
+    inner.rebind(&inner_source);
+
+    CRPC_CHECK(outer.enter() == &outer_source);
+    CRPC_CHECK(inner.enter() == &inner_source);
+
+    inner.retire(); // same thread: must return immediately
+    CRPC_CHECK_FALSE(inner.active());
+    inner.leave();
+
+    outer.retire(); // outer marker survived the inner leave
+    CRPC_CHECK_FALSE(outer.active());
+    outer.leave();
+    CRPC_CHECK(outer.enter() == nullptr);
+}
+
+// The outer guard is below the innermost marker; a rebind must still see it.
+CRPC_TEST(bound_guard_outer_marker_survives_inner_delivery) {
+    crpc::io::detail::bound_guard outer;
+    crpc::io::detail::bound_guard inner;
+    dummy_source outer_source;
+    dummy_source inner_source;
+    dummy_source replacement;
+    outer.rebind(&outer_source);
+    inner.rebind(&inner_source);
+
+    CRPC_CHECK(outer.enter() == &outer_source);
+    CRPC_CHECK(inner.enter() == &inner_source);
+
+    outer.rebind(&replacement); // not the top marker, still exempt
+    CRPC_CHECK(outer.active());
+    CRPC_CHECK(outer.enter() == &replacement);
+    outer.leave();
+
+    inner.leave();
+    outer.leave();
+    CRPC_CHECK(outer.active());
+    outer.retire();
+    CRPC_CHECK_FALSE(outer.active());
+}
+
 CRPC_TEST_MAIN()

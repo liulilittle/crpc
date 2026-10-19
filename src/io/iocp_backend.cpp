@@ -1060,6 +1060,16 @@ public:
         }
         st_->bound.rebind(source);
         if (source != nullptr) {
+            {
+                std::lock_guard<std::mutex> lk(st_->m);
+                if (st_->phase != conn_phase::open) {
+                    return;
+                }
+                // Delivery paused because no source was bound. Clear it like
+                // resume_read() does; otherwise deliver_read() stops on the
+                // first check and never resumes on this connection.
+                st_->paused = false;
+            }
             deliver_read(st_.get());
         }
     }

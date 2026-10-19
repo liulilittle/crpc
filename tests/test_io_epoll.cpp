@@ -562,6 +562,33 @@ void timer_probe(void* arg) noexcept {
 }
 } // namespace
 
+CRPC_TEST(epoll_bind_after_consumed_edge_still_delivers) {
+    auto be = io::epoll_backend::create();
+    CRPC_CHECK(be.ok());
+    fixture f(*be.value());
+    CRPC_CHECK(f.ok);
+
+    recording_source server_rx;
+    const std::string payload = "early-bytes";
+    recording_completion done;
+    f.client->sink().push(bytes_of(payload), &done);
+    CRPC_CHECK(wait_until([&] { return done.calls.load() == 1; }, 3000));
+
+    // Give the loop time to consume the EPOLLIN edge while no source is bound.
+    // The bytes stay buffered and no further edge will arrive in ET mode.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CRPC_CHECK_EQ(0, server_rx.data_calls.load());
+
+    f.server->bind_source(&server_rx);
+    // No further write: only bind_source's unconditional schedule() can
+    // deliver the already-buffered bytes.
+    CRPC_CHECK(wait_until([&] { return server_rx.size() == payload.size(); },
+                          3000));
+    CRPC_CHECK_EQ(payload.size(), server_rx.size());
+
+    f.shutdown();
+}
+
 // A source that blocks inside on_data until the test releases it. It lets the
 // test observe whether bind_source(nullptr) waits for the call to return.
 struct blocking_source final : io::source {

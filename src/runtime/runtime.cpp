@@ -38,6 +38,9 @@ struct timer_entry {
     void* key = nullptr;
     runtime::timer_fn fn = nullptr;
     void* arg = nullptr;
+    // Keeps the callback context alive while the entry is in the wheel and
+    // while run_timers() invokes the callback after popping it.
+    std::shared_ptr<void> keep;
 };
 
 } // namespace
@@ -540,6 +543,11 @@ bool runtime::spawn(spawn_fn fn, void* ctx) noexcept {
 
 bool runtime::arm_timer(void* key, std::uint64_t deadline_ns, timer_fn fn,
                         void* arg) noexcept {
+    return arm_timer(key, deadline_ns, fn, arg, std::shared_ptr<void>{});
+}
+
+bool runtime::arm_timer(void* key, std::uint64_t deadline_ns, timer_fn fn,
+                        void* arg, std::shared_ptr<void> keep) noexcept {
     if (key == nullptr || fn == nullptr) {
         return false;
     }
@@ -556,7 +564,8 @@ bool runtime::arm_timer(void* key, std::uint64_t deadline_ns, timer_fn fn,
         entry.key = key;
         entry.fn = fn;
         entry.arg = arg;
-        impl_->timers.emplace(map_key, entry);
+        entry.keep = std::move(keep);
+        impl_->timers.emplace(map_key, std::move(entry));
         impl_->timer_index.emplace(key, map_key);
     }
     impl_->wake();

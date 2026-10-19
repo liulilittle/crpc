@@ -141,6 +141,13 @@ public:
     // argument or an allocation failure.
     bool arm_timer(void* key, std::uint64_t deadline_ns, timer_fn fn, void* arg) noexcept;
 
+    // Same, but keeps `keep` alive until the callback returns. The wheel pops
+    // an entry under its lock and invokes the callback after releasing it; an
+    // owner that frees the callback context in that window would otherwise
+    // leave `arg` dangling.
+    bool arm_timer(void* key, std::uint64_t deadline_ns, timer_fn fn, void* arg,
+                   std::shared_ptr<void> keep) noexcept;
+
     // Cancels the timer identified by `key`. Returns true when one was armed.
     bool cancel_timer(void* key) noexcept;
 

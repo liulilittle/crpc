@@ -589,15 +589,17 @@ private:
     void sleep_for(client_detail::call_core& core, std::chrono::nanoseconds delay) noexcept;
     void notify_waiter() noexcept;
     rpc::call_id make_call_id() noexcept;
-    void tick_poll() noexcept;
-    void evict_idle(const std::shared_ptr<impl>& impl,
-                    std::chrono::nanoseconds idle_eviction) noexcept;
+    static void deadline_tick(const std::shared_ptr<impl>& impl,
+                              std::chrono::nanoseconds idle_eviction) noexcept;
+    static void evict_idle(const std::shared_ptr<impl>& impl,
+                           std::chrono::nanoseconds idle_eviction) noexcept;
     static void deadline_thunk(void* ctx) noexcept;
 
-    // A deadline timer runs on the shard thread and calls back into this
-    // client. The callback copies the shared control block before it starts,
-    // so it never touches `this` after tick_poll() returns. `timer_mutex_`
-    // guards the pointer and the stopping flag.
+    // A deadline timer runs on the shard thread. Its context is the shared
+    // gate below, not `this`: the runtime keeps the gate alive across the
+    // wheel-pop/callback window, and the callback never dereferences the
+    // client. `timer_mutex_` guards the pointer; the gate guards its own
+    // state.
     struct timer_gate;
     std::mutex timer_mutex_;
     std::shared_ptr<timer_gate> timer_gate_;

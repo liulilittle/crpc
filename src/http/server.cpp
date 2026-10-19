@@ -1696,10 +1696,15 @@ void session::arm_probe() {
         return;
     }
     // `runtime::arm_timer` is keyed by the session address, so re-arming
-    // replaces the pending entry rather than adding a second one.
+    // replaces the pending entry rather than adding a second one. The entry
+    // also keeps the session alive across the wheel-pop/callback window: the
+    // runtime pops under its lock and calls the trampoline after releasing it,
+    // so a bare `this` could dangle if the last owner dropped its reference.
     probe_armed_ = true;
     armed_deadline_ns_ = deadline;
-    if (!shard_->arm_timer(this, deadline, &session::probe_trampoline, this)) {
+    std::shared_ptr<session> keep = shared_from_this();
+    if (!shard_->arm_timer(this, deadline, &session::probe_trampoline, this,
+                           keep)) {
         probe_armed_ = false;
         armed_deadline_ns_ = 0;
     }
@@ -1988,9 +1993,10 @@ void http_server::stop() noexcept {
     for (const std::shared_ptr<session>& value : sessions) {
         value->force_close();
     }
-    // Sessions are retained until the shards are joined. A probe timer holds
-    // only a raw pointer to its session, so a session must outlive the shard
-    // that may still fire it; after the join no timer can run.
+    // Sessions are retained until the shards are joined. A probe timer entry
+    // now holds a keep-alive reference to the session, so the callback cannot
+    // outlive it; the entry is released when the runtime (and its timer wheel)
+    // is destroyed. The session destructor therefore must not touch shard_.
     for (std::unique_ptr<runtime>& shard : state.shards) {
         shard->stop();
     }
