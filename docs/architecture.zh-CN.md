@@ -254,12 +254,12 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 每个请求的顺序：
 
-1. `submit`（连接 reader）在 per-connection 在途上限之前、分配任何 job 之前执行可选的**连接级**令牌桶。拒绝返回 `resource_exhausted` + `retry_after`（HTTP 429）。这是连接级洪泛保护，不是服务级 rate 阶段。
-2. `handle_request` **先**检查 breaker。open 直接返回 `unavailable`（503）及其 `retry_after`。半开探针令牌会跳过服务级 rate、bulkhead 和并发上限直接 dispatch，受 `half_open_max_probes` 限制；因此 bulkhead 满载不会饿死 breaker。探针仍受连接级令牌桶约束，不保证跨连接的探针供给。
+1. `submit`（连接 reader）在 per-connection 在途上限之前、任何业务分配之前执行可选的**连接级**令牌桶。拒绝返回 `resource_exhausted` + `retry_after`（HTTP 429）；此时只分配必要的 forced-reject job。这是连接级洪泛保护，不是服务级 rate 阶段。
+2. `handle_request` **先**检查 breaker。open 直接返回 `unavailable`（503）及其 `retry_after`。半开探针令牌会跳过服务级 rate 与 bulkhead 阶段，受 `half_open_max_probes` 限制，因此饱和的 rate 桶或 bulkhead 不会饿死 breaker。服务级在途上限是真实容量边界，探针同样受其约束：cap 满时探针返回 `overload`。探针仍受连接级令牌桶约束，不保证跨连接的探针供给。
 3. closed 路径：服务级 rate（可选、感知 deadline；若等待会越过调用 deadline 则返回 `deadline_exceeded`，HTTP 504）-> 服务级 bulkhead（满载返回 `overload`，429）-> 现有服务级在途上限 -> `rpc::dispatcher::dispatch`。
 4. 结果分类：本地准入（rate、bulkhead、连接池、并发上限）与应用错误调用 `ignore()`；`internal`、`unavailable`、`not_acknowledged` 调用 `failure()`；`deadline_exceeded` 在 handler 已运行时记 `slow()`、在 dispatcher 执行前拒绝时记 `ignore()`；`ok` 由 permit 实测耗时分为 `success` 或 `slow`。
 
-两个服务级阶段默认都是 `nullopt`（一次可预测分支；不构造对象、不加锁、不分配）。bulkhead 需要显式配置 `per_service_bulkhead`；capacity 为 0 时由 `per_service_inflight` 派生。`resilience_enabled=false` 跳过新的 rate/bulkhead 阶段并保留 breaker 与并发上限，行为与接线前一致。`stop()` 先停止 accept、drain、关闭连接，并在 join 全部分片之后才释放 guard 表；Debug 构建断言每个计数与 bulkhead 都回到零。64 位统计包括 `rate_limited_connection`、`rate_limited_service`、`bulkhead_rejected`、`breaker_open`、`deadline_rejected`、`probe_admitted`；`rejected_overload` 现在只统计 per-connection 与 per-method 上限。
+两个服务级阶段默认都是 `nullopt`（一次可预测分支；不构造对象、不加锁、不分配）。bulkhead 需要显式配置 `per_service_bulkhead`；capacity 为 0 时由 `per_service_inflight` 派生。`resilience_enabled=false` 跳过新的 rate/bulkhead 阶段并保留 breaker 与并发上限，行为与接线前一致；此模式没有探针特判，cap 同样作用于探针。`stop()` 先停止 accept、drain、关闭连接，并在 join 全部分片之后才释放 guard 表；Debug 构建断言每个计数与 bulkhead 都回到零。64 位统计包括 `rate_limited_connection`、`rate_limited_service`、`bulkhead_rejected`、`breaker_open`、`deadline_rejected`、`probe_admitted`；`rejected_overload` 统计 per-connection cap、per-service cap 与 per-method 上限（rate/bulkhead/breaker 仍在各自计数器）。
 
 客户端路径仍经过负载均衡、带共享预算的重试和每端点断路器（`src/client/client_facade.cpp:73,153,335,557-569`）。服务端流水线证据：`src/server/server.cpp:295-380,882-1145,1339-1385`；`include/crpc/server.hpp:78-180`。
 

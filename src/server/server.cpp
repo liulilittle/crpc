@@ -980,17 +980,16 @@ struct server::impl {
                 return;
             }
             probe = permit.is_probe();
-            if (probe) {
-                probe_admitted.fetch_add(1, std::memory_order_relaxed);
-            }
         }
 
-        // Closed path: rate -> bulkhead -> existing per-service cap. A probe
-        // skips all three and goes straight to the dispatcher.
+        // Admission: rate -> bulkhead -> existing per-service cap. A half-open
+        // probe skips the per-service rate and bulkhead stages only; the cap
+        // is a real capacity bound and applies to probes too (this is also the
+        // pre-pipeline behaviour when resilience is disabled).
         bool cap_entered = false;
         resilience::bulkhead_permit bulkhead_permit;
-        if (guard != nullptr && !probe) {
-            if (opt.resilience_enabled) {
+        if (guard != nullptr) {
+            if (opt.resilience_enabled && !probe) {
                 if (guard->rate) {
                     resilience::rate_limit_result limited;
                     if (decoded && envelope.extensions.has(trace_extension::has_deadline)) {
@@ -1064,6 +1063,11 @@ struct server::impl {
                 return;
             }
             cap_entered = true;
+        }
+        if (probe) {
+            // Count probes that got past admission and reached dispatch; a
+            // probe rejected by the per-service cap is not an admitted probe.
+            probe_admitted.fetch_add(1, std::memory_order_relaxed);
         }
 
         buffer response;
@@ -1354,7 +1358,7 @@ void server_connection::submit(frame& request) noexcept {
                     reject->forced_error = true;
                     reject->forced_code = rpc_code::resource_exhausted;
                     reject->forced_retry_after = limited.retry_after;
-                    if (reject->conn &&
+                    if (!reject->conn ||
                         !shard->submit(&server::impl::run_job, reject,
                                        &server::impl::drop_job)) {
                         delete reject;
@@ -1380,7 +1384,7 @@ void server_connection::submit(frame& request) noexcept {
                 reject->forced_error = true;
                 reject->forced_code = rpc_code::overload;
                 reject->forced_retry_after = owner->opt.overload_retry_after;
-                if (reject->conn &&
+                if (!reject->conn ||
                     !shard->submit(&server::impl::run_job, reject,
                                   &server::impl::drop_job)) {
                     delete reject;

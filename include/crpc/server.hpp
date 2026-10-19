@@ -126,8 +126,9 @@ public:
         std::size_t in_flight_calls = 0;
         std::size_t accepted_connections = 0;
         std::size_t requests_handled = 0;
-        // Per-connection cap and per-method concurrency rejections only. Rate,
-        // bulkhead and breaker rejections are reported in their own counters.
+        // Per-connection cap, per-service cap and per-method concurrency
+        // rejections. Rate, bulkhead and breaker rejections are reported in
+        // their own counters.
         std::size_t rejected_overload = 0;
         std::size_t handler_failures = 0;
         // Resilience admissions. Monotonic, never reset, snapshot from 64-bit
