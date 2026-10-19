@@ -95,7 +95,19 @@ C++ API 是主接口。为语言绑定与插件作者提供 C ABI（`include/crp
 - 状态以 `int` 返回，枚举有文档；
 - 回调携带 `void* user` 上下文，永不抛出。
 
+导出修饰在编译期选择，与 `CRPC_API` 一致：
+
+| 构建形态 | 宏 | Windows | GCC/Clang |
+|---|---|---|---|
+| 静态库（默认） | 均无 | 无修饰 | 无修饰 |
+| 动态库，构建中 | `CRPC_SHARED` + `CRPC_BUILDING` | `dllexport` | 默认可见性 |
+| 动态库，消费方 | `CRPC_SHARED` | `dllimport` | 无修饰 |
+
 C ABI 独立版本化（`CRPC_C_ABI_VERSION`），遵循相同的 MAJOR/MINOR 规则。
+
+全部函数在 `src/c_api.cpp` 中基于 C++ 门面实现，不存在只有声明没有定义的符号。
+`tests/test_c_api.c` 以 C 翻译单元编译（CMake 目标设置 `LINKER_LANGUAGE CXX`），
+因此导出修饰写错或实现缺失会在构建期失败，而不是拖到下游消费者。
 
 ## 7. 兼容矩阵
 

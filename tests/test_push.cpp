@@ -40,7 +40,6 @@ bool payload_is(const push_message& message, std::string_view text) {
            std::memcmp(data.data(), text.data(), data.size()) == 0;
 }
 
-int kind_id(hub_event_kind kind) { return static_cast<int>(kind); }
 int code_id(rpc_code code) { return static_cast<int>(code); }
 
 // A demultiplexer stand-in: inbound payload frames, a bounded send ring with

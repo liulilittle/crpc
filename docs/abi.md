@@ -110,8 +110,22 @@ provided for language bindings and plugin authors:
 - status returned as `int` with a documented enumeration,
 - callbacks carry a `void* user` context and never throw.
 
+The export decoration is selected at compile time and mirrors `CRPC_API`:
+
+| Build | Macros | Windows | GCC/Clang |
+|---|---|---|---|
+| static library (default) | neither | none | none |
+| shared library, building | `CRPC_SHARED` + `CRPC_BUILDING` | `dllexport` | default visibility |
+| shared library, consuming | `CRPC_SHARED` | `dllimport` | none |
+
 The C ABI is versioned separately (`CRPC_C_ABI_VERSION`) and follows the same
 MAJOR/MINOR rules.
+
+Every function is implemented in `src/c_api.cpp` over the C++ facade; there are
+no declaration-only symbols. `tests/test_c_api.c` is compiled as a C
+translation unit (the CMake target sets `LINKER_LANGUAGE CXX`) so a broken
+decoration or a missing definition fails the build rather than a downstream
+consumer.
 
 ## 7. Compatibility matrix
 
