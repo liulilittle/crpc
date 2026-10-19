@@ -39,6 +39,7 @@
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/http/content_coding.hpp>
 #include <crpc/http/message.hpp>
 #include <crpc/io.hpp>
 #include <crpc/io/tls.hpp>
@@ -143,6 +144,26 @@ struct http_server_options {
     // Server-Sent Events (HTTP/1.1, single shard) options. SSE routes are
     // registered on the builder with `sse_route()`.
     sse_options sse{};
+
+    // --- HTTP content coding -------------------------------------------------
+    // Negotiate a response Content-Encoding from the request's Accept-Encoding
+    // and encode the body. When false, responses are always identity (the
+    // request side may still decode).
+    bool enable_response_coding = true;
+    // Decode a request body that carries Content-Encoding: gzip|deflate. When
+    // false the encoding is left for the application (fail-closed 415 is still
+    // not produced; the header reaches the route unchanged).
+    bool enable_request_decoding = true;
+    // Compression thresholds and bomb limits shared with the content_coding
+    // module. `min_response_bytes` gates response compression.
+    coding_limits coding{};
+    // Hard ceiling on the decoded request body. A body that would exceed it is
+    // answered with 413 and the connection is closed. Zero disables the check
+    // (the module's own `max_decompressed_bytes` still applies).
+    std::size_t max_decoded_body = 8u * 1024u * 1024u;
+    // Decoded/encoded ratio ceiling applied on top of `coding`. Zero disables
+    // the check (the default: requests may be highly compressible).
+    std::size_t max_decoded_ratio = 0;
 };
 
 struct http_statistics {
@@ -169,6 +190,12 @@ struct http_statistics {
     std::size_t sse_hub_delivered = 0;
     std::size_t sse_hub_queued = 0;
     std::size_t sse_hub_dropped = 0;
+    // Responses whose body was actually encoded (the encoded form was smaller
+    // than the identity body). A rejected compression (identity fallback or a
+    // non-compressible response) is not counted.
+    std::size_t responses_compressed = 0;
+    // Request bodies decoded from a Content-Encoding.
+    std::size_t requests_decoded = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with

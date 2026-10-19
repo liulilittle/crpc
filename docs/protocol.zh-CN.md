@@ -30,6 +30,7 @@
 | [18](#s18) | 版本与验证 |
 | [19](#s19) | 推送投递（已实现子集） |
 | [20](#s20) | HTTP/1.1 Server-Sent Events（已实现子集） |
+| [21](#s21) | HTTP 内容编码（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -369,3 +370,25 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 ### 20.5 HTTP/2
 
 本子集不支持 HTTP/2 SSE。命中 SSE 路由的请求会收到一个完整的 `501` 响应，不会打开流。
+
+## 21. HTTP 内容编码（已实现子集） <a id="s21"></a>
+
+本节对服务器门面的内容编码接线（HTTP/1.1、进程内）具有规范效力。原语位于 `include/crpc/http/content_coding.hpp` / `src/http/content_coding.cpp`；服务端接线位于 `src/http/server.cpp`。SSE 响应（第 20 节）、HTTP/2 响应与文件下载永不参与内容编码。
+
+### 21.1 请求解码
+
+携带 `Content-Encoding: gzip` 或 `deflate`（仅单层）的请求，其请求体在路由前被解码。解码后的体替换线上体并移除 `Content-Encoding`；若存在 `Content-Length`，改写为解码后的长度。不支持的编码或分层编码返回 `415`；损坏或截断的流返回 `400`；超过 `http_server_options::max_decoded_body`（默认 8 MiB）返回 `413` 并关闭连接。`max_decoded_ratio` 限制解码/编码比（0 为默认值，表示关闭该检查：合法请求可以高度可压缩）。请求解码由 `enable_request_decoding` 控制。
+
+### 21.2 响应压缩
+
+启用 `enable_response_coding` 时，响应体按 `Accept-Encoding`（q 值；gzip 优先于 deflate，再优先 identity）协商。即使最终不压缩，也会进行协商，并携带 `Vary: Accept-Encoding`。若客户端拒绝所有支持的编码（`identity;q=0` 且 gzip/deflate 不可接受），返回 `406`。
+
+仅当以下条件全部满足时才真正编码：选中了压缩编码；体不小于 `coding_limits::min_response_bytes`（默认 1024）；媒体类型不是已压缩类型（`image/*`、`video/*`、`audio/*`、`application/zip|gzip|zstd|br|octet-stream|...`）；状态不是 `204/304/206`；未自带 `Content-Encoding`；且编码后的结果**严格小于** identity 体。否则保持 identity 且**不发送** `Content-Encoding`（禁止静默膨胀）。`Content-Length` 反映线上（编码后）长度；`HEAD` 与 `GET` 采用同一决策，发送相同响应头但不发送体。
+
+### 21.3 编解码器
+
+编码器输出定长 Huffman deflate 块，内含最小 LZ77 匹配器（3 字节哈希链、32 KiB 环形历史、贪心匹配最长 258 字节；匹配可跨 `write` 边界），并封装为 gzip 或 zlib 容器。其输出可被任何合规解码器解压；解码器以 zlib 向量独立验证，编码器以 Python `zlib`/`gzip` 独立验证。
+
+### 21.4 HTTP/2
+
+本切片中 HTTP/2 不使用这些编码：请求携带需要解码的 `Content-Encoding` 返回 `501`；响应协商会选中 gzip/deflate 时返回 `501`（fail-closed，禁止静默降级为 identity）。`Accept-Encoding` 选中 identity（且未拒绝）时正常响应；拒绝 identity 返回 `406`。

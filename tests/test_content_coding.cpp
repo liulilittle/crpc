@@ -396,4 +396,49 @@ CRPC_TEST(content_coding_token_helpers) {
                   std::string(crpc::http::to_string(content_coding::gzip)));
 }
 
+// The encoder must run LZ77 matching, not fixed-Huffman literals only: a
+// highly repetitive payload has to shrink well below its identity size while
+// remaining a valid gzip stream.
+CRPC_TEST(content_coding_lz77_repetitive_ratio) {
+    std::string text;
+    for (int i = 0; i < 5000; ++i) {
+        text += "The quick brown fox jumps over the lazy dog. ";
+    }
+    std::string encoded;
+    CRPC_CHECK(crpc::http::compress_all(content_coding::gzip, as_span(text),
+                                        encoded)
+                   .ok());
+    CRPC_CHECK(encoded.size() < text.size() / 4);
+    // LZ77 makes this far more compressible than the 100:1 bomb ceiling; the
+    // ratio guard is disabled explicitly (it exists to bound hostile inputs,
+    // not legitimate repetitive payloads).
+    coding_limits limits;
+    limits.max_compression_ratio = 0;
+    auto decoded = crpc::http::decompress_all(content_coding::gzip,
+                                              as_span(encoded), limits);
+    CRPC_CHECK(decoded.ok());
+    CRPC_CHECK_EQ(text, decoded.value());
+}
+
+// A match may reference bytes written by an earlier `write` call; the history
+// ring and hash chain must persist across blocks.
+CRPC_TEST(content_coding_lz77_match_crosses_write_boundary) {
+    const std::string first =
+        "abcdefghijklmnopqrstuvwxyz0123456789 repeated repeated repeated";
+    const std::string second = first + " tail tail tail";
+    content_encoder encoder(content_coding::gzip);
+    std::string encoded;
+    CRPC_CHECK(encoder.start(encoded).ok());
+    CRPC_CHECK(encoder.write(as_span(first), encoded).ok());
+    CRPC_CHECK(encoder.write(as_span(second), encoded).ok());
+    CRPC_CHECK(encoder.finish(encoded).ok());
+
+    auto decoded =
+        crpc::http::decompress_all(content_coding::gzip, as_span(encoded));
+    CRPC_CHECK(decoded.ok());
+    CRPC_CHECK_EQ(first + second, decoded.value());
+    // The second half repeats the first: the match surely crosses the boundary.
+    CRPC_CHECK(encoded.size() < (first.size() + second.size()));
+}
+
 CRPC_TEST_MAIN()

@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <crpc/http/content_coding.hpp>
 #include <crpc/http/sse.hpp>
 #include <crpc/http2/connection.hpp>
 #include <crpc/http2/frame.hpp>
@@ -160,6 +161,35 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
         }
     }
     return nullptr;
+}
+
+// Media types that are already compressed (or binary); re-compressing them
+// wastes CPU and can inflate the response.
+[[nodiscard]] bool is_incompressible_type(std::string_view content_type) noexcept {
+    const std::size_t semicolon = content_type.find(';');
+    std::string_view type = content_type.substr(0, semicolon);
+    while (!type.empty() && (type.back() == ' ' || type.back() == '\t')) {
+        type.remove_suffix(1);
+    }
+    const std::size_t slash = type.find('/');
+    if (slash == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view major = type.substr(0, slash);
+    const std::string_view minor = type.substr(slash + 1);
+    if (ci_equal(major, "image") || ci_equal(major, "video") ||
+        ci_equal(major, "audio")) {
+        return true;
+    }
+    if (!ci_equal(major, "application")) {
+        return false;
+    }
+    return ci_equal(minor, "zip") || ci_equal(minor, "gzip") ||
+           ci_equal(minor, "x-gzip") || ci_equal(minor, "zstd") ||
+           ci_equal(minor, "x-zstd") || ci_equal(minor, "br") ||
+           ci_equal(minor, "x-brotli") || ci_equal(minor, "octet-stream") ||
+           ci_equal(minor, "x-7z-compressed") ||
+           ci_equal(minor, "x-rar-compressed");
 }
 
 enum class query_result : u8 { missing, ok, invalid };
@@ -352,6 +382,13 @@ private:
     [[nodiscard]] bool keep_alive(const http::request& request) const noexcept;
     void send_http1_error(int status_code, std::string_view detail,
                           const http::request& request, bool keep);
+    // Request-side content coding: decodes a gzip/deflate body in place and
+    // returns the HTTP status to answer with (200 when no change was needed).
+    int decode_request_body(http::request& request);
+    // Response-side content coding: negotiates Accept-Encoding, encodes the
+    // body, or replaces the response with 406.
+    void apply_response_coding(const http::request& request,
+                               http::response& response);
 
     // Server-Sent Events. `sse_open` runs on the shard after the request has
     // been parsed and takes ownership of the response (the connection is
@@ -492,6 +529,8 @@ struct server_state {
     std::atomic<std::size_t> tls_connections{0};
     std::atomic<std::size_t> rejected{0};
     std::atomic<std::size_t> timed_out{0};
+    std::atomic<std::size_t> responses_compressed{0};
+    std::atomic<std::size_t> requests_decoded{0};
 
     struct pending_listener {
         endpoint ep;
@@ -1018,6 +1057,109 @@ void session::send_http1_error(int status_code, std::string_view detail,
     flush_writes();
 }
 
+int session::decode_request_body(http::request& request) {
+    const std::string* encoding = request.headers.find("content-encoding");
+    if (encoding == nullptr) {
+        return 200;
+    }
+    const request_encoding_plan plan = plan_request_decoding(*encoding);
+    if (!plan.ok) {
+        return plan.http_status;
+    }
+    if (!plan.encoded) {
+        return 200;
+    }
+
+    coding_limits limits = state_.options.coding;
+    if (state_.options.max_decoded_body != 0) {
+        limits.max_decompressed_bytes =
+            std::min(limits.max_decompressed_bytes,
+                     state_.options.max_decoded_body);
+    }
+    limits.max_compression_ratio = state_.options.max_decoded_ratio;
+
+    content_decoder decoder(plan.coding, limits);
+    std::string decoded;
+    status result = decoder.feed(as_bytes(request.body), decoded);
+    if (result.ok()) {
+        result = decoder.finish(decoded);
+    }
+    if (!result.ok()) {
+        return result.code() == rpc_code::resource_exhausted ? 413 : 400;
+    }
+
+    request.body = std::move(decoded);
+    state_.requests_decoded.fetch_add(1, std::memory_order_relaxed);
+    // The representation is now decoded: drop Content-Encoding and describe the
+    // decoded length if the request carried one.
+    http::header_list filtered;
+    for (const header& field : request.headers) {
+        if (ci_equal(field.name, "content-encoding")) {
+            continue;
+        }
+        if (ci_equal(field.name, "content-length")) {
+            filtered.add(field.name, std::to_string(request.body.size()));
+            continue;
+        }
+        filtered.add(field.name, field.value);
+    }
+    request.headers = std::move(filtered);
+    return 200;
+}
+
+void session::apply_response_coding(const http::request& request,
+                                    http::response& response) {
+    const std::string* accept = request.headers.find("accept-encoding");
+    const std::string value = accept != nullptr ? *accept : std::string{};
+    const negotiation neg =
+        negotiate_response(value, state_.options.coding);
+    if (!neg.acceptable) {
+        response = make_problem(406, "no acceptable content coding", request.path);
+        response.version = request.version;
+        return;
+    }
+    const int status_code = response.status_code;
+    if (response_forbids_body(status_code) || status_code == 206 ||
+        response.headers.contains("content-encoding")) {
+        return;
+    }
+    // A negotiated response varies on Accept-Encoding even when the body stays
+    // identity (a cache must not reuse it for a different client).
+    if (response.headers.find("vary") == nullptr) {
+        response.headers.add("Vary", "Accept-Encoding");
+    }
+    if (!neg.compressed || !should_compress(neg, response.body.size(),
+                                            state_.options.coding) ||
+        response.body.empty()) {
+        return;
+    }
+    if (const std::string* type = response.headers.find("content-type")) {
+        if (is_incompressible_type(*type)) {
+            return;
+        }
+    }
+    std::string encoded;
+    const crpc::status result = compress_all(neg.coding, as_bytes(response.body),
+                                             encoded, state_.options.coding);
+    if (!result.ok() || encoded.size() >= response.body.size()) {
+        // Never inflate a response: fall back to identity and send no
+        // Content-Encoding.
+        return;
+    }
+    http::header_list filtered;
+    for (const header& field : response.headers) {
+        if (ci_equal(field.name, "content-length") ||
+            ci_equal(field.name, "transfer-encoding")) {
+            continue;
+        }
+        filtered.add(field.name, field.value);
+    }
+    filtered.add("Content-Encoding", to_string(neg.coding));
+    response.headers = std::move(filtered);
+    response.body = std::move(encoded);
+    state_.responses_compressed.fetch_add(1, std::memory_order_relaxed);
+}
+
 void session::process_http1(std::string input) {
     http::parse_status status =
         parser_.feed(as_bytes(input));
@@ -1097,6 +1239,16 @@ void session::handle_http1_request(http::request request) {
         return;
     }
 
+    if (state_.options.enable_request_decoding) {
+        const int decode_status = decode_request_body(request);
+        if (decode_status != 200) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(decode_status, "request content decoding failed",
+                             request, decode_status != 413 && keep);
+            return;
+        }
+    }
+
     const bool framed = request.headers.contains("content-length") ||
                         request.headers.contains("transfer-encoding");
     if (method_requires_framing(request.method) && !framed &&
@@ -1138,6 +1290,9 @@ void session::handle_http1_request(http::request request) {
             response = make_problem(404, "no router configured", routed.path);
         }
         response.version = routed.version;
+        if (state_.options.enable_response_coding) {
+            apply_response_coding(routed, response);
+        }
         if (!keep) {
             response.headers.add("Connection", "close");
         } else if (routed.version == http_version::http_1_0) {
@@ -1755,6 +1910,43 @@ void session::dispatch_h2(u32 stream_id) {
     if (head_only) {
         routed.method = http::method::get;
         routed.method_token = "GET";
+    }
+    // Request and response content coding are HTTP/1.1-only in this slice:
+    // HTTP/2 requests that would need them fail closed with a complete
+    // response instead of a silent identity downgrade.
+    const auto h2_not_implemented = [&](std::string_view detail) {
+        http::response response;
+        response.status_code = 501;
+        response.reason = "Not Implemented";
+        response.headers.add("Content-Type", "text/plain; charset=utf-8");
+        response.body = detail;
+        state_.handled.fetch_add(1, std::memory_order_relaxed);
+        send_h2_response(stream_id, response, head_only);
+    };
+    if (const std::string* encoding = routed.headers.find("content-encoding")) {
+        const request_encoding_plan plan = plan_request_decoding(*encoding);
+        if (!plan.ok || plan.encoded) {
+            h2_not_implemented("request content coding is not supported over HTTP/2\n");
+            return;
+        }
+    }
+    if (state_.options.enable_response_coding) {
+        const std::string* accept = routed.headers.find("accept-encoding");
+        const negotiation neg = negotiate_response(
+            accept != nullptr ? *accept : std::string{}, state_.options.coding);
+        if (!neg.acceptable) {
+            http::response response =
+                make_problem(406, "no acceptable content coding", routed.path);
+            response.version = routed.version;
+            state_.handled.fetch_add(1, std::memory_order_relaxed);
+            send_h2_response(stream_id, response, head_only);
+            return;
+        }
+        if (neg.compressed) {
+            h2_not_implemented(
+                "response content coding is not supported over HTTP/2\n");
+            return;
+        }
     }
     // SSE is not implemented over HTTP/2 in this slice. A matching route must
     // fail closed with a complete, non-streaming response rather than pretend
@@ -2719,6 +2911,10 @@ http_statistics http_server::stats() const noexcept {
     out.tls_connections = impl_->state.tls_connections.load(std::memory_order_relaxed);
     out.rejected_connections = impl_->state.rejected.load(std::memory_order_relaxed);
     out.timed_out_connections = impl_->state.timed_out.load(std::memory_order_relaxed);
+    out.responses_compressed =
+        impl_->state.responses_compressed.load(std::memory_order_relaxed);
+    out.requests_decoded =
+        impl_->state.requests_decoded.load(std::memory_order_relaxed);
     out.sse_connections =
         impl_->state.sse_connections.load(std::memory_order_relaxed);
     out.sse_events_delivered =

@@ -30,6 +30,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [18](#s18) | Versioning and verification |
 | [19](#s19) | Push delivery (implemented subset) |
 | [20](#s20) | HTTP/1.1 Server-Sent Events (implemented subset) |
+| [21](#s21) | HTTP content coding (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -435,3 +436,57 @@ sequence, and a client must de-duplicate on the `(epoch, seq)` pair.
 
 SSE is not implemented over HTTP/2 in this subset. A request whose path matches
 an SSE route is answered with a complete `501` response; no stream is opened.
+
+## 21. HTTP content coding (implemented subset) <a id="s21"></a>
+
+This section is normative for the content-coding wiring in the server facade
+(HTTP/1.1, in process). The primitives live in
+`include/crpc/http/content_coding.hpp` / `src/http/content_coding.cpp`; the
+server wiring lives in `src/http/server.cpp`. SSE responses (section 20),
+HTTP/2 responses and file downloads are never content-coded.
+
+### 21.1 Request decoding
+
+A request with `Content-Encoding: gzip` or `deflate` (exactly one layer) has its
+body decoded before routing. The decoded body replaces the wire body and
+`Content-Encoding` is removed; a `Content-Length` is rewritten to the decoded
+size. An unsupported or layered coding is `415`; a malformed or truncated
+stream is `400`; exceeding `http_server_options::max_decoded_body` (default
+8 MiB) is `413` and closes the connection. `max_decoded_ratio` caps the
+decoded/encoded ratio (0, the default, disables the check: a legitimate
+request may be highly compressible). Request decoding is controlled by
+`enable_request_decoding`.
+
+### 21.2 Response compression
+
+When `enable_response_coding` is set, the response body is negotiated from
+`Accept-Encoding` (q-values; gzip preferred over deflate over identity).
+Negotiation happens even for a body that is not compressed, and such a response
+carries `Vary: Accept-Encoding`. A client that refuses every supported coding
+(`identity;q=0` with no acceptable gzip/deflate) is answered `406`.
+
+The body is actually encoded only when a coding was selected, the body is at
+least `coding_limits::min_response_bytes` (default 1024), the media type is not
+already compressed (`image/*`, `video/*`, `audio/*`, `application/zip|gzip|zstd|
+br|octet-stream|...`), the response is not `204/304/206`, does not already carry
+`Content-Encoding`, and the encoded form is **strictly smaller** than the
+identity body. Otherwise the response stays identity and **no**
+`Content-Encoding` header is sent (never inflate). `Content-Length` reflects the
+on-the-wire (encoded) length; `HEAD` runs the same decision as `GET` and sends
+the same headers with no body.
+
+### 21.3 Codec
+
+The encoder emits fixed-Huffman deflate blocks with a minimal LZ77 matcher
+(3-byte hash chains, a 32 KiB history ring, greedy matching up to 258 bytes;
+matches may cross `write` boundaries) wrapped in a gzip or zlib container. Its
+output is valid for any conforming decoder; the decoder is independently
+verified against zlib vectors and the encoder against Python `zlib`/`gzip`.
+
+### 21.4 HTTP/2
+
+HTTP/2 does not use these codings in this slice: a request that carries a
+`Content-Encoding` needing decoding is `501`, and a response whose negotiation
+would select gzip/deflate is `501` (fail closed, no silent identity downgrade).
+`Accept-Encoding` that selects identity (and does not refuse it) is answered
+normally; refusing identity is `406`.

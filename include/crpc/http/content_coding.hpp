@@ -28,10 +28,10 @@
 // Codec implementation: the decoder implements the full DEFLATE specification
 // (stored, fixed and dynamic Huffman blocks, zlib and gzip wrappers) and is
 // verified against vectors produced by zlib. The encoder emits fixed-Huffman
-// literal blocks only (no LZ77 matching): the output is valid gzip/zlib that
-// any conforming decoder accepts, but its compression ratio is not better than
-// ~1:1. Applications that need real compression can pre-compress with zlib and
-// hand the bytes to the pipeline.
+// blocks with a minimal LZ77 matcher (3-byte hash chains over a 32 KiB history
+// ring, greedy matches of 3..258 bytes; matches may cross `write` boundaries)
+// and is verified by decompressing its output with zlib. The output is a valid
+// gzip/zlib stream, and repetitive input compresses well.
 //
 // Documented limitations (fail closed, never silent corruption):
 //

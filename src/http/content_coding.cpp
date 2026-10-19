@@ -5,6 +5,7 @@
 #include <limits>
 #include <new>
 #include <utility>
+#include <vector>
 
 namespace crpc::http {
 namespace {
@@ -1215,6 +1216,13 @@ const rpc_error& content_decoder::error() const noexcept {
 // --- Encoder ----------------------------------------------------------------
 
 struct content_encoder::impl {
+    static constexpr std::size_t k_window = static_cast<std::size_t>(k_history_size);
+    static constexpr std::size_t k_hash_bits = 15;
+    static constexpr std::size_t k_hash_size = std::size_t{1} << k_hash_bits;
+    static constexpr std::size_t k_chain_limit = 128;
+    static constexpr std::uint32_t k_min_match = 3;
+    static constexpr std::uint32_t k_max_match = 258;
+
     content_coding coding = content_coding::identity;
     coding_limits limits{};
     bool started = false;
@@ -1228,7 +1236,18 @@ struct content_encoder::impl {
     std::uint32_t adler_b = 0;
     std::uint64_t input_bytes = 0;
 
-    impl(content_coding c, const coding_limits& l) : coding(c), limits(l) {}
+    // Minimal LZ77 state: one 32 KiB ring of recent bytes and a hash chain over
+    // 3-byte prefixes. Positions are global input offsets; a slot is
+    // `position % k_window`. The chain persists across `write` calls so a match
+    // may cross a write boundary.
+    std::array<std::uint8_t, k_window> window{};
+    std::array<std::int32_t, k_hash_size> head{};
+    std::vector<std::int32_t> prev;
+
+    impl(content_coding c, const coding_limits& l) : coding(c), limits(l) {
+        head.fill(-1);
+        prev.assign(k_window, -1);
+    }
 
     void fail(rpc_code code, std::string message) {
         failed = true;
@@ -1264,6 +1283,76 @@ struct content_encoder::impl {
         } else {
             put_code(0x190u + (value - 144u), 9, out);
         }
+    }
+
+    void put_fixed_symbol(std::uint32_t symbol, std::string& out) {
+        // RFC 1951 fixed Huffman: 256..279 are 7-bit codes 0..23 and 280..287
+        // are 8-bit codes 0xC0..0xC7.
+        if (symbol <= 279) {
+            put_code(symbol - 256, 7, out);
+        } else {
+            put_code(0xC0u + (symbol - 280), 8, out);
+        }
+    }
+
+    void put_length(std::uint32_t length, std::string& out) {
+        std::size_t index = 0;
+        if (length == k_max_match) {
+            index = 28; // canonical code 285
+        } else {
+            while (index < 28 &&
+                   length > k_length_base[index] +
+                                ((1u << k_length_extra[index]) - 1u)) {
+                ++index;
+            }
+        }
+        put_fixed_symbol(257u + static_cast<std::uint32_t>(index), out);
+        if (k_length_extra[index] != 0) {
+            put(length - k_length_base[index], k_length_extra[index], out);
+        }
+    }
+
+    void put_distance(std::uint32_t distance, std::string& out) {
+        std::size_t index = 0;
+        while (index < 29 &&
+               distance > k_dist_base[index] +
+                              ((1u << k_dist_extra[index]) - 1u)) {
+            ++index;
+        }
+        put_code(static_cast<std::uint32_t>(index), 5, out);
+        if (k_dist_extra[index] != 0) {
+            put(distance - k_dist_base[index], k_dist_extra[index], out);
+        }
+    }
+
+    [[nodiscard]] std::uint8_t byte_at(std::uint64_t position,
+                                       span<const std::byte> current,
+                                       std::uint64_t current_start) const noexcept {
+        if (position >= current_start) {
+            return static_cast<std::uint8_t>(current[position - current_start]);
+        }
+        return window[position % k_window];
+    }
+
+    [[nodiscard]] static std::size_t hash3(std::uint8_t a, std::uint8_t b,
+                                           std::uint8_t c) noexcept {
+        return ((static_cast<std::size_t>(a) << 10) ^
+                (static_cast<std::size_t>(b) << 5) ^
+                static_cast<std::size_t>(c)) &
+               (k_hash_size - 1);
+    }
+
+    // Inserts one position into the hash chain. Requires `position + 2` to be a
+    // valid input byte.
+    void insert(std::uint64_t position, span<const std::byte> current,
+                std::uint64_t current_start) {
+        const std::uint8_t a = byte_at(position, current, current_start);
+        const std::uint8_t b = byte_at(position + 1, current, current_start);
+        const std::uint8_t c = byte_at(position + 2, current, current_start);
+        const std::size_t slot = hash3(a, b, c);
+        prev[position % k_window] = head[slot];
+        head[slot] = static_cast<std::int32_t>(position);
+        window[position % k_window] = a;
     }
 
     void update_checksums(span<const std::byte> data) noexcept {
@@ -1326,11 +1415,73 @@ struct content_encoder::impl {
             return status{};
         }
         update_checksums(data);
+        const std::uint64_t base = input_bytes;
         input_bytes += data.size();
         put(0, 1, out);          // BFINAL = 0
         put(1, 2, out);          // BTYPE = fixed Huffman
-        for (std::size_t i = 0; i < data.size(); ++i) {
-            put_literal(static_cast<std::uint8_t>(data[i]), out);
+
+        const std::size_t n = data.size();
+        std::size_t i = 0;
+        while (i < n) {
+            std::uint32_t best_length = 0;
+            std::uint64_t best_distance = 0;
+            if (i + k_min_match <= n) {
+                const std::size_t slot = hash3(
+                    static_cast<std::uint8_t>(data[i]),
+                    static_cast<std::uint8_t>(data[i + 1]),
+                    static_cast<std::uint8_t>(data[i + 2]));
+                std::int32_t candidate = head[slot];
+                prev[(base + i) % k_window] = candidate;
+                head[slot] = static_cast<std::int32_t>(base + i);
+                window[(base + i) % k_window] =
+                    static_cast<std::uint8_t>(data[i]);
+
+                const std::uint64_t here = base + i;
+                const std::uint32_t max_length = static_cast<std::uint32_t>(
+                    std::min<std::size_t>(k_max_match, n - i));
+                std::size_t chain = 0;
+                while (candidate >= 0 && chain < k_chain_limit) {
+                    const std::uint64_t position =
+                        static_cast<std::uint64_t>(candidate);
+                    if (position >= here) {
+                        break;
+                    }
+                    const std::uint64_t distance = here - position;
+                    if (distance > k_window) {
+                        break;
+                    }
+                    std::uint32_t length = 0;
+                    while (length < max_length &&
+                           byte_at(position + length, data, base) ==
+                               static_cast<std::uint8_t>(
+                                   data[i + length])) {
+                        ++length;
+                    }
+                    if (length > best_length) {
+                        best_length = length;
+                        best_distance = distance;
+                        if (length == max_length) {
+                            break;
+                        }
+                    }
+                    candidate = prev[position % k_window];
+                    ++chain;
+                }
+            }
+            if (best_length >= k_min_match) {
+                put_length(best_length, out);
+                put_distance(static_cast<std::uint32_t>(best_distance), out);
+                for (std::uint32_t k = 1; k < best_length; ++k) {
+                    const std::size_t offset = i + k;
+                    if (offset + 2 < n) {
+                        insert(base + offset, data, base);
+                    }
+                }
+                i += best_length;
+            } else {
+                put_literal(static_cast<std::uint8_t>(data[i]), out);
+                ++i;
+            }
         }
         put_code(0, 7, out);     // end of block
         return status{};
