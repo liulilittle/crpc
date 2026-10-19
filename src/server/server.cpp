@@ -66,6 +66,24 @@ struct request_job {
 struct server_connection {
     server::impl* owner = nullptr;
     runtime* shard = nullptr;
+
+    struct reader_source final : io::source {
+        explicit reader_source(server_connection* owner) noexcept : owner(owner) {}
+        std::size_t on_data(span<const std::byte> data) noexcept override {
+            return owner->on_data(data);
+        }
+        void on_eof() noexcept override { owner->on_terminal(); }
+        void on_error(std::error_code ec) noexcept override {
+            (void)ec;
+            owner->on_terminal();
+        }
+        server_connection* owner;
+    };
+
+    // Declared before `conn` so reverse destruction tears the connection down
+    // before the source it borrows. The destructor also unbinds explicitly:
+    // bind_source(nullptr) waits for in-flight delivery to finish.
+    std::unique_ptr<reader_source> source;
     std::unique_ptr<connection> conn;
     frame_decoder decoder{max_frame_default};
     std::mutex decode_mutex;
@@ -82,22 +100,12 @@ struct server_connection {
     std::deque<std::unique_ptr<send_op>> send_queue;
     bool send_busy = false;
 
-    struct reader_source final : io::source {
-        explicit reader_source(server_connection* owner) noexcept : owner(owner) {}
-        std::size_t on_data(span<const std::byte> data) noexcept override {
-            return owner->on_data(data);
-        }
-        void on_eof() noexcept override { owner->on_terminal(); }
-        void on_error(std::error_code ec) noexcept override {
-            (void)ec;
-            owner->on_terminal();
-        }
-        server_connection* owner;
-    };
-
-    std::unique_ptr<reader_source> source;
-
     server_connection() = default;
+    ~server_connection() {
+        if (conn) {
+            conn->bind_source(nullptr);
+        }
+    }
 
     void on_terminal() noexcept {
         closed.store(true, std::memory_order_release);

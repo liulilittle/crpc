@@ -87,6 +87,16 @@ struct client::impl {
         std::make_shared<client_detail::client_liveness>();
 };
 
+// Timer bookkeeping that outlives the client on a callback's stack. The
+// callback holds a strong reference, so a callback that destroys its own client
+// can still decrement the count and notify the destructor.
+struct client::timer_gate {
+    std::mutex m;
+    std::condition_variable cv;
+    int in_flight = 0;
+    bool stopping = false;
+};
+
 // --- call_core ---------------------------------------------------------------
 
 namespace client_detail {
@@ -108,9 +118,10 @@ void call_core::signal() noexcept {
 // --- construction ------------------------------------------------------------
 
 client::client(options opt, std::vector<endpoint_config> endpoints)
-    : options_(std::move(opt)),
+    : timer_gate_(std::make_shared<timer_gate>()),
+      options_(std::move(opt)),
       endpoints_(std::move(endpoints)),
-      impl_(std::make_unique<impl>()),
+      impl_(std::make_shared<impl>()),
       budget_(resilience::budget_config_from(options_.retry)) {
     const std::uint64_t seed =
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(this)) ^
@@ -138,21 +149,31 @@ client::client(options opt, std::vector<endpoint_config> endpoints)
 
 client::~client() {
     // A deadline timer may be running `tick_poll()` on the shard thread right
-    // now. Block new callbacks, wait for the running one, then tear down. A
-    // callback that destroys its own client (same thread) is exempt: it is the
-    // last user of the object and waiting would deadlock.
+    // now. Block new callbacks, then wait for the running one. The callback
+    // holds its own reference to the gate and never touches this object after
+    // tick_poll() returns. A callback that destroys its own client (same
+    // thread) is exempt: it is the last user of the object and waiting would
+    // deadlock.
+    std::shared_ptr<timer_gate> gate;
     {
         std::lock_guard<std::mutex> lk(timer_mutex_);
-        timer_stopping_ = true;
+        gate = timer_gate_;
+        if (gate) {
+            gate->stopping = true;
+        }
     }
-    if (timer_thread_local != this) {
-        std::unique_lock<std::mutex> lk(timer_mutex_);
-        timer_cv_.wait(lk, [this] { return timers_in_flight_ == 0; });
+    if (gate && timer_thread_local != this) {
+        std::unique_lock<std::mutex> lk(gate->m);
+        gate->cv.wait(lk, [&gate] { return gate->in_flight == 0; });
     }
     close();
 }
 
 void client::close() noexcept {
+    // The timer callback may destroy the client and return into tick_poll(),
+    // which still uses the implementation. Keep it alive for the duration of
+    // this call and give tick_poll() its own reference at the same time.
+    const std::shared_ptr<impl> impl = impl_;
     // Setting `closed_` and snapshotting the live states happen in one critical
     // section. `register_core_if_open()` takes the same mutex, so a concurrent
     // attempt is either inserted before this snapshot (and is finalized below)
@@ -161,17 +182,17 @@ void client::close() noexcept {
     // finalize_active() is about to write.
     std::vector<std::shared_ptr<client_detail::call_state_base>> active;
     {
-        std::lock_guard<std::mutex> lk(impl_->calls_mutex);
+        std::lock_guard<std::mutex> lk(impl->calls_mutex);
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
-        active.reserve(impl_->active_calls.size());
-        for (auto& entry : impl_->active_calls) {
+        active.reserve(impl->active_calls.size());
+        for (auto& entry : impl->active_calls) {
             active.push_back(std::move(entry.second));
         }
-        impl_->active_calls.clear();
+        impl->active_calls.clear();
     }
-    for (std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
+    for (std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
         std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
         {
             std::lock_guard<std::mutex> lk(pool->mutex);
@@ -649,12 +670,15 @@ void client::normalize_context(client_detail::call_core& core,
 
 void client::deadline_thunk(void* ctx) noexcept {
     client* self = static_cast<client*>(ctx);
+    std::shared_ptr<timer_gate> gate;
     {
         std::lock_guard<std::mutex> lk(self->timer_mutex_);
-        if (self->timer_stopping_) {
+        gate = self->timer_gate_;
+        if (!gate || gate->stopping) {
             return;
         }
-        ++self->timers_in_flight_;
+        std::lock_guard<std::mutex> gk(gate->m);
+        ++gate->in_flight;
     }
     // Marks this thread as being inside a timer callback, so a destructor that
     // runs from here does not wait for itself.
@@ -662,16 +686,23 @@ void client::deadline_thunk(void* ctx) noexcept {
     timer_thread_local = self;
     self->tick_poll();
     timer_thread_local = previous;
+    // From here on only the local gate is touched: tick_poll() may have run a
+    // user callback that destroyed the client.
     {
-        std::lock_guard<std::mutex> lk(self->timer_mutex_);
-        if (--self->timers_in_flight_ == 0) {
-            self->timer_cv_.notify_all();
+        std::lock_guard<std::mutex> lk(gate->m);
+        if (--gate->in_flight == 0) {
+            gate->cv.notify_all();
         }
     }
 }
 
 void client::tick_poll() noexcept {
-    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
+    // A user callback below may destroy the client. Keep the implementation
+    // alive on this stack and copy every scalar read before the callback so
+    // nothing here dereferences `this` afterwards.
+    const std::shared_ptr<impl> impl = impl_;
+    const std::chrono::nanoseconds idle_eviction = options_.idle_eviction;
+    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
         std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
         {
             std::lock_guard<std::mutex> lk(pool->mutex);
@@ -685,14 +716,15 @@ void client::tick_poll() noexcept {
             slot->conn->poll();
         }
     }
-    if (options_.idle_eviction.count() > 0) {
-        evict_idle();
+    if (idle_eviction.count() > 0) {
+        evict_idle(impl, idle_eviction);
     }
 }
 
-void client::evict_idle() noexcept {
+void client::evict_idle(const std::shared_ptr<impl>& impl,
+                        std::chrono::nanoseconds idle_eviction) noexcept {
     const auto now = steady_now();
-    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
+    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
         std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
         std::size_t count = 0;
         {
@@ -707,7 +739,7 @@ void client::evict_idle() noexcept {
             if (slot->in_flight.load(std::memory_order_acquire) != 0) {
                 continue;
             }
-            if (now - slot->idle_since < options_.idle_eviction) {
+            if (now - slot->idle_since < idle_eviction) {
                 continue;
             }
             bool closed_now = false;

@@ -52,6 +52,8 @@
 #include <crpc/error.hpp>
 #include <crpc/io/iocp_backend.hpp>
 
+#include "bound_guard.hpp"
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
@@ -195,7 +197,7 @@ struct conn_state {
     std::uint64_t id = 0;
     SOCKET sock = INVALID_SOCKET;
     endpoint remote_ep;
-    std::atomic<io::source*> bound{nullptr};
+    io::detail::bound_guard bound;
 
     std::mutex m;
     conn_phase phase = conn_phase::open;
@@ -669,21 +671,20 @@ bool post_send(conn_state* st) noexcept {
 }
 
 void handle_read_error(conn_state* st, unsigned long wsa_error) noexcept {
-    io::source* s = nullptr;
     bool first = false;
     {
         std::lock_guard<std::mutex> lk(st->m);
         if (!st->error_delivered) {
             st->error_delivered = true;
             first = true;
-            s = st->bound.load(std::memory_order_acquire);
         }
     }
     if (!first) {
         return;
     }
-    if (s != nullptr) {
+    if (io::source* s = st->bound.enter()) {
         s->on_error(map_wsa_error(wsa_error));
+        st->bound.leave();
     }
     initiate_close(st);
 }
@@ -694,7 +695,6 @@ void deliver_read(conn_state* st) noexcept {
             return;
         }
         for (;;) {
-            io::source* s = nullptr;
             std::byte* ptr = nullptr;
             std::size_t avail = 0;
             bool post = false;
@@ -708,8 +708,7 @@ void deliver_read(conn_state* st) noexcept {
                 } else if (st->paused) {
                     stop = true;
                 } else if (st->rx_off < st->rx_got) {
-                    s = st->bound.load(std::memory_order_acquire);
-                    if (s == nullptr) {
+                    if (!st->bound.active()) {
                         st->paused = true;
                         stop = true;
                     } else {
@@ -729,7 +728,14 @@ void deliver_read(conn_state* st) noexcept {
                 break;
             }
 
+            io::source* s = st->bound.enter();
+            if (s == nullptr) {
+                std::lock_guard<std::mutex> lk(st->m);
+                st->paused = true;
+                break;
+            }
             std::size_t consumed = s->on_data(span<const std::byte>(ptr, avail));
+            st->bound.leave();
             if (consumed > avail) {
                 consumed = avail; // clamp a violating return instead of overrun
             }
@@ -762,7 +768,6 @@ void deliver_read(conn_state* st) noexcept {
 void handle_recv_complete(overlapped_op* op, std::size_t bytes,
                           unsigned long error) noexcept {
     conn_state* st = static_cast<conn_state*>(op->owner);
-    io::source* s = nullptr;
     bool eof = false;
     bool err = false;
     bool deliver = false;
@@ -776,7 +781,6 @@ void handle_recv_complete(overlapped_op* op, std::size_t bytes,
         } else if (bytes == 0) {
             if (!st->eof_delivered) {
                 st->eof_delivered = true;
-                s = st->bound.load(std::memory_order_acquire);
                 eof = true;
             }
         } else {
@@ -796,8 +800,9 @@ void handle_recv_complete(overlapped_op* op, std::size_t bytes,
         return;
     }
     if (eof) {
-        if (s != nullptr) {
+        if (io::source* s = st->bound.enter()) {
             s->on_eof();
+            st->bound.leave();
         }
         initiate_close(st);
         return;
@@ -1039,6 +1044,9 @@ public:
 
     ~iocp_connection() override {
         if (st_) {
+            // The source is borrowed: wait for calls already running into it
+            // before the connection state is torn down.
+            st_->bound.retire();
             initiate_close(st_.get());
         }
     }
@@ -1050,7 +1058,7 @@ public:
         if (!st_) {
             return;
         }
-        st_->bound.store(source, std::memory_order_release);
+        st_->bound.rebind(source);
         if (source != nullptr) {
             deliver_read(st_.get());
         }
@@ -1093,19 +1101,23 @@ private:
     public:
         explicit src_adapter(conn_state* st) noexcept : st_(st) {}
         std::size_t on_data(span<const std::byte> data) noexcept override {
-            io::source* s = st_->bound.load(std::memory_order_acquire);
-            return s != nullptr ? s->on_data(data) : 0;
+            if (io::source* s = st_->bound.enter()) {
+                const std::size_t used = s->on_data(data);
+                st_->bound.leave();
+                return used;
+            }
+            return 0;
         }
         void on_eof() noexcept override {
-            io::source* s = st_->bound.load(std::memory_order_acquire);
-            if (s != nullptr) {
+            if (io::source* s = st_->bound.enter()) {
                 s->on_eof();
+                st_->bound.leave();
             }
         }
         void on_error(std::error_code ec) noexcept override {
-            io::source* s = st_->bound.load(std::memory_order_acquire);
-            if (s != nullptr) {
+            if (io::source* s = st_->bound.enter()) {
                 s->on_error(ec);
+                st_->bound.leave();
             }
         }
 

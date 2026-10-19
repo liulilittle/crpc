@@ -51,6 +51,12 @@ client::client(std::unique_ptr<connection> connection, client_options options)
 
 client::~client() {
     close();
+    if (conn_) {
+        // `source_` is declared after `conn_`, so reverse destruction would
+        // free it before the connection. Unbind explicitly: bind_source waits
+        // for any in-flight delivery before returning.
+        conn_->bind_source(nullptr);
+    }
 }
 
 bool client::is_open() const noexcept {

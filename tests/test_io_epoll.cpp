@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -560,6 +561,76 @@ void timer_probe(void* arg) noexcept {
     static_cast<std::atomic<int>*>(arg)->fetch_add(1);
 }
 } // namespace
+
+// A source that blocks inside on_data until the test releases it. It lets the
+// test observe whether bind_source(nullptr) waits for the call to return.
+struct blocking_source final : io::source {
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    std::atomic<bool> exited{false};
+
+    std::size_t on_data(span<const std::byte> data) noexcept override {
+        {
+            std::unique_lock<std::mutex> lk(m);
+            entered = true;
+            cv.notify_all();
+            cv.wait(lk, [this] { return release; });
+        }
+        exited.store(true, std::memory_order_release);
+        return data.size();
+    }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+
+    bool wait_entered(int timeout_ms = 3000) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                           [this] { return entered; });
+    }
+    void unblock() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            release = true;
+        }
+        cv.notify_all();
+    }
+};
+
+CRPC_TEST(epoll_bind_source_null_waits_for_in_flight_delivery) {
+    auto be = io::epoll_backend::create();
+    CRPC_CHECK(be.ok());
+    fixture f(*be.value());
+    CRPC_CHECK(f.ok);
+
+    blocking_source rx;
+    f.server->bind_source(&rx);
+
+    const std::string payload = "in-flight";
+    recording_completion done;
+    f.client->sink().push(bytes_of(payload), &done);
+    CRPC_CHECK(rx.wait_entered());
+
+    std::atomic<bool> unbind_returned{false};
+    std::atomic<bool> exited_at_return{false};
+    std::thread unbinder([&] {
+        f.server->bind_source(nullptr);
+        exited_at_return.store(rx.exited.load(std::memory_order_acquire));
+        unbind_returned.store(true, std::memory_order_release);
+    });
+
+    // The callback is still blocked, so the unbind must not have returned.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CRPC_CHECK_FALSE(unbind_returned.load(std::memory_order_acquire));
+
+    rx.unblock();
+    unbinder.join();
+    CRPC_CHECK(unbind_returned.load(std::memory_order_acquire));
+    CRPC_CHECK(exited_at_return.load(std::memory_order_acquire));
+
+    f.shutdown();
+}
 
 CRPC_TEST(epoll_submillisecond_timer_fires) {
     auto be = io::epoll_backend::create();

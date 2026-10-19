@@ -590,22 +590,21 @@ private:
     void notify_waiter() noexcept;
     rpc::call_id make_call_id() noexcept;
     void tick_poll() noexcept;
-    void evict_idle() noexcept;
+    void evict_idle(const std::shared_ptr<impl>& impl,
+                    std::chrono::nanoseconds idle_eviction) noexcept;
     static void deadline_thunk(void* ctx) noexcept;
 
     // A deadline timer runs on the shard thread and calls back into this
-    // client. The destructor must not free the client while such a callback is
-    // executing (TSan: ~client vs tick_poll). `timers_in_flight_` counts them
-    // and `timer_cv_` publishes their completion; both are guarded by
-    // `timer_mutex_`.
+    // client. The callback copies the shared control block before it starts,
+    // so it never touches `this` after tick_poll() returns. `timer_mutex_`
+    // guards the pointer and the stopping flag.
+    struct timer_gate;
     std::mutex timer_mutex_;
-    std::condition_variable timer_cv_;
-    int timers_in_flight_ = 0;
-    bool timer_stopping_ = false;
+    std::shared_ptr<timer_gate> timer_gate_;
 
     options options_;
     std::vector<endpoint_config> endpoints_;
-    std::unique_ptr<impl> impl_;
+    std::shared_ptr<impl> impl_;
     std::atomic<bool> closed_{false};
     std::atomic<std::uint64_t> seq_{0};
     std::array<std::byte, 16> client_id_{};

@@ -21,6 +21,8 @@
 
 #if defined(CRPC_OS_LINUX)
 
+#include "bound_guard.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -254,6 +256,9 @@ public:
     }
 
     ~epoll_connection() override {
+        // The source is borrowed: wait for calls already running into it
+        // before the connection is torn down.
+        bound_.retire();
         terminate(std::error_code{}, false);
         ensure_quiescent();
     }
@@ -267,7 +272,7 @@ public:
     io::sink& sink() noexcept override { return sink_adapter_; }
 
     void bind_source(io::source* src) noexcept override {
-        bound_.store(src, std::memory_order_release);
+        bound_.rebind(src);
         if (src == nullptr) {
             return;
         }
@@ -362,19 +367,23 @@ private:
         explicit source_adapter_t(epoll_connection& owner) noexcept
             : owner_(owner) {}
         std::size_t on_data(span<const std::byte> data) noexcept override {
-            io::source* s = owner_.bound_.load(std::memory_order_acquire);
-            return s != nullptr ? s->on_data(data) : 0;
+            if (io::source* s = owner_.bound_.enter()) {
+                const std::size_t used = s->on_data(data);
+                owner_.bound_.leave();
+                return used;
+            }
+            return 0;
         }
         void on_eof() noexcept override {
-            io::source* s = owner_.bound_.load(std::memory_order_acquire);
-            if (s != nullptr) {
+            if (io::source* s = owner_.bound_.enter()) {
                 s->on_eof();
+                owner_.bound_.leave();
             }
         }
         void on_error(std::error_code ec) noexcept override {
-            io::source* s = owner_.bound_.load(std::memory_order_acquire);
-            if (s != nullptr) {
+            if (io::source* s = owner_.bound_.enter()) {
                 s->on_error(ec);
+                owner_.bound_.leave();
             }
         }
 
@@ -509,7 +518,6 @@ private:
     // --- read path (loop thread) -----------------------------------------
 
     void read_loop() noexcept {
-        io::source* src = bound_.load(std::memory_order_acquire);
         for (;;) {
             {
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -517,10 +525,13 @@ private:
                     return;
                 }
             }
+            // Announce one call for this iteration. The source is borrowed, so
+            // it must not be held across iterations.
+            io::source* src = bound_.enter();
+            if (src == nullptr) {
+                return;
+            }
             if (rx_tail_ != 0) {
-                if (src == nullptr) {
-                    return;
-                }
                 std::size_t used =
                     src->on_data(span<const std::byte>(rx_.get(), rx_tail_));
                 if (used > rx_tail_) {
@@ -529,6 +540,7 @@ private:
                 if (used < rx_tail_) {
                     std::memmove(rx_.get(), rx_.get() + used, rx_tail_ - used);
                     rx_tail_ -= used;
+                    bound_.leave();
                     std::lock_guard<std::mutex> lk(mtx_);
                     if (!closed_ && !error_delivered_) {
                         read_paused_ = true;
@@ -536,9 +548,6 @@ private:
                     return;
                 }
                 rx_tail_ = 0;
-            }
-            if (src == nullptr) {
-                return;
             }
             const ssize_t k = ::recv(fd_, rx_.get(), rx_cap_, 0);
             if (k > 0) {
@@ -551,14 +560,17 @@ private:
                 if (used < got) {
                     std::memmove(rx_.get(), rx_.get() + used, got - used);
                     rx_tail_ = got - used;
+                    bound_.leave();
                     std::lock_guard<std::mutex> lk(mtx_);
                     if (!closed_ && !error_delivered_) {
                         read_paused_ = true;
                     }
                     return;
                 }
+                bound_.leave();
                 continue;
             }
+            bound_.leave();
             if (k == 0) {
                 {
                     std::lock_guard<std::mutex> lk(mtx_);
@@ -581,7 +593,6 @@ private:
     }
 
     void deliver_eof_if_ready() noexcept {
-        io::source* src = nullptr;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (closed_ || error_delivered_ || eof_delivered_ || !peer_eof_) {
@@ -591,10 +602,10 @@ private:
                 return;
             }
             eof_delivered_ = true;
-            src = bound_.load(std::memory_order_acquire);
         }
-        if (src != nullptr) {
+        if (io::source* src = bound_.enter()) {
             src->on_eof();
+            bound_.leave();
         }
     }
 
@@ -675,7 +686,6 @@ private:
 
     void terminate(std::error_code ec, bool is_error) noexcept {
         io::completion* pending = nullptr;
-        io::source* src = nullptr;
         bool deliver_error = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -693,15 +703,17 @@ private:
             if (is_error && !error_delivered_ && !eof_delivered_) {
                 error_delivered_ = true;
                 deliver_error = true;
-                src = bound_.load(std::memory_order_acquire);
             }
         }
         if (pending != nullptr) {
             pending->complete(io::io_result{
                 std::make_error_code(std::errc::operation_canceled), 0});
         }
-        if (deliver_error && src != nullptr) {
-            src->on_error(ec);
+        if (deliver_error) {
+            if (io::source* src = bound_.enter()) {
+                src->on_error(ec);
+                bound_.leave();
+            }
         }
 
         const int fd = fd_;
@@ -749,7 +761,7 @@ private:
     bool valid_ = false;
     std::uint64_t token_ = 0;
 
-    std::atomic<io::source*> bound_{nullptr};
+    io::detail::bound_guard bound_;
     std::atomic<bool> open_{true};
 
     mutable std::mutex mtx_;
