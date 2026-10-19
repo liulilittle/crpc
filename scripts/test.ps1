@@ -1,4 +1,4 @@
-﻿# test.ps1 -- one-click test for CRPC (reference implementation).
+# test.ps1 -- one-click test for CRPC (reference implementation).
 # Location in the final repo: <repo>/scripts/test.ps1
 #
 # Usage:
@@ -101,7 +101,7 @@ $env:CRPC_TEST_MINIDUMP_DIR = $dumpDir
 
 # Per-test ceiling. A test that needs longer must raise it explicitly rather than
 # relying on the runner to hang forever.
-$testTimeoutSeconds = 300
+$testTimeoutSeconds = 30
 
 
 $sanList = if ($Sanitizer -eq 'all') { @('asan', 'ubsan', 'tsan') } else { @($Sanitizer) }

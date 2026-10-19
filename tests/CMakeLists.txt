@@ -33,7 +33,7 @@ foreach(source ${CRPC_TEST_SOURCES})
     target_link_libraries(${target} PRIVATE crpc_core)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME ${target} COMMAND ${target})
-    set_tests_properties(${target} PROPERTIES TIMEOUT 300)
+    set_tests_properties(${target} PROPERTIES TIMEOUT 30)
 endforeach()
 
 # --- C ABI smoke test --------------------------------------------------------
@@ -46,4 +46,4 @@ set_target_properties(crpc_test_c_api PROPERTIES
     C_STANDARD_REQUIRED ON)
 target_link_libraries(crpc_test_c_api PRIVATE crpc_core)
 add_test(NAME crpc_test_c_api COMMAND crpc_test_c_api)
-set_tests_properties(crpc_test_c_api PROPERTIES TIMEOUT 60)
+set_tests_properties(crpc_test_c_api PROPERTIES TIMEOUT 30)
