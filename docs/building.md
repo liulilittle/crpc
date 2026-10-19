@@ -71,6 +71,12 @@ validated (`include/rtti/reflect.hpp`, `include/corocc/coro.h`) and added with
 directory. RTTI's own test entries are excluded by name from CTest because they
 are not built under `EXCLUDE_FROM_ALL`. `COROCC_BUILD_TESTS` is forced off.
 
+The strict warning policy (`-Wall -Wextra -Wpedantic -Werror` on GCC/Clang,
+`/W4 /WX` on MSVC) is attached to crpc's own targets with
+`target_compile_options`, not to the directory, so it never reaches these
+vendored checkouts: a dependency's warnings cannot fail the crpc build, and
+crpc's `-Wpedantic` is not imposed on third-party code.
+
 If a dependency is absent, the corresponding `CRPC_HAVE_*` macro is off:
 RTTI-dependent codecs are not registered, the MVC field-attribute macros are not
 defined, and coroutine-backed components are not compiled. The current CRPC sources do

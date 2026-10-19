@@ -57,6 +57,8 @@ export CRPC_COROCC_DIR=/path/to/corocc
 
 变量只在缓存值为空时于配置期读取；脚本转发环境，不需要额外参数。每个根都会校验（`include/rtti/reflect.hpp`、`include/corocc/coro.h`），并以 `add_subdirectory(... EXCLUDE_FROM_ALL)` 加入构建树的 `_deps` 目录。RTTI 自带的测试条目在 `EXCLUDE_FROM_ALL` 下不会构建，因此按名称从 CTest 排除。`COROCC_BUILD_TESTS` 被强制关闭。
 
+严格的告警策略（GCC/Clang 的 `-Wall -Wextra -Wpedantic -Werror`，MSVC 的 `/W4 /WX`）通过 `target_compile_options` 挂在 crpc 自身的目标上，而不是目录上，因此不会传到这些 vendored 仓库：依赖的告警不会让 crpc 构建失败，crpc 的 `-Wpedantic` 也不会强加到第三方代码。
+
 缺少依赖时，对应的 `CRPC_HAVE_*` 宏关闭：依赖 RTTI 的编解码器不注册，MVC 字段 attribute 宏不定义，协程相关组件不参与编译。当前 CRPC 源码不调用 `coro_rt_*`；corocc 会被链接，但运行时尚未使用。写明这一点是为了避免把“没有 corocc 的构建”误判为损坏的构建。
 
 ## 3. CMake 选项 <a id="s3"></a>

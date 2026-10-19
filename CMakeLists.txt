@@ -74,9 +74,17 @@ if(MSVC)
         add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/W4>")
     endif()
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    # GCC/Clang warning policy. It is kept in a variable and attached to the
+    # crpc target below (target_compile_options) rather than to the directory
+    # (add_compile_options). Directory-scope options are inherited by every
+    # add_subdirectory(), including the vendored corocc checkout further down,
+    # whose own -Werror then turns crpc's -Wpedantic into hard errors in
+    # third-party code crpc does not own. PUBLIC scope still propagates the
+    # policy to every in-tree consumer (tests, bench, examples) through their
+    # link to crpc, so crpc's own code stays fully checked.
+    set(CRPC_WARNING_OPTIONS -Wall -Wextra -Wpedantic)
     if(CRPC_WARNINGS_AS_ERRORS)
-        add_compile_options(-Werror)
+        list(APPEND CRPC_WARNING_OPTIONS -Werror)
     endif()
 endif()
 
@@ -145,6 +153,15 @@ if(CRPC_BUILD_SHARED)
 endif()
 
 add_library(crpc ${CRPC_LIBRARY_TYPE})
+
+# The warning policy is target-scoped, not directory-scoped, so it never
+# reaches the vendored corocc checkout while still covering every target that
+# links crpc (the library itself, tests, bench, examples). MSVC keeps its
+# directory-level policy above: its options are language-guarded to C/CXX and
+# already exclude the MASM backend.
+if(NOT MSVC)
+    target_compile_options(crpc PUBLIC ${CRPC_WARNING_OPTIONS})
+endif()
 
 # Sources are discovered by pattern so that independent subsystems can be added
 # without editing this file. CONFIGURE_DEPENDS re-globs on reconfigure.
