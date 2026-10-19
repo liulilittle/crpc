@@ -196,6 +196,11 @@ struct write_completion final : io::completion {
 struct pending_h2_stream {
     http::request request;
     bool headers_ready = false;
+    // Absolute monotonic deadline for the request body (0 = none). Set when
+    // HEADERS arrive; an open stream that never reaches END_STREAM is reset at
+    // this deadline instead of being bounded only by the connection idle timer,
+    // which every trickled byte refreshes (No-stall rule).
+    u64 deadline_ns = 0;
 };
 
 // The request-processing engine of one connection.
@@ -1124,6 +1129,13 @@ void session::build_h2_request(u32 stream_id, const header_list& fields) {
     pending_h2_stream stream;
     stream.headers_ready = true;
     stream.request = std::move(request);
+    if (shard_ != nullptr && state_.options.request_timeout.count() > 0) {
+        stream.deadline_ns =
+            shard_->now_ns() +
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 state_.options.request_timeout)
+                                 .count());
+    }
     h2_streams_[stream_id] = std::move(stream);
 }
 
@@ -1634,6 +1646,14 @@ void session::arm_probe() {
         (deadline == 0 || request_deadline_ns_ < deadline)) {
         deadline = request_deadline_ns_;
     }
+    // HTTP/2 bounds each open stream separately: one stream trickling bytes must
+    // not keep another stream's request alive forever.
+    for (const auto& item : h2_streams_) {
+        const u64 stream_deadline = item.second.deadline_ns;
+        if (stream_deadline != 0 && (deadline == 0 || stream_deadline < deadline)) {
+            deadline = stream_deadline;
+        }
+    }
     if (deadline == 0) {
         return;
     }
@@ -1681,6 +1701,23 @@ void session::on_probe() {
             // A peer that never sends WINDOW_UPDATE must not stall the
             // connection silently: probe it so a dead peer is observed (R18).
             h2_send_ping();
+        }
+    }
+    if (phase_ == phase::h2) {
+        // Reset every stream whose request never completed. A stream-level
+        // error is enough: the connection and the other streams stay usable.
+        for (auto it = h2_streams_.begin(); it != h2_streams_.end();) {
+            if (it->second.deadline_ns != 0 && now >= it->second.deadline_ns) {
+                const u32 stream_id = it->first;
+                it = h2_streams_.erase(it);
+                h2_end_pending_.erase(stream_id);
+                state_.timed_out.fetch_add(1, std::memory_order_relaxed);
+                // h2_send_rst also closes the connection-level record and
+                // records our own reset so it is not re-processed.
+                h2_send_rst(stream_id, h2::error_code::cancel);
+            } else {
+                ++it;
+            }
         }
     }
     arm_probe();

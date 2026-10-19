@@ -877,6 +877,43 @@ CRPC_TEST(request_timeout_answers_408_for_a_partial_request) {
     CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
 }
 
+CRPC_TEST(h2c_incomplete_request_is_reset_at_the_deadline) {
+    http::http_server_options options;
+    options.request_timeout = std::chrono::milliseconds(200);
+    options.idle_timeout = std::chrono::milliseconds(0);
+    fixture fx(options);
+
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    capture_source capture;
+    client->bind_source(&capture);
+
+    h2::hpack_encoder encoder;
+    std::string out(preface);
+    // HEADERS without END_STREAM opens the stream; then trickle one DATA byte
+    // every 50 ms, which refreshes the idle timer but must not refresh the
+    // request deadline.
+    out += h2_request_headers(1, "POST", "/echo", false, encoder);
+    out += h2_frame(h2::frame_type::data, 0, 1, "x");
+    send_raw(*client, out);
+
+    h2_parse_state parsed;
+    std::size_t consumed = 0;
+    const bool reset = crpc_test::wait_for(
+        [&] {
+            const std::string data = capture.snapshot();
+            if (data.size() > consumed) {
+                parsed.feed(std::string_view(data).substr(consumed));
+                consumed = data.size();
+            }
+            return parsed.got_rst;
+        },
+        5000);
+    CRPC_CHECK(reset);
+    CRPC_CHECK_EQ(parsed.rst_stream, u32{1});
+    CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
+}
+
 // --- TLS test ----------------------------------------------------------------
 
 CRPC_TEST(tls_alpn_routing_or_skip) {
