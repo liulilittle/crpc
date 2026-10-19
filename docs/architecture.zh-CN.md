@@ -226,7 +226,9 @@ HTTP/2 在协议层实现：9 字节大端帧编解码、包含静态表/动态�
 
 MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时注册条目；`router::freeze` 编译模式、拒绝畸形模式与冲突，并构建精确匹配表加按优先级排序的参数列表。绑定按固定顺序从 route/query/header/form/file/body 填充反射 DTO，并显式映射 400。`router::handle` 执行匹配、Accept 协商、绑定、调用与响应写出。
 
-缺失项均属于**已设计，未实现**：HTTP/1.1 与 HTTP/2 服务端连接循环、TLS/ALPN、h2/h2c 分派、HTTP 压缩、SSE/长轮询，以及 CRPC 调用到 HTTP 的适配器。`CRPC_WITH_OPENSSL` 会链接 OpenSSL 并定义 `CRPC_HAVE_OPENSSL`，但目前没有 TLS 代码消费它。
+仍缺失：服务端路径中的 HTTP 压缩接线、SSE/长轮询，以及 CRPC 调用到 HTTP 的适配器，均属于**已设计，未实现**。
+
+`http/server.hpp` 实现把上述各层接通的服务端门面。`http_server` 绑定一个或多个 `io::backend_factory` 监听器，把每条被接受的连接分配到某个 shard 的 `runtime`，并只在该线程上触碰全部协议状态：传输 source 只把字节拷入有界 ingress 缓冲并投递任务，因此不存在每连接线程，缓冲满时暂停读取（R1 credit）而不是丢弃。明文连接做嗅探——HTTP/2 连接前导选择 h2c，其余为 HTTP/1.1。请求经 MVC 路由分派（HEAD 执行 GET 处理器并丢弃正文），序列化后的响应入队；每连接写队列保证同一时刻至多一个后端 push 在途，队列增长则对读取方背压。HTTP/1.1 处理 keep-alive、流水线、`100-continue`、chunked 正文与 400/404/405/411/413/431/500 路径，并通过消息层拒绝请求走私。HTTP/2 原样复用帧/HPACK/连接层：遵守连接与流窗口，对超出对端窗口的响应停车并在 `WINDOW_UPDATE` 后恢复（对端窗口长期为零时周期性 PING 探测，R18），应答 PING/SETTINGS/GOAWAY，并把流错误映射为 RST_STREAM、连接错误映射为 GOAWAY。`listen_tls` 用 `io::tls_stream` 包装监听器，并按 ALPN 结果路由（`h2` 走 HTTP/2，`http/1.1` 走 HTTP/1.1）；公共头不出现 OpenSSL 类型，未定义 `CRPC_HAVE_OPENSSL` 时 `listen_tls` 返回明确错误。`stop()` 停止接受、在 HTTP/2 上发送 GOAWAY、在 `drain_timeout` 内排空在途请求后关闭，且幂等。
 
 ## 13. 集群层 <a id="s13"></a>
 
@@ -289,10 +291,10 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 截止时间与取消 | `rpc/client.cpp`、`rpc/call.cpp` | 已实现，有测试 |
 | 幂等键 | `rpc/call.hpp`（`call_id`）、调用信封 | 部分：键已携带，无去重表 |
 | 有序 lane | `rpc/call.hpp` 中的 `lane_token` | 已设计，未实现 |
-| HTTP/1.1 | `http/message.hpp`、`src/http/message.cpp` | 消息层已实现 |
-| HTTP/2 与 HPACK | `http2/*` | 协议层已实现 |
-| HTTPS/TLS | `CRPC_WITH_OPENSSL` 选项 | 已设计，未实现 |
-| MVC/REST | `mvc/*` | 已实现，未接入服务器 |
+| HTTP/1.1 | `http/message.hpp`、`http/server.hpp` | 已实现：消息层 + 服务端门面 |
+| HTTP/2 与 HPACK | `http2/*`、`http/server.hpp` | 已实现：协议层 + h2c/h2 服务端 |
+| HTTPS/TLS | `http/server.hpp`、`io/tls.hpp` | `CRPC_WITH_OPENSSL` 下已实现；未启用时返回明确错误 |
+| MVC/REST | `mvc/*` | 已实现，经 `http_server` 接线 |
 | multipart 与文件 | `http/multipart.hpp`、`http/file_transfer.hpp` | 已实现，无专用测试套件 |
 | Registry | `cluster/registry.hpp`、`src/cluster/registry.cpp` | 已实现，有测试 |
 | 租约/选举/健康/watch | `cluster/*` | 已实现的原语 |
@@ -310,9 +312,9 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | inproc / epoll / IOCP | 已实现 | `test_io_inproc.cpp`、`test_io_epoll.cpp`、`test_io_iocp.cpp` |
 | RPC 核心 | 部分 | `test_rpc_core.cpp`；无服务端循环、协程停车或流集成 |
 | 编解码 | 已实现 | `test_codec.cpp`；文本格式依赖 RTTI |
-| HTTP/1.1、multipart、文件 | 部分 | `test_http_message.cpp`；无 multipart/文件套件 |
-| HTTP/2 + HPACK | 协议层已实现 | `test_http2.cpp`；无 socket/TLS/ALPN 适配器 |
-| MVC | 已实现 | `test_mvc.cpp`；handler 调用是本地调用，不是网络服务器 |
+| HTTP/1.1、multipart、文件 | 部分 | `test_http_message.cpp`、`test_http_server.cpp`；无 multipart/文件套件 |
+| HTTP/2 + HPACK | 已实现 | `test_http2.cpp`；`test_http_server.cpp` 覆盖 inproc 上的 h2c |
+| MVC | 已实现 | `test_mvc.cpp`；`test_http_server.cpp` 经 inproc 走路由器分派 |
 | 集群原语 | 已实现 | `test_cluster.cpp`；无网络 registry 服务 |
 | 韧性原语 | 已实现 | `test_resilience.cpp`；无流水线集成 |
 | 可观测性 | 部分 | `test_observability.cpp`；AOP 未接线，无指标 |

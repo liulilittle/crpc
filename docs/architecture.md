@@ -226,7 +226,9 @@ HTTP/2 is implemented at the protocol layer: a 9-byte big-endian frame codec, HP
 
 MVC is a route table plus binding: `CRPC_ROUTE` and `CRPC_HTTP_*` register entries at static initialization; `router::freeze` compiles patterns, rejects malformed patterns and conflicts, and builds an exact-match table plus a priority-sorted parameter list. Binding fills a reflected DTO from route/query/header/form/file/body sources in a fixed order, with explicit 400 mapping. `router::handle` performs match, Accept negotiation, bind, invoke and response writing.
 
-Missing, all **specified, not implemented**: the HTTP/1.1 and HTTP/2 server connection loops, TLS/ALPN, h2/h2c dispatch, HTTP compression, SSE/long polling, and the CRPC-call-over-HTTP adapter. `CRPC_WITH_OPENSSL` links OpenSSL and defines `CRPC_HAVE_OPENSSL`, but no TLS code consumes it yet.
+Missing: HTTP compression wiring into the server path, SSE/long polling, and the CRPC-call-over-HTTP adapter, all **specified, not implemented**.
+
+`http/server.hpp` implements the server facade that ties those layers together. `http_server` binds one or more `io::backend_factory` listeners, assigns each accepted connection to a shard `runtime`, and touches all protocol state on that single thread: the transport source only copies bytes into a bounded ingress buffer and posts work, so no per-connection thread is created and a full ingress buffer pauses reading (the R1 credit) instead of dropping. Cleartext connections are sniffed -- the HTTP/2 connection preface selects h2c, anything else is HTTP/1.1. A request is dispatched through the MVC router (HEAD runs the GET handler and drops the body) and the serialized response is queued; a per-connection write queue keeps at most one backend push in flight and backpressures the reader when it grows. HTTP/1.1 handles keep-alive, pipelining, `100-continue`, chunked bodies and the 400/404/405/411/413/431/500 paths, and rejects request smuggling through the message layer. HTTP/2 reuses the frame/HPACK/connection layers unchanged: it honours connection and stream windows, parks a response that exceeds the peer window and resumes it on `WINDOW_UPDATE` (with a periodic PING probe when a peer stays at zero, R18), answers PING/SETTINGS/GOAWAY, and maps errors to RST_STREAM for a stream error and GOAWAY for a connection error. `listen_tls` wraps a listener in `io::tls_stream` and routes on the ALPN result (`h2` -> HTTP/2, `http/1.1` -> HTTP/1.1); the public header stays free of OpenSSL types and `listen_tls` returns a clear error when the library is built without `CRPC_HAVE_OPENSSL`. `stop()` stops accepting, sends GOAWAY on HTTP/2, drains in-flight requests up to `drain_timeout`, then closes; it is idempotent.
 
 ## 13. Cluster layer <a id="s13"></a>
 
@@ -291,10 +293,10 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Deadline and cancel | `rpc/client.cpp`, `rpc/call.cpp` | implemented, tested |
 | Idempotency key | `rpc/call.hpp` (`call_id`), call envelope | partial: key carried, no dedup table |
 | Ordered lanes | `lane_token` in `rpc/call.hpp` | specified, not implemented |
-| HTTP/1.1 | `http/message.hpp`, `src/http/message.cpp` | implemented at message layer |
-| HTTP/2 and HPACK | `http2/*` | implemented at protocol layer |
-| HTTPS/TLS | `CRPC_WITH_OPENSSL` option | specified, not implemented |
-| MVC/REST | `mvc/*` | implemented, not wired to a server |
+| HTTP/1.1 | `http/message.hpp`, `http/server.hpp` | implemented: message layer + server facade |
+| HTTP/2 and HPACK | `http2/*`, `http/server.hpp` | implemented: protocol layer + h2c/h2 server |
+| HTTPS/TLS | `http/server.hpp`, `io/tls.hpp` | implemented with `CRPC_WITH_OPENSSL`; clear error without it |
+| MVC/REST | `mvc/*` | implemented, wired through `http_server` |
 | Multipart and files | `http/multipart.hpp`, `http/file_transfer.hpp` | implemented, no dedicated suite |
 | Registry | `cluster/registry.hpp`, `src/cluster/registry.cpp` | implemented, tested |
 | Lease/election/health/watch | `cluster/*` | implemented primitives |
@@ -312,9 +314,9 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | inproc / epoll / IOCP | implemented | `test_io_inproc.cpp`, `test_io_epoll.cpp`, `test_io_iocp.cpp` |
 | RPC core | partial | `test_rpc_core.cpp`; no server loop, coroutine park or stream integration |
 | codec | implemented | `test_codec.cpp`; text formats depend on RTTI being present |
-| HTTP/1.1, multipart, files | partial | `test_http_message.cpp`; no multipart/file suite |
-| HTTP/2 + HPACK | implemented at protocol layer | `test_http2.cpp`; no socket/TLS/ALPN adapter |
-| MVC | implemented | `test_mvc.cpp`; handler invocation is local, not a network server |
+| HTTP/1.1, multipart, files | partial | `test_http_message.cpp`, `test_http_server.cpp`; no multipart/file suite |
+| HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
+| MVC | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
 | cluster primitives | implemented | `test_cluster.cpp`; no network registry service |
 | resilience primitives | implemented | `test_resilience.cpp`; no pipeline integration |
 | observability | partial | `test_observability.cpp`; AOP not wired, no metrics |

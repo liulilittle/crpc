@@ -289,7 +289,9 @@ HTTP/2 是独立的协议层。固定头 9 字节且为大端：
 | 关闭 | `GOAWAY`；现有流排空或取消 |
 | 追踪/超时/幂等/lane | `x-crpc-trace-id`、`x-crpc-timeout-ms`、`x-crpc-idempotency-key`、`x-crpc-attempt`、`x-crpc-lane-id`、`x-crpc-lane-seq` |
 
-两个 stream id 空间相互独立；适配器必须维护 `h2_stream_id -> call_slot*` 映射。h2 与 CRPC 的流控层也相互独立、不共享。上述协议层已实现；CRPC 到 h2 的适配器、socket/TLS/ALPN 层以及 h2c 升级分派属于**已设计，未实现**。
+两个 stream id 空间相互独立；适配器必须维护 `h2_stream_id -> call_slot*` 映射。h2 与 CRPC 的流控层也相互独立、不共享。
+
+HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 传输：明文连接首字节匹配 HTTP/2 连接前导（`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`）即按 HTTP/2 服务，其余明文连接按 HTTP/1.1，TLS 连接按 ALPN 结果（`h2` 或 `http/1.1`）路由。请求经 MVC 路由器分派而非 CRPC 调用槽适配器，因此上面的 `h2_stream_id -> call_slot*` 映射属于 CRPC-on-h2 映射，仍为**已设计，未实现**。HTTP 服务端复用本节描述的同一套帧、HPACK、连接层与流控规则。
 
 ## 18. 版本与验证 <a id="s18"></a>
 

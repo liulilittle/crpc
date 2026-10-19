@@ -289,7 +289,9 @@ The intended CRPC mapping (design §12.4):
 | shutdown | `GOAWAY`; existing streams drain or are cancelled |
 | trace/timeout/idempotency/lane | `x-crpc-trace-id`, `x-crpc-timeout-ms`, `x-crpc-idempotency-key`, `x-crpc-attempt`, `x-crpc-lane-id`, `x-crpc-lane-seq` |
 
-The two stream-id spaces are independent; the adapter must keep an `h2_stream_id -> call_slot*` map. The h2 and CRPC flow-control layers are also independent and not shared. The protocol layer above is implemented; the CRPC-on-h2 adapter, the socket/TLS/ALPN layer and h2c upgrade dispatch are **specified, not implemented**.
+The two stream-id spaces are independent; the adapter must keep an `h2_stream_id -> call_slot*` map. The h2 and CRPC flow-control layers are also independent and not shared.
+
+The HTTP server facade (`http/server.hpp`) implements the HTTP/1.1, h2c and h2 transport itself: a cleartext connection whose first bytes match the HTTP/2 connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) is served as HTTP/2, any other cleartext connection as HTTP/1.1, and a TLS connection is routed by the ALPN result (`h2` or `http/1.1`). Requests are dispatched through the MVC router rather than the CRPC call-slot adapter, so the `h2_stream_id -> call_slot*` map above belongs to the CRPC-on-h2 mapping, which remains **specified, not implemented**. The HTTP server uses the same frame, HPACK and connection layers and the same flow-control rules described in this section.
 
 ## 18. Versioning and verification <a id="s18"></a>
 
