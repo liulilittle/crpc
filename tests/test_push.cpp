@@ -640,6 +640,40 @@ CRPC_TEST(hub_front_replay_capacity_insufficient) {
     CRPC_CHECK_EQ(message.seq, static_cast<u64>(4));
 }
 
+// The count bound and the byte bound are independent capacities: satisfying
+// `max_messages >= max_replay` does not make the front replay fit. This pins
+// the `resource_exhausted` answer for a byte-budget overrun, so the protocol
+// documentation's "409 Restart, never a silent drop" promise is tested.
+CRPC_TEST(hub_front_replay_byte_budget_insufficient) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 8;
+    options.max_replay = 8;
+    options.max_bytes = 2; // exactly two one-byte messages
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    const auto connection = h.attach(1);
+    for (int i = 1; i <= 3; ++i) {
+        h.publish("t", as_bytes("x"), delivery_mode::reliable);
+    }
+    // The byte bound kept only seq2/seq3 in the queue (seq1 was dropped from
+    // the front by the overflow policy); the replay window still holds 1..3.
+    push_message message;
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(2));
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(3));
+
+    // Requeueing all three needs three bytes but only two are allowed, and the
+    // queued reliable messages cannot be dropped to make room. Explicit
+    // restart, never a silent skip.
+    const status front = h.retransmit_front(1, "t");
+    CRPC_CHECK_FALSE(front.ok());
+    CRPC_CHECK_EQ(code_id(front.code()), code_id(rpc_code::resource_exhausted));
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK_FALSE(h.try_take(connection, std::string_view("t"), message));
+}
+
 CRPC_TEST(hub_attach_front_replays_at_head) {
     hub h;
     subscribe_options options;
