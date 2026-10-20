@@ -103,6 +103,11 @@ dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
 planned, not implemented; while it is absent, callers and the library must be
 built from the same headers.
 
+Additive types do not change existing layouts. `client::resilience_statistics`
+(a standard-layout, trivially copyable value type, §9) and
+`client::resilience_stats()` are MINOR additions; they add symbols only.
+`client::statistics` keeps its field order, size and meaning.
+
 ## 5. Enum values
 
 - Enum values that are written to the wire are fixed forever; they are never

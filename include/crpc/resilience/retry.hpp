@@ -155,6 +155,16 @@ public:
     [[nodiscard]] bool next(rpc_code code, bool idempotent,
                             std::chrono::nanoseconds& delay) noexcept;
 
+    // Deadline- and hint-aware variant. `min_delay` is a lower bound supplied
+    // by the failure (for example a server `retry_after`). `deadline` is an
+    // absolute monotonic timestamp used when `has_deadline` is true. The
+    // deadline check runs before the budget is charged, so a retry that cannot
+    // fit does not consume a token.
+    [[nodiscard]] bool next(rpc_code code, bool idempotent,
+                            std::chrono::nanoseconds min_delay,
+                            std::chrono::nanoseconds deadline, bool has_deadline,
+                            std::chrono::nanoseconds& delay) noexcept;
+
     [[nodiscard]] u32 attempts() const noexcept { return attempts_; }
     [[nodiscard]] bool budget_denied() const noexcept { return budget_denied_; }
     [[nodiscard]] bool predicate_denied() const noexcept { return predicate_denied_; }
@@ -166,6 +176,7 @@ private:
 
     retry_policy policy_;
     retry_budget* budget_ = nullptr;
+    clock_source clock_;
     random_fn random_ = nullptr;
     void* random_context_ = nullptr;
     deterministic_rng internal_rng_;

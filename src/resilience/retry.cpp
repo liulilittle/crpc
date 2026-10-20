@@ -101,6 +101,7 @@ retry_sequence::retry_sequence(const retry_policy& policy, retry_budget* budget,
                                void* random_context) noexcept
     : policy_(policy),
       budget_(budget),
+      clock_(clock),
       random_(random),
       random_context_(random_context),
       internal_rng_(clock.now_ns() ^ 0x9E3779B97F4A7C15ull) {
@@ -154,6 +155,50 @@ bool retry_sequence::next(rpc_code code, bool idempotent,
     ++attempts_;
     return true;
 }
+
+bool retry_sequence::next(rpc_code code, bool idempotent,
+                          std::chrono::nanoseconds min_delay,
+                          std::chrono::nanoseconds deadline, bool has_deadline,
+                          std::chrono::nanoseconds& delay) noexcept {
+    if (attempts_ >= policy_.max_attempts) {
+        return false;
+    }
+    if (!is_retryable(code, idempotent)) {
+        predicate_denied_ = true;
+        return false;
+    }
+
+    const std::chrono::nanoseconds backoff = compute_backoff();
+    std::chrono::nanoseconds candidate = backoff;
+    if (min_delay.count() > candidate.count()) {
+        candidate = min_delay;
+    }
+    if (candidate.count() < 0) {
+        candidate = std::chrono::nanoseconds(0);
+    }
+
+    if (has_deadline) {
+        const auto now = clock_.now_ns();
+        const auto deadline_ns = deadline.count();
+        if (deadline_ns <= 0 || now >= static_cast<u64>(deadline_ns)) {
+            return false;
+        }
+        const u64 remaining = static_cast<u64>(deadline_ns) - now;
+        if (static_cast<u64>(candidate.count()) >= remaining) {
+            return false;
+        }
+    }
+
+    if (budget_ != nullptr && !budget_->try_acquire()) {
+        budget_denied_ = true;
+        return false;
+    }
+
+    delay = candidate;
+    ++attempts_;
+    return true;
+}
+
 
 double retry_sequence::uniform_unit() noexcept {
     const u64 value = random_ != nullptr ? random_(random_context_) : internal_rng_.next();

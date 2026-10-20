@@ -182,6 +182,40 @@ struct client_liveness {
     std::atomic<bool> alive{true};
 };
 
+// How a finished attempt feeds the endpoint breaker. A logical call records
+// exactly one outcome: intermediate attempts of a retry are ignored, and the
+// terminal result is classified or, for a locally observed timeout, recorded as
+// a failure. Caller cancellations and abandoned handles are ignored.
+enum class breaker_record : u8 {
+    ignore,
+    by_code,
+    failure
+};
+
+// Where a failed attempt failed. The origin decides whether the endpoint
+// breaker is touched at all, whether a retry is legal without idempotency, and
+// whether `unknown_side_effect` can apply. Local admission and lifecycle
+// failures say nothing about the endpoint.
+enum class failure_origin : u8 {
+    local_lifecycle,
+    local_gate,
+    local_capacity,
+    endpoint_open,
+    endpoint_pre_send,
+    endpoint_sent,
+    remote,
+    timeout,
+    cancel
+};
+
+// Maps an origin and the terminal code to the single breaker outcome.
+[[nodiscard]] breaker_record breaker_record_for(failure_origin origin,
+                                                rpc_code code) noexcept;
+
+// Classifies a completed low-level call. A local timeout carries the
+// `crpc.local_timeout` metadata marker; a peer deadline does not.
+[[nodiscard]] failure_origin result_origin(const rpc_error& error) noexcept;
+
 // Type-independent per-call state.
 struct call_core {
     // Atomic: the completion callback may read it on a backend thread while
@@ -203,10 +237,14 @@ struct call_core {
     // the connection slot and the breaker permit.
     std::atomic<bool> finalized{false};
     std::atomic<rpc_code> terminal{rpc_code::ok};
+    // Set by `call::cancel()`, with or without an in-flight low-level call.
+    // The retry wait polls it so a backoff can be interrupted.
+    std::atomic<bool> canceled{false};
     rpc_error error;
     std::uint32_t attempts = 0;
     bool idempotent = false;
     bool has_deadline = false;
+    failure_origin origin = failure_origin::local_lifecycle;
     std::chrono::steady_clock::time_point deadline{};
     void* pool = nullptr;
     std::shared_ptr<connection_slot> slot;
@@ -249,16 +287,6 @@ struct call_state final : call_state_base {
     }
     return core.owner.load(std::memory_order_acquire);
 }
-
-// How a finished attempt feeds the endpoint breaker. A logical call records
-// exactly one outcome: intermediate attempts of a retry are ignored, and the
-// terminal result is classified or, for a locally observed timeout, recorded as
-// a failure. Caller cancellations and abandoned handles are ignored.
-enum class breaker_record : u8 {
-    ignore,
-    by_code,
-    failure
-};
 
 template <typename Resp>
 struct wake_functor {
@@ -313,6 +341,22 @@ public:
         std::size_t calls_started = 0;
         std::size_t retries = 0;
         std::size_t breaker_rejections = 0;
+    };
+
+    // Additive observability for the client resilience pipeline. This is a new
+    // value type; `client::statistics` keeps its existing layout and ABI.
+    struct resilience_statistics {
+        std::size_t rate_limited = 0;
+        std::size_t bulkhead_rejected = 0;
+        std::size_t local_gate_rejected = 0;
+        std::size_t endpoint_open = 0;
+        std::size_t lb_unavailable = 0;
+        std::size_t pre_send_retries = 0;
+        std::size_t probe_admitted = 0;
+        std::size_t retries_delayed_by_hint = 0;
+        // Current per-endpoint bulkhead occupancy (0 when no gate is
+        // configured). Lets tests observe close/cancel releasing a permit.
+        std::size_t bulkhead_in_use = 0;
     };
 
     class builder {
@@ -401,30 +445,35 @@ public:
                         }
                         // A locally observed timeout is a dependency failure,
                         // even though a server-produced `deadline_exceeded`
-                        // application result is ignored by `by_code`.
-                        const client_detail::breaker_record record =
-                            failure.code == rpc_code::deadline_exceeded
-                                ? client_detail::breaker_record::failure
-                                : client_detail::breaker_record::by_code;
+                        // application result is ignored by the code table.
+                        const client_detail::failure_origin origin =
+                            client_detail::failure_origin::timeout;
                         st->inner.reset();
-                        current->finish_attempt(st->core, failure.code, record);
+                        current->finish_attempt(st->core, failure.code, origin,
+                                                client_detail::breaker_record::failure);
                         return rpc::rpc_result<Resp>(std::move(failure));
                     }
                     rpc::rpc_result<Resp> result(
                         rpc_error(rpc_code::internal, "call produced no result"));
                     const bool decoded = st->inner->try_get(result);
                     const rpc_code code = st->inner->code();
+                    rpc_error terminal_error;
+                    if (!(decoded && code == rpc_code::ok)) {
+                        terminal_error = result.error();
+                    }
+                    const client_detail::failure_origin origin =
+                        client_detail::result_origin(terminal_error);
                     st->inner.reset();
                     std::chrono::nanoseconds delay{0};
                     const bool retry =
                         !(decoded && code == rpc_code::ok) &&
-                        current->should_retry(st->core, code, delay);
+                        current->should_retry(st->core, terminal_error, origin, delay);
                     // One logical call feeds the breaker once: a retried
                     // attempt is ignored and only the terminal result counts.
                     current->finish_attempt(
-                        st->core, code,
+                        st->core, code, origin,
                         retry ? client_detail::breaker_record::ignore
-                              : client_detail::breaker_record::by_code);
+                              : client_detail::breaker_record_for(origin, code));
                     if (decoded && code == rpc_code::ok) {
                         return result;
                     }
@@ -432,8 +481,17 @@ public:
                         return result;
                     }
                     current->sleep_for(st->core, delay);
+                    if (st->core.canceled.load(std::memory_order_acquire)) {
+                        return rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::canceled, "call canceled"));
+                    }
                     st->core.reset_for_attempt();
                     continue;
+                }
+
+                if (st->core.canceled.load(std::memory_order_acquire)) {
+                    return rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::canceled, "call canceled"));
                 }
 
                 rpc_error failure;
@@ -441,16 +499,22 @@ public:
                 if (issued.ok()) {
                     continue;
                 }
+                const client_detail::failure_origin origin = st->core.origin;
                 std::chrono::nanoseconds delay{0};
-                const bool retry = owner->should_retry(st->core, failure.code, delay);
+                const bool retry =
+                    owner->should_retry(st->core, failure, origin, delay);
                 owner->finish_attempt(
-                    st->core, failure.code,
+                    st->core, failure.code, origin,
                     retry ? client_detail::breaker_record::ignore
-                          : client_detail::breaker_record::by_code);
+                          : client_detail::breaker_record_for(origin, failure.code));
                 if (!retry) {
                     return rpc::rpc_result<Resp>(std::move(failure));
                 }
                 owner->sleep_for(st->core, delay);
+                if (st->core.canceled.load(std::memory_order_acquire)) {
+                    return rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::canceled, "call canceled"));
+                }
                 // The failed issue finalized this attempt (and dropped its
                 // permit); re-arm it for the next one, as the decoded path
                 // above does. Without this the next issue sees `finalized`
@@ -469,12 +533,19 @@ public:
                 // The handle has delivered its terminal result: record it once
                 // and release the timer and slot.
                 const rpc_code code = state_->inner->code();
+                rpc_error terminal_error;
+                if (code != rpc_code::ok) {
+                    terminal_error = out.error();
+                }
+                const client_detail::failure_origin origin =
+                    client_detail::result_origin(terminal_error);
                 std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
                 st->inner.reset();
                 client* const owner = client_detail::live_owner(st->core);
                 if (owner != nullptr) {
-                    owner->finish_attempt(st->core, code,
-                                          client_detail::breaker_record::by_code);
+                    owner->finish_attempt(
+                        st->core, code, origin,
+                        client_detail::breaker_record_for(origin, code));
                 }
             }
             return decoded;
@@ -482,15 +553,27 @@ public:
 
         // Cancels the in-flight attempt. Idempotent.
         void cancel() noexcept {
-            if (state_ != nullptr && state_->inner) {
+            if (state_ == nullptr) {
+                return;
+            }
+            // Set the flag even when there is no low-level inner call: during a
+            // retry backoff there is nothing to cancel at the transport, but
+            // the waiter must stop.
+            state_->core.canceled.store(true, std::memory_order_release);
+            if (state_->inner) {
                 state_->inner->cancel();
+            }
+            client* const owner = client_detail::live_owner(state_->core);
+            if (owner != nullptr) {
                 // Release the attempt's timer and slot now; `inner` is kept so
                 // a subsequent get()/try_get() can still observe `canceled`.
-                client* const owner = client_detail::live_owner(state_->core);
-                if (owner != nullptr) {
-                    owner->abandon_attempt(state_->core);
-                }
+                owner->abandon_attempt(state_->core);
+                owner->notify_waiter();
             }
+            {
+                std::lock_guard<std::mutex> lk(state_->core.mutex);
+            }
+            state_->core.cv.notify_all();
         }
 
     private:
@@ -559,6 +642,7 @@ public:
 
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
+    [[nodiscard]] resilience_statistics resilience_stats() const noexcept;
 
     // Low-level path used by `stub`. Encodes are the caller's responsibility.
     template <typename Resp>
@@ -582,13 +666,40 @@ public:
         core.retry = std::make_unique<resilience::retry_sequence>(options_.retry, &budget_);
         budget_.on_request();
 
-        rpc_error failure;
-        const status issued = issue(st, failure);
-        if (!issued.ok()) {
-            // `issue` leaves the attempt for its caller to finalize, so the
-            // initial (and here terminal) failure is recorded exactly once.
-            finish_attempt(core, failure.code, client_detail::breaker_record::by_code);
-            return rpc::rpc_result<client::call<Resp>>(std::move(failure));
+        // The first attempt may fail before anything was sent (all candidates
+        // open, connect refused, pool exhausted). Those failures are safe to
+        // retry even for a non-idempotent call. Remote failures cannot happen
+        // here because a successful issue returns a handle immediately.
+        for (;;) {
+            if (closed_.load(std::memory_order_acquire)) {
+                return rpc::rpc_result<call<Resp>>(
+                    rpc_error(rpc_code::shutting_down, "client is closed"));
+            }
+            if (core.canceled.load(std::memory_order_acquire)) {
+                return rpc::rpc_result<call<Resp>>(
+                    rpc_error(rpc_code::canceled, "call canceled"));
+            }
+            rpc_error failure;
+            const status issued = issue(st, failure);
+            if (issued.ok()) {
+                break;
+            }
+            const client_detail::failure_origin origin = core.origin;
+            std::chrono::nanoseconds delay{0};
+            const bool retry = should_retry(core, failure, origin, delay);
+            finish_attempt(core, failure.code, origin,
+                           retry ? client_detail::breaker_record::ignore
+                                 : client_detail::breaker_record_for(origin,
+                                                                     failure.code));
+            if (!retry) {
+                return rpc::rpc_result<call<Resp>>(std::move(failure));
+            }
+            sleep_for(core, delay);
+            if (core.canceled.load(std::memory_order_acquire)) {
+                return rpc::rpc_result<call<Resp>>(
+                    rpc_error(rpc_code::canceled, "call canceled"));
+            }
+            core.reset_for_attempt();
         }
         call<Resp> handle;
         handle.state_ = std::move(st);
@@ -615,6 +726,7 @@ private:
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
                       rpc_code code) noexcept;
     void finish_attempt(client_detail::call_core& core, rpc_code code,
+                        client_detail::failure_origin origin,
                         client_detail::breaker_record record) noexcept;
     // Idempotent counterpart to finish_attempt for paths that end an attempt
     // without a result (handle destruction, try_get, cancel, close).
@@ -626,7 +738,9 @@ private:
     void unregister_core(client_detail::call_core& core) noexcept;
     void finalize_active(
         std::vector<std::shared_ptr<client_detail::call_state_base>>& active) noexcept;
-    [[nodiscard]] bool should_retry(client_detail::call_core& core, rpc_code code,
+    [[nodiscard]] bool should_retry(client_detail::call_core& core,
+                                    const rpc_error& error,
+                                    client_detail::failure_origin origin,
                                     std::chrono::nanoseconds& delay) noexcept;
     [[nodiscard]] std::shared_ptr<client_detail::client_liveness>
     liveness_token() const noexcept;
@@ -659,6 +773,14 @@ private:
     std::atomic<std::size_t> calls_started_{0};
     std::atomic<std::size_t> retries_{0};
     std::atomic<std::size_t> breaker_rejections_{0};
+    std::atomic<std::size_t> rate_limited_{0};
+    std::atomic<std::size_t> bulkhead_rejected_{0};
+    std::atomic<std::size_t> local_gate_rejected_{0};
+    std::atomic<std::size_t> endpoint_open_{0};
+    std::atomic<std::size_t> lb_unavailable_{0};
+    std::atomic<std::size_t> pre_send_retries_{0};
+    std::atomic<std::size_t> probe_admitted_{0};
+    std::atomic<std::size_t> retries_delayed_by_hint_{0};
 };
 
 // --- Template implementations ------------------------------------------------
@@ -686,6 +808,7 @@ status client::issue(
     // call against a closed client.
     if (core.finalized.load(std::memory_order_acquire)) {
         release_slot(slot, rpc_code::shutting_down);
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::shutting_down, "client is closed");
         return status{failure};
     }
@@ -694,6 +817,7 @@ status client::issue(
     std::lock_guard<std::recursive_mutex> lk(slot->mutex);
     if (!slot->healthy.load(std::memory_order_acquire) || !slot->conn ||
         !slot->conn->is_open()) {
+        core.origin = client_detail::failure_origin::endpoint_pre_send;
         rpc_error unavailable(rpc_code::unavailable, "connection is not usable");
         failure = unavailable;
         return status{failure};
@@ -701,6 +825,9 @@ status client::issue(
     rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
         core.service_id, core.method_id, core.request.readable(), core.ctx);
     if (!started.ok()) {
+        core.origin = started.error().code == rpc_code::resource_exhausted
+                          ? client_detail::failure_origin::local_capacity
+                          : client_detail::failure_origin::endpoint_pre_send;
         failure = started.error();
         return status{failure};
     }

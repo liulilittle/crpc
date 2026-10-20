@@ -612,6 +612,9 @@ void client::poll() noexcept {
             continue;
         }
         rpc_error error(rpc_code::deadline_exceeded, "deadline exceeded");
+        // Local-only marker: the facade distinguishes this from a
+        // server-produced deadline (which must not open the breaker).
+        error.metadata.set("crpc.local_timeout", "1");
         if (slot->written && !slot->idempotent) {
             error.metadata.set("unknown_side_effect", "1");
         }

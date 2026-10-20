@@ -47,6 +47,22 @@ namespace {
     }
 }
 
+[[nodiscard]] bool transport_result_code(rpc_code code) noexcept {
+    switch (code) {
+    case rpc_code::connection_refused:
+    case rpc_code::connection_reset:
+    case rpc_code::broken_pipe:
+    case rpc_code::eof:
+    case rpc_code::protocol_error:
+    case rpc_code::shutting_down:
+        return true;
+    default:
+        return false;
+    }
+}
+
+constexpr const char* k_local_timeout_metadata = "crpc.local_timeout";
+
 [[nodiscard]] std::uint64_t mix64(std::uint64_t value) noexcept {
     value += 0x9E3779B97F4A7C15ull;
     value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -55,6 +71,45 @@ namespace {
 }
 
 } // namespace
+
+namespace client_detail {
+
+breaker_record breaker_record_for(failure_origin origin, rpc_code code) noexcept {
+    switch (origin) {
+    case failure_origin::local_lifecycle:
+    case failure_origin::local_gate:
+    case failure_origin::local_capacity:
+    case failure_origin::endpoint_open:
+    case failure_origin::cancel:
+        return breaker_record::ignore;
+    case failure_origin::timeout:
+    case failure_origin::endpoint_pre_send:
+    case failure_origin::endpoint_sent:
+        return breaker_record::failure;
+    case failure_origin::remote:
+        if (code == rpc_code::ok) {
+            return breaker_record::by_code;
+        }
+        return counts_as_breaker_failure(code) ? breaker_record::failure
+                                               : breaker_record::ignore;
+    }
+    return breaker_record::ignore;
+}
+
+failure_origin result_origin(const rpc_error& error) noexcept {
+    if (error.metadata.find(k_local_timeout_metadata) != nullptr) {
+        return failure_origin::timeout;
+    }
+    if (error.code == rpc_code::canceled) {
+        return failure_origin::cancel;
+    }
+    if (transport_result_code(error.code)) {
+        return failure_origin::endpoint_sent;
+    }
+    return failure_origin::remote;
+}
+
+} // namespace client_detail
 
 namespace {
 
@@ -75,23 +130,33 @@ struct client::impl {
         std::mutex mutex;
         std::vector<std::shared_ptr<client_detail::connection_slot>> slots;
         resilience::circuit_breaker breaker;
+        // Live in-flight attempts for this endpoint, read by the load balancer
+        // (least-inflight) without taking `mutex`.
+        std::atomic<std::uint32_t> in_flight{0};
         bool had_connection = false;
         std::size_t failed_connections = 0;
     };
 
     struct instance_view final : resilience::instance_set {
-        const std::vector<resilience::instance>* instances = nullptr;
+        const std::vector<std::unique_ptr<endpoint_pool>>* pools = nullptr;
         std::size_t size() const noexcept override {
-            return instances != nullptr ? instances->size() : 0;
+            return pools != nullptr ? pools->size() : 0;
         }
         resilience::instance at(std::size_t index) const noexcept override {
-            return instances != nullptr ? (*instances)[index] : resilience::instance{};
+            resilience::instance entry;
+            if (pools == nullptr || index >= pools->size()) {
+                return entry;
+            }
+            entry.id = index;
+            entry.weight = 1;
+            entry.healthy = true;
+            entry.inflight = (*pools)[index]->in_flight.load(std::memory_order_acquire);
+            return entry;
         }
         u64 version() const noexcept override { return 1; }
     };
 
     std::vector<std::unique_ptr<endpoint_pool>> pools;
-    std::vector<resilience::instance> instances;
     instance_view view;
     std::unique_ptr<resilience::load_balancer> balancer;
 
@@ -165,14 +230,8 @@ client::client(options opt, std::vector<endpoint_config> endpoints)
     for (std::size_t i = 0; i < endpoints_.size(); ++i) {
         impl_->pools.push_back(std::make_unique<impl::endpoint_pool>(
             endpoints_[i].ep, endpoints_[i].backend, options_.breaker));
-        resilience::instance entry;
-        entry.id = i;
-        entry.weight = 1;
-        entry.healthy = true;
-        entry.inflight = 0;
-        impl_->instances.push_back(entry);
     }
-    impl_->view.instances = &impl_->instances;
+    impl_->view.pools = &impl_->pools;
     impl_->balancer = std::make_unique<resilience::load_balancer>(options_.lb);
 }
 
@@ -329,6 +388,20 @@ client::statistics client::stats() const noexcept {
     return out;
 }
 
+client::resilience_statistics client::resilience_stats() const noexcept {
+    resilience_statistics out;
+    out.rate_limited = rate_limited_.load(std::memory_order_relaxed);
+    out.bulkhead_rejected = bulkhead_rejected_.load(std::memory_order_relaxed);
+    out.local_gate_rejected = local_gate_rejected_.load(std::memory_order_relaxed);
+    out.endpoint_open = endpoint_open_.load(std::memory_order_relaxed);
+    out.lb_unavailable = lb_unavailable_.load(std::memory_order_relaxed);
+    out.pre_send_retries = pre_send_retries_.load(std::memory_order_relaxed);
+    out.probe_admitted = probe_admitted_.load(std::memory_order_relaxed);
+    out.retries_delayed_by_hint =
+        retries_delayed_by_hint_.load(std::memory_order_relaxed);
+    return out;
+}
+
 // --- admission and pools -----------------------------------------------------
 
 bool client::begin_attempt(
@@ -337,32 +410,117 @@ bool client::begin_attempt(
     rpc_error& failure) {
     const auto now = steady_now();
     if (core.has_deadline && now >= core.deadline) {
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::deadline_exceeded, "deadline already passed");
         return false;
     }
+    if (core.canceled.load(std::memory_order_acquire)) {
+        core.origin = client_detail::failure_origin::cancel;
+        failure = rpc_error(rpc_code::canceled, "call canceled");
+        return false;
+    }
+    core.attempts += 1;
     if (impl_->pools.empty()) {
+        lb_unavailable_.fetch_add(1, std::memory_order_relaxed);
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::unavailable, "no endpoint configured");
         return false;
     }
-    const result<resilience::instance> selected = impl_->balancer->select(impl_->view);
-    if (!selected.ok()) {
-        failure = rpc_error(rpc_code::unavailable, "no usable endpoint");
+
+    // Selection loop: ask the balancer for a candidate, admit it through its
+    // breaker, and move on when that breaker is open. `allow()` itself promotes
+    // an expired open endpoint to half-open and hands out a probe, so an
+    // endpoint is never permanently removed from the ring. The permit returned
+    // here is carried into the attempt; later stages must not call allow()
+    // again for the same attempt.
+    const std::size_t pool_count = impl_->pools.size();
+    constexpr std::size_t k_tried_words = 8;
+    std::uint64_t tried[k_tried_words] = {};
+    const auto mark_tried = [&tried](std::size_t index) noexcept {
+        if (index / 64 < k_tried_words) {
+            tried[index / 64] |= (std::uint64_t{1} << (index % 64));
+        }
+    };
+    const auto is_tried = [&tried](std::size_t index) noexcept {
+        return index / 64 < k_tried_words &&
+               (tried[index / 64] & (std::uint64_t{1} << (index % 64))) != 0;
+    };
+
+    resilience::breaker_permit chosen;
+    std::size_t chosen_index = pool_count;
+    bool any_rejected = false;
+    bool have_hint = false;
+    std::chrono::milliseconds min_hint{0};
+    for (std::size_t iteration = 0; iteration < pool_count; ++iteration) {
+        std::size_t index = pool_count;
+        const result<resilience::instance> selected = impl_->balancer->select(impl_->view);
+        if (selected.ok()) {
+            const auto candidate = static_cast<std::size_t>(selected.value().id);
+            if (candidate < pool_count && !is_tried(candidate)) {
+                index = candidate;
+            }
+        }
+        if (index == pool_count) {
+            // consistent_hash returns the same key repeatedly, so the main
+            // selection can stall on a tried endpoint. Fall back to a linear
+            // scan of the remaining candidates.
+            for (std::size_t i = 0; i < pool_count; ++i) {
+                if (!is_tried(i)) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        if (index == pool_count) {
+            break;
+        }
+        mark_tried(index);
+        resilience::breaker_permit permit = impl_->pools[index]->breaker.allow();
+        if (permit.allowed()) {
+            chosen = std::move(permit);
+            chosen_index = index;
+            break;
+        }
+        any_rejected = true;
+        const std::chrono::milliseconds hint = permit.retry_after();
+        if (hint.count() > 0 && (!have_hint || hint < min_hint)) {
+            min_hint = hint;
+            have_hint = true;
+        }
+    }
+
+    if (chosen_index == pool_count) {
+        if (any_rejected) {
+            endpoint_open_.fetch_add(1, std::memory_order_relaxed);
+            breaker_rejections_.fetch_add(1, std::memory_order_relaxed);
+            core.origin = client_detail::failure_origin::endpoint_open;
+            failure = rpc_error(rpc_code::unavailable, "endpoint circuit breaker is open");
+            // A pre-send retry must not spin: wait at least the policy's first
+            // backoff (or longer when the breaker asks for it).
+            std::int64_t initial_ns = options_.retry.initial_backoff.count();
+            if (initial_ns < 0) {
+                initial_ns = 0;
+            }
+            std::chrono::milliseconds initial_ms(
+                (initial_ns + 999'999) / 1'000'000);
+            std::chrono::milliseconds delay = initial_ms;
+            if (!have_hint || min_hint > delay) {
+                delay = have_hint ? min_hint : delay;
+            }
+            failure.retry_after = delay;
+        } else {
+            lb_unavailable_.fetch_add(1, std::memory_order_relaxed);
+            core.origin = client_detail::failure_origin::local_lifecycle;
+            failure = rpc_error(rpc_code::unavailable, "no usable endpoint");
+        }
         return false;
     }
-    const std::size_t index = static_cast<std::size_t>(selected.value().id);
-    if (index >= impl_->pools.size()) {
-        failure = rpc_error(rpc_code::unavailable, "load balancer returned an unknown endpoint");
-        return false;
+
+    impl::endpoint_pool& pool = *impl_->pools[chosen_index];
+    if (chosen.is_probe()) {
+        probe_admitted_.fetch_add(1, std::memory_order_relaxed);
     }
-    impl::endpoint_pool& pool = *impl_->pools[index];
-    resilience::breaker_permit permit = pool.breaker.allow();
-    if (!permit.allowed()) {
-        breaker_rejections_.fetch_add(1, std::memory_order_relaxed);
-        failure = rpc_error(rpc_code::unavailable, "endpoint circuit breaker is open");
-        failure.retry_after = permit.retry_after();
-        return false;
-    }
-    core.permit = std::move(permit);
+    core.permit = std::move(chosen);
     core.pool = &pool;
     // The closed decision and the tracking insertion are one atomic step
     // (R1). If close()/``~client`` already set `closed_` (or will do so before
@@ -371,10 +529,10 @@ bool client::begin_attempt(
     if (!register_core_if_open(core, keep)) {
         core.permit = resilience::breaker_permit{};
         core.pool = nullptr;
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::shutting_down, "client is closed");
         return false;
     }
-    core.attempts += 1;
     calls_started_.fetch_add(1, std::memory_order_relaxed);
     if (options_.shard != nullptr && core.has_deadline) {
         const std::uint64_t deadline_ns = static_cast<std::uint64_t>(
@@ -411,10 +569,12 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     client_detail::call_core& core, rpc_error& failure) {
     auto* pool = static_cast<impl::endpoint_pool*>(core.pool);
     if (pool == nullptr) {
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::internal, "attempt has no endpoint pool");
         return nullptr;
     }
     if (pool->backend == nullptr) {
+        core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::invalid_argument, "endpoint has no backend");
         return nullptr;
     }
@@ -457,6 +617,7 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     }
     if (best != nullptr) {
         best->in_flight.fetch_add(1, std::memory_order_acq_rel);
+        pool->in_flight.fetch_add(1, std::memory_order_acq_rel);
         return best;
     }
     for (const std::shared_ptr<client_detail::connection_slot>& entry : dead) {
@@ -467,11 +628,13 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
         }
     }
     if (saturated) {
+        core.origin = client_detail::failure_origin::local_capacity;
         failure = rpc_error(rpc_code::resource_exhausted,
                             "connection pool is saturated");
         return nullptr;
     }
     if (pool->slots.size() >= options_.pool_size) {
+        core.origin = client_detail::failure_origin::local_capacity;
         failure = rpc_error(rpc_code::resource_exhausted,
                             "connection pool is exhausted");
         return nullptr;
@@ -479,6 +642,7 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
 
     std::unique_ptr<connection> raw = pool->backend->connect(pool->ep, connect_options{});
     if (!raw) {
+        core.origin = client_detail::failure_origin::endpoint_pre_send;
         pool->failed_connections += 1;
         if (pool->had_connection) {
             failure = rpc_error(rpc_code::shutting_down,
@@ -505,6 +669,7 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     raw_ptr->bind_source(slot->guarded.get());
     slot->in_flight.store(1, std::memory_order_release);
     pool->slots.push_back(slot);
+    pool->in_flight.fetch_add(1, std::memory_order_acq_rel);
     pool->had_connection = true;
     return slot;
 }
@@ -517,11 +682,14 @@ void client::release_slot(
     }
     slot->in_flight.fetch_sub(1, std::memory_order_acq_rel);
     slot->idle_since = steady_now();
+    auto* pool = static_cast<impl::endpoint_pool*>(slot->pool);
+    if (pool != nullptr) {
+        pool->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
     if (!transport_failure(code)) {
         return;
     }
     slot->healthy.store(false, std::memory_order_release);
-    auto* pool = static_cast<impl::endpoint_pool*>(slot->pool);
     if (pool == nullptr) {
         return;
     }
@@ -534,6 +702,7 @@ void client::release_slot(
 }
 
 void client::finish_attempt(client_detail::call_core& core, rpc_code code,
+                            client_detail::failure_origin,
                             client_detail::breaker_record record) noexcept {
     if (core.finalized.exchange(true, std::memory_order_acq_rel)) {
         return;
@@ -590,10 +759,37 @@ void client::abandon_attempt(client_detail::call_core& core) noexcept {
     unregister_core(core);
 }
 
-bool client::should_retry(client_detail::call_core& core, rpc_code code,
+bool client::should_retry(client_detail::call_core& core, const rpc_error& error,
+                          client_detail::failure_origin origin,
                           std::chrono::nanoseconds& delay) noexcept {
-    if (code == rpc_code::ok || !core.idempotent || !is_retryable(code)) {
+    const rpc_code code = error.code;
+    if (code == rpc_code::ok) {
         return false;
+    }
+    const bool pre_send =
+        origin == client_detail::failure_origin::local_capacity ||
+        origin == client_detail::failure_origin::endpoint_open ||
+        origin == client_detail::failure_origin::endpoint_pre_send;
+    switch (origin) {
+    case client_detail::failure_origin::local_lifecycle:
+    case client_detail::failure_origin::local_gate:
+    case client_detail::failure_origin::cancel:
+    case client_detail::failure_origin::timeout:
+        // Gate rejections are the caller's own quota (retrying bypasses the
+        // limit), lifecycle failures are terminal, and a local timeout is a
+        // dependency failure that must not be amplified.
+        return false;
+    case client_detail::failure_origin::local_capacity:
+    case client_detail::failure_origin::endpoint_open:
+    case client_detail::failure_origin::endpoint_pre_send:
+        // Nothing was sent: retrying cannot duplicate a side effect.
+        break;
+    case client_detail::failure_origin::endpoint_sent:
+    case client_detail::failure_origin::remote:
+        if (!core.idempotent || !is_retryable(code)) {
+            return false;
+        }
+        break;
     }
     if (core.has_deadline && steady_now() >= core.deadline) {
         return false;
@@ -601,12 +797,28 @@ bool client::should_retry(client_detail::call_core& core, rpc_code code,
     if (!core.retry) {
         return false;
     }
+    std::chrono::nanoseconds min_delay{0};
+    if (error.retry_after.count() > 0) {
+        min_delay = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            error.retry_after);
+    }
+    const std::int64_t deadline_ns =
+        core.has_deadline
+            ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  core.deadline.time_since_epoch())
+                  .count()
+            : 0;
     std::chrono::nanoseconds computed{0};
-    if (!core.retry->next(code, core.idempotent, computed)) {
+    if (!core.retry->next(code, core.idempotent || pre_send, min_delay,
+                          std::chrono::nanoseconds(deadline_ns), core.has_deadline,
+                          computed)) {
         return false;
     }
-    if (core.has_deadline && steady_now() + computed >= core.deadline) {
-        return false;
+    if (pre_send) {
+        pre_send_retries_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (error.retry_after.count() > 0 && computed >= min_delay) {
+        retries_delayed_by_hint_.fetch_add(1, std::memory_order_relaxed);
     }
     delay = computed;
     retries_.fetch_add(1, std::memory_order_relaxed);
@@ -663,24 +875,58 @@ status client::wait_ready(client_detail::call_core& core) const {
 
 void client::sleep_for(client_detail::call_core& core,
                        std::chrono::nanoseconds delay) noexcept {
-    (void)core;
     if (delay.count() <= 0) {
         return;
     }
+    const auto until = steady_now() + delay;
     if (options_.shard != nullptr && options_.shard->loop_mode() &&
         options_.shard->is_owner_thread() && !options_.shard->stopped()) {
-        const std::uint64_t deadline =
-            options_.shard->now_ns() + static_cast<std::uint64_t>(delay.count());
-        const status slept = options_.shard->sleep_until(deadline);
-        if (slept.ok() || slept.code() == rpc_code::canceled) {
+        // A shard has no per-call cancellation for `sleep_until`, so cut the
+        // wait into 5 ms slices and re-check the cancel flag between them.
+        // The upper bound on cancel latency is one slice plus scheduling.
+        while (steady_now() < until) {
+            if (core.canceled.load(std::memory_order_acquire) ||
+                closed_.load(std::memory_order_acquire)) {
+                return;
+            }
+            auto slice = steady_now() + std::chrono::milliseconds(5);
+            if (slice > until) {
+                slice = until;
+            }
+            const std::uint64_t deadline_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    slice.time_since_epoch())
+                    .count());
+            const status slept = options_.shard->sleep_until(deadline_ns);
+            if (slept.ok() || slept.code() == rpc_code::canceled) {
+                continue;
+            }
+            // Not inside a coroutine: do not block the shard.
+            if (slept.code() == rpc_code::failed_precondition) {
+                return;
+            }
+        }
+        return;
+    }
+    std::unique_lock<std::mutex> lk(core.mutex);
+    const auto canceled_or_closed = [this, &core] {
+        return core.canceled.load(std::memory_order_acquire) ||
+               closed_.load(std::memory_order_acquire);
+    };
+    while (steady_now() < until) {
+        if (canceled_or_closed()) {
             return;
         }
-        // Not inside a coroutine: do not block the shard.
-        if (slept.code() == rpc_code::failed_precondition) {
+        // Short slices bound the close() latency; cancel() notifies the same
+        // condition variable and wakes this wait immediately.
+        auto slice = steady_now() + std::chrono::milliseconds(5);
+        if (slice > until) {
+            slice = until;
+        }
+        if (core.cv.wait_until(lk, slice, canceled_or_closed)) {
             return;
         }
     }
-    std::this_thread::sleep_for(delay);
 }
 
 void client::notify_waiter() noexcept {

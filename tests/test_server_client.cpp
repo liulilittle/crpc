@@ -7,12 +7,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstddef>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -2487,6 +2489,502 @@ CRPC_TEST(pool_exhaustion_does_not_stall) {
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted), second_code);
     CRPC_CHECK_EQ(0, first_code);
     CRPC_CHECK(elapsed < 2s);
+}
+
+// G22 Slice 2a: local admission outcomes must not feed the endpoint breaker.
+// The second call is rejected locally because the only connection is busy; the
+// third call must still be admitted.
+CRPC_TEST(client_local_pool_exhaustion_ignores_breaker) {
+    fixture f;
+    fixture_config cfg;
+    cfg.pool_size = 1;
+    cfg.max_inflight = 1;
+    cfg.default_deadline = 5s;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 1;
+    cfg.configure_breaker = true;
+    cfg.breaker.min_requests = 1;
+    cfg.breaker.failure_ratio_threshold = 0.5;
+    cfg.breaker.slow_call_threshold = 5s;
+    cfg.breaker.slow_call_ratio_threshold = 1.0;
+    cfg.breaker.open_duration = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int first_code = -1;
+    int second_code = -1;
+    int third_code = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto slow = f.cli->service<int, int>(kService, kSlow);
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto first = slow.call(1);
+            auto second = echo.call(2);
+            second_code = second.ok() ? 0 : static_cast<int>(second.code());
+            if (first.ok()) {
+                auto handle = std::move(first).value();
+                auto result = handle.get();
+                first_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                first_code = static_cast<int>(first.code());
+            }
+            auto third = echo.call(3);
+            if (!third.ok()) {
+                third_code = static_cast<int>(third.code());
+                return;
+            }
+            auto handle = std::move(third).value();
+            auto result = handle.get();
+            third_code = result.ok() ? 0 : static_cast<int>(result.code());
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted), second_code);
+    CRPC_CHECK_EQ(0, first_code);
+    CRPC_CHECK_EQ(0, third_code);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), f.cli->stats().breaker_rejections);
+}
+
+// G22 Slice 2a: the first issue must be able to re-select another endpoint
+// when the round-robin choice is open. The first call is deliberately limited
+// to one attempt so it opens the dead endpoint's breaker; every later call then
+// has to skip that endpoint inside the selection loop.
+CRPC_TEST(client_initial_open_endpoint_reselects) {
+    crpc::inproc_backend backend;
+    service_state service;
+    const std::string live_name = "crpc-reselect-live";
+    const std::string dead_name = "crpc-reselect-dead";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(live_name), backend);
+    register_services(sb, service);
+    sb.handler_workers(8);
+    sb.drain_timeout(2000ms);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::client::builder cb;
+    // Round robin starts at the dead endpoint, so the first call opens its
+    // breaker before reaching the live one on a later selection.
+    cb.add_endpoint(crpc::endpoint::inproc(dead_name), backend);
+    cb.add_endpoint(crpc::endpoint::inproc(live_name), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.plain_thread_timeout(2s);
+    crpc::resilience::retry_policy retry;
+    retry.max_attempts = 1;
+    cb.retry(retry);
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.5;
+    breaker.slow_call_threshold = 5s;
+    breaker.slow_call_ratio_threshold = 1.0;
+    breaker.open_duration = 5s;
+    cb.breaker(breaker);
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        srv->stop();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(kService, kEcho);
+    int first_code = -1;
+    std::vector<int> later_codes;
+    {
+        auto started = stub.call(0);
+        first_code = started.ok() ? 0 : static_cast<int>(started.code());
+    }
+    for (int i = 0; i < 5; ++i) {
+        auto started = stub.call(i + 1);
+        if (!started.ok()) {
+            later_codes.push_back(static_cast<int>(started.code()));
+            continue;
+        }
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        later_codes.push_back(result.ok() ? 0 : static_cast<int>(result.code()));
+    }
+
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused), first_code);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(5), later_codes.size());
+    for (int code : later_codes) {
+        CRPC_CHECK_EQ(0, code);
+    }
+    CRPC_CHECK_EQ(5, service.echo_calls.load());
+
+    cli->close();
+    srv->stop();
+}
+
+// G22 Slice 2a: `retry_after` from the server is a lower bound on the retry
+// delay, not a value the backoff policy may shorten. The service rate limiter
+// has exactly one token every 167 ms, so the only way the second attempt can
+// succeed is by waiting out the advertised hint.
+CRPC_TEST(client_remote_retry_after_is_honored) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 5s;
+    cfg.default_idempotent = true;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff = 1ms;
+    cfg.retry.max_backoff = 1ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    cfg.configure_service_rate = true;
+    cfg.service_rate.rate_per_second = 6.0;
+    cfg.service_rate.burst = 1.0;
+    cfg.service_rate.initial_tokens = 0.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int code = -1;
+    std::chrono::nanoseconds elapsed{0};
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto stub = f.cli->service<int, int>(kService, kEcho);
+            const auto begin = clock_type::now();
+            auto started = stub.call(5);
+            if (!started.ok()) {
+                code = static_cast<int>(started.code());
+                return;
+            }
+            auto handle = std::move(started).value();
+            auto result = handle.get();
+            elapsed = clock_type::now() - begin;
+            code = result.ok() ? 0 : static_cast<int>(result.code());
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(0, code);
+    CRPC_CHECK(elapsed >= 150ms);
+    CRPC_CHECK_EQ(1, f.service.echo_calls.load());
+    CRPC_CHECK(f.cli->resilience_stats().retries_delayed_by_hint >= 1);
+}
+
+// G22 Slice 2a: cancel during the backoff wait must wake the waiter at once and
+// must not issue another attempt.
+CRPC_TEST(client_cancel_during_backoff) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 5s;
+    cfg.default_idempotent = true;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 3;
+    cfg.retry.initial_backoff = 100ms;
+    cfg.retry.max_backoff = 100ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+    f.service.flaky_failures_remaining.store(1);
+
+    auto handle = std::make_unique<crpc::client::call<int>>();
+    {
+        auto stub = f.cli->service<int, int>(kService, kFlaky);
+        auto started = stub.call(1);
+        CRPC_CHECK(started.ok());
+        if (!started.ok()) {
+            return;
+        }
+        *handle = std::move(started).value();
+    }
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.service.flaky_calls.load(std::memory_order_acquire) >= 1; },
+        2000));
+    // Let the first response finish and the retry loop enter its 100 ms wait.
+    std::this_thread::sleep_for(20ms);
+
+    int code = -1;
+    std::atomic<bool> returned{false};
+    std::chrono::nanoseconds latency{0};
+    std::thread waiter([&] {
+        auto result = handle->get();
+        code = result.ok() ? 0 : static_cast<int>(result.code());
+        returned.store(true, std::memory_order_release);
+    });
+
+    // Wait until the getter is blocked in the retry delay.
+    std::this_thread::sleep_for(20ms);
+    const auto cancel_time = clock_type::now();
+    handle->cancel();
+    waiter.join();
+    latency = clock_type::now() - cancel_time;
+
+    CRPC_CHECK(returned.load(std::memory_order_acquire));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled), code);
+    CRPC_CHECK(latency < 20ms);
+    CRPC_CHECK_EQ(1, f.service.flaky_calls.load());
+
+    handle.reset();
+    f.cli->close();
+}
+
+// G22 Slice 2a: a low-level timer timeout is a local observation. `try_get`
+// must classify it as an endpoint failure (metadata marker), unlike a
+// server-reported deadline.
+CRPC_TEST(client_try_get_local_timeout_is_failure) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 5s;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 1;
+    cfg.configure_breaker = true;
+    cfg.breaker.min_requests = 1;
+    cfg.breaker.failure_ratio_threshold = 0.5;
+    cfg.breaker.slow_call_threshold = 5s;
+    cfg.breaker.slow_call_ratio_threshold = 1.0;
+    cfg.breaker.open_duration = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int timeout_code = -1;
+    int second_code = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto slow = f.cli->service<int, int>(kService, kSlow);
+            crpc::rpc::call_context ctx;
+            ctx.has_deadline = true;
+            ctx.deadline = clock_type::now() + 40ms;
+            auto started = slow.call(1, ctx);
+            if (!started.ok()) {
+                timeout_code = static_cast<int>(started.code());
+                return;
+            }
+            auto handle = std::move(started).value();
+            // Yield to the shard until the low-level deadline timer fires; a
+            // blocking wait here would stop the timer wheel from running.
+            for (int i = 0; i < 4000 && !handle.ready(); ++i) {
+                (void)f.shard->sleep_until(f.shard->now_ns() + 1'000'000ull);
+            }
+            CRPC_CHECK(handle.ready());
+            crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+            if (handle.try_get(out)) {
+                timeout_code = out.ok() ? 0 : static_cast<int>(out.code());
+            }
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto echo_started = echo.call(2);
+            second_code = echo_started.ok() ? 0
+                                            : static_cast<int>(echo_started.code());
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded), timeout_code);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), second_code);
+    CRPC_CHECK(f.cli->stats().breaker_rejections >= 1);
+}
+
+// G22 Slice 2a: when every candidate breaker is open, the failure is pre-send.
+// The first issue may wait for the smallest hint (or the initial backoff) and
+// try again; a half-open probe then succeeds.
+CRPC_TEST(client_all_open_retries_pre_send) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff = 1ms;
+    cfg.retry.max_backoff = 1ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    cfg.configure_breaker = true;
+    cfg.breaker.min_requests = 1;
+    cfg.breaker.failure_ratio_threshold = 0.5;
+    cfg.breaker.slow_call_threshold = 5s;
+    cfg.breaker.slow_call_ratio_threshold = 1.0;
+    cfg.breaker.open_duration = 50ms;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int first_code = -1;
+    int second_code = -1;
+    crpc::u32 attempts = 0;
+    std::chrono::nanoseconds elapsed{0};
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto fail = f.cli->service<int, int>(kService, kFail);
+            auto first = fail.call(1);
+            if (first.ok()) {
+                auto handle = std::move(first).value();
+                auto result = handle.get();
+                first_code = result.ok() ? 0 : static_cast<int>(result.code());
+            } else {
+                first_code = static_cast<int>(first.code());
+            }
+            const auto begin = clock_type::now();
+            crpc::rpc::call_context ctx;
+            ctx.idempotent = true;
+            auto second = echo.call(2, ctx);
+            if (!second.ok()) {
+                second_code = static_cast<int>(second.code());
+                return;
+            }
+            auto handle = std::move(second).value();
+            auto result = handle.get();
+            second_code = result.ok() ? 0 : static_cast<int>(result.code());
+            attempts = handle.attempts();
+            elapsed = clock_type::now() - begin;
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), first_code);
+    CRPC_CHECK_EQ(0, second_code);
+    CRPC_CHECK_EQ(static_cast<crpc::u32>(2), attempts);
+    CRPC_CHECK(elapsed >= 40ms);
+    CRPC_CHECK(f.cli->stats().breaker_rejections >= 1);
+}
+
+// G22 Slice 2a: local pre-send capacity failures may be retried even when the
+// call is not idempotent, because nothing was sent.
+CRPC_TEST(client_local_capacity_retries_non_idempotent) {
+    fixture f;
+    fixture_config cfg;
+    cfg.pool_size = 1;
+    cfg.max_inflight = 1;
+    cfg.default_deadline = 5s;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff = 300ms;
+    cfg.retry.max_backoff = 300ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int first_code = -1;
+    crpc::u32 second_attempts = 0;
+    int second_code = -1;
+    std::chrono::nanoseconds second_elapsed{0};
+
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    std::thread first_caller([&] {
+        auto blocking = f.cli->service<int, int>(kService, kBlocking);
+        auto started = blocking.call(1);
+        if (!started.ok()) {
+            first_code = static_cast<int>(started.code());
+            return;
+        }
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        first_code = result.ok() ? 0 : static_cast<int>(result.code());
+    });
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.service.blocking_calls.load(std::memory_order_acquire) >= 1; },
+        2000));
+    // Release the server handler while the echo call is waiting out its
+    // pre-send retry delay, so its second attempt finds a free slot.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(50ms);
+        f.service.blocking_gate.store(1, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(10ms);
+
+    {
+        auto echo = f.cli->service<int, int>(kService, kEcho);
+        const auto begin = clock_type::now();
+        // Not idempotent: retrying is only legal because the first attempt
+        // failed before it was sent.
+        auto started = echo.call(7);
+        second_elapsed = clock_type::now() - begin;
+        if (!started.ok()) {
+            second_code = static_cast<int>(started.code());
+        } else {
+            auto handle = std::move(started).value();
+            auto result = handle.get();
+            second_code = result.ok() ? 0 : static_cast<int>(result.code());
+            second_attempts = handle.attempts();
+        }
+    }
+    first_caller.join();
+    releaser.join();
+
+    CRPC_CHECK_EQ(0, first_code);
+    CRPC_CHECK_EQ(0, second_code);
+    CRPC_CHECK_EQ(static_cast<crpc::u32>(2), second_attempts);
+    CRPC_CHECK(second_elapsed >= 250ms);
+    CRPC_CHECK_EQ(1, f.service.echo_calls.load());
+}
+
+// G22 Slice 2a: the additive resilience statistics must not disturb the
+// existing `client::statistics` layout, and the new counters must be live.
+CRPC_TEST(client_resilience_stats_abi) {
+    static_assert(std::is_standard_layout_v<crpc::client::resilience_statistics>);
+    static_assert(std::is_trivially_copyable_v<crpc::client::resilience_statistics>);
+    static_assert(sizeof(crpc::client::statistics) == 6 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::statistics, active_connections) == 0);
+    static_assert(offsetof(crpc::client::statistics, in_flight_calls) ==
+                  sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::statistics, failed_connections) ==
+                  2 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::statistics, calls_started) ==
+                  3 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::statistics, retries) ==
+                  4 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::statistics, breaker_rejections) ==
+                  5 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, rate_limited) == 0);
+    static_assert(offsetof(crpc::client::resilience_statistics,
+                           bulkhead_rejected) == sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics,
+                           local_gate_rejected) == 2 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, endpoint_open) ==
+                  3 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, lb_unavailable) ==
+                  4 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, pre_send_retries) ==
+                  5 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, probe_admitted) ==
+                  6 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics,
+                           retries_delayed_by_hint) == 7 * sizeof(std::size_t));
+    static_assert(offsetof(crpc::client::resilience_statistics, bulkhead_in_use) ==
+                  8 * sizeof(std::size_t));
+
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 2s;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 1;
+    cfg.configure_breaker = true;
+    cfg.breaker.min_requests = 1;
+    cfg.breaker.failure_ratio_threshold = 0.5;
+    cfg.breaker.slow_call_threshold = 5s;
+    cfg.breaker.slow_call_ratio_threshold = 1.0;
+    cfg.breaker.open_duration = 5s;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int second_code = -1;
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto fail = f.cli->service<int, int>(kService, kFail);
+            auto first = fail.call(1);
+            if (first.ok()) {
+                auto handle = std::move(first).value();
+                (void)handle.get();
+            }
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            auto second = echo.call(2);
+            second_code = second.ok() ? 0 : static_cast<int>(second.code());
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), second_code);
+    const crpc::client::resilience_statistics rs = f.cli->resilience_stats();
+    CRPC_CHECK(rs.endpoint_open >= 1);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), rs.rate_limited);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), rs.bulkhead_rejected);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), rs.local_gate_rejected);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), rs.bulkhead_in_use);
 }
 
 CRPC_TEST(no_leak_after_close) {
