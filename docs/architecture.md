@@ -99,7 +99,7 @@ Rules that hold today:
 - `io` depends only on `base`; the RPC layer accepts a `backend_factory&` and never tests whether the transport is TCP or in-process.
 - `rpc/client.hpp` includes `frame.hpp`, `io.hpp`, `rpc/call.hpp` and `rpc/dispatcher.hpp`; `rpc/dispatcher.hpp` includes `frame.hpp` and `rpc/call.hpp`.
 - `mvc/router.hpp` includes `http/message.hpp`, `codec.hpp` and `mvc/binding.hpp`; `http2/connection.hpp` includes `http2/frame.hpp`, `http2/hpack.hpp` and `http/message.hpp`.
-- `cluster`, `push` and `flow` are independent of `rpc` today. `resilience` is partly integrated: `client_facade` wires load balancing, retry and a per-endpoint breaker; `rpc::server` wires the admission half of the pipeline (per-connection rate, per-service rate, bulkhead, breaker, cap), while the client-side rate/bulkhead stages and fallback remain unimplemented. The observability interceptor chain is not wired.
+- `cluster`, `push` and `flow` are independent of `rpc` today. `resilience` is partly integrated: `client_facade` wires load balancing, per-endpoint rate/bulkhead/breaker, retry and the deadline; `rpc::server` wires the admission half of the pipeline (per-connection rate, per-service rate, bulkhead, breaker, cap). Fallback functions remain unimplemented. The observability interceptor chain is not wired.
 - No script enforces these directions. The design's context-dependency rule is a review rule; a build-time dependency check is **specified, not implemented**.
 
 ## 5. Base layer <a id="s5"></a>
@@ -189,7 +189,7 @@ Evidence: `include/crpc/runtime.hpp:55-69`, `src/runtime/runtime.cpp:108-118,246
 
 `rpc::method_traits` derives request/response types from a member pointer; the typed trampoline decodes with `call_codec<T>` and encodes the response. `call_codec` has no primary definition for an unsupported type, so a missing specialization is a compile error rather than a silent empty payload. The typed registration path is implemented (`service_registry::register_service`/`register_method` and `register_typed_method`), and the RTTI-driven declaration macros (`CRPC_ROUTE`, `CRPC_HTTP_*`, `CRPC_FROM_*`) live in `mvc/attributes.hpp` for the MVC/HTTP side. They are macros over an explicitly named controller and member, not a separate code-generation step. Evidence: `include/crpc/rpc/dispatcher.hpp:167-174,226-289,316-322`; `include/crpc/mvc/attributes.hpp:45-90`.
 
-The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in §14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side rate/bulkhead stages, fallback functions and the unified client pipeline are still **specified, not implemented**. Evidence: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
+The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in §14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side pipeline is wired per endpoint; fallback functions remain **specified, not implemented**. Evidence: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
 
 ## 10. Call state machine <a id="s10"></a>
 
@@ -252,7 +252,16 @@ Five components are implemented independently:
   backoff and jitter, plus a shared token-bucket budget; `unknown_side_effect`
   is retryable only when idempotent.
 
-The design's fixed six-stage pipeline is `rate_limit -> bulkhead -> breaker -> load_balance -> retry -> deadline`. The **server admission half** is wired; the client's rate/bulkhead stages and fallback functions are still **specified, not implemented**.
+The design's fixed six-stage pipeline is `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`. The server admission half is wired; the client wires the same stages per endpoint. Fallback functions remain **specified, not implemented**, and the global rate stage belongs to slice 2c.
+
+On the client, one logical call runs:
+
+1. A selection loop asks the load balancer for a candidate and admits it through that endpoint's breaker. `allow()` hands out the half-open probe and promotes an expired open endpoint, so a rejected candidate makes the loop try the next one instead of failing the call.
+2. A half-open probe skips the per-endpoint rate and bulkhead gates. The connection-pool and in-flight caps still apply to probes, and a probe refused by a cap records no endpoint failure.
+3. The closed path takes the per-endpoint rate limiter (deadline-aware; a wait that would cross the call deadline answers `deadline_exceeded`), then the per-endpoint bulkhead (full answers `overload`), then the pooled connection and the low-level call.
+4. Local gate rejections call `ignore()` and are never retried automatically: the caller owns that quota. Pool saturation, an exhausted slot pool, an open candidate after the selection loop, and connect failures are pre-send failures and may be retried even when the call is not idempotent; sent/remote failures require idempotency or an idempotency key. `retry_after` is a lower bound on the delay (`max(backoff, hint)`), capped by the deadline, and the retry budget is charged only after that deadline check.
+5. Every gate is `nullopt` by default (one predictable branch; no object, lock or allocation). `resilience_enabled=false` creates no gates and skips them; the failure-origin classification remains active. Close/cancel finalize the active attempt and release its bulkhead and breaker permits exactly once.
+6. `call::cancel()` sets the cancel flag whether or not a low-level call is in flight. A retry wait is interrupted by it: the plain-thread path waits on a condition variable the cancel notifies, and the shard path sleeps in 5 ms slices, so the observed latency is about one slice plus scheduling (bounded by the configured backoff only when a shard sleep cannot be cut). A cancelled call issues no further attempt.
 
 `server::start()` builds a frozen, read-only `service_guard` table after `registry.freeze()` (one entry per registered service: optional rate limiter, optional bulkhead, breaker, lock-free in-flight counter). An unknown service id has no entry and creates no state, so wire-chosen ids cannot grow memory. The handler path takes no guard lock and does not allocate.
 
@@ -265,7 +274,7 @@ Per request:
 
 Both per-service stages are `nullopt` by default (one predictable branch; no object, lock or allocation). A bulkhead needs an explicit `per_service_bulkhead`; a zero capacity derives from `per_service_inflight`. `resilience_enabled=false` skips the new rate/bulkhead stages and keeps the breaker and cap, matching the pre-pipeline behaviour; there is no probe special case in that mode, so the cap applies to probes as well. `stop()` stops accepts, drains, closes connections and joins every shard before releasing the guard table; Debug builds assert that each cap and bulkhead returned to zero. 64-bit counters report `rate_limited_connection`, `rate_limited_service`, `bulkhead_rejected`, `breaker_open`, `deadline_rejected` and `probe_admitted`; `rejected_overload` counts the per-connection cap, the per-service cap and the per-method limit (rate, bulkhead and breaker rejections stay in their own counters).
 
-The client path still passes through load balancing, retry with a shared budget and a per-endpoint breaker (`src/client/client_facade.cpp:73,153,335,557-569`). Evidence for the server pipeline: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
+The client path passes through the same stages per endpoint: load balancing with breaker-aware re-selection, per-endpoint rate/bulkhead gates (probes skip them), retry with a shared budget and an honoured `retry_after`, and a per-endpoint breaker (`src/client/client_facade.cpp`). Evidence for the server pipeline: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
 
 ## 15. Observability <a id="s15"></a>
 
@@ -315,7 +324,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Multipart and files | `http/multipart.hpp`, `http/file_transfer.hpp` | implemented, no dedicated suite |
 | Registry | `cluster/registry.hpp`, `src/cluster/registry.cpp` | implemented, tested |
 | Lease/election/health/watch | `cluster/*` | implemented primitives |
-| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline wired; client rate/bulkhead and fallback missing |
+| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline and per-endpoint client pipeline wired; fallback missing |
 | Push hub/streams | `push/*` | implemented, not wired to frames/HTTP |
 | Tracing/logging/AOP | `observability/*` | implemented, AOP not wired |
 | Flow control | `flow/estimator.hpp` | implemented primitives, not wired |
@@ -333,7 +342,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
 | MVC | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
 | cluster primitives | implemented | `test_cluster.cpp`; no network registry service |
-| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline wired; client rate/bulkhead and fallback missing |
+| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback missing |
 | observability | partial | `test_observability.cpp`; AOP not wired, no metrics |
 | push | partial | `test_push.cpp`; no PUSH frame/HTTP integration |
 | flow | partial | `test_flow.cpp`; not wired to transport |

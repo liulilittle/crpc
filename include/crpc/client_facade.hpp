@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,8 +51,10 @@
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/io.hpp>
+#include <crpc/resilience/bulkhead.hpp>
 #include <crpc/resilience/circuit_breaker.hpp>
 #include <crpc/resilience/load_balancer.hpp>
+#include <crpc/resilience/rate_limiter.hpp>
 #include <crpc/resilience/retry.hpp>
 #include <crpc/rpc/call.hpp>
 #include <crpc/rpc/client.hpp>
@@ -249,6 +252,7 @@ struct call_core {
     void* pool = nullptr;
     std::shared_ptr<connection_slot> slot;
     resilience::breaker_permit permit;
+    std::optional<resilience::bulkhead_permit> bulkhead;
     std::unique_ptr<resilience::retry_sequence> retry;
 
     void signal() noexcept;
@@ -271,6 +275,10 @@ struct call_state_base {
 template <typename Resp>
 struct call_state final : call_state_base {
     call_core core;
+    // Guards the `inner` pointer between the call owner and a concurrent
+    // cancel() from another thread. The pointed-to low-level handle has its
+    // own synchronization; this mutex only protects the pointer lifetime.
+    std::mutex inner_mutex;
     std::unique_ptr<rpc::call<Resp>> inner;
 
     [[nodiscard]] call_core& core_ref() noexcept override { return core; }
@@ -322,6 +330,11 @@ public:
         resilience::breaker_config breaker{};
         // Retry policy for the whole client.
         resilience::retry_policy retry{};
+        // Per-endpoint resilience gates. Empty by default: no object, no lock
+        // and no allocation on the call path.
+        bool resilience_enabled = true;
+        std::optional<resilience::rate_limit_config> per_endpoint_rate;
+        std::optional<resilience::bulkhead_config> per_endpoint_bulkhead;
         // Applied when a call carries no explicit deadline.
         std::chrono::nanoseconds default_deadline{std::chrono::seconds(1)};
         bool default_idempotent = false;
@@ -368,6 +381,11 @@ public:
         builder& load_balancer(resilience::lb_strategy strategy);
         builder& breaker(resilience::breaker_config config);
         builder& retry(resilience::retry_policy policy);
+        builder& resilience_enabled(bool value);
+        builder& per_endpoint_rate(resilience::rate_limit_config config);
+        builder& per_endpoint_bulkhead(resilience::bulkhead_config config);
+        builder& clear_per_endpoint_rate();
+        builder& clear_per_endpoint_bulkhead();
         builder& default_deadline(std::chrono::nanoseconds value);
         builder& default_idempotent(bool value);
         builder& plain_thread_timeout(std::chrono::nanoseconds value);
@@ -425,7 +443,17 @@ public:
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::shutting_down, "client is closed"));
                 }
-                if (st->inner != nullptr) {
+                // Presence is read under `inner_mutex` so a concurrent cancel()
+                // (which takes the same lock to reach the low-level handle) has
+                // a happens-before edge on the pointer. The lock is released
+                // before wait_ready(): cancel() must be able to reach the
+                // handle while this thread waits for it.
+                bool has_inner = false;
+                {
+                    std::lock_guard<std::mutex> lk(st->inner_mutex);
+                    has_inner = st->inner != nullptr;
+                }
+                if (has_inner) {
                     const status waited = owner->wait_ready(st->core);
                     client* const current = client_detail::live_owner(st->core);
                     if (current == nullptr) {
@@ -448,22 +476,37 @@ public:
                         // application result is ignored by the code table.
                         const client_detail::failure_origin origin =
                             client_detail::failure_origin::timeout;
-                        st->inner.reset();
+                        {
+                            std::lock_guard<std::mutex> lk(st->inner_mutex);
+                            st->inner.reset();
+                        }
                         current->finish_attempt(st->core, failure.code, origin,
                                                 client_detail::breaker_record::failure);
                         return rpc::rpc_result<Resp>(std::move(failure));
                     }
                     rpc::rpc_result<Resp> result(
                         rpc_error(rpc_code::internal, "call produced no result"));
-                    const bool decoded = st->inner->try_get(result);
-                    const rpc_code code = st->inner->code();
+                    rpc::call<Resp>* inner = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(st->inner_mutex);
+                        inner = st->inner.get();
+                    }
+                    if (inner == nullptr) {
+                        return rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::shutting_down, "client is closed"));
+                    }
+                    const bool decoded = inner->try_get(result);
+                    const rpc_code code = inner->code();
                     rpc_error terminal_error;
                     if (!(decoded && code == rpc_code::ok)) {
                         terminal_error = result.error();
                     }
                     const client_detail::failure_origin origin =
                         client_detail::result_origin(terminal_error);
-                    st->inner.reset();
+                    {
+                        std::lock_guard<std::mutex> lk(st->inner_mutex);
+                        st->inner.reset();
+                    }
                     std::chrono::nanoseconds delay{0};
                     const bool retry =
                         !(decoded && code == rpc_code::ok) &&
@@ -524,15 +567,27 @@ public:
         }
 
         [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
-            if (state_ == nullptr || state_->inner == nullptr ||
+            if (state_ == nullptr ||
                 !state_->core.done.load(std::memory_order_acquire)) {
                 return false;
             }
-            const bool decoded = state_->inner->try_get(out);
+            // Snapshot the handle under `inner_mutex`: a concurrent cancel() may
+            // be using it at the same time, and only the owning thread ever
+            // resets it (from get()/try_get()/release()), so the pointer stays
+            // valid for the duration of this call.
+            rpc::call<Resp>* inner = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(state_->inner_mutex);
+                inner = state_->inner.get();
+            }
+            if (inner == nullptr) {
+                return false;
+            }
+            const bool decoded = inner->try_get(out);
             if (decoded) {
                 // The handle has delivered its terminal result: record it once
                 // and release the timer and slot.
-                const rpc_code code = state_->inner->code();
+                const rpc_code code = inner->code();
                 rpc_error terminal_error;
                 if (code != rpc_code::ok) {
                     terminal_error = out.error();
@@ -540,7 +595,10 @@ public:
                 const client_detail::failure_origin origin =
                     client_detail::result_origin(terminal_error);
                 std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
-                st->inner.reset();
+                {
+                    std::lock_guard<std::mutex> lk(st->inner_mutex);
+                    st->inner.reset();
+                }
                 client* const owner = client_detail::live_owner(st->core);
                 if (owner != nullptr) {
                     owner->finish_attempt(
@@ -560,8 +618,11 @@ public:
             // retry backoff there is nothing to cancel at the transport, but
             // the waiter must stop.
             state_->core.canceled.store(true, std::memory_order_release);
-            if (state_->inner) {
-                state_->inner->cancel();
+            {
+                std::lock_guard<std::mutex> lk(state_->inner_mutex);
+                if (state_->inner) {
+                    state_->inner->cancel();
+                }
             }
             client* const owner = client_detail::live_owner(state_->core);
             if (owner != nullptr) {
@@ -587,11 +648,15 @@ public:
                 return;
             }
             std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
-            if (st->inner) {
-                // Resetting `inner` runs the low-level handle destructor, which
-                // detaches (and synchronizes with) any in-flight callback under
-                // the connection lock before the call_state can be freed.
-                st->inner.reset();
+            {
+                std::lock_guard<std::mutex> lk(st->inner_mutex);
+                if (st->inner) {
+                    // Resetting `inner` runs the low-level handle destructor,
+                    // which detaches (and synchronizes with) any in-flight
+                    // callback under the connection lock before the call_state
+                    // can be freed.
+                    st->inner.reset();
+                }
             }
             client* const owner = client_detail::live_owner(st->core);
             if (owner != nullptr) {
@@ -831,7 +896,10 @@ status client::issue(
         failure = started.error();
         return status{failure};
     }
-    st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+    {
+        std::lock_guard<std::mutex> inner_lk(st->inner_mutex);
+        st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+    }
     st->inner->then(client_detail::wake_functor<Resp>{&core});
     return status{};
 }

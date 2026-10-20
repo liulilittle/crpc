@@ -2,6 +2,7 @@
 #include <crpc/client_facade.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <mutex>
 #include <new>
@@ -122,14 +123,36 @@ thread_local const void* timer_thread_local = nullptr;
 struct client::impl {
     struct endpoint_pool {
         endpoint_pool(endpoint ep, backend_factory* backend,
-                      const resilience::breaker_config& config)
-            : ep(std::move(ep)), backend(backend), breaker(config) {}
+                      const resilience::breaker_config& config,
+                      const std::optional<resilience::rate_limit_config>& rate_config,
+                      const std::optional<resilience::bulkhead_config>& bulkhead_config,
+                      bool resilience_enabled)
+            : ep(std::move(ep)), backend(backend), breaker(config) {
+            if (resilience_enabled) {
+                if (rate_config.has_value()) {
+                    rate.emplace(*rate_config);
+                }
+                if (bulkhead_config.has_value()) {
+                    bulkhead.emplace(*bulkhead_config);
+                }
+            }
+        }
+
+        ~endpoint_pool() {
+            // Debug builds catch a leaked gate permit before the pool (and the
+            // objects permits point at) is destroyed.
+            if (bulkhead.has_value()) {
+                assert(bulkhead->in_use() == 0);
+            }
+        }
 
         endpoint ep;
         backend_factory* backend = nullptr;
         std::mutex mutex;
         std::vector<std::shared_ptr<client_detail::connection_slot>> slots;
         resilience::circuit_breaker breaker;
+        std::optional<resilience::rate_limiter> rate;
+        std::optional<resilience::bulkhead> bulkhead;
         // Live in-flight attempts for this endpoint, read by the load balancer
         // (least-inflight) without taking `mutex`.
         std::atomic<std::uint32_t> in_flight{0};
@@ -229,7 +252,9 @@ client::client(options opt, std::vector<endpoint_config> endpoints)
 
     for (std::size_t i = 0; i < endpoints_.size(); ++i) {
         impl_->pools.push_back(std::make_unique<impl::endpoint_pool>(
-            endpoints_[i].ep, endpoints_[i].backend, options_.breaker));
+            endpoints_[i].ep, endpoints_[i].backend, options_.breaker,
+            options_.per_endpoint_rate, options_.per_endpoint_bulkhead,
+            options_.resilience_enabled));
     }
     impl_->view.pools = &impl_->pools;
     impl_->balancer = std::make_unique<resilience::load_balancer>(options_.lb);
@@ -339,6 +364,10 @@ void client::finalize_active(
         if (options_.shard != nullptr) {
             (void)options_.shard->cancel_timer(core);
         }
+        if (core->bulkhead.has_value()) {
+            core->bulkhead->leave();
+            core->bulkhead.reset();
+        }
         core->permit = resilience::breaker_permit{};
         if (core->slot) {
             // Release the in-flight accounting exactly once, but keep the
@@ -399,6 +428,11 @@ client::resilience_statistics client::resilience_stats() const noexcept {
     out.probe_admitted = probe_admitted_.load(std::memory_order_relaxed);
     out.retries_delayed_by_hint =
         retries_delayed_by_hint_.load(std::memory_order_relaxed);
+    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
+        if (pool->bulkhead.has_value()) {
+            out.bulkhead_in_use += pool->bulkhead->in_use();
+        }
+    }
     return out;
 }
 
@@ -517,17 +551,66 @@ bool client::begin_attempt(
     }
 
     impl::endpoint_pool& pool = *impl_->pools[chosen_index];
-    if (chosen.is_probe()) {
+    const bool is_probe = chosen.is_probe();
+    if (is_probe) {
         probe_admitted_.fetch_add(1, std::memory_order_relaxed);
     }
     core.permit = std::move(chosen);
     core.pool = &pool;
+
+    // Per-endpoint gates run after selection and breaker admission. A half-open
+    // probe skips them so a saturated limiter cannot starve recovery; the pool
+    // and in-flight caps still apply to probes. Gate rejection is a local
+    // admission decision: the permit is ignored by finish_attempt and the
+    // caller does not retry automatically.
+    if (!is_probe) {
+        if (pool.rate.has_value()) {
+            resilience::rate_limit_result limited;
+            if (core.has_deadline) {
+                const auto deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    core.deadline.time_since_epoch());
+                limited = pool.rate->acquire_for(1, deadline_ns);
+            } else {
+                limited = pool.rate->try_acquire(1);
+            }
+            if (!limited.ok()) {
+                rate_limited_.fetch_add(1, std::memory_order_relaxed);
+                local_gate_rejected_.fetch_add(1, std::memory_order_relaxed);
+                core.origin = client_detail::failure_origin::local_gate;
+                if (limited.deadline_met) {
+                    failure = rpc_error(rpc_code::resource_exhausted,
+                                        "endpoint rate limit reached");
+                    failure.retry_after = limited.retry_after;
+                } else {
+                    // The caller cannot wait out the bucket within its own
+                    // deadline, so the hint would be meaningless here.
+                    failure = rpc_error(
+                        rpc_code::deadline_exceeded,
+                        "endpoint rate limit cannot meet the deadline");
+                }
+                return false;
+            }
+        }
+        if (pool.bulkhead.has_value()) {
+            resilience::bulkhead_permit permit = pool.bulkhead->try_enter();
+            if (!permit.allowed()) {
+                bulkhead_rejected_.fetch_add(1, std::memory_order_relaxed);
+                local_gate_rejected_.fetch_add(1, std::memory_order_relaxed);
+                core.origin = client_detail::failure_origin::local_gate;
+                failure = rpc_error(rpc_code::overload, "endpoint bulkhead is full");
+                failure.retry_after = permit.retry_after();
+                return false;
+            }
+            core.bulkhead.emplace(std::move(permit));
+        }
+    }
     // The closed decision and the tracking insertion are one atomic step
     // (R1). If close()/``~client`` already set `closed_` (or will do so before
     // this returns), either the insert wins and the snapshot in close() sees
     // the core, or this returns false and no timer is ever armed.
     if (!register_core_if_open(core, keep)) {
         core.permit = resilience::breaker_permit{};
+        core.bulkhead.reset();
         core.pool = nullptr;
         core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::shutting_down, "client is closed");
@@ -710,6 +793,10 @@ void client::finish_attempt(client_detail::call_core& core, rpc_code code,
     if (options_.shard != nullptr) {
         (void)options_.shard->cancel_timer(&core);
     }
+    if (core.bulkhead.has_value()) {
+        core.bulkhead->leave();
+        core.bulkhead.reset();
+    }
     if (core.permit.allowed()) {
         switch (record) {
         case client_detail::breaker_record::ignore:
@@ -744,7 +831,11 @@ void client::abandon_attempt(client_detail::call_core& core) noexcept {
     if (options_.shard != nullptr) {
         (void)options_.shard->cancel_timer(&core);
     }
-    // An abandoned attempt records no breaker outcome; just drop the permit.
+    // An abandoned attempt records no breaker outcome; just drop the permits.
+    if (core.bulkhead.has_value()) {
+        core.bulkhead->leave();
+        core.bulkhead.reset();
+    }
     core.permit = resilience::breaker_permit{};
     if (core.slot) {
         // Release the in-flight accounting but keep the connection slot alive
@@ -1103,6 +1194,33 @@ client::builder& client::builder::breaker(resilience::breaker_config config) {
 
 client::builder& client::builder::retry(resilience::retry_policy policy) {
     options_.retry = policy;
+    return *this;
+}
+
+client::builder& client::builder::resilience_enabled(bool value) {
+    options_.resilience_enabled = value;
+    return *this;
+}
+
+client::builder& client::builder::per_endpoint_rate(
+    resilience::rate_limit_config config) {
+    options_.per_endpoint_rate = config;
+    return *this;
+}
+
+client::builder& client::builder::per_endpoint_bulkhead(
+    resilience::bulkhead_config config) {
+    options_.per_endpoint_bulkhead = config;
+    return *this;
+}
+
+client::builder& client::builder::clear_per_endpoint_rate() {
+    options_.per_endpoint_rate.reset();
+    return *this;
+}
+
+client::builder& client::builder::clear_per_endpoint_bulkhead() {
+    options_.per_endpoint_bulkhead.reset();
     return *this;
 }
 
