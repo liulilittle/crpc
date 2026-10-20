@@ -280,14 +280,16 @@ struct http_statistics {
     // water, 409 conflicts/restarts, and 503 capacity rejections.
     std::size_t longpoll_waiters = 0;
     std::size_t longpoll_subscribers = 0;
-    // Effective replay bound after start() clamps it to `max_messages`.
-    std::size_t longpoll_replay_window = 0;
     std::size_t longpoll_events = 0;
     std::size_t longpoll_timeouts = 0;
     std::size_t longpoll_ack_clamped = 0;
     std::size_t longpoll_conflicts = 0;
     std::size_t longpoll_restarts = 0;
     std::size_t longpoll_overloaded = 0;
+    // Effective replay bound after start() clamps it to `max_messages`; zero
+    // when the server is not running. Appended at the end so the field order
+    // of every pre-existing member is unchanged (docs/abi.md §4).
+    std::size_t longpoll_replay_window = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with

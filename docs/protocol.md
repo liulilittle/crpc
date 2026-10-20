@@ -644,9 +644,18 @@ skipping data; the client restarts the subscription. `retransmit_front` relies
 on `subscribe_options::max_messages >= subscribe_options::max_replay`. A replay
 bound larger than the queue bound is rejected by the long-poll `start()` with
 `invalid_argument` (the queue's memory bound is never silently enlarged); a
-smaller replay bound is raised to the queue bound, so the front replay can
-always hold the whole retained unacknowledged window. This requirement is
-specific to front replay: tail replay (SSE) has no cross-bound requirement, and
+smaller replay bound is raised to the queue bound. Both bounds together are
+necessary but not sufficient for the front replay to always fit: it must also
+fit the byte budget (`subscribe_options::max_bytes`), which `start()` neither
+checks nor rewrites. The two bounds are independent, so a window that satisfies
+`max_messages >= max_replay` can still exceed `max_bytes`; `retransmit_front`
+then returns `resource_exhausted` and the poll answers `409 Restart` rather
+than silently dropping the unacknowledged messages. With the documented
+defaults (`max_messages = max_replay = 1024`, `max_bytes = 1 MiB`) three
+600 KiB publishes leave only the newest message queued; after it is delivered
+the front replay must requeue all three (1.8 MiB), so a cursor-gap poll is a
+`409 Restart` (measured, not inferred). This requirement is specific to front
+replay: tail replay (SSE) has no cross-bound requirement, and
 `hub::subscribe` neither rejects nor rewrites the caller's bounds. A direct hub
 caller that uses `retransmit_front` while `max_messages < max_replay` gets
 `resource_exhausted` (a safe restart), never a silent skip.

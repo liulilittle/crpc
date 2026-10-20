@@ -1417,6 +1417,216 @@ CRPC_TEST(longpoll_ttl_housekeeping_without_poll) {
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
     CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+
+    // Second, independent cycle. The first sweep above proves the timer fired
+    // once; this cycle proves the callback re-armed itself. Without the
+    // re-arm (M14) the second residue is never swept and this wait times out.
+    const u64 second_subscriber = (1ull << 32) + 81;
+    {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        lp_parser parser;
+        send_raw(*client,
+                 http1("GET", poll_target(second_subscriber, "timeout=0")));
+        CRPC_CHECK(wait_polls(parser, capture, 1));
+        CRPC_CHECK_EQ(204, parser.responses[0].status);
+        client->close();
+    }
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().active_connections == 0; }, 5000));
+    CRPC_CHECK(publish_text(*fx.server, "news", "late-again"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+}
+
+// A poll that subscribes and attaches but is then answered 503 (overload)
+// leaves an owner with no waiting session. The subscription and its queued
+// messages must still be reclaimed by the periodic housekeeping timer alone:
+// no later poll of that subscriber is sent.
+CRPC_TEST(longpoll_503_after_attach_sweeps_residue_without_poll) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_waiters = 1;
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(300);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 waiter_id = (1ull << 32) + 101;
+    const u64 rejected_id = (1ull << 32) + 103;
+
+    // One waiter fills the single slot.
+    capture_source waiter_capture;
+    auto waiter = fx.connect();
+    waiter->bind_source(&waiter_capture);
+    lp_parser waiter_parser;
+    send_raw(*waiter, http1("GET", poll_target(waiter_id, "timeout=0")));
+    CRPC_CHECK(wait_polls(waiter_parser, waiter_capture, 1));
+    send_raw(*waiter, http1("GET", poll_target(waiter_id)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    // The second poll subscribes and attaches first, then hits the waiter cap
+    // and is answered 503. Its owner entry is already recorded.
+    capture_source rejected_capture;
+    auto rejected = fx.connect();
+    rejected->bind_source(&rejected_capture);
+    lp_parser rejected_parser;
+    send_raw(*rejected,
+             http1("GET", poll_target(rejected_id, "timeout=1000")));
+    CRPC_CHECK(wait_polls(rejected_parser, rejected_capture, 1));
+    CRPC_CHECK_EQ(503, rejected_parser.responses[0].status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_overloaded);
+    CRPC_CHECK_EQ(std::size_t{2}, fx.server->stats().longpoll_subscribers);
+
+    // A message for the rejected subscriber lands in the residue's queue. The
+    // waiting poll takes its own copy and completes, leaving the residue queue
+    // as the only queued message.
+    CRPC_CHECK(publish_text(*fx.server, "news", "residue"));
+    CRPC_CHECK(wait_polls(waiter_parser, waiter_capture, 2));
+    CRPC_CHECK_EQ(200, waiter_parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("residue"), waiter_parser.responses[1].body);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+
+    // The rejected connection stays open (keep-alive) and never polls again;
+    // the waiter closes. Only the housekeeping timer can reclaim both.
+    waiter->close();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 0; }, 5000));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_subscribers == 0; }, 5000));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
+    // The connection itself is unaffected: it is a normal keep-alive session.
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().active_connections);
+    rejected->close();
+}
+
+// The count bound and the byte bound are independent. With the documented
+// defaults (max_messages = max_replay = 1024, max_bytes = 1 MiB) three 600 KiB
+// publishes satisfy the count bound but not the byte budget, so a cursor-gap
+// poll must answer 409 Restart instead of silently dropping unacked data.
+CRPC_TEST(longpoll_front_replay_byte_budget_restarts) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+    // Defaults: 1024 messages, 1 MiB per subscription.
+    CRPC_CHECK_EQ(std::size_t{1024},
+                  fx.server->stats().longpoll_replay_window);
+
+    const u64 subscriber = (1ull << 32) + 107;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    const std::string payload(600u * 1024u, 'b');
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    // The 1 MiB queue keeps only the newest message.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK_EQ(payload, parser.responses[1].body);
+    CRPC_CHECK(parser.responses[1].head.find("X-CRPC-Event-ID: 1:3") !=
+               std::string::npos);
+
+    // Front replay would need 1.8 MiB of queue budget: an explicit restart.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:0")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(409, parser.responses[2].status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_restarts);
+    client->close();
+}
+
+// A subscriber that re-polls after its session ended must have its TTL clock
+// refreshed, otherwise the sweep reclaims a subscription that is demonstrably
+// in use. Timeline (subscriber_ttl = 600 ms, timer period = 600 ms, fixture
+// start at t=0):
+//   ~0 ms    poll 1 -> 204; release records last_seen ~= 10
+//   ~400 ms  poll 2 -> 204 (subscription already exists); attach refreshes
+//            last_seen to ~400. Its own open-path sweep is throttled.
+//   ~610 ms  housekeeping tick: age 210 < TTL -> the entry must survive.
+//            Without the attach refresh (last_seen still ~10) age = 600 and
+//            the sweep reclaims it, so the check below fails.
+//   ~810 ms  assertion point.
+CRPC_TEST(longpoll_repoll_after_release_refreshes_ttl) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(600);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 113;
+    {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        lp_parser parser;
+        send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+        CRPC_CHECK(wait_polls(parser, capture, 1));
+        CRPC_CHECK_EQ(204, parser.responses[0].status);
+        CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
+        // The peer goes away: keep-queue release. The owner entry goes away
+        // with the session but the subscription survives inside `subscriber_ttl`.
+        client->close();
+    }
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().active_connections == 0; }, 5000));
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+
+    // Re-poll the same id while the subscription still exists: subscribe
+    // answers `failed_precondition` (already), so this poll must reuse the id
+    // and record fresh activity for the TTL sweep.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+    CRPC_CHECK(parser.responses[0].head.find(
+                   "X-CRPC-Subscriber: " + std::to_string(subscriber)) !=
+               std::string::npos);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "kept"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+
+    // Cross the next housekeeping tick. The refreshed entry is still inside
+    // its TTL, so neither the subscription nor its queue may be reclaimed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(410));
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_hub_queued);
+
+    // ...and the TTL still reclaims it once the refreshed stamp expires.
+    client->close();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
 }
 
 CRPC_TEST(longpoll_queue_bound_covers_replay_window) {
@@ -1793,23 +2003,83 @@ CRPC_TEST(longpoll_cross_protocol_same_subscriber_409) {
     lp_client->close();
 }
 
+// Repeated start()/stop() on ONE server object. Every cycle must (a) leave no
+// waiter, subscriber, queued message or effective replay bound behind, and
+// (b) run the periodic housekeeping timer again after the restart, so a stale
+// "stopped" flag from the previous stop() would show up as an unswept residue.
+// A stopped server must also refuse publishes and let no callback touch state.
 CRPC_TEST(longpoll_timer_stop_repeated_is_safe) {
-    for (int i = 0; i < 5; ++i) {
-        http::http_server_options options;
-        options.idle_timeout = std::chrono::milliseconds(0);
-        options.request_timeout = std::chrono::milliseconds(0);
-        options.longpoll.timeout = std::chrono::milliseconds(0);
-        options.longpoll.max_timeout = std::chrono::milliseconds(0);
-        options.longpoll.subscriber_ttl = std::chrono::milliseconds(20);
-        options.longpoll.slow_timeout = std::chrono::milliseconds(0);
-        longpoll_fixture fx(options,
-                            "http-lp-timer-" + std::to_string(i));
-        // Let the periodic housekeeping timer fire while the server is up,
-        // then cancel it from stop().
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(100);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options, "http-lp-timer");
+    CRPC_CHECK_EQ(std::size_t{1024},
+                  fx.server->stats().longpoll_replay_window);
+
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        if (cycle != 0) {
+            // A stopped server can be started again; the periodic timer is
+            // armed afresh and the effective bound is recomputed.
+            const status restarted = fx.server->start();
+            CRPC_CHECK(restarted.ok());
+            CRPC_CHECK(fx.server->running());
+            CRPC_CHECK_EQ(std::size_t{1024},
+                          fx.server->stats().longpoll_replay_window);
+        }
+
+        // Every cycle leaves a keep-queue residue: a poll creates the
+        // subscriber, the peer closes (release keeps the subscription and its
+        // queue), and a publish lands in that queue. Only the periodic timer
+        // can reclaim it. If a previous stop() left `stopped` set, the
+        // restarted server's timer never sweeps and this wait times out.
+        {
+            capture_source capture;
+            auto client = fx.connect();
+            client->bind_source(&capture);
+            lp_parser parser;
+            send_raw(*client,
+                     http1("GET", poll_target((1ull << 32) + 109,
+                                              "timeout=0")));
+            CRPC_CHECK(wait_polls(parser, capture, 1));
+            CRPC_CHECK_EQ(204, parser.responses[0].status);
+            CRPC_CHECK_EQ(std::size_t{1},
+                          fx.server->stats().longpoll_subscribers);
+            client->close();
+        }
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] { return fx.server->stats().active_connections == 0; }, 5000));
+        CRPC_CHECK(publish_text(*fx.server, "news", "cycle"));
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+        // The timer must sweep it with no further poll on that connection.
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
+        CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+
         fx.server->stop();
         CRPC_CHECK_FALSE(fx.server->running());
-        CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_waiters);
+        const http::http_statistics stopped = fx.server->stats();
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.longpoll_waiters);
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.longpoll_subscribers);
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.sse_connections);
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.active_connections);
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.sse_hub_queued);
+        // waiters/sse_connections are zeroed by stop(); the replay bound must
+        // follow the same lifecycle.
+        CRPC_CHECK_EQ(std::size_t{0}, stopped.longpoll_replay_window);
+
+        // A stopped server refuses publishes, and no later timer callback may
+        // enqueue anything: sleep past the TTL and re-check.
+        CRPC_CHECK_FALSE(publish_text(*fx.server, "news", "after-stop"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const http::http_statistics idle = fx.server->stats();
+        CRPC_CHECK_EQ(std::size_t{0}, idle.sse_hub_queued);
+        CRPC_CHECK_EQ(std::size_t{0}, idle.longpoll_subscribers);
+        CRPC_CHECK_EQ(std::size_t{0}, idle.longpoll_waiters);
     }
 }
 

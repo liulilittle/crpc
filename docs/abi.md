@@ -103,6 +103,13 @@ dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
 planned, not implemented; while it is absent, callers and the library must be
 built from the same headers.
 
+A public struct that gains a field is therefore a MAJOR change even when the new
+field is appended: `http_statistics` grew `longpoll_replay_window` in this
+release, and that field is placed at the very end so every pre-existing member
+keeps its offset (the struct's size and the trailing padding still change, so
+the version must move). Treat it as MAJOR unless a size-tagged options struct
+exists (§7).
+
 Additive types do not change existing layouts. `client::resilience_statistics`
 (a standard-layout, trivially copyable value type, §9) and
 `client::resilience_stats()` are MINOR additions; they add symbols only.

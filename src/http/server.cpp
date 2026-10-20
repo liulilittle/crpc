@@ -4564,6 +4564,9 @@ void http_server::stop() noexcept {
             state.longpoll_lost.clear();
             state.longpoll_waiters.store(0, std::memory_order_relaxed);
             state.sse_connections.store(0, std::memory_order_relaxed);
+            // Same lifecycle as waiters/sse_connections: a stopped server
+            // reports no effective replay bound until the next start().
+            state.longpoll_replay_window.store(0, std::memory_order_relaxed);
         }
         state.longpoll_keepalive_timer.reset();
         state.acceptors.clear();
@@ -4612,10 +4615,17 @@ void http_server::stop() noexcept {
         state.longpoll_lost.clear();
         state.longpoll_waiters.store(0, std::memory_order_relaxed);
         state.sse_connections.store(0, std::memory_order_relaxed);
+        // Same lifecycle as waiters/sse_connections: a stopped server reports
+        // no effective replay bound until the next start().
+        state.longpoll_replay_window.store(0, std::memory_order_relaxed);
     }
     state.shards.clear();
     state.longpoll_keepalive_timer.reset();
-    state.pending_listeners.clear();
+    // `pending_listeners` is builder configuration, not live state: keep it so
+    // a later start() can bind the same listeners again. Clearing it made
+    // start() return ok() after stop() while binding nothing, which left every
+    // client without a connection. The bound `listener` objects themselves are
+    // released above.
     state.tls_context.reset();
     state.acceptors.clear();
 }
