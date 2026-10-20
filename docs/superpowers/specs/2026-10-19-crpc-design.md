@@ -1410,7 +1410,7 @@ SSE responses use `text/event-stream`, `Cache-Control: no-cache`, and `X-Accel-B
 
 Compression and decompression are streaming `stream_reader`/`stream_writer` decorators; nothing is fully buffered. Backpressure propagates from the downstream write to the upstream read.
 ### 14.2 CRPC frame compression
-`flags.COMPRESSED` plus `flags.ALGO` select lz4 (1) or zstd (2); gzip (3) is for compatibility. The handshake `compress_bitmap` is the intersection of both sides. `compress_min` defaults to 512 bytes; smaller payloads are sent uncompressed. Compression is per frame payload; a batch is not compressed across frames. A compression failure is fail-closed: the connection closes, never a silent plaintext fallback.
+`flags.COMPRESSED` plus `flags.ALGO` select lz4 block (1); gzip (3) is the compatibility codec; zstd (2) is reserved and not implemented (a decoder rejects it with `protocol_error`). The handshake `compress_bitmap` is the intersection of both sides. `compress_min` defaults to 512 bytes; smaller payloads are sent uncompressed. Compression is per frame payload; a batch is not compressed across frames. A compression failure is fail-closed: the connection closes, never a silent plaintext fallback.
 
 Flow control counts compressed bytes on the wire. `WINDOW_UPDATE` returns compressed bytes, so both sides agree on window accounting.
 ### 14.3 Large messages
@@ -1733,7 +1733,7 @@ CI jobs: MSVC x64 Debug/Release, MSVC x86 Debug/Release, GCC x64, Clang x64, ASa
 | MVC | GET/POST/PUT/DELETE/PATCH, parameter binding, problem+json |
 | Codecs | crpc-binary, JSON, XML, INI, TOML, protobuf, FlatBuffers (all wired; protobuf/FlatBuffers require user `schema<t>`) |
 | Files | Streaming multipart upload, temp-file RAII, download with Range/206 |
-| Compression | HTTP gzip/deflate; CRPC lz4/zstd |
+| Compression | HTTP gzip/deflate; CRPC lz4 block (+gzip compatibility in a later slice); zstd reserved, not implemented |
 | Push | `push_hub`, subscriptions, streaming, SSE, long polling |
 | Observability | AOP, W3C traceparent, high-performance logging |
 | Engineering | One-command scripts, sanitizer matrix, zero warnings |

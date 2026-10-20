@@ -347,7 +347,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | push | partial | `test_push.cpp`; no PUSH frame/HTTP integration |
 | flow | partial | `test_flow.cpp`; not wired to transport |
 | shard/coroutines | implemented | `test_server_client.cpp`; `src/runtime/runtime.cpp` calls `coro_rt_*`; automatic `clamp(cores-1,1,32)` shard count not implemented |
-| compression | partial | HTTP gzip/deflate streaming codec implemented and tested (`test_content_coding.cpp`) but not wired into `http_server`; frame flags carry lz4/zstd/gzip ids, with no lz4/zstd codec on the CRPC path |
+| compression | partial | HTTP gzip/deflate streaming codec implemented and tested (`test_content_coding.cpp`) but not wired into `http_server`; CRPC frame compression: lz4 block implemented and tested (`test_frame_compression.cpp`), zstd reserved and fail-closed, gzip reserved for the next slice; a `COMPRESSED` frame is decompressed or rejected, never delivered as plaintext (it used to be delivered verbatim) |
 | SSE / long polling | specified | no SSE writer or HTTP push adapter |
 
 ## 20. Verification map <a id="s20"></a>

@@ -38,6 +38,16 @@
 // extension of the call envelope rather than of the fixed frame header. This
 // keeps the 16-byte header exactly as specified in section 7.1 of the design.
 //
+// Compression: this header only defines the flags and the algorithm ids. The
+// codec, the container and the limits live in <crpc/frame_compression.hpp>, and
+// this header deliberately does not include it, so the frame layer stays
+// compression-agnostic. A COMPRESSED frame is produced only by
+// encode_frame_compressed; encode_frame rejects the flags instead of writing a
+// frame that claims a stream it does not contain. The whole-frame decoders
+// reject a COMPRESSED frame they cannot decompress (decode_frame has no output
+// buffer, so it always rejects; frame_decoder decompresses in copying mode and
+// rejects in borrowing mode). See docs/protocol.md section 24.
+//
 // Fail-closed rules: an unknown frame type, a non-zero reserved field, a
 // stream id with bit 31 set, a stream scope violation, an inconsistent
 // compression flag, an unknown compression algorithm, a non-zero ext without
@@ -187,8 +197,9 @@ struct frame {
 // frame_flag_crc32c is set, ext is replaced by crc32c(value.payload). All other
 // header fields must already be valid. `out` must hold at least
 // encoded_frame_size(value) bytes. Failure modes:
-//   * rpc_code::invalid_argument -- invalid type, flags, stream scope, ext, or
-//     payload longer than `max_frame`;
+//   * rpc_code::invalid_argument -- invalid type, flags, stream scope, ext, a
+//     COMPRESSED flag or a non-zero ALGO (a compressed frame is produced only
+//     by encode_frame_compressed), or payload longer than `max_frame`;
 //   * rpc_code::encode_error -- `out` is too small.
 // On failure `written` is zero.
 [[nodiscard]] CRPC_API status encode_frame(span<std::byte> out,
@@ -201,6 +212,11 @@ struct frame {
 // CRC32C is verified when the flag is set. On success `value.payload` points
 // into `in` and is valid for as long as `in` is valid. Failure modes: any
 // protocol violation is rpc_code::protocol_error; `value` is unchanged.
+//
+// This function has no output buffer, so it cannot deliver a decompressed
+// payload: a COMPRESSED frame is rejected with rpc_code::protocol_error (never
+// returned as compressed bytes). Use decode_frame_compressed from
+// <crpc/frame_compression.hpp> to decode one.
 [[nodiscard]] CRPC_API status decode_frame(span<const std::byte> in,
                                            frame& value,
                                            u32 max_frame = max_frame_default) noexcept;
@@ -276,11 +292,28 @@ struct call_envelope {
 
 // --- Incremental decoder -----------------------------------------------------
 
+// Per-frame report for frame_decoder::next(frame&, frame_compression_info*).
+// Declared here, defined in <crpc/frame_compression.hpp>: this header must stay
+// compression-agnostic and never include the compression header, but the
+// decoder's overload needs to name the type. A pointer to an incomplete type is
+// enough for the declaration.
+struct frame_compression_info;
+
 // Streaming frame decoder. Bytes are copied into an internal buffer; a complete
 // frame is only produced by next(). The decoder performs no allocation for a
 // frame payload when a caller payload buffer was supplied to the constructor,
 // and it never allocates for a payload before the header has been validated
 // against max_frame.
+//
+// Compression: in borrowing mode (no payload buffer) a COMPRESSED frame cannot
+// be delivered, so it is rpc_code::protocol_error. In copying mode the payload
+// is decompressed into the caller's buffer and the returned header is
+// normalised (COMPRESSED/ALGO cleared, payload_len set to the logical length,
+// CRC32C recomputed over the logical payload). The logical length must fit the
+// payload buffer, otherwise the frame is rpc_code::resource_exhausted before
+// any decompression; that buffer size is therefore the decoder's runtime
+// logical ceiling. The ratio guard uses the default limit because the decoder
+// has no place to store a policy. See <crpc/frame_compression.hpp>.
 //
 // Usage:
 //
@@ -291,9 +324,19 @@ struct call_envelope {
 //       switch (decoder.next(value)) {
 //       case frame_decoder::result::frame_ready: handle(value); break;
 //       case frame_decoder::result::need_more: goto next_chunk;
+//       case frame_decoder::result::frame_dropped: continue; // ONE_WAY only
 //       case frame_decoder::result::error: fail(decoder.error()); break;
 //       }
 //   }
+//
+// `frame_dropped` was appended to `result` after `error`: existing values keep
+// their numbers and existing code keeps compiling, but a `switch` over `result`
+// without a `default` must add the new case (GCC/Clang report
+// -Werror=switch; MSVC /W4 does not).
+//
+// A dropped frame is not an error: error() stays rpc_code::ok and the decoder
+// keeps reading. The reason is only available through the two-argument overload
+// below; the single-argument form reports the drop but cannot explain it.
 //
 // feed() may be called with arbitrarily split chunks, including one byte at a
 // time, and with several frames in one chunk. next() may be called before a
@@ -303,7 +346,11 @@ public:
     enum class result : u8 {
         need_more,
         frame_ready,
-        error
+        error,
+        // A ONE_WAY frame with a malformed compressed payload was consumed and
+        // discarded. `out` is unchanged, error() stays ok, and the caller must
+        // call next() again. Only copying mode can produce this result.
+        frame_dropped
     };
 
     // Borrowing mode: decoded payloads point into the decoder's internal
@@ -339,6 +386,12 @@ public:
     // In borrowing mode out.payload is invalidated by the next feed() or
     // next(). In copying mode it is invalidated by the next next().
     [[nodiscard]] result next(frame& out) noexcept;
+
+    // Same as next(frame&) and additionally reports what came off the wire.
+    // `info` may be null, in which case this is exactly next(out). A dropped
+    // ONE_WAY frame returns result::frame_dropped with `info->dropped` set and
+    // `info->drop_reason` naming the failure; error() stays ok.
+    [[nodiscard]] result next(frame& out, frame_compression_info* info) noexcept;
 
     // Error code of the last failure. rpc_code::ok when no error occurred.
     [[nodiscard]] rpc_code error() const noexcept;

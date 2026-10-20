@@ -4,6 +4,34 @@
 
 ## 1.0.0 - 2026-10-19
 
+### 行为变更：COMPRESSED 帧不再被当作明文交付
+
+帧级压缩现已实现 LZ4 block 编解码（`ALGO = 1`），其余情况一律 fail-closed。此前行为不安全：
+`encode_frame` 接受 `COMPRESSED` 标志却写出未压缩 payload；`decode_frame` 与 `frame_decoder`
+把压缩字节当作 payload 返回；任何算法 id 都被接受。`COMPRESSED` 的 8 字节 `PING` 甚至会被
+原样回送为明文 `PONG`。
+
+变更内容：
+
+- `encode_frame` 对 `COMPRESSED` 标志或非零 `ALGO` 返回 `invalid_argument`；压缩帧只能由
+  `encode_frame_compressed` 产生。
+- `decode_frame` 对 `COMPRESSED` 帧返回 `protocol_error`（它没有输出缓冲）；`frame_decoder`
+  在拷贝模式下解压、借用模式下拒绝。解码后的帧头被规范化：清 `COMPRESSED`/`ALGO`，
+  `payload_len` 与 `CRC32C` 改写为逻辑 payload 的对应值。
+- zstd（2）与 gzip（3）在本构建中是被识别但 fail-closed 的 id；`4`-`7` 直接拒绝。
+- `COMPRESSED` 只允许出现在 `REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH` 上；
+  控制帧（含 `PUSH_ACK`）带 `COMPRESSED` 是 `protocol_error`。
+- `ONE_WAY` 帧上的畸形压缩 payload 属于显式丢弃：解码器返回 `result::frame_dropped`，
+  `error()` 保持 `ok`，原因经 `frame_compression_info::drop_reason` 报告。判据是帧类型而非
+  `UNRELIABLE` 标志，因此对端无法把 `REQUEST` 上的致命违规降级为静默丢帧。
+- `frame_decoder::result` 末尾追加 `frame_dropped`（既有值编号不变）。对 `result` 做无 `default`
+  的 `switch` 的代码必须补上该分支：GCC/Clang 会报 `-Werror=switch`，MSVC `/W4` 不告警。
+
+兼容性：生产路径不写 `COMPRESSED` 帧，两处生产解码器都是借用模式，因此既有对端行为不变。
+手工构造压缩帧的对端现在会得到协议错误，而不是被静默误交付——这正是有意的收紧。详见
+`docs/protocol.md` 第 24 节。
+
+
 CRPC 首个正式版本。本版本覆盖核心原语、CRPC 调用/服务器门面，以及
 HTTP/1.1、HTTP/2 与 HTTPS 前门。这不表示所有设计目标均已达成；实测差距见“已知限制”。
 

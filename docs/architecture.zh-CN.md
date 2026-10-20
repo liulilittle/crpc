@@ -343,7 +343,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 推送 | 部分 | `test_push.cpp`；无 PUSH 帧/HTTP 集成 |
 | 流控 | 部分 | `test_flow.cpp`；未接入传输 |
 | 分片/协程 | 已设计 | 无 `shard` 类型或 `coro_rt_*` 调用 |
-| 压缩 | 已设计 | 帧标志已定义；无 lz4/zstd/gzip 实现 |
+| 压缩 | 部分 | HTTP gzip/deflate 流式编解码已实现并测试（\	est_content_coding.cpp\），尚未接入 \http_server\；CRPC 帧压缩：lz4 block 已实现并测试（\	est_frame_compression.cpp\），zstd 保留且 fail-closed，gzip 留待下一阶段；\COMPRESSED\ 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
 | SSE / 长轮询 | 已设计 | 无 SSE writer 或 HTTP 推送适配器 |
 
 ## 20. 验证映射 <a id="s20"></a>

@@ -4,6 +4,39 @@
 
 ## 1.0.0 - 2026-10-19
 
+### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
+
+Frame-level compression is now implemented for the LZ4 block codec (`ALGO = 1`) and the frame layer
+fails closed everywhere else. The previous behaviour was unsafe: `encode_frame` accepted a
+`COMPRESSED` flag and wrote the payload uncompressed, `decode_frame` and `frame_decoder` returned the
+compressed bytes as if they were the payload, and any algorithm id was accepted. A `COMPRESSED`
+`PING` with an 8-byte payload could even be echoed back as a plaintext `PONG`.
+
+What changed:
+
+- `encode_frame` rejects a `COMPRESSED` flag or a non-zero `ALGO` with `invalid_argument`; a
+  compressed frame is produced only by `encode_frame_compressed`.
+- `decode_frame` rejects a `COMPRESSED` frame with `protocol_error` (it has no output buffer);
+  `frame_decoder` decompresses in copying mode and rejects in borrowing mode. A decoded frame's
+  header is normalised: `COMPRESSED`/`ALGO` cleared, `payload_len` and `CRC32C` rewritten for the
+  logical payload.
+- zstd (2) and gzip (3) are recognised ids that fail closed in this build; `4`-`7` are rejected.
+- `COMPRESSED` is only accepted on `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`. A
+  `COMPRESSED` control frame - including `PUSH_ACK` - is `protocol_error`.
+- A malformed compressed payload on a `ONE_WAY` frame is an explicit drop: the decoder returns
+  `result::frame_dropped`, `error()` stays `ok`, and the reason is reported through
+  `frame_compression_info::drop_reason`. The drop criterion is the frame type, not the `UNRELIABLE`
+  flag, so a peer cannot downgrade a fatal violation on a `REQUEST` into a lost request.
+- `frame_decoder::result` gained `frame_dropped` (appended, so existing values keep their numbers).
+  Code that switches over `result` without a `default` must add the case: GCC/Clang report
+  `-Werror=switch`; MSVC `/W4` does not warn.
+
+Compatibility: no production path writes a `COMPRESSED` frame, and both production decoders are in
+borrowing mode, so no existing peer changes behaviour. A peer that hand-crafts a compressed frame
+now gets a protocol error instead of silent misdelivery - that is the intended tightening. See
+`docs/protocol.md` section 24.
+
+
 The first CRPC release. It covers the core primitives, the CRPC call/server
 facade and the HTTP/1.1, HTTP/2 and HTTPS front ends. It is not a claim that
 every design target is met; the measured gaps are listed under known

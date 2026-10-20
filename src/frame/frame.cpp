@@ -7,6 +7,7 @@
 #include <limits>
 
 #include <crpc/frame.hpp>
+#include <crpc/frame_compression.hpp>
 #include <crpc/wire.hpp>
 
 namespace crpc {
@@ -159,6 +160,23 @@ constexpr crc32c_table crc32c_lookup = make_crc32c_table();
     return code == rpc_code::protocol_error ? rpc_code::invalid_argument : code;
 }
 
+// Whole-frame compression gate, shared by encode_frame/decode_frame and the
+// incremental decoder. It is deliberately not part of validate_header:
+// decode_frame_header must keep accepting a COMPRESSED header (including on a
+// control frame) so the whole-frame paths can decide with the payload in hand.
+//
+// Returns rpc_code::ok when the frame carries no COMPRESSED flag, or when it
+// carries one on a type whose payload is application data. A COMPRESSED control
+// frame is a protocol violation: those payloads are fixed-size control fields
+// where compression can only inflate (PUSH_ACK is also size-checked by the
+// server), so the compressed form would be misread as a malformed one.
+[[nodiscard]] bool compression_allowed_for(const frame_header& header) noexcept {
+    if ((header.flags & frame_flag_compressed) == 0) {
+        return true;
+    }
+    return frame_type_carries_compression(header.type);
+}
+
 } // namespace
 
 // --- CRC32C ------------------------------------------------------------------
@@ -236,6 +254,13 @@ std::size_t encoded_frame_size(const frame& value) noexcept {
 
 status encode_frame(span<std::byte> out, const frame& value, std::size_t& written, u32 max_frame) noexcept {
     written = 0;
+    if ((value.header.flags & (frame_flag_compressed | frame_flag_algo_mask)) != 0) {
+        // A frame that claims a compressed payload it does not contain is worse
+        // than no compression at all: the peer would either misparse it or
+        // silently deliver it as plaintext. Only encode_frame_compressed may set
+        // those bits, and only after actually compressing the payload.
+        return rpc_code::invalid_argument;
+    }
     if (value.payload.size() > static_cast<std::size_t>(max_frame) ||
         value.payload.size() > static_cast<std::size_t>(std::numeric_limits<u32>::max())) {
         return rpc_code::invalid_argument;
@@ -307,6 +332,14 @@ status decode_frame(span<const std::byte> in, frame& value, u32 max_frame) noexc
 
     const span<const std::byte> payload =
         in.subspan(frame_header_size + extension_bytes, static_cast<std::size_t>(header.payload_len));
+    if (!compression_allowed_for(header)) {
+        return rpc_code::protocol_error;
+    }
+    if ((header.flags & frame_flag_compressed) != 0) {
+        // No output buffer: this entry point cannot deliver decompressed bytes
+        // and must never hand the compressed stream to the caller as a payload.
+        return rpc_code::protocol_error;
+    }
     if ((header.flags & frame_flag_crc32c) != 0 && crc32c(payload) != header.ext) {
         return rpc_code::protocol_error;
     }
@@ -510,6 +543,13 @@ void frame_decoder::compact() noexcept {
 }
 
 frame_decoder::result frame_decoder::next(frame& out) noexcept {
+    return next(out, nullptr);
+}
+
+frame_decoder::result frame_decoder::next(frame& out, frame_compression_info* info) noexcept {
+    if (info != nullptr) {
+        *info = frame_compression_info{};
+    }
     if (error_ != rpc_code::ok) {
         return result::error;
     }
@@ -553,6 +593,127 @@ frame_decoder::result frame_decoder::next(frame& out) noexcept {
     const span<const std::byte> payload(
         base + frame_header_size + extension_bytes,
         static_cast<std::size_t>(header.payload_len));
+
+    // Consumes the frame just parsed. A drop is a normal, non-latching outcome:
+    // the bytes are gone and the decoder stays usable, which is why error_ is
+    // not touched here.
+    const auto consume = [&]() noexcept {
+        read_offset_ += total;
+        if (read_offset_ == buffer_.size()) {
+            buffer_.clear();
+            read_offset_ = 0;
+        }
+    };
+
+    if (!compression_allowed_for(header)) {
+        error_ = rpc_code::protocol_error;
+        return result::error;
+    }
+
+    if ((header.flags & frame_flag_compressed) != 0) {
+        if (payload_buffer_.empty()) {
+            // Borrowing mode has nowhere to put the decompressed bytes and must
+            // never hand the compressed stream to the caller.
+            error_ = rpc_code::protocol_error;
+            return result::error;
+        }
+        const compression_algorithm algorithm = frame_compression(header);
+        if (!is_supported_compression(algorithm) || algorithm == compression_algorithm::none) {
+            error_ = rpc_code::protocol_error;
+            return result::error;
+        }
+        if (payload.size() < min_compressed_payload_size) {
+            error_ = rpc_code::protocol_error;
+            return result::error;
+        }
+
+        const std::size_t logical_size =
+            static_cast<std::size_t>(static_cast<u8>(payload[0])) |
+            (static_cast<std::size_t>(static_cast<u8>(payload[1])) << 8) |
+            (static_cast<std::size_t>(static_cast<u8>(payload[2])) << 16) |
+            (static_cast<std::size_t>(static_cast<u8>(payload[3])) << 24);
+        if (logical_size == 0 || logical_size > static_cast<std::size_t>(max_frame_)) {
+            error_ = rpc_code::protocol_error;
+            return result::error;
+        }
+        if (logical_size > payload_buffer_.size()) {
+            // Bounded before any decompression: the buffer is the real ceiling.
+            error_ = rpc_code::resource_exhausted;
+            return result::error;
+        }
+
+        // Frame-local failures are an explicit drop on ONE_WAY only. The
+        // criterion is the frame type, not the UNRELIABLE flag: a peer can set
+        // that flag on a reliable frame, and it must not be able to downgrade a
+        // fatal protocol violation into a silently lost request.
+        const bool droppable = header.type == frame_type::one_way;
+        const auto drop_or_fail = [&](rpc_code reason) noexcept {
+            if (droppable) {
+                consume();
+                if (info != nullptr) {
+                    info->algorithm = algorithm;
+                    info->wire_size = header.payload_len;
+                    info->logical_size = static_cast<std::uint32_t>(logical_size);
+                    info->dropped = true;
+                    // The frame was discarded because its payload could not be
+                    // decoded; error() stays ok and the caller learns the reason
+                    // from here. decode_error is the documented drop reason.
+                    info->drop_reason = rpc_code::decode_error;
+                }
+                return result::frame_dropped;
+            }
+            error_ = reason;
+            return result::error;
+        };
+
+        if ((header.flags & frame_flag_crc32c) != 0 && crc32c(payload) != header.ext) {
+            return drop_or_fail(rpc_code::protocol_error);
+        }
+
+        // The decoder carries no policy member (ABI), so its ceiling is the
+        // frame limit it was constructed with; the payload buffer was already
+        // checked above and is the stricter bound. The ratio guard uses the
+        // default, which admits every legal LZ4 stream.
+        compression_limits limits;
+        limits.max_payload = max_frame_;
+
+        std::size_t decoded_size = 0;
+        const status decode_status = decompress_payload(
+            algorithm, payload.subspan(compressed_payload_prefix_size), logical_size,
+            payload_buffer_.first(logical_size), decoded_size, limits);
+        if (!decode_status.ok()) {
+            // Algorithm and limit failures stay fatal on every frame type; the
+            // codec has already distinguished them by its status code.
+            if (decode_status.code() == rpc_code::protocol_error) {
+                return drop_or_fail(rpc_code::protocol_error);
+            }
+            error_ = decode_status.code();
+            return result::error;
+        }
+        if (decoded_size != logical_size) {
+            return drop_or_fail(rpc_code::protocol_error);
+        }
+
+        header.flags = static_cast<u8>(
+            header.flags & static_cast<u8>(~(frame_flag_compressed | frame_flag_algo_mask)));
+        header.payload_len = static_cast<u32>(logical_size);
+        header.ext = (header.flags & frame_flag_crc32c) != 0
+                         ? crc32c(span<const std::byte>(payload_buffer_.data(), logical_size))
+                         : u32{0};
+
+        out.header = header;
+        out.ordered = ordered;
+        out.payload = span<const std::byte>(payload_buffer_.data(), logical_size);
+
+        consume();
+        if (info != nullptr) {
+            info->algorithm = algorithm;
+            info->wire_size = static_cast<std::uint32_t>(payload.size());
+            info->logical_size = static_cast<std::uint32_t>(logical_size);
+        }
+        return result::frame_ready;
+    }
+
     if ((header.flags & frame_flag_crc32c) != 0 && crc32c(payload) != header.ext) {
         error_ = rpc_code::protocol_error;
         return result::error;
@@ -574,10 +735,10 @@ frame_decoder::result frame_decoder::next(frame& out) noexcept {
     out.ordered = ordered;
     out.payload = output_payload;
 
-    read_offset_ += total;
-    if (read_offset_ == buffer_.size()) {
-        buffer_.clear();
-        read_offset_ = 0;
+    consume();
+    if (info != nullptr) {
+        info->wire_size = header.payload_len;
+        info->logical_size = header.payload_len;
     }
     return result::frame_ready;
 }
