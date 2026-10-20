@@ -536,6 +536,166 @@ CRPC_TEST(hub_shard_routing) {
     CRPC_CHECK(topic_shard("topic", 0u, 1u) == 0u);
 }
 
+// --- Hub: keep-queue release and front replay --------------------------------
+
+CRPC_TEST(hub_release_keeps_queue_and_attach_none) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 8;
+    options.max_replay = 8;
+    options.retransmit_budget = 3;
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    auto first = h.attach(1);
+    for (int i = 1; i <= 6; ++i) {
+        const std::string body = "m" + std::to_string(i);
+        h.publish("t", as_bytes(body), delivery_mode::reliable);
+    }
+
+    push_message message;
+    CRPC_CHECK(h.try_take(first, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(1));
+
+    // Session end: keep-queue release. The queue is untouched and nothing is
+    // counted as a retransmission.
+    CRPC_CHECK(h.release(first).ok());
+    CRPC_CHECK_FALSE(h.try_take(first, std::string_view("t"), message));
+    CRPC_CHECK_EQ(h.stats().retransmits, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(5));
+
+    // A new connection only retargets the queue; attach(none) does not replay
+    // the already-taken sequence.
+    const auto second = h.attach(1, attach_replay::none);
+    CRPC_CHECK(second != hub::invalid_connection);
+    for (int i = 2; i <= 6; ++i) {
+        CRPC_CHECK(h.try_take(second, std::string_view("t"), message));
+        CRPC_CHECK_EQ(message.seq, static_cast<u64>(i));
+        CRPC_CHECK(h.ack(1, "t", message.seq).ok());
+    }
+    CRPC_CHECK_FALSE(h.try_take(second, std::string_view("t"), message));
+    CRPC_CHECK_EQ(h.stats().retransmits, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+
+    CRPC_CHECK_EQ(code_id(h.release(first).code()), code_id(rpc_code::not_found));
+}
+
+CRPC_TEST(hub_retransmit_front_preserves_order) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 8;
+    options.max_replay = 8;
+    options.retransmit_budget = 3;
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    const auto connection = h.attach(1);
+    for (int i = 1; i <= 6; ++i) {
+        const std::string body = "m" + std::to_string(i);
+        h.publish("t", as_bytes(body), delivery_mode::reliable);
+    }
+
+    // seq1 is taken but not acknowledged (the response was lost). Front replay
+    // must put it back at the head, not at the tail.
+    push_message message;
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(1));
+    CRPC_CHECK(h.retransmit_front(1, "t").ok());
+    CRPC_CHECK_EQ(h.stats().retransmits, static_cast<u64>(1));
+
+    for (int i = 1; i <= 6; ++i) {
+        CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+        CRPC_CHECK_EQ(message.seq, static_cast<u64>(i));
+        CRPC_CHECK(payload_is(message, "m" + std::to_string(i)));
+        CRPC_CHECK(h.ack(1, "t", message.seq).ok());
+    }
+    CRPC_CHECK_FALSE(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(0));
+}
+
+CRPC_TEST(hub_attach_front_replays_at_head) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 8;
+    options.max_replay = 8;
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    auto first = h.attach(1);
+    for (int i = 1; i <= 3; ++i) {
+        h.publish("t", as_bytes("x"), delivery_mode::reliable);
+    }
+    push_message message;
+    CRPC_CHECK(h.try_take(first, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(1));
+    CRPC_CHECK(h.release(first).ok());
+
+    // The explicit front mode replays the taken sequence before the still
+    // queued ones, in sequence order.
+    const auto second = h.attach(1, attach_replay::front);
+    CRPC_CHECK(second != hub::invalid_connection);
+    for (int i = 1; i <= 3; ++i) {
+        CRPC_CHECK(h.try_take(second, std::string_view("t"), message));
+        CRPC_CHECK_EQ(message.seq, static_cast<u64>(i));
+    }
+    CRPC_CHECK_FALSE(h.try_take(second, std::string_view("t"), message));
+}
+
+CRPC_TEST(hub_budget_counts_only_transmitted) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 8;
+    options.max_replay = 8;
+    options.retransmit_budget = 1;
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    auto first = h.attach(1);
+    for (int i = 1; i <= 4; ++i) {
+        h.publish("t", as_bytes("x"), delivery_mode::reliable);
+    }
+    // A keep-queue release/attach of never-transmitted messages is not a
+    // retransmission and must not consume the budget.
+    CRPC_CHECK(h.release(first).ok());
+    const auto second = h.attach(1, attach_replay::none);
+    CRPC_CHECK_EQ(h.stats().retransmits, static_cast<u64>(0));
+
+    push_message message;
+    CRPC_CHECK(h.try_take(second, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(1));
+    CRPC_CHECK(h.retransmit_front(1, "t").ok()); // attempts = 1, budget = 1
+    CRPC_CHECK(h.try_take(second, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(1));
+    // The second retransmission exceeds the budget: the subscriber is
+    // disconnected and the caller is told to restart, not to wait.
+    const status over = h.retransmit_front(1, "t");
+    CRPC_CHECK_FALSE(over.ok());
+    CRPC_CHECK_EQ(code_id(over.code()), code_id(rpc_code::not_acknowledged));
+    CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(0));
+}
+
+CRPC_TEST(hub_trimmed_replay_reports_gap) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 2;
+    options.max_replay = 2;
+    options.retransmit_budget = 3;
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    const auto connection = h.attach(1);
+    for (int i = 1; i <= 4; ++i) {
+        h.publish("t", as_bytes("x"), delivery_mode::reliable);
+    }
+    // The replay window held only seq3/seq4; seq1/seq2 can no longer be
+    // retransmitted. This must be an explicit restart, not a silent skip.
+    push_message message;
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    const status gap = h.retransmit_front(1, "t");
+    CRPC_CHECK_FALSE(gap.ok());
+    CRPC_CHECK_EQ(code_id(gap.code()), code_id(rpc_code::resource_exhausted));
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+}
+
 // --- Stream: reader ----------------------------------------------------------
 
 CRPC_TEST(stream_read_some_and_exact) {

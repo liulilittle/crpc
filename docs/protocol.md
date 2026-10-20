@@ -32,6 +32,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [20](#s20) | HTTP/1.1 Server-Sent Events (implemented subset) |
 | [21](#s21) | HTTP content coding (implemented subset) |
 | [22](#s22) | HTTP file download and Range (implemented subset) |
+| [23](#s23) | HTTP/1.1 long polling (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -310,7 +311,7 @@ Verification is in `tests/test_frame.cpp` (header and ordered/ping golden bytes,
 This section is normative for the implemented single-shard, in-process subset.
 PUSH travels on the same connection as REQUEST/RESPONSE. Cross-shard routing,
 ordered/gap handling and `stream_transport` integration are outside this subset;
-HTTP SSE has its own subset in section 20.
+HTTP SSE and HTTP long polling have their own subsets in sections 20 and 23.
 
 ### 19.1 PUSH envelope
 
@@ -382,8 +383,9 @@ per-subscription queues and their overflow policy instead.
 ## 20. HTTP/1.1 Server-Sent Events (implemented subset) <a id="s20"></a>
 
 This section is normative for the implemented SSE subset: HTTP/1.1, a single
-shard, in process. Long polling, HTTP/2 SSE, cross-shard publish, authentication
-and `content_coding` are outside this subset. The framing helpers live in
+shard, in process. Long polling is specified in section 23; HTTP/2 SSE,
+cross-shard publish, authentication and `content_coding` are outside this
+subset. The framing helpers live in
 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`; the server wiring lives in
 `src/http/server.cpp`.
 
@@ -568,3 +570,111 @@ next request.
 
 A request path that matches a download route is answered with a complete `501`
 over HTTP/2 (fail closed); no file is streamed.
+
+## 23. HTTP/1.1 long polling (implemented subset) <a id="s23"></a>
+
+This section is normative for the implemented long-poll subset: HTTP/1.1, a
+single shard, in process. Routes are registered with
+`http_server::builder::add_longpoll_route()`; the session state machine lives in
+`src/http/server.cpp`. Long polling requires
+`http_server_options::shards == 1`; a request on a multi-shard server is
+answered `503`. Long-poll paths, SSE paths and download paths are mutually
+exclusive (`start()` rejects a conflict). SSE behaviour is unchanged.
+
+### 23.1 Request and subscription identity
+
+`GET <longpoll-path>`. `HEAD` and every other method are `405`; HTTP/1.0 is
+`400`. Query parameters override the registered route: `topic` (must be
+non-empty), `mode` (`reliable` or `unreliable`), `ordered` (`0`/`1` or
+`false`/`true`), `subscriber` and `timeout`. `timeout` is milliseconds, defaults
+to `longpoll_options::timeout` (25 s) and is clamped to
+`[0, longpoll_options::max_timeout]` (30 s); `0` performs one non-blocking take
+and answers `204` when the queue is empty.
+
+A cursor is either `Last-Event-ID: <epoch>:<seq>` or `?cursor=<epoch>:<seq>`.
+`Last-Event-ID` has priority; if both are present and differ the request is
+`400`. Parsing is the strict SSE parser. Long-poll subscriber ids live in
+`[2^32, 2^33)` (SSE allocates from 1); a client-supplied id outside that range
+is `400`. When `subscriber` is absent the server allocates an id. Every `200`
+and `204` carries `X-CRPC-Subscriber`, and the client must persist it. A new
+subscription created after an overflow/TTL loss returns a fresh server id, so
+the client resets its de-duplication state; the namespace is a
+collision-avoidance convention, not a security boundary.
+
+### 23.2 Responses
+
+| Case | Status | Body | Key headers |
+|---|---|---|---|
+| Event | `200` | exactly one raw message | `Content-Type` (default `application/octet-stream`), `Content-Length`, `Cache-Control: no-store, no-cache`, `X-CRPC-Event-ID: <epoch>:<seq>`, `X-CRPC-Subscriber`, `Connection: keep-alive|close` |
+| Timeout | `204` | empty | `Cache-Control: no-store, no-cache`, `X-CRPC-Subscriber`, `Connection: keep-alive|close`; no `Content-Length`, no `X-CRPC-Event-ID` |
+| Zero-length event | `200` | empty (`Content-Length: 0`) | same as an event, including `X-CRPC-Event-ID` |
+| Invalid parameter/cursor | `400` | problem/plain | - |
+| Unknown/unowned topic | `404` | plain | - |
+| Same subscriber already active | `409` | plain | - |
+| Replay window gap / retransmission budget | `409` | plain (`Restart`) | - |
+| Waiting-poll capacity | `503` | plain | `Retry-After: 1` |
+| HTTP/2 | `501` | plain | complete response, no stream |
+
+The reliable-mode event id uses the per-subscription `seq`; unreliable mode
+uses `topic_seq` and has no acknowledgement. Responses are never
+content-coded and carry no `Vary` (the special route runs before response
+coding). A zero-length reliable event is a `200` with `Content-Length: 0` and an
+event id; it is distinguishable from the bodyless `204` timeout.
+
+### 23.3 Acknowledgement and at-least-once delivery
+
+A `200` does not acknowledge the message. The next request's cursor is the
+cumulative ACK: the server clamps it to the highest sequence it has delivered
+for that `(subscriber, topic)` and calls `hub.ack(cursor)`. An over-large cursor
+is clamped (`longpoll_ack_clamped`); a cursor whose epoch differs from
+`longpoll_options::epoch` is not acknowledged. The de-duplication key is
+`(subscriber, epoch, seq)`.
+
+A normal `200` or `204` never detaches: the token, subscription and queue are
+kept across polls. Session end (peer close, stop, stall) uses the hub's
+keep-queue `release(token)`: it invalidates the token but leaves queued
+messages `in_queue` and does not count a retransmission. If the client's cursor
+is behind the delivered high water, the server calls `retransmit_front`, which
+inserts the already-taken but unacknowledged reliable messages at the FRONT of
+the queue in sequence order before taking one. `retransmit_budget` counts only
+messages that were actually transmitted. If the replay window no longer
+contains the first unacknowledged sequence (it was trimmed by `max_replay`) or
+the budget is exhausted, the current poll is `409 Restart` instead of silently
+skipping data; the client restarts the subscription. `retransmit_front` relies
+on `subscribe_options::max_replay >= subscribe_options::max_messages`; `start()`
+raises the replay bound to the queue bound when needed.
+
+### 23.4 Waiting, liveness and limits
+
+The take and the wait registration happen under the same hub lock as `publish`,
+so a publish can never fall between "queue empty" and "wait registered". While
+a poll waits, the connection's idle and request deadlines are disabled and a
+dedicated poll deadline is armed. A publish wake posts shard work; the shard
+takes one message and answers immediately. When the deadline fires, the server
+performs one more take (a wake may have been dropped by a full shard inbox)
+before answering `204`, then re-arms the idle deadline. The connection stays
+keep-alive; HTTP/1.1 pipelining is not parsed until the poll's response has been
+queued.
+
+A subscriber has at most one active transport: a second concurrent poll from
+another connection is `409` (the first token is not retargeted). Total waiting
+polls are bounded by `longpoll_options::max_waiters`; beyond it the request is
+`503` with `Retry-After: 1`. `http_server_options::max_connections` remains the
+accept-level socket bound. A peer that stops draining a polled body is closed
+by `longpoll_options::slow_timeout`; the taken message stays unacknowledged and
+is replayed by the next poll's cursor gap. A subscriber that sends no poll for
+`longpoll_options::subscriber_ttl` (5 min) is unsubscribed (`unsubscribe_all`)
+and its high-water/owner bookkeeping is removed. On `stop()` a waiting poll is
+woken and the session is closed; the keep-queue release runs before the hub is
+destroyed.
+
+### 23.5 Differences from SSE (section 20)
+
+| Dimension | SSE | Long polling |
+|---|---|---|
+| Framing | chunked `text/event-stream` events | one `Content-Length` raw body per `200` |
+| Timeout | heartbeat comments; no 204 | `204`, no body |
+| ACK | reconnect `Last-Event-ID` | next poll cursor (cumulative) |
+| Connection ownership | dedicated stream, idle disabled | keep-alive, idle re-armed after each poll |
+| Concurrency | reconnect retargets the token | same subscriber active transport -> `409` |
+| Resource cleanup | existing subset has no TTL (D5) | TTL + `unsubscribe_all` |

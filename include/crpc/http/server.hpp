@@ -86,6 +86,56 @@ struct sse_options {
     push::subscribe_options subscribe{};
 };
 
+// HTTP/1.1 long polling. Each request waits up to `timeout` for one message
+// and answers `200` with the raw payload plus `Content-Length`, or `204` when
+// the wait expires. The subscription lives across polls: a normal response
+// never detaches, and a client acknowledges cumulatively by sending the event
+// id it received as `Last-Event-ID` (or `?cursor=`) on the next poll.
+struct longpoll_options {
+    // Default and maximum wait in milliseconds. A query `timeout` is clamped to
+    // `[0, max_timeout]`; zero performs one non-blocking take and answers 204
+    // when the queue is empty.
+    std::chrono::milliseconds timeout{25000};
+    std::chrono::milliseconds max_timeout{30000};
+
+    // A subscriber that sends no poll for this long is unsubscribed and its
+    // bookkeeping removed (zero disables the sweep).
+    std::chrono::milliseconds subscriber_ttl{std::chrono::minutes(5)};
+
+    // Bound on concurrently waiting polls. A poll beyond it is answered 503
+    // with `Retry-After: 1`.
+    std::size_t max_waiters = 4096;
+
+    // Per-session bound on staged response bytes. Zero reuses
+    // `http_server_options::egress_cap_bytes`.
+    std::size_t egress_cap_bytes = 0;
+
+    // A peer that stops draining a polled response for this long is closed
+    // (zero disables the check). The message stays unacknowledged and is
+    // replayed by the next poll's cursor gap.
+    std::chrono::milliseconds slow_timeout{30000};
+
+    // `Content-Type` of a 200 response.
+    std::string content_type = "application/octet-stream";
+
+    // Epoch stamped into event ids and compared with a client cursor.
+    u64 epoch = 1;
+
+    // Hub subscription bounds. `max_replay` is raised to at least
+    // `max_messages` at start() so the replay window can always hold the
+    // queue, which `retransmit_front` relies on.
+    push::subscribe_options subscribe{};
+};
+
+// One long-poll endpoint. The request may override `topic`, `mode` and
+// `ordered` with the query parameters of the same names.
+struct longpoll_route {
+    std::string path;
+    std::string topic;
+    push::delivery_mode mode = push::delivery_mode::reliable;
+    bool ordered = false;
+};
+
 // One file download endpoint. `path` is the request path prefix (e.g.
 // `/files`); the remainder is resolved under `root` after percent-decoding and
 // a path-traversal check. `GET` and `HEAD` are served, `Range` is honored with
@@ -158,6 +208,10 @@ struct http_server_options {
     // registered on the builder with `sse_route()`.
     sse_options sse{};
 
+    // HTTP/1.1 long polling (single shard). Routes are registered on the
+    // builder with `add_longpoll_route()`.
+    longpoll_options longpoll{};
+
     // --- HTTP content coding -------------------------------------------------
     // Negotiate a response Content-Encoding from the request's Accept-Encoding
     // and encode the body. When false, responses are always identity (the
@@ -219,6 +273,17 @@ struct http_statistics {
     std::size_t requests_decoded = 0;
     // Download responses (200/206/416) served from a download route.
     std::size_t downloads_served = 0;
+    // Long-poll state: currently waiting polls, live subscribers tracked for
+    // TTL, 200 responses, 204 timeouts, cursors clamped to the delivered high
+    // water, 409 conflicts/restarts, and 503 capacity rejections.
+    std::size_t longpoll_waiters = 0;
+    std::size_t longpoll_subscribers = 0;
+    std::size_t longpoll_events = 0;
+    std::size_t longpoll_timeouts = 0;
+    std::size_t longpoll_ack_clamped = 0;
+    std::size_t longpoll_conflicts = 0;
+    std::size_t longpoll_restarts = 0;
+    std::size_t longpoll_overloaded = 0;
 };
 
 // The server facade. Build it with `builder`, add TLS listeners with
@@ -250,6 +315,9 @@ public:
         // fails with `failed_precondition` otherwise. An HTTP/2 request that
         // targets an SSE path is answered with 501 (fail-closed, no stream).
         builder& add_sse_route(sse_route route);
+        // Registers a long-poll endpoint (HTTP/1.1 only; HTTP/2 requests that
+        // match are answered with 501).
+        builder& add_longpoll_route(longpoll_route route);
         // Registers a file download endpoint (HTTP/1.1 only; HTTP/2 requests
         // that match are answered with 501).
         builder& add_download_route(download_route route);
@@ -260,6 +328,7 @@ public:
         http_server_options options_{};
         std::vector<listener_config> listeners_;
         std::vector<sse_route> sse_routes_;
+        std::vector<longpoll_route> longpoll_routes_;
         std::vector<download_route> download_routes_;
         const mvc::router* router_ = nullptr;
     };

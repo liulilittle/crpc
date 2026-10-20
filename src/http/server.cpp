@@ -164,6 +164,28 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
     return nullptr;
 }
 
+// Long-poll route lookup. The list is immutable once the server is built.
+[[nodiscard]] const longpoll_route* find_longpoll_route(
+    const std::vector<longpoll_route>& routes, std::string_view path) noexcept {
+    for (const longpoll_route& route : routes) {
+        if (route.path == path) {
+            return &route;
+        }
+    }
+    return nullptr;
+}
+
+// Long-poll subscriber ids live in [1<<32, 1<<33); SSE allocates from 1. The
+// namespace is a collision-avoidance convention, not a security boundary.
+constexpr u64 k_longpoll_subscriber_base = 1ull << 32;
+constexpr u64 k_longpoll_subscriber_limit = 1ull << 33;
+constexpr u64 k_longpoll_subscriber_count =
+    k_longpoll_subscriber_limit - k_longpoll_subscriber_base;
+
+[[nodiscard]] bool is_longpoll_subscriber(u64 id) noexcept {
+    return id >= k_longpoll_subscriber_base && id < k_longpoll_subscriber_limit;
+}
+
 // A download route match: the longest registered prefix that bounds the path at
 // a '/' and the (still percent-encoded) remainder.
 struct download_match {
@@ -493,6 +515,8 @@ public:
     // Wakes the SSE pump. Safe from any thread: it only posts a shard task, so
     // `http_server::publish()` never touches shard-only state directly.
     void wake_sse() noexcept;
+    // Wakes a waiting long poll. Same contract as `wake_sse`.
+    void wake_longpoll() noexcept;
 
     [[nodiscard]] runtime* shard() const noexcept { return shard_; }
 
@@ -538,6 +562,10 @@ private:
     [[nodiscard]] bool keep_alive(const http::request& request) const noexcept;
     void send_http1_error(int status_code, std::string_view detail,
                           const http::request& request, bool keep);
+    // Long-poll error response; 503 may carry `Retry-After: 1`.
+    void send_longpoll_error(int status_code, std::string_view detail,
+                             const http::request& request, bool keep,
+                             bool retry_after);
     // Request-side content coding: decodes a gzip/deflate body in place and
     // returns the HTTP status to answer with (200 when no change was needed).
     int decode_request_body(http::request& request);
@@ -574,6 +602,21 @@ private:
     void sse_close(bool graceful) noexcept;
     // Hard close after detach; used for stall detection and write failures.
     void sse_abort() noexcept;
+
+    // HTTP/1.1 long polling. `longpoll_open` parses the request, acks the
+    // cursor, attaches/retargets the hub token and either answers immediately
+    // or arms one wait. `longpoll_pump` is the single take path, called from the
+    // shard on a publish wake, on a probe, or after an open.
+    void longpoll_open(http::request request, const longpoll_route& route);
+    void longpoll_pump();
+    void longpoll_send_message(const push::push_message& message, bool keep);
+    void longpoll_send_timeout(bool keep);
+    void longpoll_finish_wait() noexcept;
+    // Session-end/release helper: keep-queue release, clear the owner and the
+    // waiter counters. Idempotent and safe after a hub reset.
+    void longpoll_release() noexcept;
+    void longpoll_mark_output();
+    [[nodiscard]] std::size_t longpoll_egress_cap() const noexcept;
 
     // Completion publishing helper (called under `mu_`).
     void queue_write_complete(bool ok) noexcept;
@@ -667,6 +710,20 @@ private:
     bool download_keep_alive_ = true;
     std::string download_buffer_;
     u64 output_stall_deadline_ns_ = 0;
+
+    // Long-poll state. `longpoll_active_` is the wait flag read by the publish
+    // thread (it only posts a shard task), so it is atomic. Everything else is
+    // shard-only. A normal 200/204 keeps the token: only session end calls
+    // `longpoll_release()` (keep-queue).
+    std::atomic<bool> longpoll_active_{false};
+    bool longpoll_response_active_ = false;
+    push::subscriber_id longpoll_subscriber_ = 0;
+    push::hub::connection_id longpoll_token_ = 0;
+    std::string longpoll_topic_;
+    bool longpoll_reliable_ = false;
+    bool longpoll_keep_ = true;
+    u64 longpoll_epoch_ = 0;
+    u64 longpoll_deadline_ns_ = 0;
 };
 
 // --- Server state ------------------------------------------------------------
@@ -690,6 +747,113 @@ struct server_state {
     std::atomic<std::size_t> sse_connections{0};
     std::atomic<std::size_t> sse_events_delivered{0};
     std::atomic<std::size_t> sse_slow_closes{0};
+    // SSE subscriber ids currently subscribed, so a long-poll request cannot
+    // take over the same logical id. A long-poll owner is checked from the SSE
+    // open path in the other direction.
+    // Reference count: a reconnect with the same id can overlap the old
+    // stream's detach. The long-poll conflict check only cares whether any SSE
+    // transport still holds the id.
+    std::unordered_map<u64, std::size_t> sse_subscribers;
+
+    // HTTP long polling (single shard). Every field below is protected by
+    // `hub_mutex` because publishes and opens run on different threads.
+    std::vector<longpoll_route> longpoll_routes;
+    struct longpoll_owner {
+        std::weak_ptr<session> owner;
+        push::hub::connection_id token = push::hub::invalid_connection;
+    };
+    std::unordered_map<u64, longpoll_owner> longpoll_owners;
+    // A subscriber with an in-flight poll; a second concurrent poll is 409.
+    std::unordered_set<u64> longpoll_busy;
+    // Per (subscriber, topic) high water: the largest reliable seq handed out
+    // by a long poll. A cursor is clamped to it before ack and a gap triggers
+    // `retransmit_front`.
+    std::map<std::pair<u64, std::string>, u64> longpoll_delivered;
+    // Last poll timestamp (monotonic ns) per subscriber for the TTL sweep.
+    std::unordered_map<u64, u64> longpoll_last_seen;
+    // Tombstones for ids removed by the TTL sweep: a client that reuses the old
+    // id after the subscription died must be handed a fresh server id (its old
+    // sequence space is gone). Bounded to max(max_waiters, 1024) entries.
+    std::unordered_map<u64, u64> longpoll_lost;
+    u64 next_longpoll_sweep_ns = 0;
+    std::atomic<u64> next_longpoll_subscriber{k_longpoll_subscriber_base};
+    std::atomic<std::size_t> longpoll_waiters{0};
+    std::atomic<std::size_t> longpoll_events{0};
+    std::atomic<std::size_t> longpoll_timeouts{0};
+    std::atomic<std::size_t> longpoll_ack_clamped{0};
+    std::atomic<std::size_t> longpoll_conflicts{0};
+    std::atomic<std::size_t> longpoll_restarts{0};
+    std::atomic<std::size_t> longpoll_overloaded{0};
+
+    void longpoll_forget(push::subscriber_id id) noexcept {
+        longpoll_owners.erase(id);
+        for (auto it = longpoll_delivered.begin();
+             it != longpoll_delivered.end();) {
+            if (it->first.first == id) {
+                it = longpoll_delivered.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        longpoll_last_seen.erase(id);
+        longpoll_lost.erase(id);
+    }
+
+    void longpoll_sweep(u64 now_ns) noexcept {
+        const std::int64_t ttl_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                options.longpoll.subscriber_ttl)
+                .count();
+        if (ttl_ns <= 0) {
+            return;
+        }
+        if (now_ns < next_longpoll_sweep_ns) {
+            return;
+        }
+        const u64 ttl = static_cast<u64>(ttl_ns);
+        const u64 period = std::min<u64>(ttl, 30000000000ull); // 30 s
+        next_longpoll_sweep_ns = now_ns + period;
+        for (auto it = longpoll_last_seen.begin();
+             it != longpoll_last_seen.end();) {
+            if (longpoll_busy.find(it->first) != longpoll_busy.end() ||
+                now_ns - it->second < ttl) {
+                ++it;
+                continue;
+            }
+            const push::subscriber_id id = it->first;
+            if (hub) {
+                (void)hub->unsubscribe_all(id);
+            }
+            longpoll_owners.erase(id);
+            for (auto dit = longpoll_delivered.begin();
+                 dit != longpoll_delivered.end();) {
+                if (dit->first.first == id) {
+                    dit = longpoll_delivered.erase(dit);
+                } else {
+                    ++dit;
+                }
+            }
+            it = longpoll_last_seen.erase(it);
+            try {
+                longpoll_lost[id] = now_ns;
+                const std::size_t tombstone_cap =
+                    options.longpoll.max_waiters > 1024
+                        ? options.longpoll.max_waiters
+                        : 1024;
+                while (longpoll_lost.size() > tombstone_cap) {
+                    auto oldest = longpoll_lost.begin();
+                    for (auto candidate = longpoll_lost.begin();
+                         candidate != longpoll_lost.end(); ++candidate) {
+                        if (candidate->second < oldest->second) {
+                            oldest = candidate;
+                        }
+                    }
+                    longpoll_lost.erase(oldest);
+                }
+            } catch (...) {
+            }
+        }
+    }
 
     std::vector<std::unique_ptr<runtime>> shards;
     std::atomic<std::size_t> next_shard{0};
@@ -1059,11 +1223,13 @@ void session::process() {
             return;
         }
         if (!input.empty() && !sse_active_.load(std::memory_order_acquire) &&
-            !download_active_.load(std::memory_order_acquire)) {
+            !download_active_.load(std::memory_order_acquire) &&
+            !longpoll_active_.load(std::memory_order_acquire)) {
             // Once the response is an event stream the connection is dedicated
             // to it: later bytes are not a pipelined request (HTTP/1.1 cannot
             // answer them in order) and must not be parsed. A streamed download
-            // likewise holds the connection until its body is written.
+            // likewise holds the connection until its body is written, and a
+            // poll in flight keeps the response order intact.
             note_activity();
             consume(std::move(input));
             arm_probe();
@@ -1073,6 +1239,9 @@ void session::process() {
         }
         if (sse_active_.load(std::memory_order_acquire)) {
             sse_pump();
+        }
+        if (longpoll_active_.load(std::memory_order_acquire)) {
+            longpoll_pump();
         }
         const bool shutdown =
             shutdown_requested_.load(std::memory_order_acquire);
@@ -1101,13 +1270,28 @@ void session::process() {
             sse_clear_stall_if_drained();
             arm_probe();
         }
+        if (longpoll_response_active_ && out_.empty() && !write_in_flight_) {
+            longpoll_response_active_ = false;
+            output_stall_deadline_ns_ = 0;
+        }
+        if (longpoll_response_active_ || longpoll_active_.load()) {
+            arm_probe();
+        }
         bool resume = false;
         bool over_egress = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            // A long-poll response may have a span-local bound below the
+            // generic session cap; honor the tighter one while it is staged.
+            const std::size_t route_cap =
+                longpoll_response_active_ ? longpoll_egress_cap() : 0;
+            const std::size_t generic_cap = state_.options.egress_cap_bytes;
+            const bool under_caps =
+                (generic_cap == 0 || out_bytes_ <= generic_cap) &&
+                (route_cap == 0 || out_bytes_ <= route_cap);
             if (read_paused_ && ingress_.empty() && !close_when_drained_ &&
                 !stop_reading_ && !download_active_.load(std::memory_order_acquire) &&
-                out_bytes_ <= state_.options.egress_cap_bytes) {
+                !longpoll_active_.load(std::memory_order_acquire) && under_caps) {
                 read_paused_ = false;
                 resume = true;
             }
@@ -1115,10 +1299,23 @@ void session::process() {
             // queue crossed its cap. Keep them there until a completion drains
             // the queue: looping now would re-parse the whole batch and rebuild
             // the unbounded queue the cap exists to prevent.
-            over_egress = state_.options.egress_cap_bytes != 0 &&
-                          out_bytes_ > state_.options.egress_cap_bytes;
+            over_egress =
+                (generic_cap != 0 && out_bytes_ > generic_cap) ||
+                (route_cap != 0 && out_bytes_ > route_cap);
             if (ingress_.empty() || over_egress ||
-                download_active_.load(std::memory_order_acquire)) {
+                download_active_.load(std::memory_order_acquire) ||
+                longpoll_active_.load(std::memory_order_acquire)) {
+                // A resumed pause must still reach the backend even when the
+                // ingress buffer is empty; otherwise a peer that was paused by
+                // a full buffer never delivers again.
+                if (resume) {
+                    if (tls_) {
+                        tls_->resume_read();
+                    }
+                    if (transport_) {
+                        transport_->resume_read();
+                    }
+                }
                 break;
             }
         }
@@ -1237,6 +1434,34 @@ void session::send_http1_error(int status_code, std::string_view detail,
     }
     std::string wire;
     if (!http::serialize(response, wire).ok()) {
+        wire = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
+               "Connection: close\r\n\r\n";
+        keep = false;
+    }
+    enqueue(std::move(wire));
+    state_.responded.fetch_add(1, std::memory_order_relaxed);
+    if (!keep) {
+        close_when_drained_ = true;
+        stop_reading_ = true;
+    }
+    flush_writes();
+}
+
+void session::send_longpoll_error(int status_code, std::string_view detail,
+                                  const http::request& request, bool keep,
+                                  bool retry_after) {
+    http::response response = make_problem(status_code, detail, request.path);
+    response.version = request.version;
+    if (retry_after) {
+        response.headers.add("Retry-After", "1");
+    }
+    if (!keep) {
+        response.headers.add("Connection", "close");
+    }
+    http::serialize_options options;
+    options.include_body = request.method != http::method::head;
+    std::string wire;
+    if (!http::serialize(response, wire, options).ok()) {
         wire = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
                "Connection: close\r\n\r\n";
         keep = false;
@@ -1410,6 +1635,16 @@ void session::process_http1(std::string input) {
             }
             return;
         }
+        if (longpoll_active_.load(std::memory_order_acquire)) {
+            // An in-flight poll owns the response order: parse pipelined bytes
+            // only after its 200/204 has been queued.
+            if (!pending.empty()) {
+                std::lock_guard<std::mutex> lk(mu_);
+                ingress_.insert(0, pending);
+                read_paused_ = true;
+            }
+            return;
+        }
         if (stop_reading_ || pending.empty()) {
             return;
         }
@@ -1452,6 +1687,16 @@ void session::handle_http1_request(http::request request) {
         }
     }
 
+    // A long-poll path is a special route, not a router action: a non-GET
+    // method is 405 even when it is a PUT/PATCH that would otherwise trip the
+    // framing rule below.
+    const longpoll_route* early_longpoll =
+        find_longpoll_route(state_.longpoll_routes, request.path);
+    if (early_longpoll != nullptr && request.method != http::method::get) {
+        longpoll_open(std::move(request), *early_longpoll);
+        return;
+    }
+
     const bool framed = request.headers.contains("content-length") ||
                         request.headers.contains("transfer-encoding");
     if (method_requires_framing(request.method) && !framed &&
@@ -1479,6 +1724,12 @@ void session::handle_http1_request(http::request request) {
                 return;
             }
             sse_open(std::move(request), *sse);
+            return;
+        }
+        const longpoll_route* longpoll =
+            find_longpoll_route(state_.longpoll_routes, request.path);
+        if (longpoll != nullptr) {
+            longpoll_open(std::move(request), *longpoll);
             return;
         }
         const download_match download =
@@ -1780,6 +2031,13 @@ void session::wake_sse() noexcept {
     schedule();
 }
 
+void session::wake_longpoll() noexcept {
+    if (!longpoll_active_.load(std::memory_order_acquire)) {
+        return;
+    }
+    schedule();
+}
+
 void session::sse_mark_output() {
     if (sse_stall_deadline_ns_ != 0 || shard_ == nullptr ||
         state_.options.sse.slow_timeout.count() <= 0) {
@@ -1814,6 +2072,16 @@ void session::sse_detach() noexcept {
     // a detached token can no longer receive a delivery or acknowledge a late
     // write. The subscription itself survives so a reconnect can replay.
     std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+    if (sse_subscriber_ != 0) {
+        auto it = state_.sse_subscribers.find(sse_subscriber_);
+        if (it != state_.sse_subscribers.end()) {
+            if (it->second <= 1) {
+                state_.sse_subscribers.erase(it);
+            } else {
+                --it->second;
+            }
+        }
+    }
     if (state_.hub) {
         (void)state_.hub->detach(token);
     }
@@ -1950,6 +2218,21 @@ void session::sse_open(http::request request, const sse_route& route) {
         return;
     }
 
+    bool longpoll_conflict = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        longpoll_conflict =
+            state_.longpoll_owners.find(subscriber) !=
+            state_.longpoll_owners.end();
+    }
+    if (longpoll_conflict) {
+        state_.longpoll_conflicts.fetch_add(1, std::memory_order_relaxed);
+        const bool keep = keep_alive(request);
+        send_longpoll_error(409, "subscriber is used by long polling", request,
+                            keep, false);
+        return;
+    }
+
     status failure;
     {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
@@ -1993,6 +2276,7 @@ void session::sse_open(http::request request, const sse_route& route) {
                         state_.sse_delivered.find({subscriber, topic});
                     sse_delivered_high_water_ =
                         high == state_.sse_delivered.end() ? 0 : high->second;
+                    ++state_.sse_subscribers[subscriber];
                     sse_active_.store(true, std::memory_order_release);
                     state_.sse_connections.fetch_add(1,
                                                      std::memory_order_relaxed);
@@ -2160,6 +2444,650 @@ void session::sse_send_heartbeat() {
     }
     enqueue(std::move(chunk));
     sse_mark_output();
+}
+
+// --- session: HTTP/1.1 long polling -----------------------------------------
+
+std::size_t session::longpoll_egress_cap() const noexcept {
+    const std::size_t configured = state_.options.longpoll.egress_cap_bytes;
+    return configured != 0 ? configured : state_.options.egress_cap_bytes;
+}
+
+void session::longpoll_mark_output() {
+    longpoll_response_active_ = true;
+    if (shard_ == nullptr || state_.options.longpoll.slow_timeout.count() <= 0) {
+        output_stall_deadline_ns_ = 0;
+        return;
+    }
+    output_stall_deadline_ns_ =
+        shard_->now_ns() +
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             state_.options.longpoll.slow_timeout)
+                             .count());
+}
+
+void session::longpoll_finish_wait() noexcept {
+    if (!longpoll_active_.exchange(false)) {
+        return;
+    }
+    longpoll_deadline_ns_ = 0;
+    try {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        if (longpoll_subscriber_ != 0 &&
+            state_.longpoll_busy.erase(longpoll_subscriber_) != 0) {
+            state_.longpoll_waiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (longpoll_subscriber_ != 0) {
+            state_.longpoll_last_seen[longpoll_subscriber_] =
+                shard_ != nullptr ? shard_->now_ns() : 0;
+        }
+    } catch (...) {
+    }
+}
+
+void session::longpoll_release() noexcept {
+    const bool was_waiting = longpoll_active_.exchange(false);
+    const push::hub::connection_id token = longpoll_token_;
+    const push::subscriber_id subscriber = longpoll_subscriber_;
+    longpoll_token_ = 0;
+    longpoll_subscriber_ = 0;
+    longpoll_topic_.clear();
+    longpoll_deadline_ns_ = 0;
+    longpoll_response_active_ = false;
+    output_stall_deadline_ns_ = 0;
+    if (token == 0 && subscriber == 0) {
+        return;
+    }
+    try {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        if (was_waiting && subscriber != 0 &&
+            state_.longpoll_busy.erase(subscriber) != 0) {
+            state_.longpoll_waiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (subscriber != 0) {
+            auto it = state_.longpoll_owners.find(subscriber);
+            if (it != state_.longpoll_owners.end()) {
+                const std::shared_ptr<session> owner = it->second.owner.lock();
+                if (!owner || owner.get() == this ||
+                    it->second.token == token) {
+                    state_.longpoll_owners.erase(it);
+                }
+            }
+            state_.longpoll_last_seen[subscriber] =
+                shard_ != nullptr ? shard_->now_ns() : 0;
+        }
+        if (token != 0 && state_.hub) {
+            // Keep-queue: queued messages stay in_queue, an already-taken
+            // message stays in the replay window, and nothing is counted as a
+            // retransmission.
+            (void)state_.hub->release(token);
+        }
+    } catch (...) {
+    }
+}
+
+void session::longpoll_send_message(const push::push_message& message,
+                                    bool keep) {
+    const bool reliable = message.mode == push::delivery_mode::reliable;
+    const u64 event_seq = reliable ? message.seq : message.topic_seq;
+    const span<const std::byte> body = message.data();
+    std::string head;
+    try {
+        head.reserve(256 + body.size());
+        head += "HTTP/1.1 200 OK\r\n";
+        head += "Content-Type: ";
+        head += state_.options.longpoll.content_type.empty()
+                    ? "application/octet-stream"
+                    : state_.options.longpoll.content_type;
+        head += "\r\n";
+        head += "Content-Length: ";
+        head += std::to_string(body.size());
+        head += "\r\n";
+        head += "Cache-Control: no-store, no-cache\r\n";
+        head += "X-CRPC-Event-ID: ";
+        head += std::to_string(message.epoch);
+        head.push_back(':');
+        head += std::to_string(event_seq);
+        head += "\r\n";
+        head += "X-CRPC-Subscriber: ";
+        head += std::to_string(longpoll_subscriber_);
+        head += "\r\n";
+        head += keep ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        head += "\r\n";
+        if (!body.empty()) {
+            head.append(reinterpret_cast<const char*>(body.data()), body.size());
+        }
+    } catch (...) {
+        // The message was taken and stays unacknowledged; the next poll's
+        // cursor gap replays it. Close instead of emitting a truncated head.
+        write_failed_ = true;
+        close_when_drained_ = true;
+        stop_reading_ = true;
+        return;
+    }
+    enqueue(std::move(head));
+    const std::size_t cap = longpoll_egress_cap();
+    if (cap != 0 && out_bytes_ > cap) {
+        // The long-poll bound is lower than the generic session bound: one
+        // message still makes progress, but no further ingress is read until
+        // the queue drains.
+        std::lock_guard<std::mutex> lk(mu_);
+        read_paused_ = true;
+    }
+    longpoll_mark_output();
+    state_.longpoll_events.fetch_add(1, std::memory_order_relaxed);
+    if (!keep) {
+        close_when_drained_ = true;
+        stop_reading_ = true;
+    }
+    // The wait disabled the idle deadline; a completed poll is inbound activity
+    // again. A peer that stops draining is still bounded by the output stall.
+    note_activity();
+    flush_writes();
+    arm_probe();
+}
+
+void session::longpoll_send_timeout(bool keep) {
+    std::string head;
+    try {
+        head += "HTTP/1.1 204 No Content\r\n";
+        head += "Cache-Control: no-store, no-cache\r\n";
+        head += "X-CRPC-Subscriber: ";
+        head += std::to_string(longpoll_subscriber_);
+        head += "\r\n";
+        head += keep ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        head += "\r\n";
+    } catch (...) {
+        write_failed_ = true;
+        close_when_drained_ = true;
+        stop_reading_ = true;
+        return;
+    }
+    enqueue(std::move(head));
+    state_.longpoll_timeouts.fetch_add(1, std::memory_order_relaxed);
+    if (!keep) {
+        close_when_drained_ = true;
+        stop_reading_ = true;
+    }
+    // A poll is inbound activity for the connection: re-arm the idle bound
+    // after the wait that had disabled it.
+    note_activity();
+    flush_writes();
+    arm_probe();
+}
+
+void session::longpoll_pump() {
+    if (!longpoll_active_.load(std::memory_order_acquire) || finished_ ||
+        write_failed_) {
+        return;
+    }
+    push::push_message message;
+    bool taken = false;
+    try {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        push::hub* hub = state_.hub.get();
+        if (hub != nullptr && longpoll_token_ != 0) {
+            taken = hub->try_take(longpoll_token_, longpoll_topic_, message);
+            if (taken) {
+                state_.longpoll_last_seen[longpoll_subscriber_] =
+                    shard_ != nullptr ? shard_->now_ns() : 0;
+                if (longpoll_reliable_ &&
+                    message.mode == push::delivery_mode::reliable) {
+                    u64& high = state_.longpoll_delivered[
+                        {longpoll_subscriber_, longpoll_topic_}];
+                    if (message.seq > high) {
+                        high = message.seq;
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        return;
+    }
+    if (!taken) {
+        arm_probe();
+        return;
+    }
+    longpoll_finish_wait();
+    longpoll_send_message(message, longpoll_keep_);
+    flush_writes();
+}
+
+void session::longpoll_open(http::request request, const longpoll_route& route) {
+    const bool keep = keep_alive(request);
+    if (request.method != http::method::get) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(405, "long polling requires GET", request, keep,
+                            false);
+        return;
+    }
+    if (request.version != http_version::http_1_1) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "long polling requires HTTP/1.1", request,
+                            false, false);
+        return;
+    }
+
+    std::string topic = route.topic;
+    std::string value;
+    switch (query_param(request.query, "topic", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid topic parameter", request, keep, false);
+        return;
+    case query_result::ok:
+        topic = std::move(value);
+        break;
+    case query_result::missing:
+        break;
+    }
+    if (topic.empty()) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "long-poll route requires a topic", request,
+                            keep, false);
+        return;
+    }
+
+    push::delivery_mode mode = route.mode;
+    switch (query_param(request.query, "mode", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid mode parameter", request, keep, false);
+        return;
+    case query_result::ok:
+        if (value == "reliable") {
+            mode = push::delivery_mode::reliable;
+        } else if (value == "unreliable") {
+            mode = push::delivery_mode::unreliable;
+        } else {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "mode must be reliable or unreliable",
+                                request, keep, false);
+            return;
+        }
+        break;
+    case query_result::missing:
+        break;
+    }
+
+    bool ordered = route.ordered;
+    switch (query_param(request.query, "ordered", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid ordered parameter", request, keep,
+                            false);
+        return;
+    case query_result::ok:
+        if (!parse_bool_text(value, ordered)) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "ordered must be 0/1 or false/true",
+                                request, keep, false);
+            return;
+        }
+        break;
+    case query_result::missing:
+        break;
+    }
+
+    const auto allocate_subscriber = [this]() -> push::subscriber_id {
+        const u64 slot =
+            state_.next_longpoll_subscriber.fetch_add(
+                1, std::memory_order_relaxed) %
+            k_longpoll_subscriber_count;
+        return k_longpoll_subscriber_base + slot;
+    };
+
+    bool have_client_subscriber = false;
+    push::subscriber_id subscriber = 0;
+    switch (query_param(request.query, "subscriber", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid subscriber parameter", request, keep,
+                            false);
+        return;
+    case query_result::ok:
+        if (!parse_u64_text(value, subscriber) ||
+            !is_longpoll_subscriber(subscriber)) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(
+                400, "subscriber must be in [2^32, 2^33)", request, keep, false);
+            return;
+        }
+        have_client_subscriber = true;
+        break;
+    case query_result::missing:
+        subscriber = allocate_subscriber();
+        break;
+    }
+
+    const u64 max_timeout_ms =
+        state_.options.longpoll.max_timeout.count() > 0
+            ? static_cast<u64>(state_.options.longpoll.max_timeout.count())
+            : 0;
+    u64 timeout_ms =
+        state_.options.longpoll.timeout.count() > 0
+            ? static_cast<u64>(state_.options.longpoll.timeout.count())
+            : 0;
+    switch (query_param(request.query, "timeout", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid timeout parameter", request, keep,
+                            false);
+        return;
+    case query_result::ok: {
+        u64 parsed = 0;
+        if (!parse_u64_text(value, parsed)) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "timeout must be a non-negative u64",
+                                request, keep, false);
+            return;
+        }
+        timeout_ms = parsed;
+        break;
+    }
+    case query_result::missing:
+        break;
+    }
+    if (timeout_ms > max_timeout_ms) {
+        timeout_ms = max_timeout_ms;
+    }
+    const std::chrono::milliseconds timeout(
+        static_cast<std::chrono::milliseconds::rep>(timeout_ms));
+
+    bool have_cursor = false;
+    sse::event_id cursor{};
+    if (const std::string* field = request.headers.find("last-event-id")) {
+        if (!sse::parse_last_event_id(*field, cursor).ok()) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "invalid Last-Event-ID", request, keep,
+                                false);
+            return;
+        }
+        have_cursor = true;
+    }
+    switch (query_param(request.query, "cursor", value)) {
+    case query_result::invalid:
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(400, "invalid cursor parameter", request, keep,
+                            false);
+        return;
+    case query_result::ok: {
+        sse::event_id parsed{};
+        if (!sse::parse_last_event_id(value, parsed).ok()) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "cursor must be <epoch>:<seq>", request,
+                                keep, false);
+            return;
+        }
+        if (have_cursor &&
+            (parsed.epoch != cursor.epoch || parsed.seq != cursor.seq)) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(400, "cursor and Last-Event-ID disagree",
+                                request, keep, false);
+            return;
+        }
+        cursor = parsed;
+        have_cursor = true;
+        break;
+    }
+    case query_result::missing:
+        break;
+    }
+
+    if (state_.options.shards != 1) {
+        state_.longpoll_overloaded.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(503, "long polling requires a single shard",
+                            request, keep, true);
+        return;
+    }
+
+    const u64 now = shard_ != nullptr ? shard_->now_ns() : 0;
+    const u64 epoch = state_.options.longpoll.epoch;
+    push::push_message message;
+    bool taken = false;
+    bool conflict = false;
+    bool restart = false;
+    bool topic_missing = false;
+    bool unavailable = false;
+    bool overloaded = false;
+
+    {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        push::hub* hub = state_.hub.get();
+        if (hub == nullptr) {
+            unavailable = true;
+        } else if (!hub->owns_topic(topic)) {
+            topic_missing = true;
+        } else {
+            state_.longpoll_sweep(now);
+
+            if (state_.sse_subscribers.find(subscriber) !=
+                state_.sse_subscribers.end()) {
+                conflict = true;
+            }
+            if (!conflict) {
+                auto owner_it = state_.longpoll_owners.find(subscriber);
+                if (owner_it != state_.longpoll_owners.end()) {
+                    const std::shared_ptr<session> owner =
+                        owner_it->second.owner.lock();
+                    if (owner && owner.get() != this) {
+                        conflict = true;
+                    } else if (!owner) {
+                        state_.longpoll_owners.erase(owner_it);
+                    }
+                }
+            }
+            if (!conflict &&
+                state_.longpoll_busy.find(subscriber) !=
+                    state_.longpoll_busy.end()) {
+                conflict = true;
+            }
+
+            if (!conflict) {
+                const bool known =
+                    state_.longpoll_last_seen.find(subscriber) !=
+                        state_.longpoll_last_seen.end() ||
+                    state_.longpoll_delivered.find({subscriber, topic}) !=
+                        state_.longpoll_delivered.end() ||
+                    state_.longpoll_lost.find(subscriber) !=
+                        state_.longpoll_lost.end();
+                const status subscribed = hub->subscribe(
+                    topic, subscriber, mode, ordered,
+                    state_.options.longpoll.subscribe);
+                const bool already =
+                    subscribed.code() == rpc_code::failed_precondition;
+                if (!subscribed.ok() && !already) {
+                    unavailable = true;
+                } else if (!already && known && have_client_subscriber) {
+                    // The subscription was lost (overflow/TTL/disconnect) and
+                    // the client reused the old id. Hand out a fresh id and a
+                    // fresh subscription so the dedup key cannot collide with
+                    // the old sequence space.
+                    const push::subscriber_id fresh = allocate_subscriber();
+                    (void)hub->unsubscribe_all(subscriber);
+                    state_.longpoll_forget(subscriber);
+                    subscriber = fresh;
+                    have_cursor = false;
+                    cursor = sse::event_id{};
+                    const status again = hub->subscribe(
+                        topic, subscriber, mode, ordered,
+                        state_.options.longpoll.subscribe);
+                    if (!again.ok()) {
+                        unavailable = true;
+                    } else {
+                        state_.longpoll_delivered.erase({subscriber, topic});
+                    }
+                } else if (!already) {
+                    state_.longpoll_delivered.erase({subscriber, topic});
+                }
+            }
+
+            if (!conflict && !unavailable) {
+                auto high_it =
+                    state_.longpoll_delivered.find({subscriber, topic});
+                const u64 high =
+                    high_it == state_.longpoll_delivered.end() ? 0
+                                                               : high_it->second;
+                u64 accepted = 0;
+                if (have_cursor && mode == push::delivery_mode::reliable &&
+                    cursor.epoch == epoch) {
+                    accepted = std::min(cursor.seq, high);
+                    if (cursor.seq > high) {
+                        state_.longpoll_ack_clamped.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    if (accepted != 0) {
+                        (void)hub->ack(subscriber, topic, accepted);
+                    }
+                }
+
+                bool reuse = false;
+                auto owner_it = state_.longpoll_owners.find(subscriber);
+                if (owner_it != state_.longpoll_owners.end() &&
+                    owner_it->second.token != push::hub::invalid_connection) {
+                    const std::shared_ptr<session> owner =
+                        owner_it->second.owner.lock();
+                    reuse = owner && owner.get() == this &&
+                            owner_it->second.token == longpoll_token_;
+                }
+                push::hub::connection_id token = longpoll_token_;
+                if (reuse) {
+                    token = owner_it->second.token;
+                } else {
+                    token = hub->attach(subscriber, push::attach_replay::none);
+                    if (token == push::hub::invalid_connection) {
+                        unavailable = true;
+                    } else {
+                        longpoll_token_ = token;
+                        state_.longpoll_owners[subscriber] =
+                            server_state::longpoll_owner{weak_from_this(),
+                                                         token};
+                    }
+                }
+
+                if (!unavailable) {
+                    longpoll_subscriber_ = subscriber;
+                    longpoll_topic_ = topic;
+                    longpoll_reliable_ =
+                        mode == push::delivery_mode::reliable;
+                    longpoll_epoch_ = epoch;
+                    longpoll_keep_ = keep;
+
+                    if (have_cursor &&
+                        mode == push::delivery_mode::reliable &&
+                        cursor.epoch == epoch && accepted < high) {
+                        const status front =
+                            hub->retransmit_front(subscriber, topic);
+                        if (!front.ok()) {
+                            if (front.code() == rpc_code::not_found ||
+                                front.code() == rpc_code::not_acknowledged ||
+                                front.code() == rpc_code::resource_exhausted) {
+                                restart = true;
+                            } else {
+                                unavailable = true;
+                            }
+                        }
+                    }
+                    if (restart) {
+                        // Drop the old subscription and its sequence space. The
+                        // last_seen tombstone is kept so a retry with the same
+                        // client-supplied id is handed a fresh server id
+                        // (D13), and the next poll neither acks the old cursor
+                        // nor replays the old sequence.
+                        (void)hub->unsubscribe_all(subscriber);
+                        state_.longpoll_owners.erase(subscriber);
+                        for (auto it = state_.longpoll_delivered.begin();
+                             it != state_.longpoll_delivered.end();) {
+                            if (it->first.first == subscriber) {
+                                it = state_.longpoll_delivered.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                        state_.longpoll_last_seen[subscriber] = now;
+                        longpoll_token_ = 0;
+                        longpoll_subscriber_ = 0;
+                        longpoll_topic_.clear();
+                    } else if (!unavailable) {
+                        state_.longpoll_last_seen[subscriber] = now;
+                        taken = hub->try_take(token, topic, message);
+                        if (taken &&
+                            longpoll_reliable_ &&
+                            message.mode == push::delivery_mode::reliable) {
+                            u64& delivered = state_.longpoll_delivered[
+                                {subscriber, topic}];
+                            if (message.seq > delivered) {
+                                delivered = message.seq;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!conflict && !restart && !unavailable && !topic_missing &&
+                !taken && timeout.count() > 0) {
+                const std::size_t waiter_cap =
+                    state_.options.longpoll.max_waiters;
+                if (waiter_cap != 0 &&
+                    state_.longpoll_waiters.load(std::memory_order_relaxed) >=
+                        waiter_cap) {
+                    overloaded = true;
+                } else {
+                    state_.longpoll_busy.insert(subscriber);
+                    state_.longpoll_waiters.fetch_add(1,
+                                                      std::memory_order_relaxed);
+                    state_.longpoll_last_seen[subscriber] = now;
+                    longpoll_deadline_ns_ =
+                        now + static_cast<u64>(
+                                  std::chrono::duration_cast<
+                                      std::chrono::nanoseconds>(timeout)
+                                      .count());
+                    idle_deadline_ns_ = 0;
+                    request_deadline_ns_ = 0;
+                    longpoll_active_.store(true, std::memory_order_release);
+                }
+            }
+        }
+    }
+
+    if (conflict) {
+        state_.longpoll_conflicts.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(409, "subscriber already has an active transport",
+                            request, keep, false);
+        return;
+    }
+    if (restart) {
+        state_.longpoll_restarts.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(409, "restart required: replay window or budget",
+                            request, keep, false);
+        return;
+    }
+    if (topic_missing) {
+        send_longpoll_error(404, "topic is not owned by this shard", request,
+                            keep, false);
+        return;
+    }
+    if (overloaded) {
+        state_.longpoll_overloaded.fetch_add(1, std::memory_order_relaxed);
+        send_longpoll_error(503, "too many waiting polls", request, keep, true);
+        return;
+    }
+    if (unavailable) {
+        send_longpoll_error(503, "long polling is unavailable", request, keep,
+                            true);
+        return;
+    }
+    if (taken) {
+        note_activity();
+        longpoll_send_message(message, keep);
+        return;
+    }
+    if (timeout.count() <= 0) {
+        longpoll_send_timeout(keep);
+        return;
+    }
+    // The wait is armed; a publish wake or the probe deadline drives it.
+    arm_probe();
 }
 
 // --- session: HTTP/2 ---------------------------------------------------------
@@ -2401,6 +3329,16 @@ void session::dispatch_h2(u32 stream_id) {
         response.reason = "Not Implemented";
         response.headers.add("Content-Type", "text/plain; charset=utf-8");
         response.body = "SSE is not supported over HTTP/2\n";
+        state_.handled.fetch_add(1, std::memory_order_relaxed);
+        send_h2_response(stream_id, response, head_only);
+        return;
+    }
+    if (find_longpoll_route(state_.longpoll_routes, routed.path) != nullptr) {
+        http::response response;
+        response.status_code = 501;
+        response.reason = "Not Implemented";
+        response.headers.add("Content-Type", "text/plain; charset=utf-8");
+        response.body = "long polling is not supported over HTTP/2\n";
         state_.handled.fetch_add(1, std::memory_order_relaxed);
         send_h2_response(stream_id, response, head_only);
         return;
@@ -2856,8 +3794,10 @@ void session::finish_now() {
     finished_ = true;
     // Detach BEFORE the transport and the hub token are destroyed. This is the
     // same ordering the push control path requires; a token that outlives its
-    // connection would receive deliveries into a dead session.
+    // connection would receive deliveries into a dead session. The long-poll
+    // path uses release() (keep-queue), never detach().
     sse_detach();
+    longpoll_release();
     download_active_.store(false, std::memory_order_release);
     download_.reset();
     output_stall_deadline_ns_ = 0;
@@ -2947,13 +3887,21 @@ void session::arm_probe() {
             deadline = stream_deadline;
         }
     }
-    // A streamed download keeps the idle deadline and adds its own output stall
-    // deadline (the earlier of the two fires first; the deadline list above
-    // already includes the idle deadline).
-    if (download_active_.load(std::memory_order_relaxed) &&
+    // A streamed download or a long-poll response keeps the idle deadline and
+    // adds its own output stall deadline (the earlier of the two fires first;
+    // the deadline list above already includes the idle deadline).
+    if ((download_active_.load(std::memory_order_relaxed) ||
+         longpoll_response_active_) &&
         output_stall_deadline_ns_ != 0 &&
         (deadline == 0 || output_stall_deadline_ns_ < deadline)) {
         deadline = output_stall_deadline_ns_;
+    }
+    // A waiting poll has no inbound liveness signal; its own deadline is the
+    // only timer besides a publish wake.
+    if (longpoll_active_.load(std::memory_order_acquire) &&
+        longpoll_deadline_ns_ != 0 &&
+        (deadline == 0 || longpoll_deadline_ns_ < deadline)) {
+        deadline = longpoll_deadline_ns_;
     }
     if (deadline == 0) {
         return;
@@ -3015,6 +3963,38 @@ void session::on_probe() {
             state_.timed_out.fetch_add(1, std::memory_order_relaxed);
             download_active_.store(false, std::memory_order_release);
             download_.reset();
+            close_when_drained_ = true;
+            stop_reading_ = true;
+            finish_now();
+            return;
+        }
+        arm_probe();
+        return;
+    }
+    if (longpoll_active_.load(std::memory_order_acquire)) {
+        if (longpoll_deadline_ns_ != 0 && now >= longpoll_deadline_ns_) {
+            // A publish wake can be dropped when the shard inbox is full (the
+            // SSE path has a heartbeat as backstop; a poll does not), so take
+            // one more time before deciding the wait expired.
+            longpoll_pump();
+            if (longpoll_active_.load(std::memory_order_acquire)) {
+                longpoll_finish_wait();
+                longpoll_send_timeout(longpoll_keep_);
+                flush_writes();
+                maybe_finish();
+            }
+        }
+        arm_probe();
+        return;
+    }
+    if (longpoll_response_active_) {
+        if (output_stall_deadline_ns_ != 0 && now >= output_stall_deadline_ns_) {
+            // The peer stopped draining the polled body. The message stays
+            // unacknowledged in the replay window and is replayed by the next
+            // poll's cursor gap.
+            output_stall_deadline_ns_ = 0;
+            longpoll_response_active_ = false;
+            state_.timed_out.fetch_add(1, std::memory_order_relaxed);
             close_when_drained_ = true;
             stop_reading_ = true;
             finish_now();
@@ -3131,6 +4111,12 @@ http_server::builder& http_server::builder::add_sse_route(sse_route route) {
     return *this;
 }
 
+http_server::builder& http_server::builder::add_longpoll_route(
+    longpoll_route route) {
+    longpoll_routes_.push_back(std::move(route));
+    return *this;
+}
+
 http_server::builder& http_server::builder::add_download_route(
     download_route route) {
     download_routes_.push_back(std::move(route));
@@ -3141,6 +4127,7 @@ std::unique_ptr<http_server> http_server::builder::build() {
     auto result = std::unique_ptr<http_server>(new http_server(options_));
     result->impl_->state.router = router_;
     result->impl_->state.sse_routes = sse_routes_;
+    result->impl_->state.longpoll_routes = longpoll_routes_;
     result->impl_->state.download_routes = download_routes_;
     for (const listener_config& config : listeners_) {
         server_state::pending_listener pending;
@@ -3237,6 +4224,62 @@ status http_server::start() {
         }
     }
 
+    if (!state.longpoll_routes.empty()) {
+        // The hub stamps one epoch into every message, and both SSE and long
+        // polling compare cursors against it. Normalize the two routing stubs
+        // to a single epoch instead of letting event ids and cursor checks
+        // disagree.
+        if (state.sse_routes.empty()) {
+            state.options.sse.epoch = state.options.longpoll.epoch;
+        } else if (state.options.sse.epoch != state.options.longpoll.epoch) {
+            return status{rpc_error(
+                rpc_code::invalid_argument,
+                "SSE and long polling must use the same epoch")};
+        } else {
+            state.options.longpoll.epoch = state.options.sse.epoch;
+        }
+        if (state.options.longpoll.subscribe.max_replay <
+            state.options.longpoll.subscribe.max_messages) {
+            // retransmit_front must be able to hold the whole queue; the
+            // replay window is the only source of already-taken messages.
+            state.options.longpoll.subscribe.max_replay =
+                state.options.longpoll.subscribe.max_messages;
+        }
+        for (std::size_t i = 0; i < state.longpoll_routes.size(); ++i) {
+            const std::string& path = state.longpoll_routes[i].path;
+            if (path.empty() || path.front() != '/') {
+                return status{rpc_error(
+                    rpc_code::invalid_argument,
+                    "a long-poll route requires an absolute path")};
+            }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (state.longpoll_routes[j].path == path) {
+                    return status{rpc_error(rpc_code::invalid_argument,
+                                            "duplicate long-poll route path")};
+                }
+            }
+            for (const sse_route& sse : state.sse_routes) {
+                if (sse.path == path) {
+                    return status{rpc_error(
+                        rpc_code::invalid_argument,
+                        "a long-poll path conflicts with an SSE path")};
+                }
+            }
+            for (const download_route& download : state.download_routes) {
+                const bool same = download.path == path;
+                const bool prefix =
+                    path.size() > download.path.size() &&
+                    path.compare(0, download.path.size(), download.path) == 0 &&
+                    path[download.path.size()] == '/';
+                if (same || prefix) {
+                    return status{rpc_error(
+                        rpc_code::invalid_argument,
+                        "a long-poll path conflicts with a download path")};
+                }
+            }
+        }
+    }
+
     for (std::size_t i = 0; i < state.download_routes.size(); ++i) {
         const std::string& path = state.download_routes[i].path;
         if (path.empty() || path.front() != '/') {
@@ -3280,6 +4323,12 @@ status http_server::start() {
             hub_options.epoch = state.options.sse.epoch;
             state.hub = std::make_unique<push::hub>(hub_options);
             state.sse_delivered.clear();
+            state.longpoll_owners.clear();
+            state.longpoll_busy.clear();
+            state.longpoll_delivered.clear();
+            state.longpoll_last_seen.clear();
+            state.longpoll_lost.clear();
+            state.next_longpoll_sweep_ns = 0;
         }
         for (std::size_t i = 0; i < count; ++i) {
             runtime_options options = state.options.runtime;
@@ -3344,6 +4393,13 @@ void http_server::stop() noexcept {
             std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
             state.hub.reset();
             state.sse_delivered.clear();
+            state.sse_subscribers.clear();
+            state.longpoll_owners.clear();
+            state.longpoll_busy.clear();
+            state.longpoll_delivered.clear();
+            state.longpoll_last_seen.clear();
+            state.longpoll_lost.clear();
+            state.longpoll_waiters.store(0, std::memory_order_relaxed);
             state.sse_connections.store(0, std::memory_order_relaxed);
         }
         state.acceptors.clear();
@@ -3384,6 +4440,13 @@ void http_server::stop() noexcept {
         std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
         state.hub.reset();
         state.sse_delivered.clear();
+        state.sse_subscribers.clear();
+        state.longpoll_owners.clear();
+        state.longpoll_busy.clear();
+        state.longpoll_delivered.clear();
+        state.longpoll_last_seen.clear();
+        state.longpoll_lost.clear();
+        state.longpoll_waiters.store(0, std::memory_order_relaxed);
         state.sse_connections.store(0, std::memory_order_relaxed);
     }
     state.shards.clear();
@@ -3423,8 +4486,23 @@ http_statistics http_server::stats() const noexcept {
         impl_->state.sse_events_delivered.load(std::memory_order_relaxed);
     out.sse_slow_closes =
         impl_->state.sse_slow_closes.load(std::memory_order_relaxed);
+    out.longpoll_waiters =
+        impl_->state.longpoll_waiters.load(std::memory_order_relaxed);
+    out.longpoll_events =
+        impl_->state.longpoll_events.load(std::memory_order_relaxed);
+    out.longpoll_timeouts =
+        impl_->state.longpoll_timeouts.load(std::memory_order_relaxed);
+    out.longpoll_ack_clamped =
+        impl_->state.longpoll_ack_clamped.load(std::memory_order_relaxed);
+    out.longpoll_conflicts =
+        impl_->state.longpoll_conflicts.load(std::memory_order_relaxed);
+    out.longpoll_restarts =
+        impl_->state.longpoll_restarts.load(std::memory_order_relaxed);
+    out.longpoll_overloaded =
+        impl_->state.longpoll_overloaded.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::recursive_mutex> lk(impl_->state.hub_mutex);
+        out.longpoll_subscribers = impl_->state.longpoll_owners.size();
         if (impl_->state.hub) {
             const push::hub_stats counters = impl_->state.hub->stats();
             out.sse_hub_published = static_cast<std::size_t>(counters.published);
@@ -3458,11 +4536,13 @@ bool http_server::publish(std::string_view topic, span<const std::byte> body,
             }
             state.hub->publish(topic, body, mode);
         }
-        // Wake every SSE session on the shard. `wake_sse` only posts a task, so
-        // this thread never touches shard-only session state or the write
-        // queue, and a slow subscriber cannot block the publisher.
+        // Wake every SSE or waiting long-poll session on the shard. Both wakes
+        // only post a task, so this thread never touches shard-only session
+        // state or the write queue, and a slow subscriber cannot block the
+        // publisher.
         for (const std::shared_ptr<session>& value : snapshot) {
             value->wake_sse();
+            value->wake_longpoll();
         }
     } catch (...) {
         return false;

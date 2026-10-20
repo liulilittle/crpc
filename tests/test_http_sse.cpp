@@ -768,6 +768,1018 @@ CRPC_TEST(h2_sse_route_fails_closed) {
     CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().sse_connections);
 }
 
+// --- HTTP/1.1 long polling ---------------------------------------------------
+
+namespace {
+
+struct lp_response {
+    int status = 0;
+    std::string head;
+    std::string body;
+};
+
+bool header_name_is(std::string_view text, std::string_view name) {
+    if (text.size() != name.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char a = text[i];
+        char b = name[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = static_cast<char>(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = static_cast<char>(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Parses a sequence of fixed-length (or bodyless) HTTP/1.1 responses from a
+// capture source. Long polling uses Content-Length or 204, never chunked.
+struct lp_parser {
+    std::string buffer;
+    std::vector<lp_response> responses;
+    std::size_t raw_consumed = 0;
+
+    void pump(capture_source& source) {
+        const std::string snapshot = source.snapshot();
+        if (snapshot.size() <= raw_consumed) {
+            return;
+        }
+        buffer.append(snapshot.data() + raw_consumed,
+                      snapshot.size() - raw_consumed);
+        raw_consumed = snapshot.size();
+        parse();
+    }
+
+    void parse() {
+        for (;;) {
+            const std::size_t end = buffer.find("\r\n\r\n");
+            if (end == std::string::npos) {
+                return;
+            }
+            const std::size_t first_space = buffer.find(' ');
+            int status = 0;
+            if (first_space != std::string::npos) {
+                status = std::atoi(buffer.c_str() + first_space + 1);
+            }
+            const std::string head = buffer.substr(0, end + 2);
+            std::size_t content_length = 0;
+            bool has_length = false;
+            std::size_t pos = buffer.find("\r\n");
+            while (pos != std::string::npos && pos + 2 <= end) {
+                const std::size_t line_end = buffer.find("\r\n", pos + 2);
+                if (line_end == std::string::npos || line_end > end) {
+                    break;
+                }
+                const std::string_view line(buffer.data() + pos + 2,
+                                            line_end - (pos + 2));
+                const std::size_t colon = line.find(':');
+                if (colon != std::string_view::npos &&
+                    header_name_is(line.substr(0, colon), "content-length")) {
+                    std::string_view value = line.substr(colon + 1);
+                    while (!value.empty() && (value.front() == ' ' ||
+                                              value.front() == '\t')) {
+                        value.remove_prefix(1);
+                    }
+                    content_length = static_cast<std::size_t>(
+                        std::strtoull(std::string(value).c_str(), nullptr, 10));
+                    has_length = true;
+                }
+                pos = line_end;
+            }
+            const std::size_t body_start = end + 4;
+            if (status == 204) {
+                lp_response response;
+                response.status = status;
+                response.head = head;
+                responses.push_back(std::move(response));
+                buffer.erase(0, body_start);
+                continue;
+            }
+            if (!has_length || buffer.size() < body_start + content_length) {
+                return;
+            }
+            lp_response response;
+            response.status = status;
+            response.head = head;
+            response.body.assign(buffer.data() + body_start, content_length);
+            responses.push_back(std::move(response));
+            buffer.erase(0, body_start + content_length);
+        }
+    }
+};
+
+struct longpoll_fixture {
+    inproc_backend backend;
+    mvc::router router;
+    std::unique_ptr<http::http_server> server;
+    std::string endpoint_name;
+
+    explicit longpoll_fixture(http::http_server_options options,
+                              std::string name = "http-lp",
+                              bool with_sse = false)
+        : endpoint_name(std::move(name)) {
+        const status frozen = router.freeze();
+        CRPC_CHECK(frozen.ok());
+        http::http_server::builder builder;
+        builder.add_listener(endpoint::inproc(endpoint_name), backend);
+        builder.router(router);
+        builder.options(options);
+        http::longpoll_route route;
+        route.path = "/poll";
+        route.topic = "news";
+        builder.add_longpoll_route(std::move(route));
+        if (with_sse) {
+            http::sse_route sse;
+            sse.path = "/events";
+            sse.topic = "news";
+            builder.add_sse_route(std::move(sse));
+        }
+        server = builder.build();
+        CRPC_CHECK(server != nullptr);
+        CRPC_CHECK(server->start().ok());
+    }
+
+    ~longpoll_fixture() {
+        if (server) {
+            server->stop();
+        }
+    }
+
+    [[nodiscard]] std::unique_ptr<connection> connect() {
+        return backend.connect(endpoint::inproc(endpoint_name),
+                               connect_options{});
+    }
+};
+
+bool wait_polls(lp_parser& parser, capture_source& capture,
+                std::size_t count, int timeout_ms = 5000) {
+    return crpc_test::wait_for(
+        [&] {
+            parser.pump(capture);
+            return parser.responses.size() >= count;
+        },
+        timeout_ms);
+}
+
+std::string poll_target(u64 subscriber, std::string_view extra = {}) {
+    std::string target = "/poll?topic=news&subscriber=";
+    target += std::to_string(subscriber);
+    if (!extra.empty()) {
+        target += "&";
+        target += extra;
+    }
+    return target;
+}
+
+} // namespace
+
+CRPC_TEST(longpoll_immediate_200_timeout_204_keepalive) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(100);
+    options.longpoll.max_timeout = std::chrono::milliseconds(500);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 7;
+    capture_source capture;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+    lp_parser parser;
+
+    // Subscribe with a zero timeout: no message, so a bodyless 204 that still
+    // carries the server-issued subscriber id.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0"),
+                            "Accept-Encoding: gzip\r\n"));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+    CRPC_CHECK(parser.responses[0].body.empty());
+    CRPC_CHECK(parser.responses[0].head.find("Content-Length") ==
+               std::string::npos);
+    CRPC_CHECK(parser.responses[0].head.find(
+                   "X-CRPC-Subscriber: " + std::to_string(subscriber)) !=
+               std::string::npos);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "one"));
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0"),
+                            "Accept-Encoding: gzip\r\n"));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    const lp_response& event = parser.responses[1];
+    CRPC_CHECK_EQ(200, event.status);
+    CRPC_CHECK_EQ(std::string("one"), event.body);
+    CRPC_CHECK(event.head.find("Content-Length: 3") != std::string::npos);
+    CRPC_CHECK(event.head.find("X-CRPC-Event-ID: 1:1") != std::string::npos);
+    CRPC_CHECK(event.head.find("X-CRPC-Subscriber: " +
+                               std::to_string(subscriber)) !=
+               std::string::npos);
+    CRPC_CHECK(event.head.find("Cache-Control:") != std::string::npos);
+    CRPC_CHECK(event.head.find("Content-Encoding") == std::string::npos);
+    CRPC_CHECK(event.head.find("Vary") == std::string::npos);
+
+    // No new message: a 100 ms wait ends in 204, on the same keep-alive
+    // connection.
+    const auto begin = std::chrono::steady_clock::now();
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber),
+                            "Last-Event-ID: 1:1\r\nX-Lp: wait\r\n"));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    CRPC_CHECK_EQ(204, parser.responses[2].status);
+    CRPC_CHECK(parser.responses[2].body.empty());
+    CRPC_CHECK(elapsed >= 50);
+    CRPC_CHECK(elapsed < 2000);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().active_connections);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "two"));
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0"),
+                            "Last-Event-ID: 1:1\r\n"));
+    CRPC_CHECK(wait_polls(parser, capture, 4));
+    CRPC_CHECK_EQ(200, parser.responses[3].status);
+    CRPC_CHECK_EQ(std::string("two"), parser.responses[3].body);
+    CRPC_CHECK(parser.responses[3].head.find("X-CRPC-Event-ID: 1:2") !=
+               std::string::npos);
+    client->close();
+}
+
+CRPC_TEST(longpoll_waiting_publish_wakes_immediately) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 11;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    send_raw(*client, http1("GET", poll_target(subscriber)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+    const auto begin = std::chrono::steady_clock::now();
+    CRPC_CHECK(publish_text(*fx.server, "news", "wake"));
+    CRPC_CHECK(wait_polls(parser, capture, 2, 2000));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    CRPC_CHECK(elapsed < 1000);
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("wake"), parser.responses[1].body);
+    CRPC_CHECK(parser.responses[1].head.find("X-CRPC-Event-ID: 1:1") !=
+               std::string::npos);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_events);
+    client->close();
+}
+
+CRPC_TEST(longpoll_burst_keeps_queue_and_order) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscribe.max_replay = 16;
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 13;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "m1"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "m2"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "m3"));
+
+    for (int i = 1; i <= 3; ++i) {
+        std::string extra = "timeout=0";
+        if (i > 1) {
+            extra += "&cursor=1:";
+            extra += std::to_string(i - 1);
+        }
+        send_raw(*client, http1("GET", poll_target(subscriber, extra)));
+        CRPC_CHECK(wait_polls(parser, capture,
+                              static_cast<std::size_t>(i) + 1));
+        const lp_response& response =
+            parser.responses[static_cast<std::size_t>(i)];
+        CRPC_CHECK_EQ(200, response.status);
+        CRPC_CHECK_EQ("m" + std::to_string(i), response.body);
+        CRPC_CHECK(response.head.find("X-CRPC-Event-ID: 1:" +
+                                      std::to_string(i)) != std::string::npos);
+    }
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber,
+                                        "timeout=0&cursor=1:3")));
+    CRPC_CHECK(wait_polls(parser, capture, 5));
+    CRPC_CHECK_EQ(204, parser.responses[4].status);
+    CRPC_CHECK_EQ(std::size_t{3}, fx.server->stats().longpoll_events);
+    client->close();
+}
+
+CRPC_TEST(longpoll_lost_response_retransmits_front) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscribe.max_replay = 16;
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 17;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK(publish_text(*fx.server, "news", "a"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "b"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "c"));
+
+    // seq1 is delivered but the response is lost (no ack). The next cursor is
+    // 1:0, so the server must put seq1 back at the FRONT.
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(std::string("a"), parser.responses[1].body);
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:0")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(std::string("a"), parser.responses[2].body);
+    CRPC_CHECK(parser.responses[2].head.find("X-CRPC-Event-ID: 1:1") !=
+               std::string::npos);
+
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:1")));
+    CRPC_CHECK(wait_polls(parser, capture, 4));
+    CRPC_CHECK_EQ(std::string("b"), parser.responses[3].body);
+    CRPC_CHECK(parser.responses[3].head.find("X-CRPC-Event-ID: 1:2") !=
+               std::string::npos);
+
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:2")));
+    CRPC_CHECK(wait_polls(parser, capture, 5));
+    CRPC_CHECK_EQ(std::string("c"), parser.responses[4].body);
+    CRPC_CHECK(parser.responses[4].head.find("X-CRPC-Event-ID: 1:3") !=
+               std::string::npos);
+    client->close();
+}
+
+CRPC_TEST(longpoll_cursor_clamp_and_epoch) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscribe.max_replay = 16;
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 19;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK(publish_text(*fx.server, "news", "a"));
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(std::string("a"), parser.responses[1].body);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "b"));
+    // A cursor beyond the delivered high water is clamped to what was actually
+    // sent (1), so seq2 is not silently acknowledged.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:99")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(std::string("b"), parser.responses[2].body);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_ack_clamped);
+
+    CRPC_CHECK(publish_text(*fx.server, "news", "c"));
+    // Wrong epoch: no ack. The next message is still delivered.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=2:2")));
+    CRPC_CHECK(wait_polls(parser, capture, 4));
+    CRPC_CHECK_EQ(std::string("c"), parser.responses[3].body);
+    CRPC_CHECK(parser.responses[3].head.find("X-CRPC-Event-ID: 1:3") !=
+               std::string::npos);
+
+    // Correct epoch, cursor 1:1. seq2 was never acknowledged (the epoch-2
+    // cursor did not ack), so the front replay must deliver seq2 again.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:1")));
+    CRPC_CHECK(wait_polls(parser, capture, 5));
+    CRPC_CHECK_EQ(std::string("b"), parser.responses[4].body);
+    CRPC_CHECK(parser.responses[4].head.find("X-CRPC-Event-ID: 1:2") !=
+               std::string::npos);
+    client->close();
+}
+
+CRPC_TEST(longpoll_same_subscriber_conflict_409) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 23;
+    capture_source first_capture;
+    auto first = fx.connect();
+    first->bind_source(&first_capture);
+    lp_parser first_parser;
+    send_raw(*first, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(first_parser, first_capture, 1));
+    CRPC_CHECK_EQ(204, first_parser.responses[0].status);
+    send_raw(*first, http1("GET", poll_target(subscriber)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    capture_source second_capture;
+    auto second = fx.connect();
+    second->bind_source(&second_capture);
+    lp_parser second_parser;
+    send_raw(*second, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(second_parser, second_capture, 1));
+    CRPC_CHECK_EQ(409, second_parser.responses[0].status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_conflicts);
+
+    // The first poll is untouched and still receives its event.
+    CRPC_CHECK(publish_text(*fx.server, "news", "go"));
+    CRPC_CHECK(wait_polls(first_parser, first_capture, 2));
+    CRPC_CHECK_EQ(200, first_parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("go"), first_parser.responses[1].body);
+    first->close();
+    second->close();
+}
+
+CRPC_TEST(longpoll_max_waiters_503_then_recovers) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_waiters = 1;
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 first_id = (1ull << 32) + 29;
+    const u64 second_id = (1ull << 32) + 31;
+    capture_source first_capture;
+    auto first = fx.connect();
+    first->bind_source(&first_capture);
+    lp_parser first_parser;
+    send_raw(*first, http1("GET", poll_target(first_id, "timeout=0")));
+    CRPC_CHECK(wait_polls(first_parser, first_capture, 1));
+    send_raw(*first, http1("GET", poll_target(first_id)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    capture_source second_capture;
+    auto second = fx.connect();
+    second->bind_source(&second_capture);
+    lp_parser second_parser;
+    send_raw(*second, http1("GET",
+                            poll_target(second_id, "timeout=1000")));
+    CRPC_CHECK(wait_polls(second_parser, second_capture, 1));
+    CRPC_CHECK_EQ(503, second_parser.responses[0].status);
+    CRPC_CHECK(second_parser.responses[0].head.find("Retry-After: 1") !=
+               std::string::npos);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_overloaded);
+
+    first->close();
+    second->close();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 0; }, 5000));
+
+    capture_source third_capture;
+    auto third = fx.connect();
+    third->bind_source(&third_capture);
+    lp_parser third_parser;
+    send_raw(*third,
+             http1("GET", poll_target((1ull << 32) + 37, "timeout=0")));
+    CRPC_CHECK(wait_polls(third_parser, third_capture, 1));
+    CRPC_CHECK_EQ(204, third_parser.responses[0].status);
+    third->close();
+}
+
+CRPC_TEST(longpoll_ttl_sweeps_idle_subscriber) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(50);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 41;
+    {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        lp_parser parser;
+        send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+        CRPC_CHECK(wait_polls(parser, capture, 1));
+        CRPC_CHECK_EQ(204, parser.responses[0].status);
+        CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
+        client->close();
+    }
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().active_connections == 0; }, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // This publish lands in the stale subscriber's queue; the sweep on the next
+    // poll must drop the subscription and that queue.
+    CRPC_CHECK(publish_text(*fx.server, "news", "late"));
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", "/poll?topic=news&timeout=0"));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
+    const http::http_statistics stats = fx.server->stats();
+    CRPC_CHECK_EQ(std::size_t{0}, stats.sse_hub_queued);
+
+    // Reusing the expired id must yield a fresh server id: the old sequence
+    // space is gone, so the client must reset its de-duplication state.
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(204, parser.responses[1].status);
+    const std::string prefix = "X-CRPC-Subscriber: ";
+    const std::size_t pos = parser.responses[1].head.find(prefix);
+    CRPC_CHECK(pos != std::string::npos);
+    u64 fresh = 0;
+    if (pos != std::string::npos) {
+        fresh = std::strtoull(parser.responses[1].head.c_str() + pos +
+                                  prefix.size(),
+                              nullptr, 10);
+    }
+    CRPC_CHECK(fresh != subscriber);
+    CRPC_CHECK(fresh >= (1ull << 32) && fresh < (1ull << 33));
+    client->close();
+}
+
+CRPC_TEST(longpoll_lost_subscription_gets_fresh_id) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscribe.max_messages = 1;
+    options.longpoll.subscribe.max_bytes = 1024;
+    options.longpoll.subscribe.max_replay = 1;
+    options.longpoll.subscribe.on_overflow =
+        push::overflow_policy::disconnect_subscriber;
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 49;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    // The second publish overflows a one-message queue with the disconnect
+    // policy, so the whole subscription disappears.
+    CRPC_CHECK(publish_text(*fx.server, "news", "first"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "second"));
+
+    // Reusing the old id must produce a NEW server id (the old sequence space
+    // is gone); the old cursor is not acknowledged.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber,
+                                        "timeout=0&cursor=1:1")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(204, parser.responses[1].status);
+    const std::string fresh_header = "X-CRPC-Subscriber: ";
+    const std::size_t header_pos =
+        parser.responses[1].head.find(fresh_header);
+    CRPC_CHECK(header_pos != std::string::npos);
+    u64 fresh = 0;
+    if (header_pos != std::string::npos) {
+        fresh = std::strtoull(
+            parser.responses[1].head.c_str() + header_pos + fresh_header.size(),
+            nullptr, 10);
+    }
+    CRPC_CHECK(fresh != subscriber);
+    CRPC_CHECK(fresh >= (1ull << 32) && fresh < (1ull << 33));
+
+    // The fresh id is stable for a sequential poll.
+    send_raw(*client, http1("GET", poll_target(fresh, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(204, parser.responses[2].status);
+    CRPC_CHECK(parser.responses[2].head.find(
+                   fresh_header + std::to_string(fresh)) != std::string::npos);
+    client->close();
+}
+
+CRPC_TEST(longpoll_zero_length_event_and_unreliable_ids) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 43;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    CRPC_CHECK(fx.server->publish("news", span<const std::byte>{},
+                                  push::delivery_mode::reliable));
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK(parser.responses[1].body.empty());
+    CRPC_CHECK(parser.responses[1].head.find("Content-Length: 0") !=
+               std::string::npos);
+    CRPC_CHECK(parser.responses[1].head.find("X-CRPC-Event-ID: 1:1") !=
+               std::string::npos);
+
+    // Unreliable mode stamps topic_seq instead of the reliable seq and never
+    // updates the cursor high water.
+    const u64 unreliable_subscriber = (1ull << 32) + 47;
+    send_raw(*client, http1("GET",
+                            poll_target(unreliable_subscriber,
+                                        "timeout=0&mode=unreliable")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(204, parser.responses[2].status);
+    CRPC_CHECK(fx.server->publish("news", span<const std::byte>(
+                                                reinterpret_cast<const std::byte*>(
+                                                    "u"),
+                                                1),
+                                  push::delivery_mode::unreliable));
+    send_raw(*client, http1("GET",
+                            poll_target(unreliable_subscriber,
+                                        "timeout=0&mode=unreliable")));
+    CRPC_CHECK(wait_polls(parser, capture, 4));
+    CRPC_CHECK_EQ(200, parser.responses[3].status);
+    CRPC_CHECK_EQ(std::string("u"), parser.responses[3].body);
+    CRPC_CHECK(parser.responses[3].head.find("X-CRPC-Event-ID: 1:") !=
+               std::string::npos);
+    client->close();
+}
+
+CRPC_TEST(longpoll_invalid_arguments_and_methods) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 53;
+    const auto expect = [&](std::string_view raw, int status) {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        send_raw(*client, raw);
+        lp_parser parser;
+        CRPC_CHECK(wait_polls(parser, capture, 1));
+        CRPC_CHECK_EQ(status, parser.responses[0].status);
+        client->close();
+    };
+
+    // HEAD gets the 405 head with no body (the response must stay framed for
+    // keep-alive), so it is checked without the body-reading parser.
+    {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        send_raw(*client, http1("HEAD", poll_target(subscriber, "timeout=0")));
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] {
+                return capture.snapshot().find("\r\n\r\n") != std::string::npos;
+            },
+            5000));
+        CRPC_CHECK(capture.snapshot().find("HTTP/1.1 405") != std::string::npos);
+        client->close();
+    }
+    expect(http1("POST", poll_target(subscriber, "timeout=0")), 405);
+    expect(http1("PUT", poll_target(subscriber, "timeout=0")), 405);
+    expect(http1("GET", "/poll?topic=news&subscriber=7&timeout=0"), 400);
+    expect(http1("GET", poll_target(subscriber, "timeout=abc")), 400);
+    expect(http1("GET", poll_target(subscriber, "timeout=0"), "Last-Event-ID: nope\r\n"),
+           400);
+    expect(std::string("GET ") + poll_target(subscriber, "timeout=0") +
+               " HTTP/1.0\r\nHost: test\r\n\r\n",
+           400);
+}
+
+CRPC_TEST(longpoll_stall_closes_and_front_replays) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(80);
+    options.longpoll.subscribe.max_replay = 16;
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 59;
+    capture_source capture;
+    gated_source gate;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    // From now on the peer stops draining. A 64 KiB body cannot complete its
+    // write, so the long-poll stall deadline must close the session.
+    client->bind_source(&gate);
+    gate.open.store(false, std::memory_order_release);
+    const std::string payload(64 * 1024, 'z');
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().active_connections == 0; }, 5000));
+    CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
+    client->close();
+
+    // The taken message was never acknowledged. A new session with cursor 1:0
+    // replays it from the front.
+    capture_source replay_capture;
+    auto replay = fx.connect();
+    replay->bind_source(&replay_capture);
+    lp_parser replay_parser;
+    send_raw(*replay, http1("GET",
+                            poll_target(subscriber,
+                                        "timeout=0&cursor=1:0")));
+    CRPC_CHECK(wait_polls(replay_parser, replay_capture, 1, 5000));
+    CRPC_CHECK_EQ(200, replay_parser.responses[0].status);
+    CRPC_CHECK_EQ(payload, replay_parser.responses[0].body);
+    CRPC_CHECK(replay_parser.responses[0].head.find("X-CRPC-Event-ID: 1:1") !=
+               std::string::npos);
+    replay->close();
+}
+
+CRPC_TEST(longpoll_cross_protocol_same_subscriber_409) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options, "http-lp-cross", true);
+
+    // SSE holds the id: a long poll with the same id is 409.
+    const u64 sse_id = (1ull << 32) + 61;
+    capture_source sse_capture;
+    auto sse_client = fx.connect();
+    sse_client->bind_source(&sse_capture);
+    send_raw(*sse_client,
+             http1("GET", "/events?topic=news&subscriber=" +
+                              std::to_string(sse_id)));
+    sse_parser sse_parser_state;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            sse_parser_state.pump(sse_capture);
+            return sse_parser_state.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+
+    capture_source denied_capture;
+    auto denied = fx.connect();
+    denied->bind_source(&denied_capture);
+    lp_parser denied_parser;
+    send_raw(*denied, http1("GET", poll_target(sse_id, "timeout=0")));
+    CRPC_CHECK(wait_polls(denied_parser, denied_capture, 1));
+    CRPC_CHECK_EQ(409, denied_parser.responses[0].status);
+    sse_client->close();
+    denied->close();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // A waiting long poll holds the id: an SSE request with the same id is 409.
+    const u64 lp_id = (1ull << 32) + 67;
+    capture_source lp_capture;
+    auto lp_client = fx.connect();
+    lp_client->bind_source(&lp_capture);
+    lp_parser lp_parser_state;
+    send_raw(*lp_client, http1("GET", poll_target(lp_id, "timeout=0")));
+    CRPC_CHECK(wait_polls(lp_parser_state, lp_capture, 1));
+    CRPC_CHECK_EQ(204, lp_parser_state.responses[0].status);
+    send_raw(*lp_client, http1("GET", poll_target(lp_id)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    capture_source sse_denied_capture;
+    auto sse_denied = fx.connect();
+    sse_denied->bind_source(&sse_denied_capture);
+    lp_parser sse_denied_parser;
+    send_raw(*sse_denied,
+             http1("GET", "/events?topic=news&subscriber=" +
+                              std::to_string(lp_id)));
+    CRPC_CHECK(wait_polls(sse_denied_parser, sse_denied_capture, 1));
+    CRPC_CHECK_EQ(409, sse_denied_parser.responses[0].status);
+    sse_denied->close();
+
+    // The waiting poll is unaffected.
+    CRPC_CHECK(publish_text(*fx.server, "news", "still-here"));
+    CRPC_CHECK(wait_polls(lp_parser_state, lp_capture, 2));
+    CRPC_CHECK_EQ(200, lp_parser_state.responses[1].status);
+    CRPC_CHECK_EQ(std::string("still-here"), lp_parser_state.responses[1].body);
+    lp_client->close();
+}
+
+CRPC_TEST(longpoll_stop_wakes_waiters) {
+    http::http_server_options options;
+    options.drain_timeout = std::chrono::milliseconds(100);
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target((1ull << 32) + 71, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    send_raw(*client, http1("GET", poll_target((1ull << 32) + 71)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    const auto begin = std::chrono::steady_clock::now();
+    fx.server->stop();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    CRPC_CHECK(elapsed < 2000);
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_waiters);
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().active_connections);
+    client->close();
+}
+
+CRPC_TEST(longpoll_h2_fails_closed) {
+    http::http_server_options options;
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/poll?topic=news", encoder);
+    send_raw(*client, out);
+
+    h2::hpack_decoder decoder;
+    std::string buf;
+    std::string block;
+    std::string body;
+    int status = 0;
+    bool end_stream = false;
+    bool headers_done = false;
+    std::size_t consumed = 0;
+    const bool complete = crpc_test::wait_for(
+        [&] {
+            const std::string data = capture.snapshot();
+            if (data.size() > consumed) {
+                buf.append(data.data() + consumed, data.size() - consumed);
+                consumed = data.size();
+            }
+            for (;;) {
+                if (buf.size() < h2::frame_header_size) {
+                    return end_stream && status != 0;
+                }
+                h2::frame_header frame;
+                const span<const std::byte> head(
+                    reinterpret_cast<const std::byte*>(buf.data()),
+                    h2::frame_header_size);
+                if (!h2::decode_frame_header(head, frame,
+                                             h2::max_max_frame_size)
+                         .ok()) {
+                    return false;
+                }
+                const std::size_t total = h2::frame_header_size + frame.length;
+                if (buf.size() < total) {
+                    return end_stream && status != 0;
+                }
+                const span<const std::byte> payload(
+                    reinterpret_cast<const std::byte*>(buf.data()) +
+                        h2::frame_header_size,
+                    frame.length);
+                if (frame.type == h2::frame_type::headers) {
+                    h2::headers_payload decoded;
+                    if (!h2::decode_headers(payload, frame.flags, decoded)
+                             .ok()) {
+                        return false;
+                    }
+                    block.assign(
+                        reinterpret_cast<const char*>(
+                            decoded.header_block.data()),
+                        decoded.header_block.size());
+                    end_stream = end_stream || decoded.end_stream;
+                    if ((frame.flags & h2::flags::end_headers) != 0 &&
+                        !headers_done) {
+                        http::header_list fields;
+                        if (decoder
+                                .decode(span<const std::byte>(
+                                            reinterpret_cast<const std::byte*>(
+                                                block.data()),
+                                            block.size()),
+                                        fields)
+                                .ok()) {
+                            for (const http::header& field : fields) {
+                                if (field.name == ":status") {
+                                    status = std::atoi(field.value.c_str());
+                                }
+                            }
+                        }
+                        headers_done = true;
+                    }
+                } else if (frame.type == h2::frame_type::continuation) {
+                    block.append(reinterpret_cast<const char*>(payload.data()),
+                                 payload.size());
+                } else if (frame.type == h2::frame_type::data) {
+                    span<const std::byte> decoded;
+                    if (h2::decode_data(payload, frame.flags, decoded).ok()) {
+                        body.append(
+                            reinterpret_cast<const char*>(decoded.data()),
+                            decoded.size());
+                    }
+                    end_stream = end_stream ||
+                                 (frame.flags & h2::flags::end_stream) != 0;
+                }
+                buf.erase(0, total);
+            }
+        },
+        5000);
+    CRPC_CHECK(complete);
+    CRPC_CHECK_EQ(501, status);
+    CRPC_CHECK(body.find("not supported") != std::string::npos);
+    CRPC_CHECK(end_stream);
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+    client->close();
+}
+
+CRPC_TEST(longpoll_multishard_unavailable_503) {
+    http::http_server_options options;
+    options.shards = 2;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options, "http-lp-multi");
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client,
+             http1("GET", poll_target((1ull << 32) + 73, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(503, parser.responses[0].status);
+    CRPC_CHECK(parser.responses[0].head.find("Retry-After: 1") !=
+               std::string::npos);
+    client->close();
+}
+
 } // namespace
 
 CRPC_TEST_MAIN()

@@ -68,6 +68,19 @@ enum class delivery_mode : u8 {
     unreliable = 1
 };
 
+// Replay policy used when a connection token is (re)attached.
+//   * `tail` -- replay unacknowledged reliable messages at the queue tail
+//     (the SSE reconnect behaviour);
+//   * `none` -- retarget queued messages only; the caller decides what, if
+//     anything, to replay (long polling);
+//   * `front` -- replay unacknowledged reliable messages at the queue front, in
+//     sequence order (ordered long polling).
+enum class attach_replay : u8 {
+    none = 0,
+    tail = 1,
+    front = 2
+};
+
 // Bounded-queue overflow behaviour. `disconnect_subscriber` removes every
 // subscription of the offending subscriber and emits an event.
 enum class overflow_policy : u8 {
@@ -212,12 +225,22 @@ public:
     // (Re)attaches a live connection for `id` and returns its token. The
     // previous token (if any) becomes stale immediately; queued messages are
     // retargeted to the new token so nothing is delivered twice. If no
-    // connection was attached, unacknowledged reliable messages are replayed.
+    // connection was attached, unacknowledged reliable messages are replayed
+    // according to `mode` (the default `tail` is the SSE behaviour).
     [[nodiscard]] connection_id attach(subscriber_id id) noexcept;
+    [[nodiscard]] connection_id attach(subscriber_id id,
+                                       attach_replay mode) noexcept;
 
     // Closes a connection token. Queued messages targeted at it are released
     // at once; the subscriptions remain so a later `attach` resumes them.
     [[nodiscard]] status detach(connection_id connection) noexcept;
+
+    // Closes a connection token without touching its queues: queued messages
+    // stay `in_queue`, no replay entry is requeued and no retransmission is
+    // counted. A later `attach` retargets the queue to the new token. This is
+    // the session-end path for long polling; `detach` keeps the historical
+    // clear-queue semantics.
+    [[nodiscard]] status release(connection_id connection) noexcept;
 
     // Publishes to every subscriber of `topic`. Never blocks: on a full queue
     // the configured overflow policy applies and the drop is counted.
@@ -244,6 +267,17 @@ public:
     [[nodiscard]] status retransmit(subscriber_id id) noexcept;
     [[nodiscard]] status retransmit(subscriber_id id,
                                     std::string_view topic) noexcept;
+
+    // Re-queues the unacknowledged reliable messages of `topic` at the FRONT of
+    // the queue, in sequence order. Only messages already transmitted are
+    // counted against `retransmit_budget`; messages that never left the queue
+    // are not a retransmission. A budget overrun disconnects the subscriber
+    // (`not_acknowledged`) and returns that code. A replay window that no
+    // longer contains the first unacknowledged sequence returns
+    // `resource_exhausted`: the caller must restart the subscription instead of
+    // silently skipping a message.
+    [[nodiscard]] status retransmit_front(subscriber_id id,
+                                          std::string_view topic) noexcept;
 
     // Advances the hub clock for slow-subscriber detection. The shard timer
     // calls this with a monotonic timestamp; time is never read internally.

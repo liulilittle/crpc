@@ -49,6 +49,11 @@ struct replay_entry {
     std::size_t bytes = 0;
     u32 attempts = 0;
     bool in_queue = false;
+    // True once the message was handed to a connection at least once. Only an
+    // actual retransmission of a transmitted message counts against the
+    // retransmission budget; re-queuing a message that never left the queue is
+    // not a retransmission.
+    bool transmitted = false;
 };
 
 struct subscription_state {
@@ -158,6 +163,16 @@ struct hub::impl {
         }
     }
 
+    void mark_replay_transmitted(subscription_state& sub, u64 seq) noexcept {
+        for (auto& entry : sub.replay) {
+            if (entry.seq == seq) {
+                entry.in_queue = false;
+                entry.transmitted = true;
+                return;
+            }
+        }
+    }
+
     void drop_queue_front(subscription_state& sub) noexcept {
         if (sub.queue.empty()) {
             return;
@@ -247,8 +262,10 @@ struct hub::impl {
         sub.queue.push_back(std::move(message));
         sub.queued_bytes += entry.bytes;
         entry.in_queue = true;
-        ++entry.attempts;
-        ++counters.retransmits;
+        if (entry.transmitted) {
+            ++entry.attempts;
+            ++counters.retransmits;
+        }
         note_high_water(sub);
         return true;
     }
@@ -268,7 +285,8 @@ struct hub::impl {
                 if (entry.seq <= sub.acked_upto || entry.in_queue) {
                     continue;
                 }
-                if (entry.attempts >= sub.options.retransmit_budget) {
+                if (entry.transmitted &&
+                    entry.attempts >= sub.options.retransmit_budget) {
                     disconnect_subscriber(state.id, hub_event_kind::not_acknowledged,
                                           rpc_code::not_acknowledged, kv.first);
                     return;
@@ -397,6 +415,115 @@ struct hub::impl {
         return false;
     }
 
+    // Front-inserts the unacknowledged, reliable replay entries of one
+    // subscription in sequence order. The replay window is checked first: a
+    // missing sequence means the window was trimmed and the caller must restart
+    // the subscription (resource_exhausted) rather than skip data.
+    [[nodiscard]] status retransmit_front_sub(const subscriber_state& state,
+                                              subscription_state& sub) noexcept {
+        if (sub.mode != delivery_mode::reliable) {
+            return status{};
+        }
+        const std::size_t count_capacity =
+            sub.options.max_messages == 0 ? 1 : sub.options.max_messages;
+        const std::size_t byte_capacity =
+            sub.options.max_bytes == 0 ? 1 : sub.options.max_bytes;
+        const std::size_t budget = sub.options.retransmit_budget;
+
+        // A complete replay window contains every assigned sequence above the
+        // acknowledged one. Entries are appended in sequence order and are only
+        // popped after an ack (from the front) or by max_replay trimming (also
+        // from the front), so the first unacknowledged sequence must be the
+        // first surviving entry.
+        u64 expected = sub.acked_upto + 1;
+        bool gap = false;
+        std::size_t needed = 0;
+        std::size_t needed_bytes = 0;
+        for (const replay_entry& entry : sub.replay) {
+            if (entry.seq <= sub.acked_upto) {
+                continue;
+            }
+            if (entry.seq != expected) {
+                gap = true;
+                break;
+            }
+            ++expected;
+            if (!entry.in_queue) {
+                if (entry.transmitted && entry.attempts >= budget) {
+                    return status(rpc_error(rpc_code::not_acknowledged,
+                                            "retransmission budget exhausted"));
+                }
+                ++needed;
+                needed_bytes += entry.bytes;
+            }
+        }
+        if (gap) {
+            return status(rpc_error(rpc_code::resource_exhausted,
+                                    "replay window gap"));
+        }
+        // Every assigned sequence is present iff the expected successor equals
+        // next_seq. A gap here means the window was trimmed at the front.
+        if (sub.next_seq > sub.acked_upto + 1 &&
+            expected != sub.next_seq) {
+            return status(rpc_error(rpc_code::resource_exhausted,
+                                    "replay window gap"));
+        }
+        if (needed == 0) {
+            return status{};
+        }
+
+        // Make room by dropping queued UNRELIABLE messages only. A reliable
+        // queued message is part of the contiguous unacknowledged run; dropping
+        // it here would let a later sequence reach the consumer first. With
+        // `max_replay >= max_messages` (a long-poll option invariant) the
+        // reliable run always fits, so a reliable overflow is a restart.
+        if (sub.queue.size() + needed > count_capacity ||
+            sub.queued_bytes + needed_bytes > byte_capacity) {
+            for (auto it = sub.queue.begin();
+                 it != sub.queue.end() &&
+                 (sub.queue.size() + needed > count_capacity ||
+                  sub.queued_bytes + needed_bytes > byte_capacity);) {
+                if (it->mode == delivery_mode::reliable) {
+                    ++it;
+                    continue;
+                }
+                sub.queued_bytes -= it->bytes;
+                it = sub.queue.erase(it);
+                ++counters.dropped_overflow;
+            }
+        }
+        if (sub.queue.size() + needed > count_capacity ||
+            sub.queued_bytes + needed_bytes > byte_capacity) {
+            return status(rpc_error(rpc_code::resource_exhausted,
+                                    "queue cannot hold the replay window"));
+        }
+
+        for (std::size_t index = sub.replay.size(); index > 0; --index) {
+            replay_entry& entry = sub.replay[index - 1];
+            if (entry.seq <= sub.acked_upto || entry.in_queue) {
+                continue;
+            }
+            queued_message message;
+            message.target = state.active;
+            message.publisher_id = entry.publisher_id;
+            message.epoch = entry.epoch;
+            message.seq = entry.seq;
+            message.topic_seq = entry.topic_seq;
+            message.mode = delivery_mode::reliable;
+            message.payload = entry.payload;
+            message.bytes = entry.bytes;
+            sub.queue.push_front(std::move(message));
+            sub.queued_bytes += entry.bytes;
+            entry.in_queue = true;
+            if (entry.transmitted) {
+                ++entry.attempts;
+                ++counters.retransmits;
+            }
+        }
+        note_high_water(sub);
+        return status{};
+    }
+
     [[nodiscard]] bool take_from(hub::connection_id connection,
                                  subscription_state& sub,
                                  push_message& out) noexcept {
@@ -426,7 +553,7 @@ struct hub::impl {
         sub.queue.pop_front();
         ++counters.delivered;
         if (was_reliable) {
-            mark_replay_in_queue(sub, seq, false);
+            mark_replay_transmitted(sub, seq);
         }
         if (sub.queue.empty() || sub.queued_bytes <= options.slow_watermark_bytes) {
             sub.high_water = false;
@@ -508,7 +635,8 @@ struct hub::impl {
         }
     }
 
-    [[nodiscard]] hub::connection_id attach(subscriber_id id) noexcept {
+    [[nodiscard]] hub::connection_id attach(subscriber_id id,
+                                            attach_replay mode) noexcept {
         try {
             const hub::connection_id cid = next_connection++;
             subscriber_state& state = subscribers[id];
@@ -525,7 +653,24 @@ struct hub::impl {
                 }
             }
             if (previous == hub::invalid_connection) {
-                replay_unacked(state, std::string_view{}, false);
+                if (mode == attach_replay::tail) {
+                    replay_unacked(state, std::string_view{}, false);
+                } else if (mode == attach_replay::front) {
+                    for (auto& kv : state.subscriptions) {
+                        const status replayed =
+                            retransmit_front_sub(state, kv.second);
+                        if (replayed.code() == rpc_code::not_acknowledged) {
+                            // A budget overrun disconnects the subscriber; the
+                            // token handed out above is stale. Copy the topic:
+                            // the disconnect erases the subscription state.
+                            const std::string topic_copy = kv.first;
+                            disconnect_subscriber(
+                                id, hub_event_kind::not_acknowledged,
+                                rpc_code::not_acknowledged, topic_copy);
+                            return hub::invalid_connection;
+                        }
+                    }
+                }
             }
             return cid;
         } catch (...) {
@@ -553,6 +698,41 @@ struct hub::impl {
             }
         }
         return status{};
+    }
+
+    status release(hub::connection_id connection) noexcept {
+        auto cit = connections.find(connection);
+        if (cit == connections.end()) {
+            return status(rpc_code::not_found);
+        }
+        const subscriber_id id = cit->second;
+        connections.erase(cit);
+        auto sit = subscribers.find(id);
+        if (sit != subscribers.end() && sit->second.active == connection) {
+            sit->second.active = hub::invalid_connection;
+        }
+        // Deliberately no clear_queue(): queued messages stay in_queue and the
+        // next attach only retargets them. Already-taken messages remain in the
+        // replay window for a cursor-gap retransmit.
+        return status{};
+    }
+
+    status retransmit_front(subscriber_id id,
+                            std::string_view topic) noexcept {
+        auto sit = subscribers.find(id);
+        if (sit == subscribers.end()) {
+            return status(rpc_code::not_found);
+        }
+        auto sub_it = sit->second.subscriptions.find(topic);
+        if (sub_it == sit->second.subscriptions.end()) {
+            return status(rpc_code::not_found);
+        }
+        const status front = retransmit_front_sub(sit->second, sub_it->second);
+        if (front.code() == rpc_code::not_acknowledged) {
+            disconnect_subscriber(id, hub_event_kind::not_acknowledged,
+                                  rpc_code::not_acknowledged, topic);
+        }
+        return front;
     }
 
     void publish(std::string_view topic, byte_span payload, delivery_mode mode,
@@ -781,11 +961,19 @@ status hub::unsubscribe_all(subscriber_id id) noexcept {
 }
 
 hub::connection_id hub::attach(subscriber_id id) noexcept {
-    return impl_->attach(id);
+    return impl_->attach(id, attach_replay::tail);
+}
+
+hub::connection_id hub::attach(subscriber_id id, attach_replay mode) noexcept {
+    return impl_->attach(id, mode);
 }
 
 status hub::detach(connection_id connection) noexcept {
     return impl_->detach(connection);
+}
+
+status hub::release(connection_id connection) noexcept {
+    return impl_->release(connection);
 }
 
 void hub::publish(std::string_view topic, byte_span payload,
@@ -817,6 +1005,11 @@ status hub::retransmit(subscriber_id id) noexcept {
 
 status hub::retransmit(subscriber_id id, std::string_view topic) noexcept {
     return impl_->retransmit(id, topic);
+}
+
+status hub::retransmit_front(subscriber_id id,
+                             std::string_view topic) noexcept {
+    return impl_->retransmit_front(id, topic);
 }
 
 void hub::tick(u64 now_ns) noexcept {

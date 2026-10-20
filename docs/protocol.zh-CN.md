@@ -32,6 +32,7 @@
 | [20](#s20) | HTTP/1.1 Server-Sent Events（已实现子集） |
 | [21](#s21) | HTTP 内容编码（已实现子集） |
 | [22](#s22) | HTTP 文件下载与 Range（已实现子集） |
+| [23](#s23) | HTTP/1.1 长轮询（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -307,7 +308,7 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ## 19. 推送投递（已实现子集） <a id="s19"></a>
 
-本节对已实现的单分片、进程内子集具有规范效力。PUSH 与 REQUEST/RESPONSE 走同一条连接。跨分片路由、ordered/gap 处理与 `stream_transport` 集成不属于本子集；HTTP SSE 见第 20 节。
+本节对已实现的单分片、进程内子集具有规范效力。PUSH 与 REQUEST/RESPONSE 走同一条连接。跨分片路由、ordered/gap 处理与 `stream_transport` 集成不属于本子集；HTTP SSE 与 HTTP 长轮询分别见第 20、23 节。
 
 ### 19.1 PUSH 信封
 
@@ -352,7 +353,7 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 ## 20. HTTP/1.1 Server-Sent Events（已实现子集） <a id="s20"></a>
 
-本节对已实现的 SSE 子集具有规范效力：HTTP/1.1、单分片、进程内。长轮询、HTTP/2 SSE、跨分片发布、鉴权与 `content_coding` 不属于本子集。分帧辅助位于 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`；服务端接线位于 `src/http/server.cpp`。
+本节对已实现的 SSE 子集具有规范效力：HTTP/1.1、单分片、进程内。长轮询见第 23 节；HTTP/2 SSE、跨分片发布、鉴权与 `content_coding` 不属于本子集。分帧辅助位于 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`；服务端接线位于 `src/http/server.cpp`。
 
 ### 20.1 请求
 
@@ -430,3 +431,52 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 ### 22.4 HTTP/2
 
 HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不进行文件流式传输。
+
+## 23. HTTP/1.1 长轮询（已实现子集） <a id="s23"></a>
+
+本节对已实现的长轮询子集具有规范效力：HTTP/1.1、单分片、进程内。路由通过 `http_server::builder::add_longpoll_route()` 注册；会话状态机位于 `src/http/server.cpp`。长轮询要求 `http_server_options::shards == 1`；多分片服务器上的请求返回 `503`。长轮询、SSE 与下载三组路径互斥（`start()` 拒绝冲突）。SSE 行为不变。
+
+### 23.1 请求与订阅标识
+
+`GET <longpoll-path>`。`HEAD` 及其他方法返回 `405`；HTTP/1.0 返回 `400`。查询参数覆盖已注册路由：`topic`（必须非空）、`mode`（`reliable` 或 `unreliable`）、`ordered`（`0`/`1` 或 `false`/`true`）、`subscriber` 与 `timeout`。`timeout` 以毫秒计，默认 `longpoll_options::timeout`（25 秒），并 clamp 到 `[0, longpoll_options::max_timeout]`（30 秒）；`0` 表示只做一次非阻塞取消息，队列为空时立即 `204`。
+
+游标为 `Last-Event-ID: <epoch>:<seq>` 或 `?cursor=<epoch>:<seq>`。`Last-Event-ID` 优先；两者同时出现且不同则 `400`。解析复用严格的 SSE 解析器。长轮询 subscriber id 位于 `[2^32, 2^33)`（SSE 从 1 分配）；客户端自带 id 越界返回 `400`。缺省时由服务端分配。每个 `200`/`204` 都携带 `X-CRPC-Subscriber`，客户端必须持久化。订阅因溢出/TTL 丢失后重建会返回新的服务端 id，客户端据此重置去重状态；该命名空间只是避免冲突的约定，不是安全边界。
+
+### 23.2 响应
+
+| 情况 | 状态 | Body | 关键头 |
+|---|---|---|---|
+| 有事件 | `200` | 恰好一条消息原始字节 | `Content-Type`（默认 `application/octet-stream`）、`Content-Length`、`Cache-Control: no-store, no-cache`、`X-CRPC-Event-ID: <epoch>:<seq>`、`X-CRPC-Subscriber`、`Connection: keep-alive|close` |
+| 超时 | `204` | 空 | `Cache-Control: no-store, no-cache`、`X-CRPC-Subscriber`、`Connection: keep-alive|close`；无 `Content-Length`、无 `X-CRPC-Event-ID` |
+| 零长度事件 | `200` | 空（`Content-Length: 0`） | 与事件相同，含 `X-CRPC-Event-ID` |
+| 参数/游标非法 | `400` | problem/plain | - |
+| 未知/不属于本 shard 主题 | `404` | plain | - |
+| 同 subscriber 已有活跃 transport | `409` | plain | - |
+| 重放窗口缺口/重传预算耗尽 | `409` | plain（`Restart`） | - |
+| 等待者上限 | `503` | plain | `Retry-After: 1` |
+| HTTP/2 | `501` | plain | 完整响应，不开流 |
+
+可靠模式的事件 id 使用每订阅 `seq`；不可靠模式使用 `topic_seq`，且没有确认。响应永不参与内容编码、不携带 `Vary`（特殊路由在响应编码之前分派）。零长度可靠事件是 `200` + `Content-Length: 0` + 事件 id，可与无 body 的 `204` 超时区分。
+
+### 23.3 确认与 at-least-once 投递
+
+`200` 不确认消息；下一次请求的游标即累积 ACK：服务端先把它 clamp 到该 `(subscriber, topic)` 已交付的最高序号，再调用 `hub.ack(cursor)`。过大的游标被 clamp（计入 `longpoll_ack_clamped`）；epoch 与 `longpoll_options::epoch` 不一致的游标不确认。去重键为 `(subscriber, epoch, seq)`。
+
+正常 `200`/`204` 从不 detach：token、订阅与队列跨 poll 保留。会话结束（对端关闭、停机、stall）使用 hub 的 keep-queue `release(token)`：token 失效，但队列消息保持 `in_queue`，且不计为重传。若客户端游标落后于已交付高水位，服务端调用 `retransmit_front`，把已取出但未确认的可靠消息按 seq 升序**前插**到队头，再取一条。`retransmit_budget` 只统计真正发送过的消息。若重放窗口已被 `max_replay` 裁剪、不再包含首个未确认序号，或预算耗尽，当前 poll 返回 `409 Restart`，绝不静默跳过数据；客户端应重建订阅。`retransmit_front` 依赖 `subscribe_options::max_replay >= subscribe_options::max_messages`；`start()` 在需要时把重放上限提升到队列上限。
+
+### 23.4 等待、存活与上限
+
+取消息与等待注册在同一把 hub 锁内完成，`publish` 也持同一把锁，因此消息不会落在“队列为空”与“等待已注册”之间。等待期间连接的 idle 与 request 截止时间被禁用，改用独立的 poll 截止时间。`publish` 唤醒只投递 shard 任务；shard 取一条后立即响应。截止时间到点时先再取一次（shard inbox 满时唤醒可能被丢），确认仍无消息才返回 `204`，随后重新武装 idle 截止时间。连接保持 keep-alive；poll 响应入队之前不解析 HTTP/1.1 流水线字节。
+
+同一 subscriber 至多一个活跃 transport：另一连接上的并发 poll 返回 `409`，第一个 token 不会被重定向。等待中的 poll 总数受 `longpoll_options::max_waiters` 限制，超出返回 `503` + `Retry-After: 1`。`http_server_options::max_connections` 仍是 accept 层的套接字上限。对端停止排空 poll 响应时由 `longpoll_options::slow_timeout` 关闭；已取消息保持未确认，由下一次 poll 的游标缺口重放。超过 `longpoll_options::subscriber_ttl`（5 分钟）没有 poll 的 subscriber 会被 `unsubscribe_all`，并清理其高水位/owner 记录。`stop()` 会唤醒等待中的 poll 并关闭会话；keep-queue release 在 hub 销毁之前完成。
+
+### 23.5 与 SSE（第 20 节）的差异
+
+| 维度 | SSE | 长轮询 |
+|---|---|---|
+| 分帧 | chunked `text/event-stream` 事件 | 每个 `200` 一条带 `Content-Length` 的原始 body |
+| 超时 | 注释心跳；无 204 | `204`，无 body |
+| ACK | 重连 `Last-Event-ID` | 下一次 poll 游标（累积） |
+| 连接归属 | 独占流，禁用 idle | keep-alive，每次 poll 后重新武装 idle |
+| 并发 | 重连会重定向 token | 同 subscriber 活跃 transport → `409` |
+| 资源清理 | 现有子集无 TTL（D5） | TTL + `unsubscribe_all` |
