@@ -214,7 +214,10 @@ public:
 
     // Subscribes `id` to `topic`. Re-subscribing the same (id, topic) fails
     // with `failed_precondition`. A topic not owned by this shard fails the
-    // same way.
+    // same way. `subscribe` accepts any replay/queue bound combination; tail
+    // replay has no cross-bound requirement, while `retransmit_front` needs
+    // `max_messages >= max_replay` and answers `resource_exhausted` when the
+    // queue cannot hold the window.
     [[nodiscard]] status subscribe(std::string_view topic, subscriber_id id,
                                    delivery_mode mode, bool ordered,
                                    subscribe_options options = {});
@@ -273,7 +276,8 @@ public:
     // counted against `retransmit_budget`; messages that never left the queue
     // are not a retransmission. A budget overrun disconnects the subscriber
     // (`not_acknowledged`) and returns that code. A replay window that no
-    // longer contains the first unacknowledged sequence returns
+    // longer contains the first unacknowledged sequence, or a queue that
+    // cannot hold the whole window (`max_messages < max_replay`), returns
     // `resource_exhausted`: the caller must restart the subscription instead of
     // silently skipping a message.
     [[nodiscard]] status retransmit_front(subscriber_id id,

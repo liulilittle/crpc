@@ -474,9 +474,11 @@ struct hub::impl {
 
         // Make room by dropping queued UNRELIABLE messages only. A reliable
         // queued message is part of the contiguous unacknowledged run; dropping
-        // it here would let a later sequence reach the consumer first. With
-        // `max_replay >= max_messages` (a long-poll option invariant) the
-        // reliable run always fits, so a reliable overflow is a restart.
+        // it here would let a later sequence reach the consumer first. Front
+        // replay needs `max_messages >= max_replay` so the queue can hold the
+        // whole window; the long-poll start() enforces that. Tail replay has no
+        // such requirement, and a direct caller with a smaller queue gets a
+        // safe `resource_exhausted` restart instead of losing unacked data.
         if (sub.queue.size() + needed > count_capacity ||
             sub.queued_bytes + needed_bytes > byte_capacity) {
             for (auto it = sub.queue.begin();

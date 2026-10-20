@@ -40,6 +40,8 @@
 #include <crpc/http2/hpack.hpp>
 #include <crpc/mvc/router.hpp>
 
+#include "longpoll_sweep.hpp"
+
 namespace crpc {
 namespace http {
 namespace {
@@ -777,6 +779,7 @@ struct server_state {
     std::unordered_map<u64, u64> longpoll_lost;
     u64 next_longpoll_sweep_ns = 0;
     std::atomic<u64> next_longpoll_subscriber{k_longpoll_subscriber_base};
+    std::atomic<std::size_t> longpoll_replay_window{0};
     std::atomic<std::size_t> longpoll_waiters{0};
     std::atomic<std::size_t> longpoll_events{0};
     std::atomic<std::size_t> longpoll_timeouts{0};
@@ -799,6 +802,108 @@ struct server_state {
         longpoll_lost.erase(id);
     }
 
+    // Server-owned housekeeping timer. TTL cleanup must not depend on another
+    // poll arriving: the last long-poll connection may already be gone. The
+    // timer lives on the single shard runtime; `keepalive` is held by the
+    // timer entry so a callback can never run against a destroyed context.
+    struct longpoll_keepalive : std::enable_shared_from_this<longpoll_keepalive> {
+        server_state* owner = nullptr;
+        std::atomic<bool> stopped{false};
+    };
+
+    std::shared_ptr<longpoll_keepalive> longpoll_keepalive_timer;
+
+    [[nodiscard]] static u64 longpoll_timer_period_ns(
+        const http_server_options& opts) noexcept {
+        const auto ttl_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                opts.longpoll.subscriber_ttl)
+                .count();
+        if (ttl_ns <= 0) {
+            return 0;
+        }
+        u64 period = static_cast<u64>(ttl_ns);
+        constexpr u64 k_max_period = 30ull * 1000ull * 1000ull * 1000ull;
+        if (period > k_max_period) {
+            period = k_max_period;
+        }
+        return period;
+    }
+
+    void arm_longpoll_timer() noexcept {
+        const std::size_t shard_count = options.shards == 0 ? 1 : options.shards;
+        if (shard_count != 1 || shards.empty() || longpoll_routes.empty()) {
+            return;
+        }
+        const u64 period = longpoll_timer_period_ns(options);
+        if (period == 0) {
+            return;
+        }
+        try {
+            if (!longpoll_keepalive_timer) {
+                longpoll_keepalive_timer =
+                    std::make_shared<longpoll_keepalive>();
+                longpoll_keepalive_timer->owner = this;
+            } else {
+                longpoll_keepalive_timer->stopped.store(
+                    false, std::memory_order_release);
+            }
+            const u64 now = shards[0]->now_ns();
+            (void)shards[0]->arm_timer(
+                longpoll_keepalive_timer.get(), now + period,
+                &server_state::longpoll_timer_trampoline,
+                longpoll_keepalive_timer.get(),
+                std::static_pointer_cast<void>(longpoll_keepalive_timer));
+        } catch (...) {
+        }
+    }
+
+    void stop_longpoll_timer() noexcept {
+        if (!longpoll_keepalive_timer) {
+            return;
+        }
+        longpoll_keepalive_timer->stopped.store(true,
+                                                std::memory_order_release);
+        if (!shards.empty()) {
+            (void)shards[0]->cancel_timer(longpoll_keepalive_timer.get());
+        }
+    }
+
+    static void longpoll_timer_trampoline(void* ctx) noexcept {
+        auto* keeper = static_cast<longpoll_keepalive*>(ctx);
+        if (keeper == nullptr || keeper->owner == nullptr ||
+            keeper->stopped.load(std::memory_order_acquire)) {
+            return;
+        }
+        server_state& st = *keeper->owner;
+        if (st.shards.empty()) {
+            return;
+        }
+        const u64 now = st.shards[0]->now_ns();
+        try {
+            std::lock_guard<std::recursive_mutex> lk(st.hub_mutex);
+            st.longpoll_sweep(now);
+        } catch (...) {
+        }
+        if (keeper->stopped.load(std::memory_order_acquire) ||
+            st.shards.empty()) {
+            return;
+        }
+        const u64 period = longpoll_timer_period_ns(st.options);
+        if (period == 0) {
+            return;
+        }
+        try {
+            const std::shared_ptr<longpoll_keepalive> keep =
+                keeper->shared_from_this();
+            (void)st.shards[0]->arm_timer(
+                keeper, now + period,
+                &server_state::longpoll_timer_trampoline, keeper,
+                std::static_pointer_cast<void>(keep));
+        } catch (...) {
+        }
+    }
+
     void longpoll_sweep(u64 now_ns) noexcept {
         const std::int64_t ttl_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -813,14 +918,34 @@ struct server_state {
         const u64 ttl = static_cast<u64>(ttl_ns);
         const u64 period = std::min<u64>(ttl, 30000000000ull); // 30 s
         next_longpoll_sweep_ns = now_ns + period;
-        for (auto it = longpoll_last_seen.begin();
-             it != longpoll_last_seen.end();) {
-            if (longpoll_busy.find(it->first) != longpoll_busy.end() ||
-                now_ns - it->second < ttl) {
-                ++it;
+
+        // UNION of owners and last_seen: an owner without last_seen is a
+        // partial-request residue and is swept immediately; an ownerless
+        // subscription (normal keep-queue session end) is swept after TTL.
+        std::vector<push::subscriber_id> victims;
+        try {
+            detail::collect_expired_longpoll_ids(
+                longpoll_owners, longpoll_last_seen, longpoll_busy, now_ns, ttl,
+                victims);
+        } catch (...) {
+            return;
+        }
+        for (const push::subscriber_id id : victims) {
+            if (longpoll_busy.find(id) != longpoll_busy.end()) {
                 continue;
             }
-            const push::subscriber_id id = it->first;
+            const auto seen = longpoll_last_seen.find(id);
+            const bool owner = longpoll_owners.find(id) != longpoll_owners.end();
+            const bool expired =
+                owner ? (seen == longpoll_last_seen.end() ||
+                         (now_ns >= seen->second &&
+                          now_ns - seen->second >= ttl))
+                      : (seen != longpoll_last_seen.end() &&
+                         now_ns >= seen->second &&
+                         now_ns - seen->second >= ttl);
+            if (!expired) {
+                continue;
+            }
             if (hub) {
                 (void)hub->unsubscribe_all(id);
             }
@@ -833,7 +958,7 @@ struct server_state {
                     ++dit;
                 }
             }
-            it = longpoll_last_seen.erase(it);
+            longpoll_last_seen.erase(id);
             try {
                 longpoll_lost[id] = now_ns;
                 const std::size_t tombstone_cap =
@@ -2519,7 +2644,10 @@ void session::longpoll_release() noexcept {
         if (token != 0 && state_.hub) {
             // Keep-queue: queued messages stay in_queue, an already-taken
             // message stays in the replay window, and nothing is counted as a
-            // retransmission.
+            // retransmission. The subscription is intentionally kept so a
+            // reconnect inside `subscriber_ttl` still resumes it; the periodic
+            // long-poll housekeeping timer performs `unsubscribe_all` when the
+            // TTL expires (no later poll is required).
             (void)state_.hub->release(token);
         }
     } catch (...) {
@@ -2916,9 +3044,14 @@ void session::longpoll_open(http::request request, const longpoll_route& route) 
                         unavailable = true;
                     } else {
                         state_.longpoll_delivered.erase({subscriber, topic});
+                        // A subscription now exists even if the following
+                        // attach fails; record activity so the TTL sweep can
+                        // find and remove this ownerless residue.
+                        state_.longpoll_last_seen[subscriber] = now;
                     }
                 } else if (!already) {
                     state_.longpoll_delivered.erase({subscriber, topic});
+                    state_.longpoll_last_seen[subscriber] = now;
                 }
             }
 
@@ -2962,6 +3095,11 @@ void session::longpoll_open(http::request request, const longpoll_route& route) 
                         state_.longpoll_owners[subscriber] =
                             server_state::longpoll_owner{weak_from_this(),
                                                          token};
+                        // The owner is visible before the response/wait path
+                        // can return early (409/503): record activity now so
+                        // the TTL sweep can never see an owner without a
+                        // last_seen entry.
+                        state_.longpoll_last_seen[subscriber] = now;
                     }
                 }
 
@@ -4238,12 +4376,31 @@ status http_server::start() {
         } else {
             state.options.longpoll.epoch = state.options.sse.epoch;
         }
-        if (state.options.longpoll.subscribe.max_replay <
-            state.options.longpoll.subscribe.max_messages) {
-            // retransmit_front must be able to hold the whole queue; the
-            // replay window is the only source of already-taken messages.
-            state.options.longpoll.subscribe.max_replay =
-                state.options.longpoll.subscribe.max_messages;
+        {
+            // retransmit_front moves the whole unacknowledged replay window
+            // back into the queue, so the queue must be able to hold it
+            // (`max_messages >= max_replay`). A replay bound larger than the
+            // queue is rejected instead of silently growing the queue's
+            // memory bound; a smaller replay bound is raised to the queue bound
+            // (the existing equalization). Zero has always meant "one".
+            push::subscribe_options& sub =
+                state.options.longpoll.subscribe;
+            if (sub.max_messages == 0) {
+                sub.max_messages = 1;
+            }
+            if (sub.max_replay == 0) {
+                sub.max_replay = 1;
+            }
+            if (sub.max_replay > sub.max_messages) {
+                return status{rpc_error(
+                    rpc_code::invalid_argument,
+                    "long-poll subscribe.max_replay must not exceed max_messages")};
+            }
+            if (sub.max_replay < sub.max_messages) {
+                sub.max_replay = sub.max_messages;
+            }
+            state.longpoll_replay_window.store(sub.max_replay,
+                                               std::memory_order_relaxed);
         }
         for (std::size_t i = 0; i < state.longpoll_routes.size(); ++i) {
             const std::string& path = state.longpoll_routes[i].path;
@@ -4359,6 +4516,9 @@ status http_server::start() {
         for (std::size_t i = 0; i < state.listeners.size(); ++i) {
             state.listeners[i]->start(state.acceptors[i].get());
         }
+        // Periodic long-poll TTL housekeeping. Armed after the shard is
+        // running; cancelled by stop() before the hub is torn down.
+        state.arm_longpoll_timer();
     } catch (...) {
         stop();
         return status{rpc_code::resource_exhausted};
@@ -4370,6 +4530,9 @@ void http_server::stop() noexcept {
     server_state& state = impl_->state;
     const bool was_accepting = state.accepting.exchange(false, std::memory_order_acq_rel);
     (void)was_accepting;
+    // Stop the periodic TTL sweep before any hub/session teardown. A callback
+    // already running on the shard finishes under `hub_mutex`.
+    state.stop_longpoll_timer();
 
     for (std::unique_ptr<listener>& listener : state.listeners) {
         if (listener) {
@@ -4402,6 +4565,7 @@ void http_server::stop() noexcept {
             state.longpoll_waiters.store(0, std::memory_order_relaxed);
             state.sse_connections.store(0, std::memory_order_relaxed);
         }
+        state.longpoll_keepalive_timer.reset();
         state.acceptors.clear();
         return;
     }
@@ -4450,6 +4614,7 @@ void http_server::stop() noexcept {
         state.sse_connections.store(0, std::memory_order_relaxed);
     }
     state.shards.clear();
+    state.longpoll_keepalive_timer.reset();
     state.pending_listeners.clear();
     state.tls_context.reset();
     state.acceptors.clear();
@@ -4503,6 +4668,9 @@ http_statistics http_server::stats() const noexcept {
     {
         std::lock_guard<std::recursive_mutex> lk(impl_->state.hub_mutex);
         out.longpoll_subscribers = impl_->state.longpoll_owners.size();
+        out.longpoll_replay_window =
+            impl_->state.longpoll_replay_window.load(
+                std::memory_order_relaxed);
         if (impl_->state.hub) {
             const push::hub_stats counters = impl_->state.hub->stats();
             out.sse_hub_published = static_cast<std::size_t>(counters.published);

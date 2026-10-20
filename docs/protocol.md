@@ -641,8 +641,15 @@ messages that were actually transmitted. If the replay window no longer
 contains the first unacknowledged sequence (it was trimmed by `max_replay`) or
 the budget is exhausted, the current poll is `409 Restart` instead of silently
 skipping data; the client restarts the subscription. `retransmit_front` relies
-on `subscribe_options::max_replay >= subscribe_options::max_messages`; `start()`
-raises the replay bound to the queue bound when needed.
+on `subscribe_options::max_messages >= subscribe_options::max_replay`. A replay
+bound larger than the queue bound is rejected by the long-poll `start()` with
+`invalid_argument` (the queue's memory bound is never silently enlarged); a
+smaller replay bound is raised to the queue bound, so the front replay can
+always hold the whole retained unacknowledged window. This requirement is
+specific to front replay: tail replay (SSE) has no cross-bound requirement, and
+`hub::subscribe` neither rejects nor rewrites the caller's bounds. A direct hub
+caller that uses `retransmit_front` while `max_messages < max_replay` gets
+`resource_exhausted` (a safe restart), never a silent skip.
 
 ### 23.4 Waiting, liveness and limits
 
@@ -664,7 +671,9 @@ accept-level socket bound. A peer that stops draining a polled body is closed
 by `longpoll_options::slow_timeout`; the taken message stays unacknowledged and
 is replayed by the next poll's cursor gap. A subscriber that sends no poll for
 `longpoll_options::subscriber_ttl` (5 min) is unsubscribed (`unsubscribe_all`)
-and its high-water/owner bookkeeping is removed. On `stop()` a waiting poll is
+and its high-water/owner bookkeeping is removed by a shard housekeeping timer
+(period `min(subscriber_ttl, 30 s)`); cleanup does not wait for a later poll.
+On `stop()` a waiting poll is
 woken and the session is closed; the keep-queue release runs before the hub is
 destroyed.
 

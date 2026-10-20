@@ -13,6 +13,7 @@
 //     conserved, and reading again resumes delivery;
 //   * lifecycle: peer close and heartbeat write failure detach the hub token;
 //   * HTTP/2 requests to an SSE path fail closed with one complete response.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -23,8 +24,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "../src/http/longpoll_sweep.hpp"
 
 #include <crpc/http/server.hpp>
 #include <crpc/http/sse.hpp>
@@ -531,7 +536,8 @@ CRPC_TEST(sse_backpressure_parks_and_resumes) {
     options.sse.slow_timeout = std::chrono::milliseconds(10000);
     // Keep the replay window larger than the publish burst so the hub's
     // dropped_overflow counter contains queue drops only; the conservation
-    // assertion below is then exact.
+    // assertion below is then exact. Tail replay does not need
+    // max_messages >= max_replay (that is a front-replay requirement only).
     options.sse.subscribe.max_replay = 4096;
     sse_fixture fx(options);
 
@@ -947,6 +953,9 @@ CRPC_TEST(longpoll_immediate_200_timeout_204_keepalive) {
     options.longpoll.max_timeout = std::chrono::milliseconds(500);
     options.longpoll.slow_timeout = std::chrono::milliseconds(0);
     longpoll_fixture fx(options);
+    // Defaults (256/1024) are accepted and equalized to the queue bound.
+    CRPC_CHECK_EQ(std::size_t{1024},
+                  fx.server->stats().longpoll_replay_window);
 
     const u64 subscriber = (1ull << 32) + 7;
     capture_source capture;
@@ -1346,6 +1355,166 @@ CRPC_TEST(longpoll_ttl_sweeps_idle_subscriber) {
     client->close();
 }
 
+CRPC_TEST(longpoll_sweep_union_covers_owner_residues) {
+    std::unordered_map<u64, int> owners;
+    std::unordered_map<u64, u64> last_seen;
+    std::unordered_set<u64> busy;
+    constexpr u64 now = 1000;
+    constexpr u64 ttl = 100;
+
+    last_seen[1] = 800;        // ownerless, expired
+    last_seen[2] = 950;        // ownerless, fresh
+    owners[3] = 0;             // owner + expired last_seen
+    last_seen[3] = 800;
+    owners[4] = 0;             // owner without last_seen (defensive residue)
+    owners[5] = 0;             // owner + fresh last_seen
+    last_seen[5] = 950;
+    last_seen[6] = 800;        // ownerless but busy
+    busy.insert(6);
+    owners[7] = 0;             // owner + busy
+    last_seen[7] = 800;
+    busy.insert(7);
+
+    std::vector<u64> expired;
+    crpc::http::detail::collect_expired_longpoll_ids(
+        owners, last_seen, busy, now, ttl, expired);
+    std::sort(expired.begin(), expired.end());
+    const std::vector<u64> expected{1, 3, 4};
+    CRPC_CHECK(expired == expected);
+}
+
+CRPC_TEST(longpoll_ttl_housekeeping_without_poll) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(300);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options);
+
+    const u64 subscriber = (1ull << 32) + 79;
+    {
+        capture_source capture;
+        auto client = fx.connect();
+        client->bind_source(&capture);
+        lp_parser parser;
+        send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+        CRPC_CHECK(wait_polls(parser, capture, 1));
+        CRPC_CHECK_EQ(204, parser.responses[0].status);
+        client->close();
+    }
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().active_connections == 0; }, 5000));
+
+    // The subscription is kept by the keep-queue release, so a publish lands
+    // in its queue...
+    CRPC_CHECK(publish_text(*fx.server, "news", "late"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
+    // ...and the shard housekeeping timer removes it after the TTL even though
+    // no later poll arrives.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+}
+
+CRPC_TEST(longpoll_queue_bound_covers_replay_window) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    // A smaller replay bound is raised to the queue bound at start(), so the
+    // queue always holds the whole replay window. (A larger replay bound is
+    // rejected by longpoll_replay_over_queue_rejected_at_start.)
+    options.longpoll.subscribe.max_messages = 4;
+    options.longpoll.subscribe.max_replay = 2;
+    longpoll_fixture fx(options);
+    CRPC_CHECK_EQ(std::size_t{4},
+                  fx.server->stats().longpoll_replay_window);
+
+    const u64 subscriber = (1ull << 32) + 83;
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+    CRPC_CHECK(publish_text(*fx.server, "news", "m1"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "m2"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "m3"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "m4"));
+
+    // The normalized queue holds all four messages, so the first poll is m1.
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("m1"), parser.responses[1].body);
+
+    // The lost response is replayed from the front; the queue has room for the
+    // whole window, so this must not be a 409 restart.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber, "timeout=0&cursor=1:0")));
+    CRPC_CHECK(wait_polls(parser, capture, 3));
+    CRPC_CHECK_EQ(200, parser.responses[2].status);
+    CRPC_CHECK_EQ(std::string("m1"), parser.responses[2].body);
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_restarts);
+
+    for (int i = 2; i <= 4; ++i) {
+        send_raw(*client, http1("GET",
+                                poll_target(subscriber,
+                                            "timeout=0&cursor=1:" +
+                                                std::to_string(i - 1))));
+        CRPC_CHECK(wait_polls(parser, capture,
+                              static_cast<std::size_t>(i) + 2));
+        const lp_response& response =
+            parser.responses[static_cast<std::size_t>(i) + 1];
+        CRPC_CHECK_EQ(200, response.status);
+        CRPC_CHECK_EQ("m" + std::to_string(i), response.body);
+        CRPC_CHECK(response.head.find("X-CRPC-Event-ID: 1:" +
+                                      std::to_string(i)) != std::string::npos);
+    }
+    // The queue is empty now: the next poll is a bodyless 204, so the
+    // 200/204 ordering is explicit.
+    send_raw(*client, http1("GET",
+                            poll_target(subscriber,
+                                        "timeout=0&cursor=1:4")));
+    CRPC_CHECK(wait_polls(parser, capture, 7));
+    CRPC_CHECK_EQ(204, parser.responses[6].status);
+    client->close();
+}
+
+CRPC_TEST(longpoll_replay_over_queue_rejected_at_start) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(0);
+    options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.subscribe.max_messages = 2;
+    options.longpoll.subscribe.max_replay = 4;
+
+    inproc_backend backend;
+    mvc::router router;
+    CRPC_CHECK(router.freeze().ok());
+    http::http_server::builder builder;
+    builder.add_listener(endpoint::inproc("http-lp-reject"), backend);
+    builder.router(router);
+    builder.options(options);
+    http::longpoll_route route;
+    route.path = "/poll";
+    route.topic = "news";
+    builder.add_longpoll_route(std::move(route));
+    auto server = builder.build();
+    CRPC_CHECK(server != nullptr);
+    const status started = server->start();
+    CRPC_CHECK_FALSE(started.ok());
+    CRPC_CHECK_EQ(static_cast<int>(rpc_code::invalid_argument),
+                  static_cast<int>(started.code()));
+}
+
 CRPC_TEST(longpoll_lost_subscription_gets_fresh_id) {
     http::http_server_options options;
     options.idle_timeout = std::chrono::milliseconds(0);
@@ -1622,6 +1791,26 @@ CRPC_TEST(longpoll_cross_protocol_same_subscriber_409) {
     CRPC_CHECK_EQ(200, lp_parser_state.responses[1].status);
     CRPC_CHECK_EQ(std::string("still-here"), lp_parser_state.responses[1].body);
     lp_client->close();
+}
+
+CRPC_TEST(longpoll_timer_stop_repeated_is_safe) {
+    for (int i = 0; i < 5; ++i) {
+        http::http_server_options options;
+        options.idle_timeout = std::chrono::milliseconds(0);
+        options.request_timeout = std::chrono::milliseconds(0);
+        options.longpoll.timeout = std::chrono::milliseconds(0);
+        options.longpoll.max_timeout = std::chrono::milliseconds(0);
+        options.longpoll.subscriber_ttl = std::chrono::milliseconds(20);
+        options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+        longpoll_fixture fx(options,
+                            "http-lp-timer-" + std::to_string(i));
+        // Let the periodic housekeeping timer fire while the server is up,
+        // then cancel it from stop().
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        fx.server->stop();
+        CRPC_CHECK_FALSE(fx.server->running());
+        CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_waiters);
+    }
 }
 
 CRPC_TEST(longpoll_stop_wakes_waiters) {

@@ -462,13 +462,13 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 
 `200` 不确认消息；下一次请求的游标即累积 ACK：服务端先把它 clamp 到该 `(subscriber, topic)` 已交付的最高序号，再调用 `hub.ack(cursor)`。过大的游标被 clamp（计入 `longpoll_ack_clamped`）；epoch 与 `longpoll_options::epoch` 不一致的游标不确认。去重键为 `(subscriber, epoch, seq)`。
 
-正常 `200`/`204` 从不 detach：token、订阅与队列跨 poll 保留。会话结束（对端关闭、停机、stall）使用 hub 的 keep-queue `release(token)`：token 失效，但队列消息保持 `in_queue`，且不计为重传。若客户端游标落后于已交付高水位，服务端调用 `retransmit_front`，把已取出但未确认的可靠消息按 seq 升序**前插**到队头，再取一条。`retransmit_budget` 只统计真正发送过的消息。若重放窗口已被 `max_replay` 裁剪、不再包含首个未确认序号，或预算耗尽，当前 poll 返回 `409 Restart`，绝不静默跳过数据；客户端应重建订阅。`retransmit_front` 依赖 `subscribe_options::max_replay >= subscribe_options::max_messages`；`start()` 在需要时把重放上限提升到队列上限。
+正常 `200`/`204` 从不 detach：token、订阅与队列跨 poll 保留。会话结束（对端关闭、停机、stall）使用 hub 的 keep-queue `release(token)`：token 失效，但队列消息保持 `in_queue`，且不计为重传。若客户端游标落后于已交付高水位，服务端调用 `retransmit_front`，把已取出但未确认的可靠消息按 seq 升序**前插**到队头，再取一条。`retransmit_budget` 只统计真正发送过的消息。若重放窗口已被 `max_replay` 裁剪、不再包含首个未确认序号，或预算耗尽，当前 poll 返回 `409 Restart`，绝不静默跳过数据；客户端应重建订阅。`retransmit_front` 依赖 `subscribe_options::max_messages >= subscribe_options::max_replay`。长轮询 `start()` 在该不等式不成立（`max_replay > max_messages`）时以 `invalid_argument` 拒绝配置，绝不静默抬高队列的内存上界；`max_replay < max_messages` 时保持现有逻辑，把重放上限提升到队列上限，使前插重放总能容纳整个保留的未确认窗口。该要求只针对前插重放：尾插重放（SSE）没有此约束，`hub::subscribe` 既不拒绝也不改写调用方的边界；直接调用 `retransmit_front` 且 `max_messages < max_replay` 时返回 `resource_exhausted`（安全重启），绝不静默跳过。
 
 ### 23.4 等待、存活与上限
 
 取消息与等待注册在同一把 hub 锁内完成，`publish` 也持同一把锁，因此消息不会落在“队列为空”与“等待已注册”之间。等待期间连接的 idle 与 request 截止时间被禁用，改用独立的 poll 截止时间。`publish` 唤醒只投递 shard 任务；shard 取一条后立即响应。截止时间到点时先再取一次（shard inbox 满时唤醒可能被丢），确认仍无消息才返回 `204`，随后重新武装 idle 截止时间。连接保持 keep-alive；poll 响应入队之前不解析 HTTP/1.1 流水线字节。
 
-同一 subscriber 至多一个活跃 transport：另一连接上的并发 poll 返回 `409`，第一个 token 不会被重定向。等待中的 poll 总数受 `longpoll_options::max_waiters` 限制，超出返回 `503` + `Retry-After: 1`。`http_server_options::max_connections` 仍是 accept 层的套接字上限。对端停止排空 poll 响应时由 `longpoll_options::slow_timeout` 关闭；已取消息保持未确认，由下一次 poll 的游标缺口重放。超过 `longpoll_options::subscriber_ttl`（5 分钟）没有 poll 的 subscriber 会被 `unsubscribe_all`，并清理其高水位/owner 记录。`stop()` 会唤醒等待中的 poll 并关闭会话；keep-queue release 在 hub 销毁之前完成。
+同一 subscriber 至多一个活跃 transport：另一连接上的并发 poll 返回 `409`，第一个 token 不会被重定向。等待中的 poll 总数受 `longpoll_options::max_waiters` 限制，超出返回 `503` + `Retry-After: 1`。`http_server_options::max_connections` 仍是 accept 层的套接字上限。对端停止排空 poll 响应时由 `longpoll_options::slow_timeout` 关闭；已取消息保持未确认，由下一次 poll 的游标缺口重放。超过 `longpoll_options::subscriber_ttl`（5 分钟）没有 poll 的 subscriber 会被 `unsubscribe_all`，并清理其高水位/owner 记录；清理由 shard housekeeping 定时器执行（周期 `min(subscriber_ttl, 30s)`），不依赖后续 poll。`stop()` 会唤醒等待中的 poll 并关闭会话；keep-queue release 在 hub 销毁之前完成。
 
 ### 23.5 与 SSE（第 20 节）的差异
 

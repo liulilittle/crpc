@@ -613,6 +613,33 @@ CRPC_TEST(hub_retransmit_front_preserves_order) {
     CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(0));
 }
 
+CRPC_TEST(hub_front_replay_capacity_insufficient) {
+    hub h;
+    subscribe_options options;
+    options.max_messages = 2;
+    options.max_replay = 4;
+    // hub::subscribe accepts this combination (tail replay is legal); it is
+    // only the long-poll start() that rejects it for front replay.
+    CRPC_CHECK(
+        h.subscribe("t", 1, delivery_mode::reliable, true, options).ok());
+    const auto connection = h.attach(1);
+    for (int i = 1; i <= 4; ++i) {
+        h.publish("t", as_bytes("x"), delivery_mode::reliable);
+    }
+    push_message message;
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(3));
+
+    // The front replay would need four queue slots but only two exist. This is
+    // a safe explicit restart, not a silent skip or a disconnect.
+    const status front = h.retransmit_front(1, "t");
+    CRPC_CHECK_FALSE(front.ok());
+    CRPC_CHECK_EQ(code_id(front.code()), code_id(rpc_code::resource_exhausted));
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK(h.try_take(connection, std::string_view("t"), message));
+    CRPC_CHECK_EQ(message.seq, static_cast<u64>(4));
+}
+
 CRPC_TEST(hub_attach_front_replays_at_head) {
     hub h;
     subscribe_options options;

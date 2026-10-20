@@ -121,9 +121,11 @@ struct longpoll_options {
     // Epoch stamped into event ids and compared with a client cursor.
     u64 epoch = 1;
 
-    // Hub subscription bounds. `max_replay` is raised to at least
-    // `max_messages` at start() so the replay window can always hold the
-    // queue, which `retransmit_front` relies on.
+    // Hub subscription bounds for front replay. start() rejects a replay bound
+    // larger than the queue (`max_replay > max_messages`) with
+    // `invalid_argument`; it never silently enlarges the queue's memory bound.
+    // A smaller replay bound is raised to the queue bound. Tail replay (SSE)
+    // has no such cross-bound requirement.
     push::subscribe_options subscribe{};
 };
 
@@ -278,6 +280,8 @@ struct http_statistics {
     // water, 409 conflicts/restarts, and 503 capacity rejections.
     std::size_t longpoll_waiters = 0;
     std::size_t longpoll_subscribers = 0;
+    // Effective replay bound after start() clamps it to `max_messages`.
+    std::size_t longpoll_replay_window = 0;
     std::size_t longpoll_events = 0;
     std::size_t longpoll_timeouts = 0;
     std::size_t longpoll_ack_clamped = 0;
