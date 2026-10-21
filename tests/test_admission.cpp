@@ -41,6 +41,31 @@ static_assert(admission::reject_code(admission::stage_kind::service_rate, true) 
               crpc::rpc_code::resource_exhausted);
 static_assert(admission::reject_code(admission::stage_kind::service_rate, false) ==
               crpc::rpc_code::deadline_exceeded);
+static_assert(admission::reject_code(admission::stage_kind::endpoint_rate, true) ==
+              crpc::rpc_code::resource_exhausted);
+static_assert(admission::reject_code(admission::stage_kind::endpoint_rate, false) ==
+              crpc::rpc_code::deadline_exceeded);
+static_assert(admission::reject_code(admission::stage_kind::endpoint_bulkhead) ==
+              crpc::rpc_code::overload);
+
+// Every stage, spelled out once. The size assertion is the drift guard: adding
+// a stage without listing it here fails to compile, and a stage missing from
+// reject_code()'s switch is caught by the loop below (MSVC does not diagnose an
+// unhandled enumerator in a switch; GCC does).
+constexpr admission::stage_kind all_stages[] = {
+    admission::stage_kind::connection_rate,
+    admission::stage_kind::service_rate,
+    admission::stage_kind::service_bulkhead,
+    admission::stage_kind::service_capacity,
+    admission::stage_kind::endpoint_rate,
+    admission::stage_kind::endpoint_bulkhead,
+    admission::stage_kind::breaker,
+    admission::stage_kind::dispatch,
+    admission::stage_kind::deadline,
+    admission::stage_kind::pool_capacity,
+};
+static_assert(sizeof(all_stages) / sizeof(all_stages[0]) == 10,
+              "update all_stages when a stage_kind is added");
 
 void check_retry_after(crpc::rpc_code code, std::chrono::milliseconds hint,
                        const char* expected, int expected_status) {
@@ -81,12 +106,18 @@ CRPC_TEST(admission_reject_code_contract) {
                crpc::rpc_code::overload);
     CRPC_CHECK(admission::reject_code(admission::stage_kind::service_capacity) ==
                crpc::rpc_code::overload);
-    CRPC_CHECK(admission::reject_code(admission::stage_kind::local_gate) ==
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::endpoint_rate, true) ==
+               crpc::rpc_code::resource_exhausted);
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::endpoint_rate, false) ==
+               crpc::rpc_code::deadline_exceeded);
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::endpoint_bulkhead) ==
+               crpc::rpc_code::overload);
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::pool_capacity) ==
                crpc::rpc_code::resource_exhausted);
     CRPC_CHECK(admission::reject_code(admission::stage_kind::deadline) ==
                crpc::rpc_code::deadline_exceeded);
 
-    // Only the rate stage reads the deadline: every other stage must answer
+    // Only the rate stages read the deadline: every other stage must answer
     // the same code for both values.
     CRPC_CHECK(admission::reject_code(admission::stage_kind::breaker, false) ==
                crpc::rpc_code::unavailable);
@@ -94,6 +125,19 @@ CRPC_TEST(admission_reject_code_contract) {
                                       false) == crpc::rpc_code::overload);
     CRPC_CHECK(admission::reject_code(admission::stage_kind::service_capacity,
                                       false) == crpc::rpc_code::overload);
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::endpoint_bulkhead,
+                                      false) == crpc::rpc_code::overload);
+    CRPC_CHECK(admission::reject_code(admission::stage_kind::pool_capacity,
+                                      false) ==
+               crpc::rpc_code::resource_exhausted);
+
+    // No stage may fall through to `internal`. This is the MSVC-safe equivalent
+    // of a -Wswitch check: a stage that is missing from the switch answers
+    // `internal` and fails here.
+    for (const admission::stage_kind kind : all_stages) {
+        CRPC_CHECK(admission::reject_code(kind, true) != crpc::rpc_code::internal);
+        CRPC_CHECK(admission::reject_code(kind, false) != crpc::rpc_code::internal);
+    }
 }
 
 CRPC_TEST(admission_fallback_eligible_one_way) {
@@ -107,11 +151,19 @@ CRPC_TEST(admission_fallback_eligible_one_way) {
         crpc::rpc_code::resource_exhausted, admission::stage_kind::service_rate,
         true));
     CRPC_CHECK_FALSE(admission::fallback_eligible(
+        crpc::rpc_code::resource_exhausted, admission::stage_kind::endpoint_rate,
+        true));
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
+        crpc::rpc_code::overload, admission::stage_kind::endpoint_bulkhead, true));
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::ok, admission::stage_kind::breaker, true));
 
     // A deadline miss is never degraded, whatever the stage.
     CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::deadline_exceeded, admission::stage_kind::service_rate,
+        false));
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
+        crpc::rpc_code::deadline_exceeded, admission::stage_kind::endpoint_rate,
         false));
     CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::deadline_exceeded, admission::stage_kind::deadline,
@@ -131,9 +183,24 @@ CRPC_TEST(admission_fallback_eligible_stage_pairs) {
     CRPC_CHECK(admission::fallback_eligible(
         crpc::rpc_code::overload, admission::stage_kind::service_capacity, false));
     CRPC_CHECK(admission::fallback_eligible(
+        crpc::rpc_code::overload, admission::stage_kind::endpoint_bulkhead, false));
+    CRPC_CHECK(admission::fallback_eligible(
         crpc::rpc_code::resource_exhausted, admission::stage_kind::service_rate,
         false));
     CRPC_CHECK(admission::fallback_eligible(
+        crpc::rpc_code::resource_exhausted, admission::stage_kind::endpoint_rate,
+        false));
+    CRPC_CHECK(admission::fallback_eligible(
+        crpc::rpc_code::resource_exhausted,
+        admission::stage_kind::pool_capacity, false));
+
+    // Load shedding: the per-connection bucket rejects before any job exists,
+    // so a fallback would pay the very cost the bucket avoids.
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
+        crpc::rpc_code::resource_exhausted,
+        admission::stage_kind::connection_rate, false));
+    // The per-service cap answers `overload` and nothing else.
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::resource_exhausted,
         admission::stage_kind::service_capacity, false));
 
@@ -142,6 +209,8 @@ CRPC_TEST(admission_fallback_eligible_stage_pairs) {
         crpc::rpc_code::unavailable, admission::stage_kind::service_rate, false));
     CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::overload, admission::stage_kind::service_rate, false));
+    CRPC_CHECK_FALSE(admission::fallback_eligible(
+        crpc::rpc_code::overload, admission::stage_kind::endpoint_rate, false));
     CRPC_CHECK_FALSE(admission::fallback_eligible(
         crpc::rpc_code::resource_exhausted, admission::stage_kind::breaker, false));
     CRPC_CHECK_FALSE(admission::fallback_eligible(

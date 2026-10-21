@@ -255,6 +255,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 1. 选择循环向负载均衡器取候选，并通过该端点的 breaker 准入。`allow()` 发放半开探针，并把 open 时长已过的端点提升为 half-open，因此候选被拒时循环会换下一个端点，而不是让调用失败。
 2. 半开探针跳过每端点 rate 与 bulkhead；连接池与在途上限仍作用于探针，被 cap 拒绝的探针不计端点失败。
 3. closed 路径先过每端点 rate（感知 deadline；等待会越过调用 deadline 时返回 `deadline_exceeded`），再过每端点 bulkhead（满载返回 `overload`），然后取连接并启动低层调用。
+   `mvc::write_error` 将正值 `rpc_error.retry_after` 投影为 `Retry-After` 头，向上取整到秒且最小为 1；提示为 0 时不写该头。HTTP 长轮询的 503 路径单独处理：固定发送 `Retry-After: 1`，不投影 `rpc_error.retry_after`。
 4. 本地 gate 拒绝调用 `ignore()`，且**不自动重试**：配额属于调用方。连接池饱和、低层 slot 耗尽、选择循环后全部 open、connect 失败属于 pre-send 失败，即使调用非幂等也可重试；已发送/远端失败要求幂等或幂等键。`retry_after` 是延迟下界（`max(backoff, hint)`），由 deadline 封顶；retry 预算在 deadline 判定之后才扣减。
 5. 所有 gate 默认 `nullopt`（一次可预测分支；不构造对象、不加锁、不分配）。`resilience_enabled=false` 不创建也不执行 gates；失败来源分类仍然生效。close/cancel 会终结当前 attempt 并恰好一次释放其 bulkhead 与 breaker permit。
 6. `call::cancel()` 无论低层调用是否在途都会置位取消标志，并中断重试等待：plain-thread 路径等待 cancel 会通知的条件变量，shard 路径按 5 ms 分片睡眠，因此观测延迟约为一个分片加调度（仅当分片内无法切分睡眠时才退化为受配置退避上界约束）。已取消的调用不再发起下一次 attempt。

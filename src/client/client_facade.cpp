@@ -461,7 +461,8 @@ bool client::begin_attempt(
     const auto now = steady_now();
     if (core.has_deadline && now >= core.deadline) {
         core.origin = client_detail::failure_origin::local_lifecycle;
-        failure = rpc_error(rpc_code::deadline_exceeded, "deadline already passed");
+        failure = rpc_error(resilience::reject_code(resilience::stage_kind::deadline),
+                            "deadline already passed");
         return false;
     }
     if (core.canceled.load(std::memory_order_acquire)) {
@@ -473,7 +474,8 @@ bool client::begin_attempt(
     if (impl_->pools.empty()) {
         lb_unavailable_.fetch_add(1, std::memory_order_relaxed);
         core.origin = client_detail::failure_origin::local_lifecycle;
-        failure = rpc_error(rpc_code::unavailable, "no endpoint configured");
+        failure = rpc_error(resilience::reject_code(resilience::stage_kind::dispatch),
+                            "no endpoint configured");
         return false;
     }
 
