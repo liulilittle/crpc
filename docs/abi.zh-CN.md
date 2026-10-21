@@ -91,14 +91,49 @@ MINOR 扩展。
 x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof` 数值。它随库一起
 编译，因此在这些护栏覆盖的范围内，布局变更会导致构建失败。
 
-这些护栏**并未**覆盖所有跨越 ABI 边界的类型。以下记录会被导出或跨边界传递，却
-**没有任何编译期布局护栏**：`frame`、`call_envelope`、`trace_extension`、
-`ordered_extension`、`io::io_result`、`rpc::call_id`、`endpoint`。其中 `frame` 与
-`call_envelope` 是 `CRPC_API` 函数的参数
-（`include/crpc/frame.hpp:193/205/220/272/281/290`），`io::io_result` 经
-`source`/`sink` 虚接口按值传递（`include/crpc/io.hpp:93`），确实跨越了边界。它们
-只受第 7 节政策约束（任何公开结构体布局变更都属 MAJOR），没有构建期检查。把它们
-纳入受护集合是可行的，但本次未做。
+这些护栏**并未**覆盖所有跨越 ABI 边界的类型，且「跨边界」的定义是精确给出的，
+而不是开放式全称：
+
+> **范围。** 在 `CRPC_API` 函数签名中按值、按引用或作为出参出现的普通聚合记录，
+> 或由虚接口按值传递的普通聚合记录。仅通过内联构造函数或 builder 方法传入的选项
+> 结构体不在此范围内，因为它们从不跨越共享库边界：调用方把构造函数编译进自己的
+> 目标文件，两侧对布局的认知必然一致。
+
+因此下列选项结构体不属于遗漏：`http_server_options`、`io::tls_config`、
+`rpc::method_options`、`resilience::breaker_config`、`resilience::retry_policy`、
+`resilience::rate_limit_config`、`resilience::bulkhead_config`、
+`push::subscribe_options` 都只经内联 builder 到达库，调用方与库之间不存在编译期
+边界。
+
+范围内**没有任何编译期布局护栏**的记录如下，均使用限定名。该清单由
+`crpc_test_abi_docs` 生成：测试会重新扫描 `include/crpc/**/*.hpp` 与
+`src/abi_check.cpp`，若新增了跨边界记录却没有更新本清单，测试即失败。之所以使用
+限定名，是因为有两个不同的记录都叫 `frame_header`（`::crpc::frame_header` 与
+`::crpc::http2::frame_header`），其中只有一个受护。
+
+- `::crpc::call_envelope`
+- `::crpc::cluster::prevote_result`
+- `::crpc::cluster::vote_result`
+- `::crpc::compression_limits`
+- `::crpc::compression_statistics`
+- `::crpc::frame`
+- `::crpc::http2::frame_header`
+- `::crpc::http2::goaway_payload`
+- `::crpc::http2::header_field`
+- `::crpc::http2::headers_payload`
+- `::crpc::http2::priority_payload`
+- `::crpc::http2::push_promise_payload`
+- `::crpc::http2::setting`
+- `::crpc::http::sse::event_id`
+- `::crpc::io::io_result`
+- `::crpc::push::push_envelope`
+- `::crpc::push::push_subscription`
+- `::crpc::push::subscribe_request`
+- `::crpc::resilience::instance`
+
+这些记录只受第 7 节政策约束（任何公开结构体布局变更都属 MAJOR），没有构建期检查。
+其中大多数都可以纳入成员数量护栏；`::crpc::endpoint` 不行，因为它的成员是私有的，
+且它作为封装类（而非普通聚合）本就不在上面的范围内（虽然它由虚方法按值返回）。
 
 这些护栏并不对所有变更类型、所有架构一视同仁，判断某个变更是否会被捕获时必须区分：
 
