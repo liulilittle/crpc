@@ -83,11 +83,11 @@ namespace {
                   #T " " #a "->" #b)
 
 // An exact member count, independent of padding and of the target ABI. The
-// structured binding decomposes `T` into exactly the listed names; if a member
-// is appended, prepended or removed the number of names no longer matches the
-// number of direct members and the binding is ill-formed, so the definition
-// fails to compile. The body is always compiled even though the function is
-// never called.
+// structured binding decomposes `T` into one name per direct member, bound in
+// declaration order. If a member is appended, prepended or removed the number
+// of names no longer matches the number of direct members and the binding is
+// ill-formed, so the definition fails to compile. The body is always compiled
+// even though the function is never called.
 //
 // This is the only guard that sees a tail append on a 32-bit target. An
 // absolute `sizeof` assertion cannot: on x86 `server::statistics` is 104 bytes
@@ -97,8 +97,25 @@ namespace {
 // A count does not care where the bytes go.
 //
 // It also covers every other target (ARM64 included), where no absolute size
-// is maintained. Reordering and mid-record insertion are caught by the relative
-// chains, so the two mechanisms together cover every layout change.
+// is maintained.
+//
+// Known limits of this guard, which must stay in sync with docs/abi.md:
+//
+//   * the binding names are new local names, not references to the member
+//     names, so a rename alone is NOT detected here. A rename is caught by the
+//     relative chains on records that have one; a rename in a record with no
+//     relative chain (`rpc_error`, `status`, `http2::*`) is not caught by this
+//     unit at all;
+//   * a reorder that keeps the count is not detected here either; the relative
+//     chains cover it where they exist;
+//   * a member *type* change that keeps the count is not detected here. For
+//     `rpc_error` the explicit member-type assertions below cover it; for the
+//     counter records the absolute `sizeof`/`offsetof` anchors cover the
+//     changes that alter width or offset.
+//
+// The mechanism relies on every direct data member being public and being
+// reachable through a structured binding; a private member makes the binding
+// ill-formed, which is why `status` is not covered by this macro.
 #define CRPC_MEMBER_COUNT(tag, T, ...)                                       \
     [[maybe_unused]] void crpc_member_count_##tag() {                        \
         T value{};                                                           \
@@ -108,9 +125,11 @@ namespace {
 // --- Exact member counts ----------------------------------------------------
 //
 // One call per cross-ABI record. These are the padding-independent half of the
-// guard: they catch an appended field on every target, including x86 and the
-// architectures for which no absolute size is maintained below. The listed
-// names are the real member names, so a rename is caught here as well.
+// guard: they catch an appended or removed field on every target, including x86
+// and the architectures for which no absolute size is maintained below.
+//
+// The names are only placeholders bound in declaration order; they are not
+// checked against the real member names. See the limits listed on the macro.
 //
 // `rpc_error` and `status` are handled separately: `rpc_error` has public
 // members and decomposes, while `status` wraps a single private `rpc_error` and
@@ -408,6 +427,31 @@ CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 // break the other required configurations, so these two records are guarded by
 // their member count, their standard-layout precondition and the
 // `sizeof(status) == sizeof(rpc_error)` relation instead.
+//
+// Because their size is not pinned, a member *type* change that keeps the
+// member count would otherwise be invisible: changing `retry_after` from
+// `std::chrono::milliseconds` to `std::chrono::microseconds`, for example,
+// leaves the count, the `sizeof(status) == sizeof(rpc_error)` relation and
+// (on x86) the absolute width all unchanged. `rpc_error` has public members,
+// so the declared types can be asserted directly. This is independent of the
+// standard library configuration and of the build type.
+
+static_assert(std::is_same<decltype(rpc_error::code), rpc_code>::value,
+              "rpc_error::code must stay rpc_code");
+static_assert(std::is_same<decltype(rpc_error::message), std::string>::value,
+              "rpc_error::message must stay std::string");
+static_assert(std::is_same<decltype(rpc_error::retryable), bool>::value,
+              "rpc_error::retryable must stay bool");
+static_assert(
+    std::is_same<decltype(rpc_error::retry_after),
+                 std::chrono::milliseconds>::value,
+    "rpc_error::retry_after must stay std::chrono::milliseconds");
+static_assert(std::is_same<decltype(rpc_error::metadata), metadata_list>::value,
+              "rpc_error::metadata must stay metadata_list");
+
+// `status` has no public data member, so its member types cannot be named from
+// here. Its single member is a `rpc_error`, and the `sizeof`/`alignof` pair
+// above pins that relation.
 
 // --- Standard-layout preconditions ------------------------------------------
 //

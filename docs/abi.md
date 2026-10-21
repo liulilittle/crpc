@@ -111,9 +111,15 @@ fails the build in the cases those guards cover.
 The guards are not uniform across change kinds or across architectures, and the
 difference matters when judging whether a given change is caught:
 
-- A reorder, an insertion between two existing members, a removal, or a renamed
-  member is caught by the relative chains and the member counts on every
-  architecture, because those guards do not depend on absolute numbers.
+- A reorder, an insertion between two existing members, or a removal is caught
+  by the relative chains on the counter records, and by the member count on
+  every architecture. Neither guard depends on absolute numbers.
+- A rename is caught by the relative chains where a chain exists. The
+  member-count guard does **not** validate names: a structured binding only
+  binds one local name per member in declaration order, so a rename in a record
+  with no relative chain (`rpc_error`, `status`, `http2::*`) is not caught here.
+  A rename in `rpc_error` is nevertheless a compile error in the header itself,
+  because its constructors initialize the renamed member.
 - A field appended at the end is caught by the member count on every
   architecture, and additionally by the absolute `sizeof` anchor on x86 and x64.
   The member count is what makes the x86 case work: on x86
@@ -133,7 +139,12 @@ of the standard library configuration rather than of this library: `rpc_error`
 and `status` measure 80 bytes on x64 Release and 96 in Debug, and 56 versus 64
 on x86, with the same headers. They are guarded by their member count, their
 standard-layout precondition, and the `sizeof(status) == sizeof(rpc_error)`
-relation.
+relation. Member **type** changes in `rpc_error` and `status` are not caught by
+those guards, because their absolute size is deliberately not pinned. The
+declared types of the `rpc_error` members are asserted individually instead
+(`code`, `message`, `retryable`, `retry_after`, `metadata`), which is
+independent of the build type; `status` has no public data member and is
+covered only by the `sizeof`/`alignof` relation.
 
 There is no size-tag pattern today. No public header declares a `struct_size`
 member; `crpc::connect_options` contains only the timeout, buffer and no-delay
