@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -375,6 +376,19 @@ void write_error(http::response& response, const rpc_error& error,
         error.message.empty() ? std::string(crpc::to_string(error.code))
                               : error.message;
     write_problem(response, status_code, detail, instance);
+    // `retry_after` is a hint in milliseconds; Retry-After is in whole
+    // seconds. Round up so a sub-second hint never becomes "0", and clamp the
+    // result to at least 1 second. A zero hint means "no hint": omit the
+    // header rather than promising an immediate retry.
+    const auto count = error.retry_after.count();
+    if (count > 0) {
+        const auto millis = static_cast<std::uint64_t>(count);
+        std::uint64_t seconds = (millis + 999u) / 1000u;
+        if (seconds == 0) {
+            seconds = 1;
+        }
+        response.headers.add("Retry-After", std::to_string(seconds));
+    }
 }
 
 std::string normalize_path(std::string_view path, bool lower) {

@@ -12,6 +12,7 @@
 #include <utility>
 
 #include <crpc/endian.hpp>
+#include <crpc/resilience/admission.hpp>
 
 namespace crpc {
 namespace {
@@ -554,7 +555,8 @@ bool client::begin_attempt(
             endpoint_open_.fetch_add(1, std::memory_order_relaxed);
             breaker_rejections_.fetch_add(1, std::memory_order_relaxed);
             core.origin = client_detail::failure_origin::endpoint_open;
-            failure = rpc_error(rpc_code::unavailable, "endpoint circuit breaker is open");
+            failure = rpc_error(resilience::reject_code(resilience::stage_kind::breaker),
+                                "endpoint circuit breaker is open");
             // A pre-send retry must not spin: wait at least the policy's first
             // backoff (or longer when the breaker asks for it).
             std::int64_t initial_ns = options_.retry.initial_backoff.count();
@@ -571,7 +573,8 @@ bool client::begin_attempt(
         } else {
             lb_unavailable_.fetch_add(1, std::memory_order_relaxed);
             core.origin = client_detail::failure_origin::local_lifecycle;
-            failure = rpc_error(rpc_code::unavailable, "no usable endpoint");
+            failure = rpc_error(resilience::reject_code(resilience::stage_kind::dispatch),
+                                "no usable endpoint");
         }
         return false;
     }
@@ -622,15 +625,18 @@ bool client::begin_attempt(
                 local_gate_rejected_.fetch_add(1, std::memory_order_relaxed);
                 core.origin = client_detail::failure_origin::local_gate;
                 if (limited.deadline_met) {
-                    failure = rpc_error(rpc_code::resource_exhausted,
+                    failure = rpc_error(resilience::reject_code(
+                                            resilience::stage_kind::endpoint_rate,
+                                            limited.deadline_met),
                                         "endpoint rate limit reached");
                     failure.retry_after = limited.retry_after;
                 } else {
                     // The caller cannot wait out the bucket within its own
                     // deadline, so the hint would be meaningless here.
-                    failure = rpc_error(
-                        rpc_code::deadline_exceeded,
-                        "endpoint rate limit cannot meet the deadline");
+                    failure = rpc_error(resilience::reject_code(
+                                            resilience::stage_kind::endpoint_rate,
+                                            limited.deadline_met),
+                                        "endpoint rate limit cannot meet the deadline");
                 }
                 return false;
             }
@@ -641,7 +647,9 @@ bool client::begin_attempt(
                 bulkhead_rejected_.fetch_add(1, std::memory_order_relaxed);
                 local_gate_rejected_.fetch_add(1, std::memory_order_relaxed);
                 core.origin = client_detail::failure_origin::local_gate;
-                failure = rpc_error(rpc_code::overload, "endpoint bulkhead is full");
+                failure = rpc_error(resilience::reject_code(
+                                        resilience::stage_kind::endpoint_bulkhead),
+                                    "endpoint bulkhead is full");
                 failure.retry_after = permit.retry_after();
                 return false;
             }

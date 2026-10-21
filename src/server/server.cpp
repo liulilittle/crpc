@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <crpc/endian.hpp>
+#include <crpc/resilience/admission.hpp>
 #include <crpc/rpc/call.hpp>
 
 namespace crpc {
@@ -973,7 +974,9 @@ struct server::impl {
             if (!permit.allowed()) {
                 breaker_open.fetch_add(1, std::memory_order_relaxed);
                 if (wants_response) {
-                    send_error(sc, job.header.stream_id, rpc_code::unavailable,
+                    send_error(sc, job.header.stream_id,
+                               resilience::reject_code(
+                                   resilience::stage_kind::breaker),
                                permit.retry_after(), "service circuit breaker is open");
                 }
                 complete_call(sc, job.counted);
@@ -1019,13 +1022,17 @@ struct server::impl {
                             deadline_rejected.fetch_add(1, std::memory_order_relaxed);
                             if (wants_response) {
                                 send_error(sc, job.header.stream_id,
-                                           rpc_code::deadline_exceeded,
+                                           resilience::reject_code(
+                                               resilience::stage_kind::service_rate,
+                                               limited.deadline_met),
                                            std::chrono::milliseconds(0),
                                            "service rate limit cannot meet the deadline");
                             }
                         } else if (wants_response) {
                             send_error(sc, job.header.stream_id,
-                                       rpc_code::resource_exhausted,
+                                       resilience::reject_code(
+                                           resilience::stage_kind::service_rate,
+                                           limited.deadline_met),
                                        limited.retry_after,
                                        "service rate limit reached");
                         }
@@ -1043,7 +1050,9 @@ struct server::impl {
                                 bulkhead_permit.retry_after().count() > 0
                                     ? bulkhead_permit.retry_after()
                                     : opt.overload_retry_after;
-                            send_error(sc, job.header.stream_id, rpc_code::overload,
+                            send_error(sc, job.header.stream_id,
+                                       resilience::reject_code(
+                                           resilience::stage_kind::service_bulkhead),
                                        hint, "service bulkhead is full");
                         }
                         complete_call(sc, job.counted);
@@ -1055,7 +1064,9 @@ struct server::impl {
                 permit.ignore();
                 rejected.fetch_add(1, std::memory_order_relaxed);
                 if (wants_response) {
-                    send_error(sc, job.header.stream_id, rpc_code::overload,
+                    send_error(sc, job.header.stream_id,
+                               resilience::reject_code(
+                                   resilience::stage_kind::service_capacity),
                                opt.overload_retry_after,
                                "service concurrency limit reached");
                 }
