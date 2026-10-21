@@ -14,6 +14,32 @@
   its field order, size and meaning, and no C ABI entry point changes. See
   [abi.md](abi.md) §4 and §8.
 
+### Compile-time layout guards
+
+- The internal translation unit `src/abi_check.cpp` (in no header, exporting no
+  symbol) now asserts the layout of the public records that cross the ABI
+  boundary: standard-layout for 13 records, an exact member count for 14 records
+  (`CRPC_MEMBER_COUNT`), relative member chains that catch a reorder, a
+  mid-record insertion or a removal (`CRPC_STEP`, `CRPC_STEP_SAME`,
+  `CRPC_STEP_MIXED`, `CRPC_AFTER`), the total width and last-field position of
+  `http_statistics`, and, on x86 and x64 only, absolute `sizeof`/`offsetof`
+  anchors (`CRPC_ABS_SIZE`, `CRPC_ABS_OFF`). The member count is what sees a tail
+  append that x86 tail padding would hide from an absolute `sizeof`.
+- [abi.md](abi.md) §4 now states the scope predicate for "crosses the ABI
+  boundary" and lists the 19 in-scope records that still have no compile-time
+  guard. `crpc_test_abi_docs` rescans `include/crpc/**/*.hpp` and
+  `src/abi_check.cpp`, so a new cross-boundary record must be guarded or added to
+  that list, or the test fails.
+- Documented blind spots: the member count does not validate names (a rename is
+  caught only by a relative chain); `rpc_error` is the only cross-ABI record
+  without a relative chain, so a reorder or rename inside it is not caught by
+  this unit; the absolute `sizeof` of `rpc_error` and `status` is deliberately
+  not pinned because it follows the standard-library configuration.
+- Impact: MINOR (build-time validation only). No ABI break: no public struct
+  layout changes and no exported symbol is added. No runtime behaviour change;
+  the build is tighter, because a layout change these guards cover now fails to
+  compile. See [abi.md](abi.md) §4 and §8.
+
 ### Client resilience pipeline
 
 - Per-endpoint rate limiter and bulkhead gates, configured with
@@ -34,6 +60,28 @@
   plain threads, 5 ms slices on a shard) and serializes access to the low-level
   call handle with the completion registration.
 
+### Admission stages and HTTP Retry-After
+
+- New header-only `crpc/resilience/admission.hpp` gives the admission vocabulary
+  one home: `resilience::stage_kind` (10 stages),
+  `resilience::admission_decision` (`admit`, `reject`, `probe_bypass`;
+  `probe_bypass` is reserved and no stage consumes it yet),
+  `reject_code(stage_kind, bool deadline_met = true)` - the single
+  stage-to-`rpc_code` table, including both rate outcomes (`resource_exhausted`
+  while the deadline is still reachable, `deadline_exceeded` otherwise) - and
+  `fallback_eligible(rpc_code, stage_kind, bool one_way)`.
+- The server and client rejection paths now take their wire code from that
+  table. The codes are unchanged, as are the messages, `retryable`, `retry_after`
+  and the per-stage counters: this part is a refactor with zero behaviour change.
+- HTTP MVC error responses now carry `Retry-After` when
+  `rpc_error::retry_after > 0`: milliseconds rounded up to whole seconds with a
+  floor of 1, and the header omitted for a zero hint. The status-code mapping is
+  unchanged.
+- Impact: MINOR (new header and symbols). No ABI break: the header is
+  header-only, `stage_kind`/`admission_decision` are not cross-ABI types, and no
+  existing record changes layout. Behaviour change is limited to the additive
+  HTTP `Retry-After` header; RPC wire codes and messages are unchanged.
+
 ### HTTP long polling
 
 - A server-owned housekeeping timer reclaims idle subscribers even when no later
@@ -51,6 +99,36 @@
   `http_server::builder::add_listener()` and `server::builder::add_listener()`).
   This also fixes `rpc::server`, whose second `start()` used to return ok while
   binding nothing.
+
+### Exception and compiler-feature contract
+
+- All 52 public headers now compile with exceptions disabled
+  (`-fno-exceptions`, MSVC `/EHs-c-`). Rebuilding the library without exceptions
+  is still unsupported: 11 of the 46 `src/` translation units fail with Linux
+  GCC, 12 with MinGW GCC and 13 with MSVC (see [building.md](building.md) §3).
+- The exception contract is stated per boundary. A header-inline boundary
+  (`obs::interceptor_chain::run`, `mvc::invoke_http`) follows the consumer's
+  exception flags; with exceptions enabled a throw is caught and becomes
+  `rpc_code::internal` / HTTP 500 `internal error`. A library translation-unit
+  boundary (`mvc::router::handle`, `rpc::dispatcher::dispatch`) follows the
+  library's flags; a library built with exceptions catches a throwing handler and
+  turns it into 500/`internal`. Without exception support a throw is outside the
+  library's contract and in practice terminates. See
+  [architecture.md](architecture.md#s15).
+- New macro `CRPC_CAN_USE_TYPEID`: it is derived from the compiler
+  (`__cpp_rtti`, and `1` for MSVC without clang-cl), and defining it externally
+  is a hard `#error`. Every `typeid` use is behind it; when compiler RTTI is
+  unavailable the type-erased codec path returns `failed_precondition` (HTTP 409)
+  instead of forming `std::type_info`. `-fno-rtti` support remains limited: with
+  the reflection dependency (`CRPC_RTTI_DIR`) the build fails inside that
+  dependency, and the guarded fallback is currently unreachable through a
+  documented configuration; it is kept for a future toolchain. See
+  [building.md](building.md) §3.
+- Impact: MINOR (new macro and new supported consumer configuration). No ABI
+  break: no layout or symbol change; the macro only selects inline branches at
+  compile time. Behaviour change: a consumer can now build its own translation
+  units without exceptions, and a throwing hook or handler in such a build leaves
+  the call site instead of being caught.
 
 ### ABI breaking: `http_statistics` layout
 

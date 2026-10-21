@@ -8,6 +8,13 @@
 
 - `client::resilience_statistics` 与 `client::resilience_stats()`：客户端韧性流水线的增补可观测性（`rate_limited`、`bulkhead_rejected`、`local_gate_rejected`、`endpoint_open`、`lb_unavailable`、`pre_send_retries`、`probe_admitted`、`retries_delayed_by_hint`、`bulkhead_in_use`）。不改变既有结构：`client::statistics` 的字段顺序、大小与含义保持不变，C ABI 入口不变。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
 
+### 编译期布局护栏
+
+- 新增内部翻译单元 `src/abi_check.cpp`（不进入任何头文件，也不导出符号），对跨越 ABI 边界的公开记录做编译期断言：13 个记录的标准布局属性、14 个记录的精确成员数量（`CRPC_MEMBER_COUNT`）、可捕获重排/中间插入/删除的相对成员链（`CRPC_STEP`、`CRPC_STEP_SAME`、`CRPC_STEP_MIXED`、`CRPC_AFTER`）、`http_statistics` 的总宽度与尾字段位置，以及仅在 x86 与 x64 上的绝对 `sizeof`/`offsetof` 锚（`CRPC_ABS_SIZE`、`CRPC_ABS_OFF`）。成员数量正是能看到「尾追加被 x86 尾部填充吸收」这一情况的护栏。
+- [abi.zh-CN.md](abi.zh-CN.md) 第 4 节现在给出「跨越 ABI 边界」的范围谓词，并列出 19 个仍无编译期护栏的范围内记录。`crpc_test_abi_docs` 会重新扫描 `include/crpc/**/*.hpp` 与 `src/abi_check.cpp`：新增跨边界记录若不加入护栏，也不更新该清单，测试即失败。
+- 已写入文档的盲区：成员数量护栏不校验名字（改名只靠相对链捕获）；`rpc_error` 是唯一没有相对链的跨 ABI 记录，因此其内部的重排或改名不会被该单元捕获；`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。
+- 影响：MINOR（仅构建期校验）。不破坏 ABI：不改变任何公开结构体布局，也不新增导出符号。运行时行为不变；构建约束收紧——护栏覆盖的布局变更现在会直接编译失败。见 [abi.zh-CN.md](abi.zh-CN.md) 第 4 节与第 8 节。
+
 ### 客户端韧性流水线
 
 - 每端点 rate limiter 与 bulkhead 准入，通过 `builder::per_endpoint_rate()` / `builder::per_endpoint_bulkhead()` 配置，可用 `builder::resilience_enabled(false)` 整体关闭。
@@ -16,6 +23,13 @@
 - 远端 `retry_after` 是重试延迟下界（`max(backoff, hint)`），由调用 deadline 封顶；retry 预算在该判定之后才扣减。`retries_delayed_by_hint` 仅统计延迟确实由 hint 决定的那些重试。
 - 选择循环用每端点位图跟踪已试候选，超过 512 个端点时自动扩容，不再静默忽略高位索引。
 - `call::cancel()` 立即中断重试等待（plain-thread 用条件变量，分片用 5 ms 分片），并与完成回调注册串行化对低层调用句柄的访问。
+
+### 准入阶段与 HTTP Retry-After
+
+- 新增头文件 `crpc/resilience/admission.hpp`（header-only），把准入（admission）词汇集中到一处：`resilience::stage_kind`（10 个阶段）、`resilience::admission_decision`（`admit`、`reject`、`probe_bypass`；`probe_bypass` 为保留值，尚无阶段消费）、`reject_code(stage_kind, bool deadline_met = true)`——唯一的「阶段到 `rpc_code`」表，包含 rate 阶段的两种结果（deadline 仍可达时为 `resource_exhausted`，否则为 `deadline_exceeded`）——以及 `fallback_eligible(rpc_code, stage_kind, bool one_way)`。
+- 服务端与客户端的拒绝路径改为从该表取线上码。码值不变，消息、`retryable`、`retry_after` 与各阶段计数器也不变：这一部分是零行为变化的重构。
+- HTTP MVC 错误响应在 `rpc_error::retry_after > 0` 时新增 `Retry-After`：毫秒向上取整为整秒、下限为 1，hint 为 0 时不写该头。状态码映射不变。
+- 影响：MINOR（新增头文件与符号）。不破坏 ABI：header-only，`stage_kind`/`admission_decision` 不是跨 ABI 类型，既有记录布局不变。行为变化仅限新增的 HTTP `Retry-After` 响应头；RPC 线上码与消息不变。
 
 ### HTTP 长轮询
 
@@ -30,6 +44,13 @@
   `stop()` -> `start()`（已写在 `http_server::builder::add_listener()` 与
   `server::builder::add_listener()` 上）。同时修复 `rpc::server`：其第二次 `start()`
   过去会返回 ok 却不绑定任何监听。
+
+### 异常与编译器特性契约
+
+- 52 个公共头现在都能在关闭异常的情况下编译（`-fno-exceptions`、MSVC `/EHs-c-`）。以无异常方式重建库仍不受支持：`src/` 的 46 个翻译单元中，Linux GCC 有 11 个失败、MinGW GCC 12 个、MSVC 13 个（见 [building.zh-CN.md](building.zh-CN.md) 第 3 节）。
+- 异常契约按边界分别说明。头内联边界（`obs::interceptor_chain::run`、`mvc::invoke_http`）跟随消费方的异常选项；启用异常时抛出的异常会被捕获并转为 `rpc_code::internal` / HTTP 500 `internal error`。库翻译单元边界（`mvc::router::handle`、`rpc::dispatcher::dispatch`）跟随库的选项；以异常构建的库会捕获抛出的 handler 并转为 500/`internal`。无异常支持时，抛出不在本库契约内，实践中会 terminate。见 [architecture.zh-CN.md](architecture.zh-CN.md#s15)。
+- 新增宏 `CRPC_CAN_USE_TYPEID`：由编译器派生（`__cpp_rtti`；非 clang-cl 的 MSVC 恒为 `1`），外部定义即触发硬 `#error`。所有 `typeid` 使用都在该宏之后；编译器 RTTI 不可用时，type-erased codec 路径返回 `failed_precondition`（HTTP 409），而不是构造 `std::type_info`。`-fno-rtti` 支持仍然受限：启用反射依赖（`CRPC_RTTI_DIR`）时构建会死在依赖内部，该兜底分支目前在任何已文档化配置下都不可达；保留它是为了将来的工具链。见 [building.zh-CN.md](building.zh-CN.md) 第 3 节。
+- 影响：MINOR（新增宏与新的消费方配置）。不破坏 ABI：无布局或符号变更；该宏只在编译期选择内联分支。行为变化：消费方现在可以用无异常方式编译自己的翻译单元；此类构建中抛出的 hook 或 handler 会离开调用点，而不是被捕获。
 
 ### ABI breaking：`http_statistics` 布局
 
