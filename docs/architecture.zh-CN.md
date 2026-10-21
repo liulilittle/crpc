@@ -277,7 +277,14 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。
+`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`src/server/server.cpp:333-337,428-431`），它不是可观测性链。
+
+**异常契约。** `obs::interceptor_chain::run` 与 MVC 的 handler 适配器 `mvc::invoke_http` 遵循同一契约，且该契约取决于消费方编译时的异常模型，而不是某个运行期开关（`include/crpc/observability/interceptor.hpp:194-231`、`include/crpc/mvc/router.hpp:385-399`）：
+
+- 有 C++ 异常（定义了 `__cpp_exceptions` 或 `_CPPUNWIND`）：hook 或 handler 抛出的异常由本层捕获并转换为 `rpc_code::internal`。链停止并返回 false；`invoke_http` 写出 HTTP 500 `internal error` 响应。异常绝不逃逸到 RPC 或 HTTP 路径。
+- 无 C++ 异常（`-fno-exceptions`，或 MSVC 未启用任何 `/EH` 选项，或使用 `/EHc-`、`/EHs-`、`/EHa-`、`/EHs-c-`、`/EHa-c-`）：本层没有 `try`/`catch`，抛出的 hook 或 handler 从调用点逃逸。调用方自带 `try`/`catch` 时仍可捕获；否则进程调用 `std::terminate`。这是 `-fno-exceptions` 的既定语义，不是 CRPC 的缺陷。
+
+因此契约要求 hook 与 handler 的实现**不得抛出**：回调按策略是 `noexcept`（[原则](principles.zh-CN.md#s8) 的「回调 `noexcept`」条款），在无异常构建中该条款的兜底是 `std::terminate`，而不是某个 catch。
 
 `obs::logger` 在栈缓冲区格式化，把固定大小的记录复制进每线程 SPSC 环（默认 8192 条），由一个后台线程批量 `WriteFile`/`writev`，支持按大小/时间轮转、脱敏和可选压缩钩子。禁用级别只花一次原子读和比较；高于 `CRPC_LOG_MAX_LEVEL` 的宏展开为空语句。
 

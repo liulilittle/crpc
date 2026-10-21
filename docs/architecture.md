@@ -283,6 +283,13 @@ The client path passes through the same stages per endpoint: load balancing with
 
 `obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:333-337,428-431`), but it is not the observability chain.
 
+**Exception contract.** `obs::interceptor_chain::run` and the MVC handler adapter `mvc::invoke_http` follow the same contract, and it depends on the exception model the consumer compiles with, not on a runtime option (`include/crpc/observability/interceptor.hpp:194-231`, `include/crpc/mvc/router.hpp:385-399`):
+
+- With C++ exceptions (`__cpp_exceptions` or `_CPPUNWIND` defined): a hook or handler that throws is caught by this layer and converted to `rpc_code::internal`. The chain stops and returns false; `invoke_http` writes the HTTP 500 `internal error` response. No exception escapes into the RPC or HTTP path.
+- Without C++ exceptions (`-fno-exceptions`, or MSVC with no `/EH` option or with `/EHc-`, `/EHs-`, `/EHa-`, `/EHs-c-`, `/EHa-c-`): the layer contains no `try`/`catch`, so a throwing hook or handler escapes from the call site. A caller that has its own `try`/`catch` still catches it; otherwise the process calls `std::terminate`. This is the defined semantics of `-fno-exceptions`, not a defect in CRPC.
+
+The contract therefore requires hook and handler implementations never to throw: callbacks are `noexcept` by policy ([principles](principles.md#s8), "noexcept on callbacks"), and in a no-exception build that rule is backed by `std::terminate` rather than by a catch.
+
 `obs::logger` formats into a stack buffer, copies a fixed-size record into a per-thread SPSC ring (8192 records by default), and drains it on one background thread with batched `WriteFile`/`writev`, size/time rotation, redaction and an optional compression hook. Disabled levels cost an atomic load and a compare; above `CRPC_LOG_MAX_LEVEL` the macro expands to nothing.
 
 `obs::tracer` uses deterministic head sampling; with no exporter, starting a span reads no clock, generates no id and allocates nothing. With an exporter, spans go through a bounded queue and a background exporter; overflow is counted. Parent/child is established by the send/receive pair, never by timestamps. Metrics are **specified, not implemented**: there is no counter/histogram registry in the tree.

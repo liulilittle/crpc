@@ -78,6 +78,39 @@ export CRPC_COROCC_DIR=/path/to/corocc
 
 `CRPC_WITH_OPENSSL` 会链接 `OpenSSL::SSL` 与 `OpenSSL::Crypto`，但尚无 TLS 源码消费该宏；HTTPS 属于**已设计，未实现**。启用该选项不应被理解为启用了 HTTPS。
 
+### 编译器特性要求
+
+CRPC 的公共头设计为可在无 C++ 异常、以及在 MSVC 上无编译器 RTTI 的条件下构建。这两个开关与 `CRPC_HAVE_RTTI` 相互独立：后者描述的是反射库，不是编译器特性。
+
+**异常。** 库支持 `-fno-exceptions` 与 `/EHs-c-`：52 个公共头在严格告警策略下用任一选项均可编译（MSVC `/EHs-c- /GR- /W4 /WX`、GCC `-fno-exceptions -Wall -Wextra -Wpedantic -Werror`，两者均 0 失败）。此类构建中 `obs::interceptor_chain::run` 与 `mvc::invoke_http` 不含 `try`/`catch`：抛出的 hook 或 handler 从调用点逃逸，调用方自带 `try`/`catch` 时才能捕获，否则进程调用 `std::terminate`。启用异常时同一调用会被捕获并报告为 `rpc_code::internal`（HTTP 500 `internal error`）。契约写在[架构 §15](architecture.zh-CN.md#s15)。
+
+**RTTI。** MSVC 接受 `/GR-`：它包含在 `/EHs-c- /GR- /W4 /WX` 下通过的 52 头扫描中。GCC/Clang 的 `-fno-rtti` 目前**不是**受支持的配置，因为 `typeid` 会被直接拒绝，而两条公共代码路径依赖它：
+
+- 类型擦除的编解码分派（`include/crpc/codec.hpp` 中的 `encode_into`/`decode_from`）以 `std::type_info` 为键，因此只在编译器提供 RTTI 时存在；
+- MVC 路由注册器记录 controller、请求类型与响应类型的 `typeid`（`include/crpc/mvc/router.hpp:418-423`），因此 `mvc/router.hpp` 以及所有包含它的头也会失败。
+
+`CRPC_HAVE_RTTI` 守卫覆盖的是反射库，不是编译器特性，因此它不会改变这一行为：类型擦除的编解码分派需要编译器 RTTI。把 GCC/Clang 的 `-fno-rtti` 构建视为已知限制，而不是可依赖的配置。
+
+**反射依赖。** `CRPC_HAVE_RTTI` 的含义是「rtti 反射库可用」（设置了 `CRPC_RTTI_DIR` 且找到 `include/rtti/reflect.hpp`）；它不是编译器的 RTTI 特性，两者正交。没有反射仓库时 `CRPC_HAVE_RTTI=0`，依赖 RTTI 的文本/模式编解码器不注册，MVC 字段 attribute 宏不定义，二进制编解码器退化为报告编解码错误的桩。
+
+**已知外部限制。** 反射库本身并非无异常：仓库中的 `include/rtti/convert.hpp` 含 `catch`（例如 `rtti/convert.hpp:2599`），因此 `-fno-exceptions` 不能与 `CRPC_RTTI_DIR` 同时使用。关闭编译器异常时应关闭反射库。
+
+可复制的验证命令（逐个头编译，不产生构建目录）：
+
+```bat
+rem MSVC：无异常、无编译器 RTTI、告警即错误。
+rem 在 Developer Command Prompt 中运行，或先执行 vcvars64.bat。
+for /r include %f in (*.hpp *.h) do @cl /nologo /std:c++17 /EHs-c- /GR- /W4 /WX /TP /Zs /I include %f
+```
+
+```sh
+# GCC：无异常、告警即错误
+find include -name '*.hpp' -o -name '*.h' | while read -r f; do
+  g++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic -Werror \
+      -fno-exceptions -I include "$f" || echo "FAIL $f"
+done
+```
+
 库只有一个目标 `crpc`（别名 `crpc::crpc` 与 `crpc_core`）。源码用 `CONFIGURE_DEPENDS` 从 `src` 递归通配，因此新增文件无需编辑 `CMakeLists.txt`。
 
 不经脚本的最小配置示例：

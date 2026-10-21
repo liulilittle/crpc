@@ -230,3 +230,7 @@ configure-time check for such a mismatch, and adding one is not implemented.
   correctness lives only in an inline function.
 - The layout of `std::variant` inside `result<T>` when `T` is a user type: it
   is stable for a given toolchain and `T`, not across toolchains.
+- Exception behaviour at the hook and handler boundary: whether a throwing hook
+  or MVC handler is reported as `rpc_code::internal` (HTTP 500 `internal error`)
+  or escapes the call site depends on the consumer's exception compiler options,
+  so it is not an ABI guarantee ([architecture §15](architecture.md#s15)).

@@ -196,3 +196,6 @@ C ABI 独立版本化（`CRPC_C_ABI_VERSION`），遵循相同的 MAJOR/MINOR �
   因此任何影响正确性的行为都不会只存在于内联函数里。
 - `result<T>` 内部 `std::variant` 的布局（当 `T` 是用户类型时）：
   对给定工具链与 `T` 稳定，跨工具链不稳定。
+- hook 与 handler 边界上的异常行为：抛出的 hook 或 MVC handler 是被报告为
+  `rpc_code::internal`（HTTP 500 `internal error`）还是从调用点逃逸，取决于消费方的
+  异常编译选项，因此不属于 ABI 保证（见[架构 §15](architecture.zh-CN.md#s15)）。
