@@ -195,9 +195,8 @@ on the platform invariants (8-bit byte, exact integer widths, IEEE-754). The ABI
 policy forbids standard containers and non-trivial types in exported signatures.
 A missing codec specialization is a compile error, not an empty payload.
 
-The `noexcept`-on-callbacks rule has no catch to fall back on in a build without
-C++ exceptions: a throwing callback then reaches `std::terminate` (see
-[architecture §15](architecture.md#s15)).
+In a build without C++ exceptions there is no catch behind that rule; see
+[architecture §15](architecture.md#s15) for the exception contract.
 
 **Verification:** `test_endian.cpp`, `test_wire.cpp`, `test_frame.cpp`, UBSan
 alignment checks, and the ABI layout assertions. The rule “no behaviour that

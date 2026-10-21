@@ -170,8 +170,7 @@ index/fence 测试。整条调用路径的时钟回拨测试属于**已设计，
 `static_assert`。ABI 策略禁止导出签名中出现标准容器与非平凡类型。
 缺少编解码特化是编译错误，而不是空负载。
 
-在无 C++ 异常的构建中，回调 `noexcept` 条款没有 catch 可以兜底：抛出的回调会走到
-`std::terminate`（见[架构 §15](architecture.zh-CN.md#s15)）。
+无 C++ 异常的构建中该条款没有 catch 兜底；异常契约见[架构 §15](architecture.zh-CN.md#s15)。
 
 **验证：** `test_endian.cpp`、`test_wire.cpp`、
 `test_frame.cpp`、UBSan 对齐检查，以及 ABI 布局断言。
