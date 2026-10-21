@@ -203,7 +203,7 @@ What changed:
 Compatibility: no production path writes a `COMPRESSED` frame, and both production decoders are in
 borrowing mode, so no existing peer changes behaviour. A peer that hand-crafts a compressed frame
 now gets a protocol error instead of silent misdelivery - that is the intended tightening. See
-`docs/protocol.md` section 24.
+`docs/protocol.md` §24.
 
 ## 1.0.0 - 2026-10-19
 
