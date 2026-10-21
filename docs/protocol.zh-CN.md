@@ -33,6 +33,7 @@
 | [21](#s21) | HTTP 内容编码（已实现子集） |
 | [22](#s22) | HTTP 文件下载与 Range（已实现子集） |
 | [23](#s23) | HTTP/1.1 长轮询（已实现子集） |
+| [24](#s24) | CRPC 帧压缩（已实现子集） |
 
 ## 1. 范围与权威 <a id="s1"></a>
 
@@ -98,7 +99,7 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 | 4 | `0x10` | `UNRELIABLE` | 尽力投递；不重传 |
 | 5–7 | `0xE0` | `ALGO` | 0 none，1 lz4，2 zstd，3 gzip，4–7 保留 |
 
-`COMPRESSED = 0` 要求 `ALGO = 0`；`COMPRESSED = 1` 要求已知且非零的 `ALGO`；大于 3 的值被拒绝；`ONE_WAY` 要求 `UNRELIABLE`。标志已定义，但代码树没有 lz4/zstd/gzip 编解码器，因此压缩属于**已设计，未实现**。
+`COMPRESSED = 0` 要求 `ALGO = 0`；`COMPRESSED = 1` 要求非零 `ALGO`（`1` lz4 已实现；`2` zstd 与 `3` gzip 保留，本版本以 `protocol_error` 失败关闭；`4`-`7` 保留）；`ONE_WAY` 要求 `UNRELIABLE`。帧级压缩的规范见第 24 节。解码器无法解压所宣告的算法时必须 fail-closed 返回 `protocol_error`，绝不把压缩字节当作 payload 交付。压缩仅定义于 `REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH`；控制帧带 `COMPRESSED` 是 `protocol_error`。头部校验仍接受这样的帧头（只校验标志一致性），拒绝发生在整帧路径。
 
 ## 6. 有序扩展 <a id="s6"></a>
 
@@ -119,6 +120,8 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 - `SETTINGS`、`SETTINGS_ACK`、`PING`、`PONG`、`GOAWAY` 要求 id 为 0。
 - `WINDOW_UPDATE` 对连接和流都合法。
 - 一条连接上的 id 永不复用。未知或已终态 id 的响应会被丢弃，绝不投递给已回收的槽。
+
+- 对 `COMPRESSED` 帧，`payload_len` 仍是**线上**字节数，payload 以 4 字节 `uncompressed_len`（小端）开头；逻辑 payload 为 `uncompressed_len <= max_frame` 字节。压缩绝不放大帧：编码后（含 4 字节前缀）不严格更小时，发送方回退为未压缩帧（§24.4）。
 
 ## 8. 调用信封 <a id="s8"></a>
 
@@ -198,6 +201,10 @@ decode: (u >> 1) ^ (~(u & 1) + 1)
 | HTTP/1.1 行 / 头 / 正文 | 8 KiB / 64 KiB + 100 字段 / 8 MiB | `parser_limits` |
 | multipart | 32 个 part、8 KiB part 头、64 MiB part、256 MiB 总量、70 字节 boundary | `multipart_limits` |
 | h2 帧 / 头列表 | 默认 16 KiB（最大 16 MiB − 1）/ 16 KiB | `http2` settings |
+| 压缩 payload 前缀 | 4 字节 | 固定（`uncompressed_len` u32 小端） |
+| `uncompressed_len` | `1..max_frame` | `protocol_error` |
+| 压缩比 | 默认 300:1（`max_compression_ratio`，0 关闭） | `resource_exhausted` |
+| 解压后帧 | `<= max_frame`；且 `<=` 解码器 payload 缓冲 | `protocol_error` / `resource_exhausted` |
 
 限制是包含性的，并在分配或指针运算之前检查。
 
@@ -226,6 +233,13 @@ decode: (u >> 1) ^ (~(u & 1) + 1)
 | 没有 `has_extensions` 却有扩展字段 | `protocol_error` |
 | 响应状态不是 0/1 | `protocol_error` |
 | `ONE_WAY` 没有 `UNRELIABLE` | `protocol_error` |
+| 不支持的 `ALGO`（zstd、本版本 gzip、保留值） | `protocol_error` |
+| 压缩 payload 短于 5 字节 | `protocol_error` |
+| `uncompressed_len` 为零或大于 `max_frame` | `protocol_error` |
+| 码流畸形或解出长度不符 | `protocol_error` |
+| 控制帧类型带 `COMPRESSED` | `protocol_error` |
+| 解压后大小或比值超过配置上限 | `resource_exhausted` |
+| `COMPRESSED` 帧到达借用模式解码器 | `protocol_error` |
 
 未知或已终态 stream 的响应不是协议错误；它会被丢弃。
 
@@ -272,6 +286,8 @@ decode: (u >> 1) ^ (~(u & 1) + 1)
 **已设计，未实现。** 设计定义 12 字节客户端 hello（`"CRPC"`、`u16` version、`u16` flags、`u16` tlv_len、`u16` reserved），随后是 `max_frame`、`initial_window`、`codec`、`compress_bitmap`、`compress_min`、`keepalive_ms`、`max_streams`、`identity`、`resume_token`、`hmac` 等 TLV。服务端 hello 使用相同前缀并带状态字节。限制 4 KiB、超时 3 秒；未知 TLV/codec/能力位、非零 reserved 或版本不匹配均 fail-closed。
 
 `protocol_version` 为 `1`，但当前代码不写也不解析握手。帧头没有版本字段，因此版本协商尚不存在；两端必须由兼容源码构建。
+
+压缩能力（`compress_bitmap`、`compress_min`、`max_decompressed_frame`）在当前实现中不由该握手协商；连接级 `SETTINGS` 帧承载同样字段，见 §24.5。对端宣告之前不压缩。
 
 ## 17. HTTP/2 映射 <a id="s17"></a>
 
@@ -383,6 +399,8 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 携带 `Content-Encoding: gzip` 或 `deflate`（仅单层）的请求，其请求体在路由前被解码。解码后的体替换线上体并移除 `Content-Encoding`；若存在 `Content-Length`，改写为解码后的长度。不支持的编码或分层编码返回 `415`；损坏或截断的流返回 `400`；超过 `http_server_options::max_decoded_body`（默认 8 MiB）返回 `413` 并关闭连接。`max_decoded_ratio` 限制解码/编码比（0 为默认值，表示关闭该检查：合法请求可以高度可压缩）。请求解码由 `enable_request_decoding` 控制。
 
+CRPC 通道的帧级压缩是独立机制，拥有自己的容器、上限与能力交换，见第 24 节；本节内容不适用于 CRPC 帧。
+
 ### 21.2 响应压缩
 
 启用 `enable_response_coding` 时，响应体按 `Accept-Encoding`（q 值；gzip 优先于 deflate，再优先 identity）协商。即使最终不压缩，也会进行协商，并携带 `Vary: Accept-Encoding`。已有 `Vary`（如 `Origin`）与 `Accept-Encoding` 合并（不重复、不覆盖）。若客户端拒绝所有支持的编码（`identity;q=0` 且 gzip/deflate 不可接受），返回 `406`，该响应同样携带 `Vary: Accept-Encoding`。
@@ -480,3 +498,122 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 | 连接归属 | 独占流，禁用 idle | keep-alive，每次 poll 后重新武装 idle |
 | 并发 | 重连会重定向 token | 同 subscriber 活跃 transport → `409` |
 | 资源清理 | 现有子集无 TTL（D5） | TTL + `unsubscribe_all` |
+
+## 24. CRPC 帧压缩（已实现子集） <a id="s24"></a>
+
+帧级压缩独立于 HTTP 内容编码（第 21 节）。它作用于单帧 payload，绝不跨帧，且只用于承载应用数据的帧类型。
+
+### 24.1 容器
+
+置位 `COMPRESSED` 的帧承载：
+
+| 偏移 | 宽度 | 字段 | 说明 |
+|---|---|---|---|
+| 0 | 4 | `uncompressed_len` | `u32` 小端，`1..max_frame`；逻辑 payload 长度 |
+| 4 | N | `codec_stream` | `lz4` block 或单个 `gzip` member |
+
+`payload_len = 4 + N <= max_frame`。置位 `CRC32C` 时，校验和覆盖**含前缀**的整个 payload，
+接收方在消耗解压 CPU 之前先验证完整性。payload 短于 5 字节、`uncompressed_len` 为零、或
+`uncompressed_len > max_frame` 都是 `protocol_error`。
+
+4 字节前缀与参考 LZ4 block API 在 `store_size=True` 下的长度前缀约定逐字节一致，
+因此第三方实现可以把 `payload + 4` 与声明长度直接交给 `LZ4_decompress_safe`。
+
+### 24.2 算法
+
+| `ALGO` | 编解码 | 状态 |
+|---|---|---|
+| 0 | none | 必需 |
+| 1 | LZ4 **block** 格式（无 frame magic、无 frame 校验和；容器已提供两者） | 已实现 |
+| 2 | zstd | 保留，**未实现**：一律 `protocol_error` |
+| 3 | gzip member（RFC 1952：deflate + CRC32 + ISIZE） | 留待下一阶段；本构建一律 `protocol_error` |
+| 4-7 | 保留 | `protocol_error` |
+
+`ALGO = 1` 是 LZ4 block 格式，不是 LZ4 frame 格式。`tests/test_frame_compression.cpp` 的
+golden 向量钉死字节布局，供第三方实现对照；它们由参考实现 LZ4 v1.10.0 产出，
+与本实现在相同输入下的输出逐字节相同。
+
+压缩仅定义于承载应用数据的帧：`REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH`。
+控制帧（`RST_STREAM`、`SETTINGS`、`SETTINGS_ACK`、`PING`、`PONG`、`GOAWAY`、`WINDOW_UPDATE`、
+`PUSH_ACK`）带 `COMPRESSED` 是 `protocol_error`：这些 payload 是定长控制字段，压缩只会膨胀，
+且 `PUSH_ACK` 还会被服务端做尺寸校验。`decode_frame_header` 仍接受这样的帧头（只校验标志一致性），
+拒绝发生在**三个**整帧入口：`decode_frame`、`decode_frame_compressed` 与
+`frame_decoder::next`。该闸门在编解码器运行之前生效，因此携带完全合法 LZ4 码流的
+控制帧仍被拒绝；在 `frame_decoder::next` 上它是**锁存**的 `protocol_error`（绝不是
+`frame_dropped`），`PUSH_ACK` 也一样，因此对端无法把违规降级为静默丢帧。
+
+### 24.3 fail-closed 规则
+
+| 条件 | 结果 |
+|---|---|
+| 不支持的 `ALGO`（zstd、本构建的 gzip、保留值） | `protocol_error` |
+| `payload_len < 5`、`uncompressed_len == 0` | `protocol_error` |
+| `uncompressed_len > max_frame` | `protocol_error` |
+| 码流畸形或截断 | `protocol_error`（可靠）/ 显式丢弃（不可靠 `ONE_WAY`） |
+| 解出字节数与 `uncompressed_len` 不符 | `protocol_error`（可靠）/ 显式丢弃（不可靠 `ONE_WAY`） |
+| `CRC32C` 不符 | `protocol_error`（可靠）/ 显式丢弃（不可靠 `ONE_WAY`） |
+| `uncompressed_len` 超过 `min(max_frame, limits.max_payload, payload 缓冲)` | `resource_exhausted`（解压前） |
+| 控制帧类型带 `COMPRESSED` | `protocol_error` |
+| 压缩/明文比值超过 `max_compression_ratio`（默认 300:1） | `resource_exhausted` |
+| `COMPRESSED` 帧到达借用模式解码器（无输出缓冲） | `protocol_error` |
+
+比值那一行只是 CPU 守卫，不是内存上界。内存上界是声明长度：解码器在解压前检查 uncompressed_len <= payload_out.size()，随后把 payload_out.first(uncompressed_len) 交给编解码器，因此每个字面量与匹配在写出前都要对照声明长度检查，且码流必须恰好产出这么多字节。所以「4 MiB 码流 + 100 字节声明」会失败且绝不写到第 100 字节之后，即使调用方缓冲是 16 MiB。
+
+可靠帧把每一行都视为连接级致命错误，与第 13 节其它行一致。`ONE_WAY` 帧额外允许上表中标注的
+**帧内**失败走「显式丢弃」：该帧被丢弃、连接继续、丢弃被计数。判据是帧**类型**，不是
+`UNRELIABLE` 标志：对端可以在 `REQUEST` 上置该标志，绝不能让它把致命协议违规降级为静默丢帧。
+算法与上限类错误在所有帧类型上都保持致命：它们是连接级威胁，不是单帧损坏。
+
+解码器绝不把压缩字节当作 payload 返回：要么交付解压后的 payload（清 `COMPRESSED`/`ALGO`，
+并把 `payload_len`、以及存在时的 `CRC32C` 改写为逻辑 payload 的对应值），要么丢弃该帧
+（仅 `ONE_WAY`，且显式计数），要么失败。
+
+### 24.4 发送策略
+
+仅当对端宣告了该算法（§24.5）、payload 至少 `max(local.compress_min, peer.compress_min)` 字节
+（默认 512）、且编码后**含 4 字节前缀**严格小于原始 payload 时才压缩；否则发送未压缩帧并保持
+`COMPRESSED` 清零：发送方绝不放大帧，因此启用压缩不会破坏任何帧大小预算。
+
+算法是传给 `encode_frame_compressed` 的运行时选择（`none` 表示要求不压缩）。不支持的取值（zstd、本构建的 gzip、保留 id）返回 `invalid_argument`，绝不静默回退到别的算法：「配置了 gzip 却发 lz4」正是本节要消除的标志与载荷不符。
+
+`encode_frame_compressed` 在写出任何字节之前，按与 `encode_frame` 完全相同的规则校验帧头
+（已知类型、stream 作用域、`stream_id` bit 31 为 0、`ONE_WAY` 需 `UNRELIABLE`、非零 `ext` 需 `CRC32C`、
+`payload_len <= max_frame`），压缩分支与 identity 分支都一样。违规时返回 `invalid_argument` 且不写入任何字节，
+因此该入口永远不会产出本实现自己的 `decode_frame_header` 会拒绝的帧。调用方提供的 `ext` 会被
+校验，而不是在缺少 `CRC32C` 时被静默归一为 0。
+
+### 24.5 能力交换
+
+压缩用连接级 `SETTINGS` 帧（`0x05`，`stream_id = 0`）协商；该帧类型早于本节存在，此前未被解析：
+
+| 偏移 | 宽度 | 字段 |
+|---|---|---|
+| 0 | 1 | `version` = 1 |
+| 1 | 1 | `flags` = 0（保留） |
+| 2 | 2 | `reserved` = 0 |
+| 4 | 4 | `compress_bitmap`：bit0 lz4、bit1 zstd、bit2 gzip；bits 3-31 必须为 0 |
+| 8 | 4 | `compress_min`：小于该值的 payload 不压缩；0 = 512 |
+| 12 | 4 | `max_decompressed_frame`：可接受的解压后单帧上限；0 = 16 MiB |
+
+双方在传输建立后、任何请求之前各发一次 `SETTINGS`。收到对端 `SETTINGS` 之前一律不压缩。
+生效发送集是双方位图的交集。`SETTINGS` 是全量快照：后到的覆盖先到的，只影响后续帧，无需确认。
+本切片尚未实现 `SETTINGS` payload 解析；当前双方都会忽略该帧，这正是「对端宣告前不压缩」
+这一安全默认值成立的原因。
+
+接收侧接受任何它**能解**的算法，无论是否宣告过；只有不可解的算法才是协议错误。这让混合部署可用：
+早于本节的旧端忽略 `SETTINGS`、从不宣告，因此永远不会收到压缩帧。
+
+### 24.6 与其它标志的交互
+
+- `ORDERED` 正交：lane 扩展位于 payload 之外，永不压缩。
+- `END_STREAM` 标记最后一个分片；每个分片独立压缩，分片之间可以混合压缩与未压缩。
+- `UNRELIABLE` 帧可以压缩。帧内解压失败会显式丢弃该帧并保持连接；丢弃以
+  `rpc_code::decode_error` 报告（经逐帧报告通道，而不是解码器锁存的错误状态）。
+  压缩的不可靠帧建议带 `CRC32C`，让位翻转在解压前被拦下。
+- 压缩逐帧独立：没有跨帧字典或历史，因此丢帧或乱序绝不会污染后续帧。
+
+### 24.7 验证
+
+`tests/test_frame_compression.cpp` 覆盖容器、编解码、fail-closed 表、不可靠丢弃路径、
+比值与大小上限、永不放大策略、golden 向量与变异 fuzz 循环。LZ4 block 编解码在 golden 向量上
+另与参考实现做了逐字节一致性对拍。

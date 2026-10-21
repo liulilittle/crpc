@@ -33,6 +33,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 | [21](#s21) | HTTP content coding (implemented subset) |
 | [22](#s22) | HTTP file download and Range (implemented subset) |
 | [23](#s23) | HTTP/1.1 long polling (implemented subset) |
+| [24](#s24) | CRPC frame compression (implemented subset) |
 
 ## 1. Scope and authority <a id="s1"></a>
 
@@ -98,7 +99,7 @@ The frame codec validates the header and the scope of every type. It does not pa
 | 4 | `0x10` | `UNRELIABLE` | best-effort delivery; no retransmission |
 | 5–7 | `0xE0` | `ALGO` | 0 none, 1 lz4, 2 zstd, 3 gzip, 4–7 reserved |
 
-`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a known non-zero `ALGO`; values above 3 are rejected; `ONE_WAY` requires `UNRELIABLE`. The flags are defined, but no lz4/zstd/gzip codec exists in the tree, so compression is **specified, not implemented**.
+`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a non-zero `ALGO` (`1` lz4 is implemented; `2` zstd and `3` gzip are reserved and fail closed with `protocol_error` in this build; `4`-`7` are reserved); `ONE_WAY` requires `UNRELIABLE`. Frame-level compression is normative in section 24. A decoder that cannot decompress the advertised algorithm fails closed with `protocol_error`; it never delivers the compressed bytes as a payload. Compression is defined only for `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`; a `COMPRESSED` control frame is `protocol_error`. The header validator still accepts such a header (it checks flag consistency only) so the whole-frame paths can reject it with the payload in hand.
 
 ## 6. Ordered extension <a id="s6"></a>
 
@@ -119,6 +120,10 @@ When `ORDERED` is set, exactly 16 bytes follow the fixed header:
 - `SETTINGS`, `SETTINGS_ACK`, `PING`, `PONG` and `GOAWAY` require id 0.
 - `WINDOW_UPDATE` is valid for both a stream and the connection.
 - An id is never reused on a connection. A response for an unknown or terminal id is dropped, never delivered to a recycled slot.
+- For a `COMPRESSED` frame, `payload_len` is still the on-the-wire byte count and the payload
+  starts with a 4-byte `uncompressed_len` (LE) prefix; the logical payload is
+  `uncompressed_len <= max_frame` bytes. Compression never enlarges a frame: a sender falls
+  back to an uncompressed frame when the encoded form is not strictly smaller (section 24.4).
 
 ## 8. Call envelope <a id="s8"></a>
 
@@ -198,6 +203,10 @@ All arithmetic is unsigned to avoid signed-overflow UB. Floats are bit-cast to `
 | HTTP/1.1 line / headers / body | 8 KiB / 64 KiB + 100 fields / 8 MiB | `parser_limits` |
 | multipart | 32 parts, 8 KiB part headers, 64 MiB part, 256 MiB total, 70-byte boundary | `multipart_limits` |
 | h2 frame / header list | 16 KiB default (16 MiB − 1 max) / 16 KiB | `http2` settings |
+| compressed payload prefix | 4 bytes | fixed (`uncompressed_len` u32 LE) |
+| `uncompressed_len` | `1..max_frame` | `protocol_error` |
+| compression ratio | 300:1 default (`max_compression_ratio`, 0 disables) | `resource_exhausted` |
+| decompressed frame | `<= max_frame`; also `<=` the decoder payload buffer | `protocol_error` / `resource_exhausted` |
 
 Limits are inclusive and checked before allocation or pointer arithmetic.
 
@@ -226,6 +235,13 @@ The decoders return `rpc_code::protocol_error` for every condition below. `rpc::
 | extension fields without `has_extensions` | `protocol_error` |
 | response status other than 0/1 | `protocol_error` |
 | `ONE_WAY` without `UNRELIABLE` | `protocol_error` |
+| unsupported `ALGO` (zstd, gzip in this build, reserved) | `protocol_error` |
+| compressed payload shorter than 5 bytes | `protocol_error` |
+| `uncompressed_len` zero or above `max_frame` | `protocol_error` |
+| malformed codec stream or decoded length mismatch | `protocol_error` |
+| `COMPRESSED` on a control frame type | `protocol_error` |
+| decompressed size or ratio above the configured limit | `resource_exhausted` |
+| `COMPRESSED` frame reaching a borrowing-mode decoder | `protocol_error` |
 
 A response for an unknown or terminal stream is not a protocol error; it is dropped.
 
@@ -272,6 +288,8 @@ The decoder never allocates for a payload whose header has not passed validation
 **Specified, not implemented.** The design defines a 12-byte client hello (`"CRPC"`, `u16` version, `u16` flags, `u16` tlv_len, `u16` reserved) followed by TLVs for `max_frame`, `initial_window`, `codec`, `compress_bitmap`, `compress_min`, `keepalive_ms`, `max_streams`, `identity`, `resume_token` and `hmac`. A server hello has the same prefix with a status byte. The limit is 4 KiB, the timeout 3 s, and unknown TLV/codec/capability, non-zero reserved or a version mismatch is fail-closed.
 
 `protocol_version` is `1`, but no handshake is written or parsed by the current code. The frame header carries no version field, so version negotiation does not exist yet; peers must be built from compatible sources.
+
+Compression capability (`compress_bitmap`, `compress_min`, `max_decompressed_frame`) is not negotiated by this handshake in the current implementation; the connection-level `SETTINGS` frame carries the same fields, see section 24.5. Until a peer advertises, nothing is compressed.
 
 ## 17. HTTP/2 mapping <a id="s17"></a>
 
@@ -461,6 +479,9 @@ stream is `400`; exceeding `http_server_options::max_decoded_body` (default
 decoded/encoded ratio (0, the default, disables the check: a legitimate
 request may be highly compressible). Request decoding is controlled by
 `enable_request_decoding`.
+
+Frame-level compression on the CRPC channel is a separate mechanism with its own container,
+limits and capability exchange; see section 24. Nothing in this section applies to CRPC frames.
 
 ### 21.2 Response compression
 
@@ -696,3 +717,151 @@ destroyed.
 | Connection ownership | dedicated stream, idle disabled | keep-alive, idle re-armed after each poll |
 | Concurrency | reconnect retargets the token | same subscriber active transport -> `409` |
 | Resource cleanup | existing subset has no TTL (D5) | TTL + `unsubscribe_all` |
+
+## 24. CRPC frame compression (implemented subset) <a id="s24"></a>
+
+Frame-level compression is independent of HTTP content coding (section 21). It applies to a single
+frame payload, never across frames, and is available on the frame types that carry application data.
+
+### 24.1 Container
+
+A frame with `COMPRESSED` set carries:
+
+| Offset | Width | Field | Notes |
+|---|---|---|---|
+| 0 | 4 | `uncompressed_len` | `u32` LE, `1..max_frame`; logical payload size |
+| 4 | N | `codec_stream` | `lz4` block or one `gzip` member |
+
+`payload_len = 4 + N <= max_frame`. `CRC32C`, when set, covers the whole payload including the
+prefix, so a receiver verifies integrity before spending CPU on decompression. A payload shorter
+than 5 bytes, a zero `uncompressed_len`, or `uncompressed_len > max_frame` is `protocol_error`.
+
+The 4-byte prefix is the same size-prefix convention the reference LZ4 block API uses with
+`store_size=True`, so a third-party implementation can feed `payload + 4` and the declared length
+straight to `LZ4_decompress_safe`.
+
+### 24.2 Algorithms
+
+| `ALGO` | Codec | Status |
+|---|---|---|
+| 0 | none | required |
+| 1 | LZ4 **block** format (no frame magic, no frame checksums; the container above supplies both) | implemented |
+| 2 | zstd | reserved, **not implemented**: always `protocol_error` |
+| 3 | gzip member (RFC 1952: deflate + CRC32 + ISIZE) | reserved for the next slice; `protocol_error` in this build |
+| 4-7 | reserved | `protocol_error` |
+
+`ALGO = 1` is the LZ4 block format, not the LZ4 frame format. Golden vectors in
+`tests/test_frame_compression.cpp` pin the byte layout for third-party implementers; they were
+produced by the reference LZ4 v1.10.0 encoder and are byte-identical to this implementation's
+output for the same inputs.
+
+Compression is only defined for frames that carry application data: `REQUEST`, `RESPONSE`,
+`DATA`, `ONE_WAY` and `PUSH`. A `COMPRESSED` bit on a control frame (`RST_STREAM`, `SETTINGS`,
+`SETTINGS_ACK`, `PING`, `PONG`, `GOAWAY`, `WINDOW_UPDATE`, `PUSH_ACK`) is `protocol_error`: those
+payloads are fixed-size control fields where compression can only inflate, and `PUSH_ACK` is
+additionally size-checked by the server. `decode_frame_header` still accepts such a header (it
+validates flag consistency only); the rejection happens on all three whole-frame entry points:
+`decode_frame`, `decode_frame_compressed` and `frame_decoder::next`. The gate is checked before
+the codec runs, so a control frame carrying a perfectly valid LZ4 stream is still refused; on
+`frame_decoder::next` it is a latched `protocol_error` (never `frame_dropped`), including for
+`PUSH_ACK`, so a peer cannot turn the violation into a silent drop.
+
+### 24.3 Fail-closed rules
+
+| Condition | Result |
+|---|---|
+| unsupported `ALGO` (zstd, gzip in this build, reserved) | `protocol_error` |
+| `payload_len < 5`, `uncompressed_len == 0` | `protocol_error` |
+| `uncompressed_len > max_frame` | `protocol_error` |
+| malformed or truncated codec stream | `protocol_error` (reliable) / explicit drop (unreliable `ONE_WAY`) |
+| decoded byte count differs from `uncompressed_len` | `protocol_error` (reliable) / explicit drop (unreliable `ONE_WAY`) |
+| `CRC32C` mismatch | `protocol_error` (reliable) / explicit drop (unreliable `ONE_WAY`) |
+| `uncompressed_len` exceeds `min(max_frame, limits.max_payload, payload buffer)` | `resource_exhausted` (before decompression) |
+| `COMPRESSED` on a control frame type | `protocol_error` |
+| compressed/plain ratio above `max_compression_ratio` (default 300:1) | `resource_exhausted` |
+| `COMPRESSED` frame on a decoder in borrowing mode (no output buffer) | `protocol_error` |
+
+The ratio row is a CPU guard, not the memory bound. The memory bound is the declared length: the
+decoder checks uncompressed_len <= payload_out.size() before decompressing and then hands the
+codec the view payload_out.first(uncompressed_len), so every literal and match is checked against
+the declared length before it is written and the stream must produce exactly that many bytes. A
+4 MiB stream carrying a 100-byte declaration therefore fails without writing past byte 100, even if
+the caller's buffer is 16 MiB.
+
+Reliable frames treat every row as fatal for the connection, exactly like the other rows of section
+13. A `ONE_WAY` frame additionally allows a *dropped frame* outcome for the frame-local rows marked
+above: the frame is discarded explicitly, the connection continues, and the drop is counted. The
+drop criterion is the frame **type**, not the `UNRELIABLE` flag: a peer can set that flag on a
+`REQUEST`, and it must not be able to turn a fatal protocol violation into a silently lost request.
+Algorithm and limit rows stay fatal on every frame type: they are connection-level threats, not
+single-frame corruption.
+
+A decoder never returns the compressed bytes as a payload: it either delivers the decompressed
+payload with `COMPRESSED`/`ALGO` cleared and `payload_len` (and `CRC32C`, when present) rewritten for
+the logical payload, drops the frame (a `ONE_WAY` frame only, explicitly counted), or fails.
+
+### 24.4 Sender policy
+
+A sender compresses a payload only when the peer advertised the algorithm (section 24.5), the
+payload is at least `max(local.compress_min, peer.compress_min)` bytes (default 512), and the
+encoded form **including the 4-byte prefix** is strictly smaller than the original payload.
+Otherwise the frame is sent uncompressed and `COMPRESSED` stays clear: a sender never inflates a
+frame, so enabling compression can never break a frame-size budget.
+
+The algorithm is a runtime choice passed to `encode_frame_compressed` (`none` requests identity).
+An unsupported choice (zstd, gzip in this build, reserved ids) is `invalid_argument`, never a
+silent fallback to a different codec: "configured gzip, sent lz4" would be the same
+flag-versus-payload mismatch this section removes.
+
+`encode_frame_compressed` validates the header with exactly the same rules as `encode_frame`
+(known type, stream scope, `stream_id` bit 31 clear, `ONE_WAY` requires `UNRELIABLE`, non-zero
+`ext` requires `CRC32C`, `payload_len <= max_frame`) before it writes a byte, on both the
+compressing and the identity branch. A violation is `invalid_argument` with nothing written, so
+the compressed entry point can never emit a frame that this implementation's own
+`decode_frame_header` refuses. A caller-supplied `ext` is validated, not silently normalised to
+zero when `CRC32C` is absent.
+
+### 24.5 Capability exchange
+
+Compression is negotiated with the connection-level `SETTINGS` frame (`0x05`, `stream_id = 0`),
+which predates this section and was previously unparsed:
+
+| Offset | Width | Field |
+|---|---|---|
+| 0 | 1 | `version` = 1 |
+| 1 | 1 | `flags` = 0 (reserved) |
+| 2 | 2 | `reserved` = 0 |
+| 4 | 4 | `compress_bitmap`: bit0 lz4, bit1 zstd, bit2 gzip; bits 3-31 must be 0 |
+| 8 | 4 | `compress_min`: payload bytes below this are never compressed; 0 = 512 |
+| 12 | 4 | `max_decompressed_frame`: accepted logical frame size; 0 = 16 MiB |
+
+Both sides send one `SETTINGS` immediately after the transport is established and before any
+request. Until the peer's `SETTINGS` arrives, nothing is compressed. The effective send set is the
+intersection of both bitmaps. `SETTINGS` is a full snapshot: a later one replaces an earlier one and
+only affects subsequent frames; no acknowledgement is required. `SETTINGS` payload parsing is not
+implemented in this slice; the frame is ignored by both current peers, which is exactly why the
+"never compress before the peer advertises" default is safe.
+
+A receiver accepts any algorithm it can decode, whether or not it was advertised; only an
+undecodable algorithm is a protocol error. This keeps mixed deployments working: a peer built
+before this section ignores `SETTINGS`, never advertises, and therefore never receives a compressed
+frame.
+
+### 24.6 Interaction with other flags
+
+- `ORDERED` is orthogonal: the lane extension is outside the payload and is never compressed.
+- `END_STREAM` marks the last fragment; every fragment is compressed independently, and fragments
+  may mix compressed and uncompressed forms.
+- `UNRELIABLE` frames may be compressed. A frame-local decompression failure discards that frame
+  explicitly and keeps the connection; the drop is reported as `rpc_code::decode_error` (through the
+  per-frame report, not through the decoder's latched error state). `CRC32C` is recommended on
+  compressed unreliable frames so bit rot is caught before decompression.
+- Compression is per frame: there is no cross-frame dictionary or history, so a dropped or
+  reordered frame can never corrupt a later one.
+
+### 24.7 Verification
+
+`tests/test_frame_compression.cpp` covers the container, the codec, the fail-closed table, the
+unreliable drop path, the ratio and size limits, the never-inflate policy, golden vectors and a
+mutation fuzz loop. The LZ4 block codec is additionally checked for byte-identical output against
+the reference implementation on the golden vectors.

@@ -34,6 +34,45 @@
   plain threads, 5 ms slices on a shard) and serializes access to the low-level
   call handle with the completion registration.
 
+### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
+
+Frame-level compression is now implemented for the LZ4 block codec (`ALGO = 1`) and the frame layer
+fails closed everywhere else. The previous behaviour was unsafe: `encode_frame` accepted a
+`COMPRESSED` flag and wrote the payload uncompressed, `decode_frame` and `frame_decoder` returned the
+compressed bytes as if they were the payload, and any algorithm id was accepted. A `COMPRESSED`
+`PING` with an 8-byte payload could even be echoed back as a plaintext `PONG`.
+
+What changed:
+
+- `encode_frame` rejects a `COMPRESSED` flag or a non-zero `ALGO` with `invalid_argument`; a
+  compressed frame is produced only by `encode_frame_compressed`.
+- `encode_frame_compressed` applies the same header validation as `encode_frame` before it
+  writes a byte (known type, stream scope, `stream_id` bit 31, `ONE_WAY`/`UNRELIABLE`,
+  `ext`/`CRC32C`, `payload_len <= max_frame`) and takes `max_frame` as an argument; a
+  violation is `invalid_argument` with nothing written on both the compressing and the
+  identity branch. A non-zero caller-supplied `ext` without `CRC32C` is now rejected
+  instead of being silently zeroed; with `CRC32C` set the field carries the payload
+  checksum by design, on both the plain and the compressed form.
+- `decode_frame` rejects a `COMPRESSED` frame with `protocol_error` (it has no output buffer);
+  `frame_decoder` decompresses in copying mode and rejects in borrowing mode. A decoded frame's
+  header is normalised: `COMPRESSED`/`ALGO` cleared, `payload_len` and `CRC32C` rewritten for the
+  logical payload.
+- zstd (2) and gzip (3) are recognised ids that fail closed in this build; `4`-`7` are rejected.
+- `COMPRESSED` is only accepted on `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`. A
+  `COMPRESSED` control frame - including `PUSH_ACK` - is `protocol_error`.
+- A malformed compressed payload on a `ONE_WAY` frame is an explicit drop: the decoder returns
+  `result::frame_dropped`, `error()` stays `ok`, and the reason is reported through
+  `frame_compression_info::drop_reason`. The drop criterion is the frame type, not the `UNRELIABLE`
+  flag, so a peer cannot downgrade a fatal violation on a `REQUEST` into a lost request.
+- `frame_decoder::result` gained `frame_dropped` (appended, so existing values keep their numbers).
+  Code that switches over `result` without a `default` must add the case: GCC/Clang report
+  `-Werror=switch`; MSVC `/W4` does not warn.
+
+Compatibility: no production path writes a `COMPRESSED` frame, and both production decoders are in
+borrowing mode, so no existing peer changes behaviour. A peer that hand-crafts a compressed frame
+now gets a protocol error instead of silent misdelivery - that is the intended tightening. See
+`docs/protocol.md` section 24.
+
 ## 1.0.0 - 2026-10-19
 
 The first CRPC release. It covers the core primitives, the CRPC call/server
