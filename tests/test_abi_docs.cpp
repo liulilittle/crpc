@@ -965,4 +965,86 @@ CRPC_TEST(abi_docs_lists_every_unguarded_cross_boundary_record) {
     CRPC_CHECK(missing.empty());
 }
 
+// The scanner above checks the *list*. These two cases check the prose around
+// it, which no scan can derive: the per-record guard description, the
+// standard-layout facts, and the scope counts. They were dropped once while the
+// list was rewritten, which left the corrected sentences unguarded; a rewrite
+// that flips any of them must fail here.
+CRPC_TEST(abi_docs_english_states_the_guard_facts) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.md");
+
+    // Counts and scope wording.
+    CRPC_CHECK(has_phrase(text, "13 of the public records"));
+    CRPC_CHECK(has_phrase(text, "an exact member count for the 14 records"));
+    CRPC_CHECK(has_phrase(text, "have **no compile-time layout guard at all**"));
+
+    // The four standard-library-bearing records are described one by one, and
+    // only rpc_error is fully guarded.
+    CRPC_CHECK(has_phrase(text, "only the first is fully guarded"));
+    CRPC_CHECK(has_phrase(
+        text, "have **no layout guard beyond a minimum alignment**"));
+    CRPC_CHECK(has_phrase(text, "`rpc_error` is the only one of the four"));
+    CRPC_CHECK(has_phrase(text, "not asserted to be standard-layout either"));
+    // buffer is the one exception across the audited toolchains.
+    CRPC_CHECK(has_phrase(
+        text, "`buffer` is on MSVC and GCC but not on Clang"));
+    // offsetof on these records is well-formed; the reason for not asserting it
+    // is portability, not ill-formedness.
+    CRPC_CHECK(has_phrase(text, "it is well-formed and yields the"));
+
+    // The corrected sentences must not regress to the old false claims.
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "an exact member count for every record that crosses"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "so `offsetof` on them would be ill-formed"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "standard-library types are not standard-layout, so neither"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "They are guarded by their member count, their standard-layout"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "all four are fully guarded"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "MSVC, GCC and Clang alike"));
+}
+
+CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.zh-CN.md");
+    CRPC_CHECK(!text.empty());
+
+    // Counts and scope wording, mirroring the English document.
+    CRPC_CHECK(has_phrase(text, "13 个公开记录"));
+    CRPC_CHECK(has_phrase(text, "**14 个**记录的精确成员数量"));
+    CRPC_CHECK(has_phrase(text, "**没有任何编译期布局护栏**"));
+
+    // The four standard-library-bearing records, described one by one.
+    CRPC_CHECK(has_phrase(text, "只有第一个是完整的"));
+    CRPC_CHECK(has_phrase(text, "**除最小对齐外没有任何布局护栏**"));
+    CRPC_CHECK(has_phrase(text, "四者中只有 `rpc_error` 的成员类型"));
+    CRPC_CHECK(has_phrase(text, "也没有被断言为标准布局"));
+    CRPC_CHECK(has_phrase(text, "`buffer` 在 MSVC 与 GCC 上是、在 Clang 上不是"));
+    CRPC_CHECK(has_phrase(text, "它是合法的且能得到"));
+
+    // Same anti-regression checks as the English document.
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "每个跨边界记录的精确成员数量"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "因此对其成员做 `offsetof` 会非法"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "标准库类型不是标准布局，因此两者都不是"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "由成员数量、标准布局前置条件以及"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "四者都受到完整守护"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "MSVC、GCC 与 Clang 上都是"));
+}
+
 CRPC_TEST_MAIN()
