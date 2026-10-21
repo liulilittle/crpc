@@ -171,18 +171,18 @@ difference matters when judging whether a given change is caught:
 - A rename is caught by a relative chain where one exists; in `rpc_error` it is
   caught by the member-type assertions in `src/abi_check.cpp`. The member-count
   guard does **not** validate names: a structured binding only binds one local
-  name per member in declaration order.
-  The only cross-ABI record with no relative chain is `rpc_error` among the 14
-  member-counted records (the unguarded records in §4 have no chain at all,
-  and `status` has no public data member), so a rename there is not caught by
-  a chain. The four
-  HTTP/2 value types `http2::h2_error`, `http2::connection_options`,
-  `http2::stream_snapshot` and `http2::window_credit` **do** have `CRPC_AFTER`
-  chains, so their renames are caught. For `rpc_error`, the unit names all five
-  members (`code`, `message`, `retryable`, `retry_after`, `metadata`) in
-  `decltype` type assertions, so a rename fails that translation unit; its
-  constructors name only `code`, `message` and `retryable`, so they do not catch
-  a rename of `retry_after` or `metadata`.
+  name per member in declaration order. The only cross-ABI record with no
+  relative chain is `rpc_error` among the 14 member-counted records (the
+  unguarded records in §4 have no chain at all, and `status` has no public data
+  member, so a rename cannot occur there), so a rename in `rpc_error` is not
+  caught by a chain. The four HTTP/2 value types `http2::h2_error`,
+  `http2::connection_options`, `http2::stream_snapshot` and
+  `http2::window_credit` **do** have `CRPC_AFTER` chains, so their renames are
+  caught. For `rpc_error`, the unit names all five members (`code`, `message`,
+  `retryable`, `retry_after`, `metadata`) in `decltype` type assertions, so a
+  rename fails that translation unit; its constructors name only `code`,
+  `message` and `retryable`, so they do not catch a rename of `retry_after` or
+  `metadata`.
 - A field appended at the end is caught by the member count on every
   architecture, and additionally by the absolute `sizeof` anchor on x86 and x64.
   The member count is what makes the x86 case work: on x86
