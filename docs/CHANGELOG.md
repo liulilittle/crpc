@@ -34,6 +34,35 @@
   plain threads, 5 ms slices on a shard) and serializes access to the low-level
   call handle with the completion registration.
 
+### HTTP long polling
+
+- A server-owned housekeeping timer reclaims idle subscribers even when no later
+  poll arrives. It is armed by `start()`, cancelled by `stop()` before the hub is
+  torn down, and re-armed by its own callback.
+- The front replay bound is clamped to the queue bound at `start()`
+  (`max_replay < max_messages` is raised, the reverse is rejected). The count
+  bound and the per-subscription byte budget are independent; a cursor gap that
+  exceeds either answers 409 Restart instead of silently dropping unacknowledged
+  data. `http_statistics::longpoll_replay_window` reports the effective bound and
+  is zero while the server is not running (including a failed `start()`).
+- `stop()` keeps the listener configuration so a later `start()` rebinds the same
+  endpoints. The stored `backend_factory` pointers are borrowed: a backend must
+  outlive the server, including every `stop()` -> `start()` cycle (documented on
+  `http_server::builder::add_listener()` and `server::builder::add_listener()`).
+  This also fixes `rpc::server`, whose second `start()` used to return ok while
+  binding nothing.
+
+### ABI breaking: `http_statistics` layout
+
+- `http_statistics` gained `longpoll_replay_window` as its last member.
+  `sizeof` is unchanged (224 on 64-bit builds) because the field occupies the
+  former trailing padding, but the six pre-existing trailing counters each moved
+  8 bytes earlier: `longpoll_events` 176→168, `longpoll_timeouts` 184→176,
+  `longpoll_ack_clamped` 192→184, `longpoll_conflicts` 200→192,
+  `longpoll_restarts` 208→200, `longpoll_overloaded` 216→208. A consumer built
+  against the old header reads the wrong offsets, so this is ABI breaking and
+  needs the MAJOR bump described in [abi.md](abi.md) §4.
+
 ### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
 
 Frame-level compression is now implemented for the LZ4 block codec (`ALGO = 1`) and the frame layer

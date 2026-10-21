@@ -79,6 +79,27 @@ struct connect_options {
 新版本库读取 `struct_size`，只访问调用方保证存在的字段。
 这就是 MINOR 版本在不破坏旧调用方的前提下新增字段的方式。
 
+
+公开结构体新增字段（即使追加在末尾）属于 MAJOR 变更：本版本 `http_statistics`
+新增了 `longpoll_replay_window`，它现在位于末尾。追加字段只会让**插入点之前**的
+成员保持偏移；插入点之后的既有成员偏移全部改变。本次 6 个既有尾部计数器各前移
+一个 `std::size_t`（审计所用 64 位构建上为 8 字节）：
+
+| 成员 | 旧偏移 | 新偏移 |
+|---|---|---|
+| `longpoll_events` | 176 | 168 |
+| `longpoll_timeouts` | 184 | 176 |
+| `longpoll_ack_clamped` | 192 | 184 |
+| `longpoll_conflicts` | 200 | 192 |
+| `longpoll_restarts` | 208 | 200 |
+| `longpoll_overloaded` | 216 | 208 |
+
+在这些构建上 `sizeof(http_statistics)` 仍为 224：新字段占用了原先的尾部填充。
+这**不**代表兼容——按旧头文件编译的消费方仍按旧偏移读取这 6 个计数器，而新字段
+与旧填充区重叠。因此该变更属 ABI breaking（MAJOR）。在尺寸标记选项结构体可用
+之前，任何公开结构体布局变更都按 MAJOR 处理（见第 8 节）。
+
+
 增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 4 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。
 
 ## 5. 枚举值

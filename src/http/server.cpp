@@ -4345,6 +4345,9 @@ status http_server::start() {
     // wrong thread.
     const std::size_t shard_count =
         state.options.shards == 0 ? 1 : state.options.shards;
+    // Published only after every validation below succeeds, so a failed start()
+    // keeps reporting zero (the documented "not running" value).
+    std::size_t effective_replay_window = 0;
     if (!state.sse_routes.empty() && shard_count != 1) {
         return status{rpc_error(rpc_code::failed_precondition,
                                 "SSE requires http_server_options::shards == 1")};
@@ -4399,8 +4402,7 @@ status http_server::start() {
             if (sub.max_replay < sub.max_messages) {
                 sub.max_replay = sub.max_messages;
             }
-            state.longpoll_replay_window.store(sub.max_replay,
-                                               std::memory_order_relaxed);
+            effective_replay_window = sub.max_replay;
         }
         for (std::size_t i = 0; i < state.longpoll_routes.size(); ++i) {
             const std::string& path = state.longpoll_routes[i].path;
@@ -4468,6 +4470,11 @@ status http_server::start() {
             rpc_code::failed_precondition,
             "HTTPS/TLS is not available: the library was built without CRPC_HAVE_OPENSSL")};
 #endif
+    }
+
+    if (!state.longpoll_routes.empty()) {
+        state.longpoll_replay_window.store(effective_replay_window,
+                                           std::memory_order_relaxed);
     }
 
     try {
@@ -4625,7 +4632,9 @@ void http_server::stop() noexcept {
     // a later start() can bind the same listeners again. Clearing it made
     // start() return ok() after stop() while binding nothing, which left every
     // client without a connection. The bound `listener` objects themselves are
-    // released above.
+    // released above. The stored backend pointers are borrowed: the caller
+    // must keep every backend alive for the whole server lifetime, including
+    // any stop()/start() cycle (see http_server::builder::add_listener()).
     state.tls_context.reset();
     state.acceptors.clear();
 }
@@ -4729,4 +4738,4 @@ bool http_server::publish(std::string_view topic, span<const std::byte> body,
 }
 
 } // namespace http
-} // namespace crpc
+} // namespace crpc

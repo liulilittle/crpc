@@ -152,6 +152,9 @@ public:
 
     class builder {
     public:
+        // The backend must outlive the server, including every stop() ->
+        // start() cycle: the listener configuration is retained so a later
+        // start() can bind it again, and it holds a borrowed pointer.
         builder& add_listener(endpoint ep, backend_factory& backend);
         builder& add_service(u64 service_id, std::string name);
         builder& add_raw_method(u64 service_id, u64 method_id, std::string name,

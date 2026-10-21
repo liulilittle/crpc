@@ -105,10 +105,26 @@ built from the same headers.
 
 A public struct that gains a field is therefore a MAJOR change even when the new
 field is appended: `http_statistics` grew `longpoll_replay_window` in this
-release, and that field is placed at the very end so every pre-existing member
-keeps its offset (the struct's size and the trailing padding still change, so
-the version must move). Treat it as MAJOR unless a size-tagged options struct
-exists (§7).
+release, and it is now the last member. Appending changes the offsets of every
+member declared after the insertion point, not only the used size. In this case
+the six pre-existing trailing counters each moved one `std::size_t` earlier
+(8 bytes on the audited 64-bit builds):
+
+| member | old offset | new offset |
+|---|---|---|
+| `longpoll_events` | 176 | 168 |
+| `longpoll_timeouts` | 184 | 176 |
+| `longpoll_ack_clamped` | 192 | 184 |
+| `longpoll_conflicts` | 200 | 192 |
+| `longpoll_restarts` | 208 | 200 |
+| `longpoll_overloaded` | 216 | 208 |
+
+`sizeof(http_statistics)` is unchanged (224 on those builds): the new field
+occupies what used to be trailing padding. That does **not** make the change
+compatible — a consumer built against the old header reads the six counters at
+their old offsets, and the new field overlaps the old padding. The change is
+ABI breaking (MAJOR) unless a size-tagged options struct exists (§7). Members
+declared before the insertion point keep their offsets.
 
 Additive types do not change existing layouts. `client::resilience_statistics`
 (a standard-layout, trivially copyable value type, §4) and
