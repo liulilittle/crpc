@@ -218,7 +218,9 @@ public:
             // at /W0. Such a build now lets the exception escape. Under /W4 /WX
             // the old header failed inside this header, while this header
             // compiles, so a consumer that never enabled /EH moves from "does
-            // not build" to "builds and terminates on throw".
+            // not build" to "builds and lets the exception escape" (the
+            // caller's own try/catch still catches it if it has one; otherwise
+            // the process terminates).
             if (!hook->on_hook(point, context)) {
                 if (context.ok()) {
                     context.set_error(rpc_code::canceled,
