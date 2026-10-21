@@ -13,9 +13,11 @@
 //     interceptor that is actually present.
 //
 // Interceptors may observe, mutate the call context (deadline, priority,
-// metadata carried by the caller), or short-circuit by returning false. A hook
-// that throws is caught by the chain and converted to `rpc_code::internal`;
-// no exception escapes into the RPC path.
+// metadata carried by the caller), or short-circuit by returning false. When
+// the translation unit is built with exception support, a hook that throws is
+// caught by the chain and converted to `rpc_code::internal`; no exception
+// escapes into the RPC path. In a `-fno-exceptions` / `/EHs-c-` build there is
+// no try/catch (see `run()`), so a throwing hook terminates the process.
 //
 // Thread safety: `add()` and `freeze()` are startup-only and are not
 // synchronised. After `freeze()` the chain is immutable and `run()` may be
@@ -117,7 +119,8 @@ struct call_context {
 //
 // `on_hook` returns true to continue the chain and false to short-circuit. It
 // must not block; an implementation may throw (for example an assertion in a
-// third-party library) and the chain converts that to `internal`.
+// third-party library) and, in an exception-enabled build, the chain converts
+// that to `internal`.
 class interceptor {
 public:
     virtual ~interceptor() = default;
@@ -168,10 +171,11 @@ public:
     // Runs every interceptor registered for `point` in registration order.
     //
     // Empty chain: one bounds check plus one count load, then return true.
-    // Non-empty chain: one virtual call per registered interceptor. A thrown
-    // hook stops the chain, sets `result` to `rpc_code::internal` and returns
-    // false. A hook returning false also stops the chain and returns false;
-    // the hook is responsible for setting `context.result`.
+    // Non-empty chain: one virtual call per registered interceptor. In an
+    // exception-enabled build a thrown hook stops the chain, sets `result` to
+    // `rpc_code::internal` and returns false. A hook returning false also stops
+    // the chain and returns false; the hook is responsible for setting
+    // `context.result`.
     [[nodiscard]] bool run(hook_point point, call_context& context) const noexcept {
         const std::size_t index = static_cast<std::size_t>(point);
         if (index >= hook_point_count()) {
@@ -184,6 +188,7 @@ public:
 
         for (u8 i = 0; i < count; ++i) {
             interceptor* hook = hooks_[index][i];
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             try {
                 if (!hook->on_hook(point, context)) {
                     if (context.ok()) {
@@ -196,6 +201,21 @@ public:
                 context.set_error(rpc_code::internal, "interceptor threw");
                 return false;
             }
+#else
+            // Built without exception support (-fno-exceptions, /EHs-c-): there
+            // is no way to observe a throw, so the hook is called directly.
+            // A hook that throws in such a build is undefined behaviour and
+            // terminates the process (std::terminate), as with any other
+            // throwing call in a no-exception translation unit. The
+            // short-circuit path is unchanged.
+            if (!hook->on_hook(point, context)) {
+                if (context.ok()) {
+                    context.set_error(rpc_code::canceled,
+                                      "interceptor short-circuited");
+                }
+                return false;
+            }
+#endif
         }
         return true;
     }
