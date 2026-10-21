@@ -132,6 +132,9 @@ struct route_entry {
     std::string path; // full pattern, normalized at freeze
     std::string name; // action (member) name
     void* controller = nullptr;
+    // Reflection metadata. All three are null when the library is built without
+    // compiler RTTI (-fno-rtti / /GR-), because std::type_info cannot be formed
+    // there; see route_registrar below. Nothing in the dispatch path reads them.
     const std::type_info* controller_type = nullptr;
     // Type metadata derived from the method pointer. `request_type` is null for
     // a no-argument handler; it names the DTO whose reflected fields drive
@@ -409,12 +412,13 @@ class route_registrar {
 public:
     route_registrar(http::method verb, const char* path, const char* name,
                     std::uint32_t ordinal) {
-        using traits = method_traits<decltype(Method)>;
         route_entry entry;
         entry.method = verb;
         entry.path = join_route_path(route_prefix_of<Controller>::value(), path);
         entry.name = name != nullptr ? name : "";
         entry.controller = &controller_instance<Controller>();
+#if CRPC_HAVE_COMPILER_RTTI
+        using traits = method_traits<decltype(Method)>;
         entry.controller_type = &typeid(Controller);
         if constexpr (!std::is_void_v<typename traits::request_type>) {
             entry.request_type = &typeid(typename traits::request_type);
@@ -422,6 +426,16 @@ public:
         if constexpr (!std::is_void_v<typename traits::response_type>) {
             entry.response_type = &typeid(typename traits::response_type);
         }
+#else
+        // Built without compiler RTTI (-fno-rtti / /GR-): these fields are
+        // std::type_info pointers, which that build cannot form. They are
+        // metadata only -- matching uses `path`/`segments` and dispatch uses
+        // `invoke`/`controller` -- so the route still registers and matches,
+        // with the three fields left null. Reflection-based request binding is
+        // unavailable in this build: bind_request() reports
+        // rpc_code::failed_precondition for a handler that takes a request DTO,
+        // so a request never reaches a controller with an unbound DTO.
+#endif
         entry.invoke = &invoke_http<Controller, Method>;
         entry.ordinal = ordinal;
         pending_routes().push_back(std::move(entry));

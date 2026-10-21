@@ -109,6 +109,41 @@
 #endif
 #endif
 
+// --- Compiler RTTI ------------------------------------------------------------
+//
+// `CRPC_HAVE_RTTI` above means "the rtti reflection headers are available". It
+// is orthogonal to the *compiler's* RTTI support, which `-fno-rtti` (GCC/Clang)
+// and `/GR-` (MSVC) remove. `typeid` is part of that compiler feature, so the
+// two switches must be tested separately: a build may have the reflection
+// headers on the include path while the compiler still rejects `typeid`.
+//
+// The type-erased `codec::encode`/`decode` boundary is keyed by
+// `std::type_info`, so it only exists when the compiler provides RTTI. Callers
+// may override the detection by defining CRPC_HAVE_COMPILER_RTTI themselves.
+//
+// The test is per compiler, because "RTTI enabled" is not the same question
+// everywhere:
+//
+//   * GCC/Clang `-fno-rtti` removes `typeid` entirely; `__cpp_rtti` is the
+//     documented feature-test macro and is absent there.
+//   * clang-cl defines `__cpp_rtti` even under `/GR-` and still accepts the
+//     static form `typeid(T)`, which is the only form this library uses.
+//   * MSVC (cl) accepts the static form `typeid(T)` even under `/GR-` --
+//     `/GR-` only disables the *dynamic* forms (`typeid(expr)` on a polymorphic
+//     glvalue, `dynamic_cast`). Verified: a `/GR-` build registers and runs the
+//     type-erased encode/decode path, producing the same bytes as `/GR`. So cl
+//     always has what this header needs, and treating `/GR-` as "no RTTI" here
+//     would break a working configuration.
+#if !defined(CRPC_HAVE_COMPILER_RTTI)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define CRPC_HAVE_COMPILER_RTTI 1
+#elif defined(__cpp_rtti)
+#define CRPC_HAVE_COMPILER_RTTI 1
+#else
+#define CRPC_HAVE_COMPILER_RTTI 0
+#endif
+#endif
+
 #if CRPC_HAVE_RTTI
 #include <rtti/reflection.hpp>
 
@@ -1456,7 +1491,22 @@ template <typename T>
     default:
         break;
     }
+#if CRPC_HAVE_COMPILER_RTTI
+    // A custom codec registered under a non-built-in id: fall back to the
+    // type-erased boundary, which is keyed by std::type_info.
     return target.encode(&value, typeid(T), out);
+#else
+    // Built without compiler RTTI: `std::type_info` cannot be formed, so the
+    // type-erased dispatch does not exist. Report the failure instead of
+    // silently succeeding.
+    const rpc_error failure(
+        rpc_code::encode_error,
+        "crpc: type-erased codec dispatch requires compiler RTTI; built with "
+        "-fno-rtti / /GR-");
+    (void)value;
+    (void)out;
+    return status{failure};
+#endif
 }
 
 template <typename T>
@@ -1510,7 +1560,18 @@ template <typename T>
     default:
         break;
     }
+#if CRPC_HAVE_COMPILER_RTTI
+    // See encode_into above: the erased boundary needs std::type_info.
     return source.decode(in, &value, typeid(T));
+#else
+    const rpc_error failure(
+        rpc_code::decode_error,
+        "crpc: type-erased codec dispatch requires compiler RTTI; built with "
+        "-fno-rtti / /GR-");
+    (void)in;
+    (void)value;
+    return status{failure};
+#endif
 }
 
 } // namespace crpc
