@@ -32,11 +32,15 @@
   `src/abi_check.cpp`, so a new cross-boundary record must be guarded or added to
   that list, or the test fails.
 - Documented blind spots: the member count does not validate names (a rename is
-  caught only by a relative chain); among the 14 member-counted records, `rpc_error`
-  is the only one without a relative chain, so a reorder or rename inside it is not
-  caught by this unit (a rename there still fails in the header's own constructors,
-  per [abi.md](abi.md) §4); the absolute `sizeof` of `rpc_error` and `status` is
-  deliberately not pinned because it follows the standard-library configuration.
+  caught by a relative chain where one exists; in `rpc_error` it is caught by
+  the member-type assertions in `src/abi_check.cpp`); among the 14
+  member-counted records, `rpc_error` is the only one without a relative chain,
+  so a reorder inside it is not caught by this unit. Its constructors name only
+  `code`, `message` and `retryable`, so they do not catch a rename of
+  `retry_after` or `metadata`; the unit's five `decltype` assertions name all
+  five members, so a rename of any of them fails there. The absolute `sizeof` of
+  `rpc_error` and `status` is deliberately not pinned because it follows the
+  standard-library configuration. See [abi.md](abi.md) §4.
 - Impact: MINOR (build-time validation only). No ABI break: no public struct
   layout changes and no exported symbol is added. No runtime behaviour change;
   the build is tighter, because a layout change these guards cover now fails to
@@ -85,10 +89,11 @@
   `rpc_error::retry_after > 0`: milliseconds rounded up to whole seconds with a
   floor of 1, and the header omitted for a zero hint. The status-code mapping is
   unchanged.
-- Impact: MINOR (new header and inline API; no exported symbol). No ABI break: the header is
-  header-only, `stage_kind`/`admission_decision` are not cross-ABI types, and no
-  existing record changes layout. Behaviour change is limited to the additive
-  HTTP `Retry-After` header; RPC wire codes and messages are unchanged.
+- Impact: MINOR (new header and inline API; no exported symbol). No ABI break:
+  the header is header-only, `stage_kind`/`admission_decision` are not cross-ABI
+  types, and no existing record changes layout. Behaviour change is limited to
+  the additive HTTP `Retry-After` header; RPC wire codes and messages are
+  unchanged.
 
 ### HTTP long polling
 

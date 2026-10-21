@@ -140,13 +140,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - 重排、在两个既有成员之间插入、删除：由相对成员链在所有架构上捕获，但**仅限于
   存在相对链的记录**。成员数量在此**不提供任何覆盖**：重排不会改变成员数量，因此
   对重排恒为盲。`rpc_error` 没有相对链，所以 `rpc_error` 内部的重排不会被捕获。
-- 重命名：仅在存在相对链的记录上由相对链捕获。成员数量护栏**不校验名字**——结构化
-  绑定只是按声明顺序为每个成员引入一个本地名字。唯一没有相对链的跨 ABI 记录是
-  `rpc_error`，因此其中的改名不会被本单元捕获（`status` 没有公开数据成员，改名
-  不可能发生）。四个 HTTP/2 值类型 `http2::h2_error`、`http2::connection_options`、
-  `http2::stream_snapshot`、`http2::window_credit` **都有** `CRPC_AFTER` 链，因此
-  它们的改名会被捕获。不过 `rpc_error` 的改名仍会在头文件自身处编译失败，因为其
-  构造函数会初始化被改名的成员。
+- 重命名：若记录存在相对链，则由该链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获。成员数量护栏**不校验名字**——结构化绑定只是按声明顺序为每个成员引入一个本地名字。唯一没有相对链的跨 ABI 记录是 `rpc_error`（就 14 个有成员数量护栏的记录而言；§4 中无护栏的记录则根本没有链，`status` 没有公开数据成员），因此其改名不由链捕获。四个 HTTP/2 值类型 `http2::h2_error`、`http2::connection_options`、`http2::stream_snapshot`、`http2::window_credit` **都有** `CRPC_AFTER` 链，因此它们的改名会被捕获。对 `rpc_error`，该单元在 `decltype` 类型断言中逐个点名其五个成员（`code`、`message`、`retryable`、`retry_after`、`metadata`），因此改名会使该翻译单元编译失败；其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名。
 - 在末尾追加字段：由成员数量在所有架构上捕获，并且在 x86 与 x64 上还会被绝对
   `sizeof` 锚额外捕获。x86 之所以必须依赖成员数量，是因为 x86 上
   `server::statistics` 为 104 字节而最后一个字段结束于 100，末尾 4 字节是填充；

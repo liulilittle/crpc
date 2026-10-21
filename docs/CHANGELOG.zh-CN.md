@@ -12,7 +12,7 @@
 
 - 新增内部翻译单元 `src/abi_check.cpp`（不进入任何头文件，也不导出符号），对跨越 ABI 边界的一部分公开记录做编译期断言：13 个记录的标准布局属性；14 个记录的精确成员数量（`CRPC_MEMBER_COUNT`，可捕获追加、中间插入或删除）；可捕获重排或改名的相对成员链（`CRPC_STEP`、`CRPC_STEP_SAME`、`CRPC_STEP_MIXED`、`CRPC_AFTER`）；`http_statistics` 的总宽度与尾字段位置；以及仅在 x86 与 x64 上的绝对 `sizeof`/`offsetof` 锚（`CRPC_ABS_SIZE`、`CRPC_ABS_OFF`）。成员数量正是能看到「尾追加被 x86 尾部填充吸收」这一情况的护栏。
 - [abi.zh-CN.md](abi.zh-CN.md) §4 现在给出「跨越 ABI 边界」的范围谓词，并列出 19 个仍无编译期护栏的范围内记录。`crpc_test_abi_docs` 会重新扫描 `include/crpc/**/*.hpp` 与 `src/abi_check.cpp`：新增跨边界记录若不加入护栏，也不更新该清单，测试即失败。
-- 已写入文档的盲区：成员数量护栏不校验名字（改名只靠相对链捕获）；在 14 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排或改名不会被该单元捕获（但 `rpc_error` 的改名仍会在头文件构造函数处编译失败，见 [abi.zh-CN.md](abi.zh-CN.md) §4）；`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。
+- 已写入文档的盲区：成员数量护栏不校验名字（若记录存在相对链，则由相对链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获）；在 14 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排不会被该单元捕获。其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名；该单元的五条 `decltype` 断言点名了全部五个成员，因此其中任何一个改名都会在那里失败。`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
 - 影响：MINOR（仅构建期校验）。不破坏 ABI：不改变任何公开结构体布局，也不新增导出符号。运行时行为不变；构建约束收紧——护栏覆盖的布局变更现在会直接编译失败。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
 
 ### 客户端韧性流水线

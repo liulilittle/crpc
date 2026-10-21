@@ -102,13 +102,13 @@ namespace {
 // Known limits of this guard, which must stay in sync with docs/abi.md:
 //
 //   * the binding names are new local names, not references to the member
-//     names, so a rename alone is NOT detected here. A rename is caught by the
-//     relative chains on records that have one; the only record with no
-//     relative chain is `rpc_error`, so a rename there is not caught by this
-//     unit at all. (`status` has no public data member, so a rename cannot
-//     occur. `http2::h2_error`, `http2::connection_options`,
-//     `http2::stream_snapshot` and `http2::window_credit` DO have chains, so
-//     their renames are caught.)
+//     names, so the binding itself does not validate names. A rename is caught
+//     by the relative chain where one exists; the only member-counted record
+//     with no chain is `rpc_error`, whose five members are named one by one in
+//     the five `decltype` assertions below, so a rename of any of them fails
+//     this translation unit. Its constructors name only `code`, `message` and
+//     `retryable`, so they do not catch a rename of `retry_after` or
+//     `metadata`. (`status` has no data member; HTTP/2 records have chains.)
 //   * a reorder that keeps the count is not detected here either; the relative
 //     chains cover it where they exist. `rpc_error` has no relative chain, so a
 //     reorder in `rpc_error` is not detected by this unit;
@@ -408,11 +408,11 @@ CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 // anchor is asserted here and this translation unit must keep compiling on
 // those targets.
 //
-// The member counts still catch an appended or removed field, and the relative
-// chains still catch a reorder or a mid-record insertion on every record that
-// has one. The only cross-ABI record without a relative chain is `rpc_error`, so
-// a reorder or a rename inside `rpc_error` is not caught on any target, this
-// branch included. What is *not* guarded outside x86/x64 is a change that
+// The member counts still catch an appended or removed field; the relative
+// chains catch a reorder or a mid-record insertion where they exist. The only
+// member-counted record without a relative chain is `rpc_error`: a reorder
+// inside it is not caught here, but a rename is caught by the five `decltype`
+// assertions above. What is *not* guarded outside x86/x64 is a change that
 // preserves the member count and the relative order but alters the absolute
 // width, which in practice means a change to the standard library's own types.
 
