@@ -33,13 +33,15 @@
 
 ### ABI breaking：`http_statistics` 布局
 
-- `http_statistics` 在末尾新增 `longpoll_replay_window`。`sizeof` 不变（64 位构建上
-  仍为 224），因为新字段占用了原先的尾部填充；但 6 个既有尾部计数器各前移 8 字节：
-  `longpoll_events` 176→168、`longpoll_timeouts` 184→176、
-  `longpoll_ack_clamped` 192→184、`longpoll_conflicts` 200→192、
-  `longpoll_restarts` 208→200、`longpoll_overloaded` 216→208。按旧头文件编译的
-  消费方会读错偏移，因此属 ABI breaking，需要 [abi.zh-CN.md](abi.zh-CN.md) 第 4 节
-  所述的 MAJOR 提升。
+- `http_statistics` 自 1.0.0 起就包含 `longpoll_replay_window`（offset 168）；
+  本版本把它**移到末尾**（offset 216）。原先排在它后面的 6 个既有长轮询计数器
+  各前移一个 `std::size_t`：`longpoll_events` 176→168、`longpoll_timeouts`
+  184→176、`longpoll_ack_clamped` 192→184、`longpoll_conflicts` 200→192、
+  `longpoll_restarts` 208→200、`longpoll_overloaded` 216→208。`sizeof` 不变
+  （64 位构建上仍为 224），原因是本次只移动字段、没有增删：1.0.0 时 6 个计数器
+  紧跟 `longpoll_replay_window`，正好填满 224 字节，尾部没有填充可被占用。
+  按旧头文件编译的消费方会按旧偏移读取全部 7 个受影响字段，因此属 ABI breaking，
+  需要 [abi.zh-CN.md](abi.zh-CN.md) 第 4 节所述的 MAJOR 提升。
 
 ### 行为变更：COMPRESSED 帧不再被当作明文交付
 

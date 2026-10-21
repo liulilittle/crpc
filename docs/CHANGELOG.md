@@ -54,14 +54,17 @@
 
 ### ABI breaking: `http_statistics` layout
 
-- `http_statistics` gained `longpoll_replay_window` as its last member.
-  `sizeof` is unchanged (224 on 64-bit builds) because the field occupies the
-  former trailing padding, but the six pre-existing trailing counters each moved
-  8 bytes earlier: `longpoll_events` 176→168, `longpoll_timeouts` 184→176,
+- `http_statistics` has carried `longpoll_replay_window` since 1.0.0 (offset
+  168); in this release it was **moved** to the end (offset 216). The six
+  pre-existing long-poll counters that followed it each moved one `std::size_t`
+  earlier: `longpoll_events` 176→168, `longpoll_timeouts` 184→176,
   `longpoll_ack_clamped` 192→184, `longpoll_conflicts` 200→192,
-  `longpoll_restarts` 208→200, `longpoll_overloaded` 216→208. A consumer built
-  against the old header reads the wrong offsets, so this is ABI breaking and
-  needs the MAJOR bump described in [abi.md](abi.md) §4.
+  `longpoll_restarts` 208→200, `longpoll_overloaded` 216→208. `sizeof` is
+  unchanged (224 on 64-bit builds) because no field was added or removed: at
+  1.0.0 the six counters followed `longpoll_replay_window` and filled the struct
+  to 224, so there was no trailing padding. A consumer built against the old
+  header reads all seven affected fields at the wrong offsets, so this is ABI
+  breaking and needs the MAJOR bump described in [abi.md](abi.md) §4.
 
 ### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
 

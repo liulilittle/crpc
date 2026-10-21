@@ -103,14 +103,14 @@ dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
 planned, not implemented; while it is absent, callers and the library must be
 built from the same headers.
 
-A public struct that gains a field is therefore a MAJOR change even when the new
-field is appended: `http_statistics` grew `longpoll_replay_window` in this
-release, and it is now the last member. Appending changes the offsets of every
-member declared after the insertion point, not only the used size. In this case
-the six pre-existing trailing counters each moved one `std::size_t` earlier
-(8 bytes on the audited 64-bit builds):
+A public struct whose layout changes is a MAJOR change, even when the change only
+moves an existing field. `http_statistics` has carried
+`longpoll_replay_window` since 1.0.0, where it sat at offset 168 before the six
+long-poll counters; in this release it was **moved** to the end of the struct
+(offset 216). The six pre-existing counters that followed it each moved one
+`std::size_t` earlier (8 bytes on the audited 64-bit builds):
 
-| member | old offset | new offset |
+| member | 1.0.0 offset | new offset |
 |---|---|---|
 | `longpoll_events` | 176 | 168 |
 | `longpoll_timeouts` | 184 | 176 |
@@ -119,12 +119,14 @@ the six pre-existing trailing counters each moved one `std::size_t` earlier
 | `longpoll_restarts` | 208 | 200 |
 | `longpoll_overloaded` | 216 | 208 |
 
-`sizeof(http_statistics)` is unchanged (224 on those builds): the new field
-occupies what used to be trailing padding. That does **not** make the change
-compatible — a consumer built against the old header reads the six counters at
-their old offsets, and the new field overlaps the old padding. The change is
-ABI breaking (MAJOR) unless a size-tagged options struct exists (§7). Members
-declared before the insertion point keep their offsets.
+`sizeof(http_statistics)` is unchanged (224 on those builds) because the move
+does not add or remove a field: at 1.0.0 the six counters followed
+`longpoll_replay_window` (which ended at offset 176) and filled the struct to
+224, so there was no trailing padding to absorb a new member. That does **not**
+make the change compatible: a consumer built against the old header reads all
+seven affected fields (`longpoll_replay_window` and the six counters) at their
+old offsets. The change is ABI breaking (MAJOR) unless a size-tagged options
+struct exists (§7). Members declared before the moved field keep their offsets.
 
 Additive types do not change existing layouts. `client::resilience_statistics`
 (a standard-layout, trivially copyable value type, §4) and
