@@ -537,7 +537,10 @@ golden 向量钉死字节布局，供第三方实现对照；它们由参考实�
 控制帧（`RST_STREAM`、`SETTINGS`、`SETTINGS_ACK`、`PING`、`PONG`、`GOAWAY`、`WINDOW_UPDATE`、
 `PUSH_ACK`）带 `COMPRESSED` 是 `protocol_error`：这些 payload 是定长控制字段，压缩只会膨胀，
 且 `PUSH_ACK` 还会被服务端做尺寸校验。`decode_frame_header` 仍接受这样的帧头（只校验标志一致性），
-拒绝发生在整帧路径。
+拒绝发生在**三个**整帧入口：`decode_frame`、`decode_frame_compressed` 与
+`frame_decoder::next`。该闸门在编解码器运行之前生效，因此携带完全合法 LZ4 码流的
+控制帧仍被拒绝；在 `frame_decoder::next` 上它是**锁存**的 `protocol_error`（绝不是
+`frame_dropped`），`PUSH_ACK` 也一样，因此对端无法把违规降级为静默丢帧。
 
 ### 24.3 fail-closed 规则
 

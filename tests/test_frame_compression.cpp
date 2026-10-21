@@ -36,6 +36,7 @@
 //   TC-27 drop then continue in one decoder
 //   TC-28 compressed control frames are refused on the whole-frame paths
 //   TC-32 the compressed entry point applies encode_frame header validation
+//   TC-34 the control-frame gate is reached with a valid codec stream
 //
 // Two generator-based vectors cover the cases whose byte streams are too large
 // to embed: 70 000 deterministic bytes (a literal run crossing the 64 KiB
@@ -1874,6 +1875,211 @@ CRPC_TEST(tc32_compressed_path_shares_header_validation) {
     CRPC_CHECK(decode_frame_header(span<const std::byte>(buffer.data(), written), produced).ok());
     CRPC_CHECK_EQ(static_cast<unsigned>(produced.flags & frame_flag_compressed),
                   static_cast<unsigned>(frame_flag_compressed));
+}
+
+// --- TC-34 ------------------------------------------------------------------
+
+// The control-frame gate must be exercised with a *valid* codec stream. A
+// malformed stream makes every decoder fail for an unrelated reason (the codec
+// rejects the bytes), so a test built only on one cannot tell whether the type
+// gate runs at all: deleting the gate would still be green.
+CRPC_TEST(tc34_control_frames_rejected_with_a_valid_codec_stream) {
+    const std::vector<std::byte> plain = text_bytes(1024);
+    const std::vector<std::byte> payload = make_compressed_payload(plain);
+
+    // The stream is genuinely decodable: this is the premise of the test.
+    {
+        std::vector<std::byte> probe(plain.size());
+        std::size_t probe_written = 0;
+        CRPC_CHECK(decompress_payload(compression_algorithm::lz4,
+                                      as_span(payload).subspan(compressed_payload_prefix_size),
+                                      plain.size(), as_writable_span(probe), probe_written)
+                       .ok());
+        CRPC_CHECK_EQ(probe_written, plain.size());
+        CRPC_CHECK(bytes_equal(as_span(probe), plain));
+    }
+    CRPC_CHECK(payload.size() < plain.size());
+
+    struct control_case {
+        const char* name;
+        frame_type type;
+        u32 stream_id;
+    };
+    const control_case control_types[] = {
+        {"rst_stream", frame_type::rst_stream, 17u},
+        {"settings", frame_type::settings, 0u},
+        {"settings_ack", frame_type::settings_ack, 0u},
+        {"ping", frame_type::ping, 0u},
+        {"pong", frame_type::pong, 0u},
+        {"goaway", frame_type::goaway, 0u},
+        {"window_update", frame_type::window_update, 0u},
+        {"push_ack", frame_type::push_ack, 17u},
+    };
+
+    // Per-type assertion with the type name in the diagnostic: a mistyped
+    // stream_id would otherwise be rejected by the scope rule instead, leaving
+    // a permanently green line and silently shrinking coverage to 6/8.
+    const auto expect_gate = [](int code, const char* type_name, const char* entry) {
+        if (code != static_cast<int>(rpc_code::protocol_error)) {
+            std::printf("  tc34: %s via %s returned %d, expected %d (type gate not applied)\n",
+                        type_name, entry, code, static_cast<int>(rpc_code::protocol_error));
+        }
+        CRPC_CHECK_EQ(code, static_cast<int>(rpc_code::protocol_error));
+    };
+
+    int rejected_by_gate = 0;
+    for (const control_case& item : control_types) {
+        // The case list must be exactly the control set; otherwise the test
+        // would prove nothing about the gate it is named after.
+        CRPC_CHECK(!frame_type_carries_compression(item.type));
+
+        const std::vector<std::byte> wire =
+            raw_frame(static_cast<u32>(payload.size()), static_cast<u8>(item.type), lz4_flags(),
+                      item.stream_id, payload);
+
+        // The header must be acceptable on its own, with the stream scope the
+        // type requires: if this failed, the rejection below would be the scope
+        // rule rather than the compression gate.
+        frame_header header;
+        CRPC_CHECK(decode_frame_header(as_span(wire), header).ok());
+        CRPC_CHECK_EQ(static_cast<int>(header.type), static_cast<int>(item.type));
+        CRPC_CHECK_EQ(header.stream_id, item.stream_id);
+
+        // 1. decode_frame (no output buffer). Also refused for DATA, so this
+        //    line is a positive contract, not the gate's criterion.
+        frame decoded;
+        expect_gate(static_cast<int>(decode_frame(as_span(wire), decoded).code()), item.name,
+                    "decode_frame");
+
+        // 2. decode_frame_compressed: the gate must fire before the codec ever
+        //    sees a perfectly decodable stream. This is the criterion that
+        //    catches a deleted gate (it would return ok and deliver the bytes).
+        std::vector<std::byte> scratch(plain.size());
+        compression_statistics stats;
+        expect_gate(static_cast<int>(decode_frame_compressed(as_span(wire), decoded,
+                                                            as_writable_span(scratch),
+                                                            max_frame_default,
+                                                            compression_limits{}, nullptr, &stats)
+                                         .code()),
+                    item.name, "decode_frame_compressed");
+        // Nothing was decompressed and nothing failed to decode: the rejection
+        // happened before the codec, i.e. on the type, not on the bytes.
+        CRPC_CHECK_EQ(stats.frames_decompressed, std::uint64_t{0});
+        CRPC_CHECK_EQ(stats.decode_failures, std::uint64_t{0});
+        if (stats.frames_decompressed == 0 && stats.decode_failures == 0) {
+            ++rejected_by_gate;
+        }
+
+        // 3. frame_decoder::next in copying mode: a latched protocol error, not
+        //    a drop. PUSH_ACK in particular must never be reported as
+        //    frame_dropped, which would keep error() == ok and let a peer feed
+        //    the connection a frame the type gate exists to refuse.
+        std::vector<std::byte> storage(plain.size());
+        frame_decoder decoder(as_writable_span(storage));
+        decoder.feed(as_span(wire));
+        frame out_frame;
+        frame_compression_info info;
+        const int next_result = static_cast<int>(decoder.next(out_frame, &info));
+        if (next_result != static_cast<int>(frame_decoder::result::error)) {
+            std::printf("  tc34: %s via frame_decoder::next returned %d, expected error\n",
+                        item.name, next_result);
+        }
+        CRPC_CHECK_EQ(next_result, static_cast<int>(frame_decoder::result::error));
+        CRPC_CHECK(!info.dropped);
+        CRPC_CHECK(decoder.failed());
+        expect_gate(static_cast<int>(decoder.error()), item.name, "frame_decoder::error()");
+
+        // 4. Borrowing mode. Positive contract only: the compressed branch
+        //    rejects borrowing mode unconditionally, so this cannot distinguish
+        //    the type gate and is deliberately not part of the acceptance
+        //    criterion.
+        frame_decoder borrower;
+        borrower.feed(as_span(wire));
+        frame borrowed;
+        frame_compression_info borrowed_info;
+        CRPC_CHECK_EQ(static_cast<int>(borrower.next(borrowed, &borrowed_info)),
+                      static_cast<int>(frame_decoder::result::error));
+        CRPC_CHECK(!borrowed_info.dropped);
+        CRPC_CHECK_EQ(static_cast<int>(borrower.error()),
+                      static_cast<int>(rpc_code::protocol_error));
+    }
+
+    // 8/8 types were refused before the codec ran.
+    CRPC_CHECK_EQ(rejected_by_gate, static_cast<int>(sizeof(control_types) /
+                                                     sizeof(control_types[0])));
+
+    // Control: the same valid stream on the types that do carry application
+    // data must still succeed on every decompressing path, so the gate is a
+    // type filter and not a blanket refusal.
+    struct allowed_case {
+        frame_type type;
+        u32 stream_id;
+    };
+    const allowed_case allowed[] = {
+        {frame_type::data, 3u}, {frame_type::request, 22u}, {frame_type::push, 23u}};
+    for (const allowed_case& item : allowed) {
+        CRPC_CHECK(frame_type_carries_compression(item.type));
+        const std::vector<std::byte> wire =
+            raw_frame(static_cast<u32>(payload.size()), static_cast<u8>(item.type), lz4_flags(),
+                      item.stream_id, payload);
+
+        std::vector<std::byte> out(plain.size());
+        frame decoded;
+        CRPC_CHECK(decode_frame_compressed(as_span(wire), decoded, as_writable_span(out),
+                                           max_frame_default)
+                       .ok());
+        CRPC_CHECK(bytes_equal(decoded.payload, plain));
+
+        std::vector<std::byte> storage(plain.size());
+        frame_decoder decoder(as_writable_span(storage));
+        decoder.feed(as_span(wire));
+        frame out_frame;
+        frame_compression_info info;
+        CRPC_CHECK_EQ(static_cast<int>(decoder.next(out_frame, &info)),
+                      static_cast<int>(frame_decoder::result::frame_ready));
+        CRPC_CHECK(!info.dropped);
+        CRPC_CHECK_EQ(static_cast<int>(info.algorithm), static_cast<int>(compression_algorithm::lz4));
+        CRPC_CHECK(bytes_equal(out_frame.payload, plain));
+    }
+
+    // Encoder side of the same contract: PUSH carries application data, so the
+    // sender path must actually compress it rather than refuse it. This keeps
+    // the "gate is a type filter" claim honest for PUSH specifically, which is
+    // the type closest to the refused control set.
+    for (const frame_type type : {frame_type::data, frame_type::push}) {
+        frame value;
+        value.header.type = type;
+        value.header.stream_id = 41;
+        value.payload = as_span(plain);
+
+        std::vector<std::byte> buffer(
+            encoded_frame_size_compressed(value, compression_algorithm::lz4));
+        std::size_t written = 0;
+        compression_algorithm chosen = compression_algorithm::none;
+        CRPC_CHECK(encode_frame_compressed(as_writable_span(buffer), value,
+                                           compression_algorithm::lz4, compression_limits{},
+                                           written, &chosen)
+                       .ok());
+        CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::lz4));
+        CRPC_CHECK(written < encoded_frame_size(value));
+        frame_header produced;
+        CRPC_CHECK(decode_frame_header(span<const std::byte>(buffer.data(), written), produced)
+                       .ok());
+        CRPC_CHECK_EQ(static_cast<unsigned>(produced.type), static_cast<unsigned>(type));
+        CRPC_CHECK_EQ(static_cast<unsigned>(produced.flags & frame_flag_compressed),
+                      static_cast<unsigned>(frame_flag_compressed));
+    }
+
+    // decode_frame still cannot decompress, so it refuses DATA as well: that is
+    // the missing-buffer rule, not the type gate.
+    {
+        const std::vector<std::byte> wire =
+            raw_frame(static_cast<u32>(payload.size()), static_cast<u8>(frame_type::data),
+                      lz4_flags(), 21u, payload);
+        frame decoded;
+        CRPC_CHECK_EQ(static_cast<int>(decode_frame(as_span(wire), decoded).code()),
+                      static_cast<int>(rpc_code::protocol_error));
+    }
 }
 
 CRPC_TEST_MAIN()

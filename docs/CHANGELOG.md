@@ -20,7 +20,9 @@ What changed:
   writes a byte (known type, stream scope, `stream_id` bit 31, `ONE_WAY`/`UNRELIABLE`,
   `ext`/`CRC32C`, `payload_len <= max_frame`) and takes `max_frame` as an argument; a
   violation is `invalid_argument` with nothing written on both the compressing and the
-  identity branch. A caller-supplied `ext` is no longer silently normalised away.
+  identity branch. A non-zero caller-supplied `ext` without `CRC32C` is now rejected
+  instead of being silently zeroed; with `CRC32C` set the field carries the payload
+  checksum by design, on both the plain and the compressed form.
 - `decode_frame` rejects a `COMPRESSED` frame with `protocol_error` (it has no output buffer);
   `frame_decoder` decompresses in copying mode and rejects in borrowing mode. A decoded frame's
   header is normalised: `COMPRESSED`/`ALGO` cleared, `payload_len` and `CRC32C` rewritten for the

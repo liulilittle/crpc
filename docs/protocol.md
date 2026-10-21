@@ -751,7 +751,11 @@ Compression is only defined for frames that carry application data: `REQUEST`, `
 `SETTINGS_ACK`, `PING`, `PONG`, `GOAWAY`, `WINDOW_UPDATE`, `PUSH_ACK`) is `protocol_error`: those
 payloads are fixed-size control fields where compression can only inflate, and `PUSH_ACK` is
 additionally size-checked by the server. `decode_frame_header` still accepts such a header (it
-validates flag consistency only); the rejection happens on the whole-frame paths.
+validates flag consistency only); the rejection happens on all three whole-frame entry points:
+`decode_frame`, `decode_frame_compressed` and `frame_decoder::next`. The gate is checked before
+the codec runs, so a control frame carrying a perfectly valid LZ4 stream is still refused; on
+`frame_decoder::next` it is a latched `protocol_error` (never `frame_dropped`), including for
+`PUSH_ACK`, so a peer cannot turn the violation into a silent drop.
 
 ### 24.3 Fail-closed rules
 

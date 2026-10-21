@@ -18,7 +18,8 @@
 - `encode_frame_compressed` 在写出任何字节之前执行与 `encode_frame` 相同的帧头校验
   （已知类型、stream 作用域、`stream_id` bit 31、`ONE_WAY`/`UNRELIABLE`、`ext`/`CRC32C`、
   `payload_len <= max_frame`），并新增 `max_frame` 形参；违规时在压缩分支与 identity 分支
-  都返回 `invalid_argument` 且不写入任何字节。调用方提供的 `ext` 不再被静默归一。
+  都返回 `invalid_argument` 且不写入任何字节。未设 `CRC32C` 时的非零 `ext` 现在被拒绝，
+  而不是被静默置 0；设了 `CRC32C` 时该字段按设计存放 payload 校验和（明文与压缩形式都一样）。
 - `decode_frame` 对 `COMPRESSED` 帧返回 `protocol_error`（它没有输出缓冲）；`frame_decoder`
   在拷贝模式下解压、借用模式下拒绝。解码后的帧头被规范化：清 `COMPRESSED`/`ALGO`，
   `payload_len` 与 `CRC32C` 改写为逻辑 payload 的对应值。
