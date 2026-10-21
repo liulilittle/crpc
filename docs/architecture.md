@@ -252,7 +252,7 @@ Five components are implemented independently:
   backoff and jitter, plus a shared token-bucket budget; `unknown_side_effect`
   is retryable only when idempotent.
 
-The design's fixed six-stage pipeline is `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`. The server admission half is wired; the client wires the same stages per endpoint. Fallback functions remain **specified, not implemented**, and the global rate stage belongs to slice 2c.
+The design names six logical stages, `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`. The server admission half is wired; the client wires the same stages per endpoint, but not in that literal order: it has to select an endpoint (load balance) and admit it through the breaker before it can apply that endpoint's rate and bulkhead, so the executed order is `select + allow -> probe check -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`. Fallback functions remain **specified, not implemented**, and the global rate stage belongs to slice 2c.
 
 On the client, one logical call runs:
 

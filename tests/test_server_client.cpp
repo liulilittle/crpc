@@ -2693,6 +2693,62 @@ CRPC_TEST(client_remote_retry_after_is_honored) {
     CRPC_CHECK(f.cli->resilience_stats().retries_delayed_by_hint >= 1);
 }
 
+// G22 Slice 2 follow-up (audit P2-1): `retries_delayed_by_hint` counts only the
+// retries whose delay the hint actually determined. Here the policy backoff
+// (500 ms) is longer than the server hint (~167 ms), so the wait is
+// policy-driven and the counter must stay at zero even though a retry happened.
+CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 5s;
+    cfg.default_idempotent = true;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 2;
+    cfg.retry.initial_backoff = 250ms;
+    cfg.retry.max_backoff = 250ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    cfg.configure_service_rate = true;
+    // One token every ~167 ms, starting empty: the first attempt is rejected
+    // with a hint below the configured 250 ms backoff.
+    cfg.service_rate.rate_per_second = 6.0;
+    cfg.service_rate.burst = 1.0;
+    cfg.service_rate.initial_tokens = 0.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+
+    int code = -1;
+    crpc::u32 attempts = 0;
+    std::chrono::nanoseconds elapsed{0};
+    const bool ran = run_on_shard(
+        *f.shard,
+        [&] {
+            auto echo = f.cli->service<int, int>(kService, kEcho);
+            crpc::rpc::call_context ctx;
+            ctx.idempotent = true;
+            const auto begin = clock_type::now();
+            auto started = echo.call(2, ctx);
+            if (!started.ok()) {
+                code = static_cast<int>(started.code());
+                return;
+            }
+            auto handle = std::move(started).value();
+            auto result = handle.get();
+            elapsed = clock_type::now() - begin;
+            code = result.ok() ? 0 : static_cast<int>(result.code());
+            attempts = handle.attempts();
+        },
+        10000);
+
+    CRPC_CHECK(ran);
+    CRPC_CHECK_EQ(0, code);
+    CRPC_CHECK_EQ(static_cast<crpc::u32>(2), attempts);
+    // The wait is the 250 ms policy backoff, not the ~167 ms hint.
+    CRPC_CHECK(elapsed >= 200ms);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), f.cli->stats().retries);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0),
+                  f.cli->resilience_stats().retries_delayed_by_hint);
+}
+
 // G22 Slice 2a: cancel during the backoff wait must wake the waiter at once and
 // must not issue another attempt.
 CRPC_TEST(client_cancel_during_backoff) {
@@ -2928,7 +2984,135 @@ CRPC_TEST(client_local_capacity_retries_non_idempotent) {
     CRPC_CHECK_EQ(1, f.service.echo_calls.load());
 }
 
-// G22 Slice 2a: the additive resilience statistics must not disturb the
+// G22 Slice 2 follow-up (audit P1-1): the selection loop must be able to reach
+// an endpoint at any index, not only the first 512. With 600 endpoints and all
+// but one breaker open, the healthy endpoint must be reached wherever it sits;
+// the old fixed 512-bit bitmap silently ignored index 512 and above, so the
+// linear fallback kept re-selecting index 512.
+CRPC_TEST(client_selection_reaches_endpoints_beyond_512) {
+    // The healthy endpoint sits just past the old 512-bit limit, so reaching it
+    // requires the loop to track index 513. The bitmap unit test below also
+    // covers the 509/512/513/599 indexes directly.
+    for (const std::size_t healthy : {std::size_t{513}}) {
+        crpc::inproc_backend backend;
+        service_state service;
+        const std::string live_name = "crpc-many-live";
+        constexpr std::size_t kEndpoints = 514;
+
+        crpc::server::builder sb;
+        sb.add_listener(crpc::endpoint::inproc(live_name), backend);
+        register_services(sb, service);
+        sb.handler_workers(8);
+        sb.drain_timeout(2000ms);
+        auto srv = sb.build();
+        CRPC_CHECK(srv != nullptr);
+        if (!srv) {
+            return;
+        }
+        CRPC_CHECK(srv->start().ok());
+
+        crpc::client::builder cb;
+        for (std::size_t i = 0; i < kEndpoints; ++i) {
+            // Every endpoint but `healthy` is a dead in-process name: connecting
+            // fails immediately, which opens its breaker on the warm-up call.
+            cb.add_endpoint(crpc::endpoint::inproc(
+                                i == healthy ? live_name
+                                             : "crpc-many-dead-" + std::to_string(i)),
+                            backend);
+        }
+        cb.pool_size(1);
+        cb.default_deadline(5s);
+        cb.plain_thread_timeout(5s);
+        // consistent_hash returns the same endpoint for the same key, so the
+        // main selection keeps offering an already-tried candidate and the loop
+        // has to fall back to its own bookkeeping. That is exactly the path the
+        // old 512-bit bitmap broke (index 512 was never marked, so the fallback
+        // kept re-selecting it and everything above it stayed unreachable).
+        cb.load_balancer(crpc::resilience::lb_strategy::consistent_hash);
+        // A retried failure is recorded as `ignore` (only the terminal result
+        // feeds the breaker), so one logical call can open at most one breaker.
+        // Each warm-up call therefore uses a single attempt: it selects the next
+        // closed candidate, fails to connect, and opens that candidate. The
+        // healthy endpoint stays closed because its own call succeeds.
+        crpc::resilience::retry_policy retry;
+        retry.max_attempts = 1;
+        cb.retry(retry);
+        crpc::resilience::breaker_config breaker;
+        breaker.min_requests = 1;
+        breaker.failure_ratio_threshold = 0.5;
+        breaker.slow_call_threshold = 5s;
+        breaker.slow_call_ratio_threshold = 1.0;
+        cb.breaker(breaker);
+        auto cli = cb.build();
+        CRPC_CHECK(cli != nullptr);
+        if (!cli) {
+            srv->stop();
+            return;
+        }
+
+        auto stub = cli->service<int, int>(kService, kEcho);
+        // One single-attempt call per endpoint: each selects the next closed
+        // candidate, fails to connect, and opens that candidate. The healthy
+        // endpoint stays closed because its own call succeeds.
+        for (std::size_t i = 0; i < kEndpoints; ++i) {
+            auto warm = stub.call(static_cast<int>(i));
+            if (warm.ok()) {
+                auto handle = std::move(warm).value();
+                (void)handle.get();
+            }
+        }
+        const int calls_before = service.echo_calls.load();
+        int code = -1;
+        crpc::u32 attempts = 0;
+        auto started = stub.call(7);
+        if (!started.ok()) {
+            code = static_cast<int>(started.code());
+        } else {
+            auto handle = std::move(started).value();
+            auto result = handle.get();
+            code = result.ok() ? 0 : static_cast<int>(result.code());
+            attempts = handle.attempts();
+        }
+
+        CRPC_CHECK_EQ(0, code);
+        CRPC_CHECK_EQ(static_cast<crpc::u32>(1), attempts);
+        CRPC_CHECK_EQ(calls_before + 1, service.echo_calls.load());
+
+        cli->close();
+        srv->stop();
+    }
+}
+
+// The selection bitmap must not allocate for a pool that fits its inline
+// capacity, and must still track every endpoint above it.
+CRPC_TEST(client_selection_bitmap_bounds) {
+    crpc::client_detail::tried_endpoints inline_bitmap;
+    CRPC_CHECK(inline_bitmap.reset(512));
+    CRPC_CHECK(inline_bitmap.uses_inline_storage());
+    inline_bitmap.mark(511);
+    CRPC_CHECK(inline_bitmap.test(511));
+    CRPC_CHECK_FALSE(inline_bitmap.test(0));
+    CRPC_CHECK_FALSE(inline_bitmap.test(512));
+
+    crpc::client_detail::tried_endpoints heap_bitmap;
+    CRPC_CHECK(heap_bitmap.reset(600));
+    CRPC_CHECK_FALSE(heap_bitmap.uses_inline_storage());
+    CRPC_CHECK_EQ(static_cast<std::size_t>(600), heap_bitmap.size());
+    // Every index below the pool size is tracked; the old implementation
+    // ignored 512 and above, which made those endpoints unreachable.
+    for (std::size_t i = 0; i < 600; ++i) {
+        CRPC_CHECK_FALSE(heap_bitmap.test(i));
+        heap_bitmap.mark(i);
+        CRPC_CHECK(heap_bitmap.test(i));
+    }
+    CRPC_CHECK_FALSE(heap_bitmap.test(600));
+    // A reset reuses the same inline path and clears the bits.
+    CRPC_CHECK(heap_bitmap.reset(64));
+    CRPC_CHECK(heap_bitmap.uses_inline_storage());
+    CRPC_CHECK_FALSE(heap_bitmap.test(0));
+}
+
+// G22 Slice 2a/2b: the additive resilience statistics must not disturb the
 // existing `client::statistics` layout, and the new counters must be live.
 CRPC_TEST(client_resilience_stats_abi) {
     static_assert(std::is_standard_layout_v<crpc::client::resilience_statistics>);
@@ -3015,7 +3199,11 @@ CRPC_TEST(client_per_endpoint_rate_rejects) {
     cfg.breaker.slow_call_ratio_threshold = 1.0;
     cfg.breaker.open_duration = 5s;
     cfg.configure_client_rate = true;
-    cfg.client_rate.rate_per_second = 20.0;
+    // One token every 500 ms. The first call spends the only token, the second
+    // arrives well before the next refill even on a slow (sanitizer) host, and
+    // the third waits out the refill. A 50 ms refill made this test flaky under
+    // ASan, where two back-to-back calls can straddle the refill boundary.
+    cfg.client_rate.rate_per_second = 2.0;
     cfg.client_rate.burst = 1.0;
     cfg.client_rate.initial_tokens = 1.0;
     // Retries are enabled and budgeted: the rejected call must still not retry.
@@ -3053,7 +3241,7 @@ CRPC_TEST(client_per_endpoint_rate_rejects) {
                 auto result = handle.get();
                 second_code = result.ok() ? 0 : static_cast<int>(result.code());
             }
-            wait_for_delay(*f.shard, 60ms);
+            wait_for_delay(*f.shard, 600ms);
             auto third = echo.call(3);
             if (third.ok()) {
                 auto handle = std::move(third).value();
@@ -4439,3 +4627,34 @@ CRPC_TEST(server_queues_a_response_while_one_push_is_in_flight) {
 } // namespace
 
 CRPC_TEST_MAIN()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

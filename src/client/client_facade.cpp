@@ -468,47 +468,52 @@ bool client::begin_attempt(
     // here is carried into the attempt; later stages must not call allow()
     // again for the same attempt.
     const std::size_t pool_count = impl_->pools.size();
-    constexpr std::size_t k_tried_words = 8;
-    std::uint64_t tried[k_tried_words] = {};
-    const auto mark_tried = [&tried](std::size_t index) noexcept {
-        if (index / 64 < k_tried_words) {
-            tried[index / 64] |= (std::uint64_t{1} << (index % 64));
-        }
-    };
-    const auto is_tried = [&tried](std::size_t index) noexcept {
-        return index / 64 < k_tried_words &&
-               (tried[index / 64] & (std::uint64_t{1} << (index % 64))) != 0;
-    };
+    // One bit per endpoint so the loop visits each candidate at most once. The
+    // bitmap is inline for small pools and heap-backed above
+    // `tried_endpoints::k_inline_bits`; an allocation failure fails the attempt
+    // explicitly rather than silently ignoring candidates (which used to make
+    // every endpoint at index >= 512 unreachable).
+    client_detail::tried_endpoints tried;
+    if (!tried.reset(pool_count)) {
+        core.origin = client_detail::failure_origin::local_lifecycle;
+        failure = rpc_error(rpc_code::resource_exhausted,
+                            "cannot track endpoint candidates");
+        return false;
+    }
 
     resilience::breaker_permit chosen;
     std::size_t chosen_index = pool_count;
     bool any_rejected = false;
     bool have_hint = false;
     std::chrono::milliseconds min_hint{0};
+    // Linear fallback cursor. It only moves forward because a tried endpoint is
+    // never untried within one attempt, so the whole loop stays O(pool_count)
+    // instead of rescanning the tried prefix on every iteration.
+    std::size_t fallback_cursor = 0;
     for (std::size_t iteration = 0; iteration < pool_count; ++iteration) {
         std::size_t index = pool_count;
         const result<resilience::instance> selected = impl_->balancer->select(impl_->view);
         if (selected.ok()) {
             const auto candidate = static_cast<std::size_t>(selected.value().id);
-            if (candidate < pool_count && !is_tried(candidate)) {
+            if (candidate < pool_count && !tried.test(candidate)) {
                 index = candidate;
             }
         }
         if (index == pool_count) {
             // consistent_hash returns the same key repeatedly, so the main
-            // selection can stall on a tried endpoint. Fall back to a linear
-            // scan of the remaining candidates.
-            for (std::size_t i = 0; i < pool_count; ++i) {
-                if (!is_tried(i)) {
-                    index = i;
-                    break;
-                }
+            // selection can stall on a tried endpoint. Fall back to the first
+            // candidate not yet tried.
+            while (fallback_cursor < pool_count && tried.test(fallback_cursor)) {
+                ++fallback_cursor;
+            }
+            if (fallback_cursor < pool_count) {
+                index = fallback_cursor;
             }
         }
         if (index == pool_count) {
             break;
         }
-        mark_tried(index);
+        tried.mark(index);
         resilience::breaker_permit permit = impl_->pools[index]->breaker.allow();
         if (permit.allowed()) {
             chosen = std::move(permit);
@@ -908,7 +913,12 @@ bool client::should_retry(client_detail::call_core& core, const rpc_error& error
     if (pre_send) {
         pre_send_retries_.fetch_add(1, std::memory_order_relaxed);
     }
-    if (error.retry_after.count() > 0 && computed >= min_delay) {
+    // Count only the retries whose wait the hint actually determined. `computed`
+    // is `max(backoff, hint)`, so `computed == min_delay` means the advertised
+    // hint (not the backoff policy) set the delay; a hint below the backoff
+    // changed nothing and must not be reported as a hint-driven delay.
+    if (error.retry_after.count() > 0 && min_delay.count() > 0 &&
+        computed == min_delay) {
         retries_delayed_by_hint_.fetch_add(1, std::memory_order_relaxed);
     }
     delay = computed;
@@ -1257,3 +1267,6 @@ std::unique_ptr<client> client::builder::build() {
 }
 
 } // namespace crpc
+
+
+

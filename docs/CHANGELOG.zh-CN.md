@@ -2,6 +2,21 @@
 
 [English](CHANGELOG.md) | **简体中文**
 
+## 未发布
+
+### 新增（MINOR，仅新增符号）
+
+- `client::resilience_statistics` 与 `client::resilience_stats()`：客户端韧性流水线的增补可观测性（`rate_limited`、`bulkhead_rejected`、`local_gate_rejected`、`endpoint_open`、`lb_unavailable`、`pre_send_retries`、`probe_admitted`、`retries_delayed_by_hint`、`bulkhead_in_use`）。不改变既有结构：`client::statistics` 的字段顺序、大小与含义保持不变，C ABI 入口不变。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
+
+### 客户端韧性流水线
+
+- 每端点 rate limiter 与 bulkhead 准入，通过 `builder::per_endpoint_rate()` / `builder::per_endpoint_bulkhead()` 配置，可用 `builder::resilience_enabled(false)` 整体关闭。
+- 实际执行序为 `select + allow -> probe 判定 -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`；半开探针跳过 rate 与 bulkhead，连接池与在途上限仍生效。
+- 本地 gate 拒绝会忽略 breaker permit、携带 limiter/bulkhead 的 `retry_after`，且**不自动重试**。
+- 远端 `retry_after` 是重试延迟下界（`max(backoff, hint)`），由调用 deadline 封顶；retry 预算在该判定之后才扣减。`retries_delayed_by_hint` 仅统计延迟确实由 hint 决定的那些重试。
+- 选择循环用每端点位图跟踪已试候选，超过 512 个端点时自动扩容，不再静默忽略高位索引。
+- `call::cancel()` 立即中断重试等待（plain-thread 用条件变量，分片用 5 ms 分片），并与完成回调注册串行化对低层调用句柄的访问。
+
 ## 1.0.0 - 2026-10-19
 
 CRPC 首个正式版本。本版本覆盖核心原语、CRPC 调用/服务器门面，以及

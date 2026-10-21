@@ -40,6 +40,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -218,6 +219,65 @@ enum class failure_origin : u8 {
 // Classifies a completed low-level call. A local timeout carries the
 // `crpc.local_timeout` metadata marker; a peer deadline does not.
 [[nodiscard]] failure_origin result_origin(const rpc_error& error) noexcept;
+
+// Candidate bookkeeping for the endpoint selection loop. One logical attempt
+// must visit each endpoint at most once, so the loop keeps one bit per
+// endpoint. A pool of up to `k_inline_bits` endpoints uses the inline bitmap
+// and allocates nothing; a larger pool grows a heap bitmap sized to the pool.
+// The previous fixed 512-bit array silently ignored higher indexes, which made
+// every endpoint at or above index 512 unreachable once the lower candidates
+// were tried (the linear fallback then kept re-selecting index 512).
+class tried_endpoints {
+public:
+    static constexpr std::size_t k_inline_bits = 512;
+    static constexpr std::size_t k_inline_words = k_inline_bits / 64;
+
+    // Returns false only when a pool larger than `k_inline_bits` cannot allocate
+    // its bitmap. The caller must then fail the attempt explicitly instead of
+    // running a selection loop that cannot track its candidates.
+    [[nodiscard]] bool reset(std::size_t count) {
+        count_ = count;
+        heap_.reset();
+        words_ = inline_;
+        std::memset(inline_, 0, sizeof(inline_));
+        if (count_ <= k_inline_bits) {
+            return true;
+        }
+        const std::size_t words = (count_ + 63) / 64;
+        try {
+            heap_ = std::make_unique<std::uint64_t[]>(words);
+        } catch (...) {
+            count_ = 0;
+            return false;
+        }
+        std::memset(heap_.get(), 0, words * sizeof(std::uint64_t));
+        words_ = heap_.get();
+        return true;
+    }
+
+    // Precondition: `index < size()`. Every index below `size()` is tracked.
+    void mark(std::size_t index) noexcept {
+        if (index < count_) {
+            words_[index / 64] |= (std::uint64_t{1} << (index % 64));
+        }
+    }
+    [[nodiscard]] bool test(std::size_t index) const noexcept {
+        return index < count_ &&
+               (words_[index / 64] & (std::uint64_t{1} << (index % 64))) != 0;
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+    // True while the bitmap lives in the object (no heap allocation). Pools up
+    // to `k_inline_bits` endpoints always stay on this path.
+    [[nodiscard]] bool uses_inline_storage() const noexcept {
+        return words_ == inline_;
+    }
+
+private:
+    std::uint64_t inline_[k_inline_words] = {};
+    std::unique_ptr<std::uint64_t[]> heap_;
+    std::uint64_t* words_ = inline_;
+    std::size_t count_ = 0;
+};
 
 // Type-independent per-call state.
 struct call_core {
@@ -897,10 +957,17 @@ status client::issue(
         return status{failure};
     }
     {
+        // Publish the handle and arm its completion callback under the same lock
+        // that cancel() takes to reach it. `rpc::call` documents single-owner
+        // use: `then()` writes callback_storage/invoke/owner while a concurrent
+        // cancel() -> invoke_callback() reads them, so both sides must be
+        // serialized. `then()` may run the callback synchronously when the call
+        // already terminated; the wake functor only touches the call core and
+        // never re-enters `inner_mutex`, so holding the lock here is safe.
         std::lock_guard<std::mutex> inner_lk(st->inner_mutex);
         st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+        st->inner->then(client_detail::wake_functor<Resp>{&core});
     }
-    st->inner->then(client_detail::wake_functor<Resp>{&core});
     return status{};
 }
 

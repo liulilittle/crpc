@@ -2,6 +2,38 @@
 
 [简体中文](CHANGELOG.zh-CN.md) | **English**
 
+## Unreleased
+
+### Added (MINOR, symbols only)
+
+- `client::resilience_statistics` and `client::resilience_stats()`: additive
+  observability for the client resilience pipeline (`rate_limited`,
+  `bulkhead_rejected`, `local_gate_rejected`, `endpoint_open`, `lb_unavailable`,
+  `pre_send_retries`, `probe_admitted`, `retries_delayed_by_hint`,
+  `bulkhead_in_use`). No existing structure changes: `client::statistics` keeps
+  its field order, size and meaning, and no C ABI entry point changes. See
+  [abi.md](abi.md) §4 and §8.
+
+### Client resilience pipeline
+
+- Per-endpoint rate limiter and bulkhead gates, configured with
+  `builder::per_endpoint_rate()` / `builder::per_endpoint_bulkhead()` and
+  disabled as a group with `builder::resilience_enabled(false)`.
+- Executed order is `select + allow -> probe check -> rate -> bulkhead ->
+  register -> pool/slot -> retry -> deadline`; a half-open probe skips the rate
+  and bulkhead gates while the pool and in-flight caps still apply.
+- Local gate rejections ignore the breaker permit, carry the limiter/bulkhead
+  `retry_after`, and are never retried automatically.
+- `retry_after` from a peer is a lower bound on the retry delay
+  (`max(backoff, hint)`), capped by the call deadline; the retry budget is
+  charged only after that check. `retries_delayed_by_hint` counts only retries
+  whose delay the hint actually determined.
+- The selection loop tracks tried candidates with a per-endpoint bitmap that
+  grows beyond 512 endpoints instead of silently ignoring higher indexes.
+- `call::cancel()` interrupts a retry wait immediately (condition variable on
+  plain threads, 5 ms slices on a shard) and serializes access to the low-level
+  call handle with the completion registration.
+
 ## 1.0.0 - 2026-10-19
 
 The first CRPC release. It covers the core primitives, the CRPC call/server

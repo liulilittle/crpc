@@ -248,7 +248,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 - `load_balancer`：在不可变 `instance_set` 上实现轮询、随机、最少在途、一致性哈希和平滑加权轮询。
 - `retry_sequence` / `retry_budget`：带指数退避与抖动的逐调用尝试，以及共享令牌桶预算；`unknown_side_effect` 仅在幂等时可重试。
 
-设计中的固定六阶段流水线是 `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`。服务端准入半边已经接线；客户端按端点接线同样的阶段。fallback 函数仍属于**已设计，未实现**，全局 rate 阶段属于 slice 2c。
+设计命名六个**逻辑阶段**：`rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`。服务端准入半边已经接线；客户端按端点接线同样的阶段，但不按字面顺序执行：必须先选出端点（负载均衡）并通过其 breaker 准入，才能应用该端点的 rate 与 bulkhead，因此实际执行序为 `select + allow -> probe 判定 -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`。fallback 函数仍属于**已设计，未实现**，全局 rate 阶段属于 slice 2c。
 
 客户端的一次逻辑调用依次经过：
 
