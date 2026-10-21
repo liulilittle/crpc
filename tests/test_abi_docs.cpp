@@ -1036,8 +1036,13 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
     // Same anti-regression checks as the English document.
     CRPC_CHECK_FALSE(forbidden_phrase(
         text, "每个跨边界记录的精确成员数量"));
+    // The claim was written with two different verbs across revisions (做 and
+    // 取), so both spellings must be forbidden; forbidding only the current one
+    // lets the older wording be restored silently.
     CRPC_CHECK_FALSE(forbidden_phrase(
         text, "因此对其成员做 `offsetof` 会非法"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        text, "因此对其成员取 `offsetof` 会非法"));
     CRPC_CHECK_FALSE(forbidden_phrase(
         text, "标准库类型不是标准布局，因此两者都不是"));
     CRPC_CHECK_FALSE(forbidden_phrase(
