@@ -22,6 +22,20 @@
 #include <utility>
 #include <vector>
 
+// `test_root()` names its directory after the process id. On Windows that is
+// GetCurrentProcessId(); everywhere else getpid().
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <crpc/http/server.hpp>
 #include <crpc/http2/connection.hpp>
 #include <crpc/http2/frame.hpp>
@@ -165,11 +179,36 @@ std::string big_payload() {
 
 std::filesystem::path test_root() {
     std::error_code ec;
-    const std::filesystem::path root =
-        std::filesystem::temp_directory_path(ec) / "crpc_dl_tests";
+    // A per-process directory: two copies of this executable (ctest -j, or a
+    // parallel build tree) otherwise delete each other's fixtures while the
+    // other run is mid-download, which shows up as a spurious stall or a 404.
+    const auto pid = static_cast<unsigned long long>(
+#if defined(_WIN32)
+        ::GetCurrentProcessId()
+#else
+        ::getpid()
+#endif
+    );
+    const std::filesystem::path root = std::filesystem::temp_directory_path(ec) /
+                                       ("crpc_dl_tests_" + std::to_string(pid));
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
     return root;
+}
+
+// The traversal fixture must sit outside the served root. Naming it after the
+// process id keeps two concurrent runs (ctest -j, parallel build trees) from
+// deleting each other's file.
+std::filesystem::path secret_path() {
+    const auto pid = static_cast<unsigned long long>(
+#if defined(_WIN32)
+        ::GetCurrentProcessId()
+#else
+        ::getpid()
+#endif
+    );
+    return std::filesystem::temp_directory_path() /
+           ("crpc_dl_secret_" + std::to_string(pid) + ".txt");
 }
 
 void write_file(const std::filesystem::path& path, const std::string& data) {
@@ -202,7 +241,7 @@ struct fixture {
         // Larger than the inproc peer queue (64 KiB) so a non-draining peer
         // actually defers the server's in-flight write.
         write_file(root / "slow.bin", big_payload().substr(0, 80000));
-        write_file(root.parent_path() / "crpc_dl_secret.txt", "SECRET");
+        write_file(secret_path(), "SECRET");
         mvc::route_entry entry;
         entry.method = http::method::get;
         entry.path = "/plain";
@@ -231,7 +270,7 @@ struct fixture {
         }
         std::error_code ec;
         std::filesystem::remove_all(root, ec);
-        std::filesystem::remove(root.parent_path() / "crpc_dl_secret.txt", ec);
+        std::filesystem::remove(secret_path(), ec);
     }
 
     std::unique_ptr<connection> connect() {
@@ -594,10 +633,14 @@ CRPC_TEST(download_if_range_without_validator_ignores_range) {
 
 CRPC_TEST(download_path_traversal_is_404) {
     fixture fx;
-    for (const char* path : {"/files/../crpc_dl_secret.txt",
-                             "/files/%2e%2e/crpc_dl_secret.txt",
-                             "/files/%2E%2E/crpc_dl_secret.txt",
-                             "/files/./small.txt"}) {
+    // The secret really exists one level above the root, so a 404 proves the
+    // traversal was rejected rather than that the target was missing.
+    const std::string secret = secret_path().filename().string();
+    const std::string paths[] = {"/files/../" + secret,
+                                 "/files/%2e%2e/" + secret,
+                                 "/files/%2E%2E/" + secret,
+                                 "/files/./small.txt"};
+    for (const std::string& path : paths) {
         parsed_response response;
         CRPC_CHECK(round_trip(fx, http1("GET", path), response));
         CRPC_CHECK_EQ(404, response.status);
@@ -666,7 +709,10 @@ CRPC_TEST(download_slow_progress_survives_stall_timeout) {
     http::http_server_options options;
     options.download_chunk_bytes = 8192;
     options.egress_cap_bytes = 32u * 1024u;
-    options.download_stall_timeout = std::chrono::milliseconds(100);
+    // 500 ms stall budget against a 50 ms resume cadence: 450 ms of margin
+    // absorbs scheduler delay on a loaded host. The no-progress case below
+    // keeps 100 ms because there the deadline itself is what is asserted.
+    options.download_stall_timeout = std::chrono::milliseconds(500);
     fixture fx(options);
 
     slow_source capture;
@@ -686,7 +732,7 @@ CRPC_TEST(download_slow_progress_survives_stall_timeout) {
                 return true;
             }
             const auto now = std::chrono::steady_clock::now();
-            if (now - last_resume >= std::chrono::milliseconds(30)) {
+            if (now - last_resume >= std::chrono::milliseconds(50)) {
                 last_resume = now;
                 client->resume_read();
             }
@@ -706,6 +752,9 @@ CRPC_TEST(download_no_progress_is_killed_by_stall) {
     http::http_server_options options;
     options.download_chunk_bytes = 8192;
     options.egress_cap_bytes = 32u * 1024u;
+    // Deliberately left at 100 ms: this case asserts that zero progress is
+    // killed at the deadline, so the tight deadline is the subject of the test,
+    // not a scheduling margin.
     options.download_stall_timeout = std::chrono::milliseconds(100);
     fixture fx(options);
 

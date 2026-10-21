@@ -2084,6 +2084,13 @@ CRPC_TEST(breaker_records_logical_call_not_attempts) {
     cfg.configure_breaker = true;
     cfg.breaker.min_requests = 2;
     cfg.breaker.failure_ratio_threshold = 0.5;
+    // Keep slow calls out of the breaker's accounting. The default derives the
+    // slow threshold from `p99_target` (max(1 ms, 5 * 100 us) = 1 ms), which an
+    // in-process call routinely exceeds on a loaded host; that would add slow
+    // outcomes and could open the breaker for a reason this test does not
+    // exercise.
+    cfg.breaker.slow_call_threshold = 5s;
+    cfg.breaker.slow_call_ratio_threshold = 1.0;
     cfg.breaker.open_duration = 5s;
     cfg.configure_retry = true;
     cfg.retry.max_attempts = 2;
@@ -2778,8 +2785,6 @@ CRPC_TEST(client_cancel_during_backoff) {
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return f.service.flaky_calls.load(std::memory_order_acquire) >= 1; },
         2000));
-    // Let the first response finish and the retry loop enter its 100 ms wait.
-    std::this_thread::sleep_for(20ms);
 
     int code = -1;
     std::atomic<bool> returned{false};
@@ -2790,8 +2795,21 @@ CRPC_TEST(client_cancel_during_backoff) {
         returned.store(true, std::memory_order_release);
     });
 
-    // Wait until the getter is blocked in the retry delay.
-    std::this_thread::sleep_for(20ms);
+    // The retry loop runs inside get(), so the synchronization point is the
+    // client's retry counter: it is incremented immediately before the 100 ms
+    // backoff wait. Observing it means the getter is about to block, and no
+    // fixed sleep is needed. This replaces the previous 20 ms sleeps, which
+    // raced both the first response and the retry loop.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.cli->stats().retries >= 1; }, 2000));
+    // Diagnostic only, never a failure: on a slow host the getter may have
+    // already run out the backoff, which weakens this run but does not break
+    // the invariant under test. The retry counter above is the real sync point.
+    if (returned.load(std::memory_order_acquire)) {
+        std::printf("NOTE client_cancel_during_backoff: getter returned before "
+                    "cancel; wake-up path not exercised\n");
+    }
+
     const auto cancel_time = clock_type::now();
     handle->cancel();
     waiter.join();
@@ -2799,7 +2817,10 @@ CRPC_TEST(client_cancel_during_backoff) {
 
     CRPC_CHECK(returned.load(std::memory_order_acquire));
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled), code);
-    CRPC_CHECK(latency < 20ms);
+    // Half the 100 ms backoff: cancel must wake the waiter at once instead of
+    // letting the delay run out. 50 ms is the discriminating midpoint between
+    // an immediate wake and the full backoff, and must not be widened.
+    CRPC_CHECK(latency < 50ms);
     CRPC_CHECK_EQ(1, f.service.flaky_calls.load());
 
     handle.reset();

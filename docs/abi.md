@@ -80,7 +80,7 @@ The rule for a public struct that crosses the ABI boundary is:
 
 The headers do **not** currently enforce item 1 with layout assertions. None of
 the public record and option structs (for example `frame_header`,
-`io::connect_options`, `rpc::client_options`, `server::options`) has a
+`crpc::connect_options`, `rpc::client_options`, `server::options`) has a
 `static_assert(sizeof(...))` or `static_assert(alignof(...))`. The assertions
 that do exist cover other contracts:
 
@@ -92,11 +92,23 @@ Several public types (`rpc_error`, `buffer`, `endpoint`) contain owning
 standard-library members and are therefore not trivially copyable. They are
 passed by reference, returned as owning CRPC types, or documented as opaque;
 they do not cross the C ABI by value. Adding per-struct `sizeof`/`alignof`
-assertions is planned, not implemented. Until it exists, a change to any public
-struct layout is a MAJOR change (§7), not a MINOR extension.
+assertions to the headers is planned, not implemented. Until that exists, a
+change to any public struct layout is a MAJOR change (§7), not a MINOR
+extension.
+
+The layout invariants that are checkable without header changes live in one
+internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
+the public records, a relative member chain over the counters of
+`http_statistics`, `client::statistics`, `client::resilience_statistics` and
+`server::statistics` (the chain follows each member's own width, so
+`server::statistics`, which mixes `std::size_t` and `std::uint64_t`, is checked
+on both 32-bit and 64-bit targets), and the total width and last-field position
+of `http_statistics`. It is compiled as part of the library, so a layout change
+fails the build. It asserts relative offsets only, never absolute ones, and it
+does not pin the size of types that own standard-library members.
 
 There is no size-tag pattern today. No public header declares a `struct_size`
-member; `io::connect_options` contains only the timeout, buffer and no-delay
+member; `crpc::connect_options` contains only the timeout, buffer and no-delay
 fields (`include/crpc/io.hpp:186-191`). The `struct_size` assignment at
 `src/runtime/runtime.cpp:101` is on a local `coro_rt_driver_ops` from the corocc
 dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
@@ -203,8 +215,11 @@ configure-time check for such a mismatch, and adding one is not implemented.
 3. The changelog states explicitly: "ABI breaking: <symbol> changed from … to …".
 4. No ABI checker is implemented: `scripts/abi_check.ps1` and
    `scripts/abi_check.sh` do not exist, and CI does not compare exported symbols
-   or layout assertions. Until such a job exists, the comparison is a manual
-   review of the diff against the previous release.
+   or layout assertions. The internal `src/abi_check.cpp` translation unit
+   guards the layout of the public records at compile time, but it is not a
+   symbol-table comparison against the previous release. Until such a job
+   exists, the comparison is a manual review of the diff against the previous
+   release.
 
 ## 9. What is not guaranteed
 

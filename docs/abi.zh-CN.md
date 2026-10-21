@@ -18,7 +18,8 @@ MAJOR.MINOR.PATCH
 | 变更 | 版本 | ABI 影响 |
 |---|---|---|
 | 删除或重命名公开符号、修改函数签名、修改结构体布局、修改跨线枚举值 | MAJOR | 破坏 |
-| 新增公开符号、末尾新增枚举值、通过"指针 + struct_size"传递的选项结构体末尾新增可选字段 | MINOR | 兼容 |
+| 修改任何公开结构体的布局（含新增字段） | MAJOR | 破坏（尚无尺寸标记选项结构体，见第 4 节） |
+| 新增公开符号、末尾新增枚举值 | MINOR | 兼容 |
 | 无接口变更的缺陷修复 | PATCH | 兼容 |
 
 线上协议有自己的版本（`protocol_version`，当前为 `1`），与库版本独立：
@@ -63,21 +64,38 @@ MAJOR.MINOR.PATCH
 每个跨越 ABI 边界的公开结构体必须：
 
 1. 是标准布局且可平凡拷贝，或被明确标注为不透明、只允许指针/引用访问；
-2. 在头文件中有 `sizeof` 与 `alignof` 的 `static_assert`；
-3. 不含虚函数（虚分派仅限两个传输接口，且其对象从不按值跨越库边界）；
-4. 不含条件成员（公开结构体内部禁止 `#if`）。
+2. 不含虚函数（虚分派仅限传输接口，且其对象从不按值跨越库边界）；
+3. 不含条件成员（公开结构体内部禁止 `#if`）。
 
-选项结构体采用尺寸标记模式：
+**头文件目前尚未强制第 1 条。** 公开记录与选项结构体（例如 `frame_header`、
+`crpc::connect_options`、`rpc::client_options`、`server::options`）中没有任何
+`static_assert(sizeof(...))` 或 `static_assert(alignof(...))`。现存的断言覆盖的是
+其它契约：
 
-```cpp
-struct connect_options {
-    std::uint32_t struct_size;   // = sizeof(connect_options)
-    // ... fields ...
-};
-```
+- `config.hpp:96-102` 固定整数宽度与 IEEE-754 格式；
+- `observability/log.hpp:327` 限定 `log_record` 为 512 字节；
+- `rpc/call.hpp:559-566` 限定内联回调存储。
 
-新版本库读取 `struct_size`，只访问调用方保证存在的字段。
-这就是 MINOR 版本在不破坏旧调用方的前提下新增字段的方式。
+若干公开类型（`rpc_error`、`buffer`、`endpoint`）含有标准库拥有型成员，因此不是
+可平凡拷贝；它们按引用传递、作为 CRPC 自有类型返回，或被标注为不透明，不按值跨越
+C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计划中的工作，**尚未**
+实施。在它存在之前，任何公开结构体的布局变更都按 MAJOR 处理（第 7 节），而不是
+MINOR 扩展。
+
+无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
+它断言公开记录的标准布局属性、`http_statistics` / `client::statistics` /
+`client::resilience_statistics` / `server::statistics` 各计数器的相对成员链
+（链条按每个成员自身的宽度推进，因此混用 `std::size_t` 与 `std::uint64_t` 的
+`server::statistics` 在 32 位与 64 位目标上都能被检查），以及 `http_statistics`
+的总宽度与尾字段位置。它随库一起编译，因此布局变更会导致构建失败。它只断言
+相对偏移、不断言绝对偏移，也不锁定含有标准库成员的类型的尺寸。
+
+**当前没有 size-tag 模式。** 没有任何公开头文件声明 `struct_size` 成员；
+`crpc::connect_options` 只有超时、缓冲区与 no-delay 字段
+（`include/crpc/io.hpp:186-191`）。`src/runtime/runtime.cpp:101` 处的
+`struct_size` 赋值作用于 corocc 依赖中局部的 `coro_rt_driver_ops`，不是 CRPC 的
+ABI 机制。尺寸标记选项结构体属于计划中的方案，**尚未**实现；在它缺席期间，调用方
+与库必须使用同一份头文件构建。
 
 
 最后一个已发布布局是 1.0.0（`bd006b2`）：`http_statistics` 只有 9 个字段，
@@ -155,18 +173,20 @@ C ABI 独立版本化（`CRPC_C_ABI_VERSION`），遵循相同的 MAJOR/MINOR �
 
 编译器与标准库：CRPC 不承诺跨标准库（MSVC STL / libstdc++ / libc++）
 或跨不同 `_ITERATOR_DEBUG_LEVEL` / `_GLIBCXX_DEBUG` 设置的 ABI 兼容。
-共享库必须与消费方使用同一工具链族与调试设置；这一点写进构建文档，
-并在 CMake 配置期可检测到不匹配时给出警告。
+共享库必须与消费方使用同一工具链族与调试设置。这一点只写进构建文档：
+没有 CMake 配置期的检查，增加该检查属于**尚未**实现的工作。
 
 ## 8. 变更流程
 
 1. 违反第 2–5 节的变更必须提升 MAJOR 版本。
-2. 同一个提交必须更新本文档、迁移指南（`docs/migration.zh-CN.md`），
-   并在可行时增加兼容垫片。
+2. 同一个提交必须更新本文档与变更日志（[CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)）。
+   迁移指南（`docs/migration.md` / `docs/migration.zh-CN.md`）**均不存在**；
+   可行时增加兼容垫片。
 3. 变更日志必须明确写出："ABI breaking: <符号> 从 … 变为 …"。
-4. CI 运行 ABI 检查任务（`scripts/abi_check.ps1` / `.sh`），
-   对比当前构建与上一个发布的导出符号表与布局断言。
-   除非提交带有 MAJOR 提升标记，否则不匹配即构建失败。
+4. **未实现 ABI 检查器**：`scripts/abi_check.ps1` 与 `scripts/abi_check.sh`
+   都不存在，CI 也不比较导出符号表或布局断言。内部翻译单元
+   `src/abi_check.cpp` 在编译期守护公开记录的布局，但它不是与上一发布版本的
+   符号表对比。在该任务存在之前，比对方式是人工审阅与上一版本的 diff。
 
 ## 9. 不保证的内容
 
