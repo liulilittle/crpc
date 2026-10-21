@@ -3106,6 +3106,12 @@ CRPC_TEST(client_selection_bitmap_bounds) {
         CRPC_CHECK(heap_bitmap.test(i));
     }
     CRPC_CHECK_FALSE(heap_bitmap.test(600));
+    // A count whose word arithmetic would overflow is rejected instead of
+    // wrapping into a tiny allocation.
+    crpc::client_detail::tried_endpoints huge;
+    CRPC_CHECK_FALSE(huge.reset(static_cast<std::size_t>(-1)));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), huge.size());
+    CRPC_CHECK(huge.uses_inline_storage());
     // A reset reuses the same inline path and clears the bits.
     CRPC_CHECK(heap_bitmap.reset(64));
     CRPC_CHECK(heap_bitmap.uses_inline_storage());
@@ -4627,34 +4633,3 @@ CRPC_TEST(server_queues_a_response_while_one_push_is_in_flight) {
 } // namespace
 
 CRPC_TEST_MAIN()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

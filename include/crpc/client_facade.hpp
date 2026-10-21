@@ -19,10 +19,14 @@
 //
 // Retry
 // -----
-// A retry happens only when the failure code is `is_retryable`, the call is
-// declared idempotent (or carries an idempotency key), the shared retry budget
-// admits it, and the overall deadline has not passed. Every attempt re-selects
-// an endpoint through the load balancer and re-admits through the breaker. The
+// A retry happens only when the failure code is `is_retryable`, the shared
+// retry budget admits it, and the overall deadline has not passed. A failure
+// observed before anything was sent (`local_capacity`, `endpoint_open`,
+// `endpoint_pre_send`) is retried even for a non-idempotent call, because no
+// side effect can have happened. Once an attempt has been sent (`endpoint_sent`
+// or a `remote` result) a retry additionally requires the call to be declared
+// idempotent or to carry an idempotency key. Every attempt re-selects an
+// endpoint through the load balancer and re-admits through the breaker. The
 // same idempotency key is reused across attempts.
 //
 // Thread safety
@@ -243,14 +247,21 @@ public:
         if (count_ <= k_inline_bits) {
             return true;
         }
-        const std::size_t words = (count_ + 63) / 64;
-        try {
-            heap_ = std::make_unique<std::uint64_t[]>(words);
-        } catch (...) {
+        // Reject counts whose word count would overflow before dividing. The
+        // caller cannot reach this today, but the arithmetic must not wrap.
+        if (count_ > static_cast<std::size_t>(-1) - 63) {
             count_ = 0;
             return false;
         }
-        std::memset(heap_.get(), 0, words * sizeof(std::uint64_t));
+        const std::size_t words = (count_ + 63) / 64;
+        // `new (std::nothrow)` rather than `make_unique`: this header must build
+        // with exceptions disabled, and the value-initialising form also clears
+        // the storage, so no second memset is needed.
+        heap_.reset(new (std::nothrow) std::uint64_t[words]());
+        if (!heap_) {
+            count_ = 0;
+            return false;
+        }
         words_ = heap_.get();
         return true;
     }
@@ -311,6 +322,15 @@ struct call_core {
     std::chrono::steady_clock::time_point deadline{};
     void* pool = nullptr;
     std::shared_ptr<connection_slot> slot;
+    // Serializes the admission resources an attempt owns between the thread
+    // that admits the attempt (begin_attempt / issue) and the thread that ends
+    // it (finish_attempt / abandon_attempt / finalize_active). Without it,
+    // `cancel()` could clear `permit` while `begin_attempt` was assigning the
+    // next attempt's permit (a data race on a non-atomic member, and a permit
+    // that could be dropped without ever being recorded). Lock order:
+    // `attempt_mutex` may be taken before `pool->mutex`/`slot->mutex` is
+    // released, never after.
+    std::mutex attempt_mutex;
     resilience::breaker_permit permit;
     std::optional<resilience::bulkhead_permit> bulkhead;
     std::unique_ptr<resilience::retry_sequence> retry;
@@ -931,13 +951,20 @@ status client::issue(
     // point. finalize_active() then saw a null `core.slot` and could not
     // release it, so release the freshly acquired slot here and do not start a
     // call against a closed client.
-    if (core.finalized.load(std::memory_order_acquire)) {
-        release_slot(slot, rpc_code::shutting_down);
-        core.origin = client_detail::failure_origin::local_lifecycle;
-        failure = rpc_error(rpc_code::shutting_down, "client is closed");
-        return status{failure};
+    {
+        // Publish the slot under the same lock the terminal paths use, and
+        // re-check `finalized` inside it: cancel()/close() may have run between
+        // the check above and this assignment, in which case publishing here
+        // would leak the slot (the terminal path already took its snapshot).
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        if (core.finalized.load(std::memory_order_acquire)) {
+            release_slot(slot, rpc_code::shutting_down);
+            core.origin = client_detail::failure_origin::local_lifecycle;
+            failure = rpc_error(rpc_code::shutting_down, "client is closed");
+            return status{failure};
+        }
+        core.slot = slot;
     }
-    core.slot = slot;
 
     std::lock_guard<std::recursive_mutex> lk(slot->mutex);
     if (!slot->healthy.load(std::memory_order_acquire) || !slot->conn ||

@@ -364,12 +364,27 @@ void client::finalize_active(
         if (options_.shard != nullptr) {
             (void)options_.shard->cancel_timer(core);
         }
-        if (core->bulkhead.has_value()) {
-            core->bulkhead->leave();
-            core->bulkhead.reset();
+        {
+            // `permit`/`bulkhead` belong to the attempt, and the admitting
+            // thread may still be inside begin_attempt/issue. Take the same
+            // lock those paths use before touching them.
+            std::lock_guard<std::mutex> lk(core->attempt_mutex);
+            if (core->bulkhead.has_value()) {
+                core->bulkhead->leave();
+                core->bulkhead.reset();
+            }
+            core->permit = resilience::breaker_permit{};
         }
-        core->permit = resilience::breaker_permit{};
-        if (core->slot) {
+        std::shared_ptr<client_detail::connection_slot> slot;
+        {
+            // `issue()` publishes `slot` on the admitting thread; take the same
+            // lock before reading it. Copy rather than move: NEW-1 requires the
+            // `shared_ptr` to stay in `core->slot` so the call-slot pool
+            // outlives the low-level handle that points into it.
+            std::lock_guard<std::mutex> lk(core->attempt_mutex);
+            slot = core->slot;
+        }
+        if (slot) {
             // Release the in-flight accounting exactly once, but keep the
             // `shared_ptr` in `core->slot` (NEW-1). The owning handle still
             // holds `st->inner`, a low-level rpc::call with a raw call_slot*
@@ -475,6 +490,12 @@ bool client::begin_attempt(
     // every endpoint at index >= 512 unreachable).
     client_detail::tried_endpoints tried;
     if (!tried.reset(pool_count)) {
+        // The bitmap could not be allocated, so this attempt cannot even track
+        // its candidates. Nothing reached an endpoint (a pre-send failure), but
+        // this is deliberately `local_lifecycle` rather than `local_capacity`:
+        // retrying an allocation failure would amplify memory pressure across
+        // the whole pool, so the call fails with `resource_exhausted` and is
+        // not retried.
         core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::resource_exhausted,
                             "cannot track endpoint candidates");
@@ -560,7 +581,25 @@ bool client::begin_attempt(
     if (is_probe) {
         probe_admitted_.fetch_add(1, std::memory_order_relaxed);
     }
-    core.permit = std::move(chosen);
+    {
+        // The terminal path (cancel()/close()/a racing completion) may already
+        // be dropping this attempt's resources; publish the permit under the
+        // same lock so the two never touch `permit` concurrently. If the
+        // attempt was already finalized, do not publish at all: `chosen` then
+        // releases its admission as it goes out of scope, so a late
+        // `begin_attempt` cannot leave an unrecorded permit behind.
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        if (core.finalized.load(std::memory_order_acquire)) {
+            core.origin = core.canceled.load(std::memory_order_acquire)
+                              ? client_detail::failure_origin::cancel
+                              : client_detail::failure_origin::local_lifecycle;
+            failure = core.canceled.load(std::memory_order_acquire)
+                          ? rpc_error(rpc_code::canceled, "call canceled")
+                          : rpc_error(rpc_code::shutting_down, "client is closed");
+            return false;
+        }
+        core.permit = std::move(chosen);
+    }
     core.pool = &pool;
 
     // Per-endpoint gates run after selection and breaker admission. A half-open
@@ -606,7 +645,22 @@ bool client::begin_attempt(
                 failure.retry_after = permit.retry_after();
                 return false;
             }
-            core.bulkhead.emplace(std::move(permit));
+            {
+                std::lock_guard<std::mutex> lk(core.attempt_mutex);
+                if (core.finalized.load(std::memory_order_acquire)) {
+                    // The terminal path already cleared the attempt's resources;
+                    // adding a bulkhead slot now would never be released.
+                    core.origin = core.canceled.load(std::memory_order_acquire)
+                                      ? client_detail::failure_origin::cancel
+                                      : client_detail::failure_origin::local_lifecycle;
+                    failure = core.canceled.load(std::memory_order_acquire)
+                                  ? rpc_error(rpc_code::canceled, "call canceled")
+                                  : rpc_error(rpc_code::shutting_down,
+                                              "client is closed");
+                    return false;
+                }
+                core.bulkhead.emplace(std::move(permit));
+            }
         }
     }
     // The closed decision and the tracking insertion are one atomic step
@@ -614,8 +668,11 @@ bool client::begin_attempt(
     // this returns), either the insert wins and the snapshot in close() sees
     // the core, or this returns false and no timer is ever armed.
     if (!register_core_if_open(core, keep)) {
-        core.permit = resilience::breaker_permit{};
-        core.bulkhead.reset();
+        {
+            std::lock_guard<std::mutex> lk(core.attempt_mutex);
+            core.permit = resilience::breaker_permit{};
+            core.bulkhead.reset();
+        }
         core.pool = nullptr;
         core.origin = client_detail::failure_origin::local_lifecycle;
         failure = rpc_error(rpc_code::shutting_down, "client is closed");
@@ -798,33 +855,41 @@ void client::finish_attempt(client_detail::call_core& core, rpc_code code,
     if (options_.shard != nullptr) {
         (void)options_.shard->cancel_timer(&core);
     }
-    if (core.bulkhead.has_value()) {
-        core.bulkhead->leave();
-        core.bulkhead.reset();
-    }
-    if (core.permit.allowed()) {
-        switch (record) {
-        case client_detail::breaker_record::ignore:
-            core.permit.ignore();
-            break;
-        case client_detail::breaker_record::failure:
-            core.permit.failure();
-            break;
-        case client_detail::breaker_record::by_code:
-            if (code == rpc_code::ok) {
-                core.permit.success();
-            } else if (counts_as_breaker_failure(code)) {
-                core.permit.failure();
-            } else {
-                core.permit.ignore();
-            }
-            break;
+    {
+        // The admitting thread may still be assigning the attempt's permit.
+        // Serialize on the same lock begin_attempt/issue use.
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        if (core.bulkhead.has_value()) {
+            core.bulkhead->leave();
+            core.bulkhead.reset();
         }
+        if (core.permit.allowed()) {
+            switch (record) {
+            case client_detail::breaker_record::ignore:
+                core.permit.ignore();
+                break;
+            case client_detail::breaker_record::failure:
+                core.permit.failure();
+                break;
+            case client_detail::breaker_record::by_code:
+                if (code == rpc_code::ok) {
+                    core.permit.success();
+                } else if (counts_as_breaker_failure(code)) {
+                    core.permit.failure();
+                } else {
+                    core.permit.ignore();
+                }
+                break;
+            }
+        }
+        core.permit = resilience::breaker_permit{};
     }
-    core.permit = resilience::breaker_permit{};
-    if (core.slot) {
-        release_slot(core.slot, code);
-        core.slot.reset();
+    {
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        if (core.slot) {
+            release_slot(core.slot, code);
+            core.slot.reset();
+        }
     }
     unregister_core(core);
 }
@@ -837,12 +902,25 @@ void client::abandon_attempt(client_detail::call_core& core) noexcept {
         (void)options_.shard->cancel_timer(&core);
     }
     // An abandoned attempt records no breaker outcome; just drop the permits.
-    if (core.bulkhead.has_value()) {
-        core.bulkhead->leave();
-        core.bulkhead.reset();
+    {
+        // `cancel()` can run while the admitting thread is still inside
+        // begin_attempt/issue, so both sides take `attempt_mutex` before
+        // touching the attempt's permit or bulkhead.
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        if (core.bulkhead.has_value()) {
+            core.bulkhead->leave();
+            core.bulkhead.reset();
+        }
+        core.permit = resilience::breaker_permit{};
     }
-    core.permit = resilience::breaker_permit{};
-    if (core.slot) {
+    std::shared_ptr<client_detail::connection_slot> slot;
+    {
+        // `issue()` publishes `slot` on the admitting thread; read it under the
+        // same lock and keep a local reference so the slot outlives the release.
+        std::lock_guard<std::mutex> lk(core.attempt_mutex);
+        slot = core.slot;
+    }
+    if (slot) {
         // Release the in-flight accounting but keep the connection slot alive
         // (NEW-1, cancel path). `call::cancel()` keeps the low-level call so a
         // later get()/try_get() can still observe `canceled`; that call holds a
@@ -1267,6 +1345,3 @@ std::unique_ptr<client> client::builder::build() {
 }
 
 } // namespace crpc
-
-
-

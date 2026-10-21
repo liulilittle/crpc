@@ -79,7 +79,7 @@ struct connect_options {
 新版本库读取 `struct_size`，只访问调用方保证存在的字段。
 这就是 MINOR 版本在不破坏旧调用方的前提下新增字段的方式。
 
-增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 9 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。
+增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 4 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。
 
 ## 5. 枚举值
 

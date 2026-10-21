@@ -111,7 +111,7 @@ the version must move). Treat it as MAJOR unless a size-tagged options struct
 exists (§7).
 
 Additive types do not change existing layouts. `client::resilience_statistics`
-(a standard-layout, trivially copyable value type, §9) and
+(a standard-layout, trivially copyable value type, §4) and
 `client::resilience_stats()` are MINOR additions; they add symbols only.
 `client::statistics` keeps its field order, size and meaning.
 
