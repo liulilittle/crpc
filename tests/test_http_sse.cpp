@@ -1560,26 +1560,46 @@ CRPC_TEST(longpoll_front_replay_byte_budget_restarts) {
 
 // A subscriber that re-polls after its session ended must have its TTL clock
 // refreshed, otherwise the sweep reclaims a subscription that is demonstrably
-// in use. Timeline (subscriber_ttl = 600 ms, timer period = 600 ms, fixture
-// start at t=0):
-//   ~0 ms    poll 1 -> 204; release records last_seen ~= 10
-//   ~400 ms  poll 2 -> 204 (subscription already exists); attach refreshes
-//            last_seen to ~400. Its own open-path sweep is throttled.
-//   ~610 ms  housekeeping tick: age 210 < TTL -> the entry must survive.
-//            Without the attach refresh (last_seen still ~10) age = 600 and
-//            the sweep reclaims it, so the check below fails.
-//   ~810 ms  assertion point.
+// in use.
+//
+// The timing makes the refresh observable. `subscriber_ttl` is also the timer
+// period, and every poll's open path runs `longpoll_sweep()`, which pushes the
+// throttle point one TTL forward. Timeline (fixture start at t=0, TTL 800):
+//   ~0 ms    start; the housekeeping timer is armed for ~800 ms.
+//   ~600 ms  poll 1 -> 204; release records last_seen ~= 600. Its open-path
+//            sweep moves the throttle point to ~1400, so the ~800 ms tick does
+//            nothing.
+//   ~1150 ms poll 2 -> 204 (same id: the subscription still exists). The
+//            open-path sweep is throttled (1150 < 1400), so the throttle point
+//            stays 1400; attach/pre-take refresh last_seen to ~1150.
+//   ~1600 ms the first *unthrottled* tick after the re-poll: age from 1150 is
+//            ~450 < TTL, so the entry survives. With the refresh removed the
+//            age would be ~1000 >= TTL and the sweep reclaims it.
+//   ~1900 ms assertion point (after the ~1600 ms tick, before the ~2400 ms).
+//   ~2400 ms and later: the refreshed stamp expires and the TTL reclaims it.
+//
+// Why RED5 ("delete just the subscribe/attach writes") is green: the poll path
+// writes the same `now` several times in one critical section. `:3150`
+// (pre-take) is the mandatory write for every successful poll; `:3102`
+// (attach) covers an owner inserted before an early 409/503 return; `:3177`
+// (wait arm) is a defensive copy taken immediately after `:3150`. Deleting any
+// single copy is overwritten by another, so the mutation this test pins is the
+// pair actually executed here (attach + pre-take). The opposite error also
+// matters: deleting *all* last_seen writes does not "clean earlier", it leaks,
+// because an ownerless residue then sits in neither `owners` nor `last_seen`
+// and neither sweep loop can ever see it.
 CRPC_TEST(longpoll_repoll_after_release_refreshes_ttl) {
     http::http_server_options options;
     options.idle_timeout = std::chrono::milliseconds(0);
     options.request_timeout = std::chrono::milliseconds(0);
     options.longpoll.timeout = std::chrono::milliseconds(0);
     options.longpoll.max_timeout = std::chrono::milliseconds(0);
-    options.longpoll.subscriber_ttl = std::chrono::milliseconds(600);
+    options.longpoll.subscriber_ttl = std::chrono::milliseconds(800);
     options.longpoll.slow_timeout = std::chrono::milliseconds(0);
     longpoll_fixture fx(options);
 
     const u64 subscriber = (1ull << 32) + 113;
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
     {
         capture_source capture;
         auto client = fx.connect();
@@ -1597,10 +1617,12 @@ CRPC_TEST(longpoll_repoll_after_release_refreshes_ttl) {
         [&] { return fx.server->stats().active_connections == 0; }, 5000));
     CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
 
-    // Re-poll the same id while the subscription still exists: subscribe
-    // answers `failed_precondition` (already), so this poll must reuse the id
-    // and record fresh activity for the TTL sweep.
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // Re-poll the same id after the first (throttled) tick but while the poll's
+    // own open-path sweep is still throttled: the open path must not move the
+    // effective sweep point, or the surviving entry would always be judged at
+    // age >= TTL. Subscribe answers `failed_precondition` (already), so this
+    // poll must reuse the id and record fresh activity for the TTL sweep.
+    std::this_thread::sleep_for(std::chrono::milliseconds(550));
     capture_source capture;
     auto client = fx.connect();
     client->bind_source(&capture);
@@ -1617,16 +1639,59 @@ CRPC_TEST(longpoll_repoll_after_release_refreshes_ttl) {
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return fx.server->stats().sse_hub_queued == 1; }, 2000));
 
-    // Cross the next housekeeping tick. The refreshed entry is still inside
-    // its TTL, so neither the subscription nor its queue may be reclaimed.
-    std::this_thread::sleep_for(std::chrono::milliseconds(410));
+    // Cross the first unthrottled housekeeping tick after the re-poll. The
+    // refreshed entry is still inside its TTL, so neither the subscription nor
+    // its queue may be reclaimed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(750));
     CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().longpoll_subscribers);
     CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_hub_queued);
 
-    // ...and the TTL still reclaims it once the refreshed stamp expires.
+    // ...and the TTL still reclaims it once the refreshed stamp expires (the
+    // release on close refreshes it too, so this needs the ~3200 ms tick).
     client->close();
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return fx.server->stats().sse_hub_queued == 0; }, 5000));
+    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().longpoll_subscribers);
+}
+
+// A start() that fails while validating the long-poll routes must leave the
+// effective replay bound at zero, exactly like a stopped server. The bound is
+// written only after every validation passes, so the duplicate-route failure
+// (which happens after the max_replay/max_messages equalisation) must not leak
+// a non-zero window into stats().
+CRPC_TEST(longpoll_failed_start_leaves_replay_window_zero) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+
+    inproc_backend backend;
+    mvc::router router;
+    CRPC_CHECK(router.freeze().ok());
+    http::http_server::builder builder;
+    builder.add_listener(endpoint::inproc("http-lp-failed-start"), backend);
+    builder.router(router);
+    builder.options(options);
+    http::longpoll_route first;
+    first.path = "/poll";
+    first.topic = "news";
+    builder.add_longpoll_route(std::move(first));
+    http::longpoll_route duplicate;
+    duplicate.path = "/poll";
+    duplicate.topic = "news";
+    builder.add_longpoll_route(std::move(duplicate));
+    auto server = builder.build();
+    CRPC_CHECK(server != nullptr);
+
+    const status started = server->start();
+    CRPC_CHECK_FALSE(started.ok());
+    CRPC_CHECK_EQ(static_cast<int>(rpc_code::invalid_argument),
+                  static_cast<int>(started.code()));
+    CRPC_CHECK_FALSE(server->running());
+    CRPC_CHECK_EQ(std::size_t{0},
+                  server->stats().longpoll_replay_window);
+    server->stop();
+    CRPC_CHECK_EQ(std::size_t{0},
+                  server->stats().longpoll_replay_window);
 }
 
 CRPC_TEST(longpoll_queue_bound_covers_replay_window) {

@@ -17,6 +17,36 @@
 - 选择循环用每端点位图跟踪已试候选，超过 512 个端点时自动扩容，不再静默忽略高位索引。
 - `call::cancel()` 立即中断重试等待（plain-thread 用条件变量，分片用 5 ms 分片），并与完成回调注册串行化对低层调用句柄的访问。
 
+### HTTP 长轮询
+
+- 服务器自有 housekeeping 定时器在之后没有 poll 到达时也会清理空闲订阅；由
+  `start()` 装配、`stop()` 在拆 hub 之前取消，并由回调自行重新装配。
+- `start()` 把前端重放上限收敛到队列上限（`max_replay < max_messages` 会被抬高，
+  反之被拒绝）。条数上限与每订阅字节预算相互独立；游标缺口超过任一上限时返回
+  409 Restart，而不是静默丢弃未确认数据。`http_statistics::longpoll_replay_window`
+  报告生效上限，服务器未运行（含 `start()` 失败）时为 0。
+- `stop()` 保留监听配置，之后 `start()` 可重新绑定同样的端点。保存的
+  `backend_factory` 指针是借用的：backend 必须活过整个 server 生命周期，包括每次
+  `stop()` -> `start()`（已写在 `http_server::builder::add_listener()` 与
+  `server::builder::add_listener()` 上）。同时修复 `rpc::server`：其第二次 `start()`
+  过去会返回 ok 却不绑定任何监听。
+
+### ABI breaking：`http_statistics` 布局
+
+- 相对已发布的 1.0.0（`bd006b2`），`http_statistics` 在本未发布周期新增了 19 个
+  字段：整个长轮询块（`longpoll_waiters`、`longpoll_subscribers`、
+  `longpoll_replay_window`、`longpoll_events`、`longpoll_timeouts`、
+  `longpoll_ack_clamped`、`longpoll_conflicts`、`longpoll_restarts`、
+  `longpoll_overloaded`）以及 10 个 SSE/压缩/下载计数器。`sizeof` 从 72（9 字段）
+  增长到 224（28 字段）；1.0.0 发布的 9 个字段偏移保持不变（0 … 64）。公开
+  结构体新增字段属于 MAJOR 变更（[abi.zh-CN.md](abi.zh-CN.md) 第 1/4 节）。
+- 在该周期内部，`longpoll_replay_window` 最初放在 offset 168，后来被移到末尾
+  （offset 216）；原先排在它后面的 6 个计数器各前移 8 字节
+  （`longpoll_events` 176→168 … `longpoll_overloaded` 216→208）。移动前后
+  `sizeof` 都是 224，因为移动前结构体尾部同样没有填充。没有任何已发布头文件
+  使用过 offset 168 的布局（无 tag、无 1.0.1），因此该内部移动不构成对已发布
+  消费者的破坏；真正破坏兼容的是 72 → 224 的增长。
+
 ### 行为变更：COMPRESSED 帧不再被当作明文交付
 
 帧级压缩现已实现 LZ4 block 编解码（`ALGO = 1`），其余情况一律 fail-closed。此前行为不安全：

@@ -34,6 +34,42 @@
   plain threads, 5 ms slices on a shard) and serializes access to the low-level
   call handle with the completion registration.
 
+### HTTP long polling
+
+- A server-owned housekeeping timer reclaims idle subscribers even when no later
+  poll arrives. It is armed by `start()`, cancelled by `stop()` before the hub is
+  torn down, and re-armed by its own callback.
+- The front replay bound is clamped to the queue bound at `start()`
+  (`max_replay < max_messages` is raised, the reverse is rejected). The count
+  bound and the per-subscription byte budget are independent; a cursor gap that
+  exceeds either answers 409 Restart instead of silently dropping unacknowledged
+  data. `http_statistics::longpoll_replay_window` reports the effective bound and
+  is zero while the server is not running (including a failed `start()`).
+- `stop()` keeps the listener configuration so a later `start()` rebinds the same
+  endpoints. The stored `backend_factory` pointers are borrowed: a backend must
+  outlive the server, including every `stop()` -> `start()` cycle (documented on
+  `http_server::builder::add_listener()` and `server::builder::add_listener()`).
+  This also fixes `rpc::server`, whose second `start()` used to return ok while
+  binding nothing.
+
+### ABI breaking: `http_statistics` layout
+
+- Relative to the released 1.0.0 (`bd006b2`), `http_statistics` gained 19
+  fields in this unreleased cycle: the whole long-poll block
+  (`longpoll_waiters`, `longpoll_subscribers`, `longpoll_replay_window`,
+  `longpoll_events`, `longpoll_timeouts`, `longpoll_ack_clamped`,
+  `longpoll_conflicts`, `longpoll_restarts`, `longpoll_overloaded`) plus ten
+  SSE/compression/download counters. `sizeof` grew from 72 (9 fields) to 224
+  (28 fields); the nine fields 1.0.0 shipped keep their offsets (0 … 64).
+  Adding fields to a public struct is a MAJOR change ([abi.md](abi.md) §1/§4).
+- Inside that cycle `longpoll_replay_window` was first placed at offset 168 and
+  later moved to the end (offset 216); the six counters that followed it each
+  moved 8 bytes earlier (`longpoll_events` 176→168 … `longpoll_overloaded`
+  216→208). `sizeof` was already 224 before and after that move because the
+  struct had no trailing padding then either. No released header ever carried
+  the offset-168 layout (no tag, no 1.0.1), so the internal move is not itself a
+  break for published consumers; the 72 → 224 growth is.
+
 ### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
 
 Frame-level compression is now implemented for the LZ4 block codec (`ALGO = 1`) and the frame layer

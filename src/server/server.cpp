@@ -1669,7 +1669,12 @@ void server::stop() noexcept {
         impl_->shards[i]->join();
     }
     impl_->shards.clear();
-    impl_->pending_listeners.clear();
+    // `pending_listeners` is builder configuration, not live state: keep it so
+    // a later start() can bind the same listeners again. Clearing it made
+    // start() return ok() after stop() while binding nothing. The stored
+    // backend pointers are borrowed: the caller must keep every backend alive
+    // for the whole server lifetime, including any stop()/start() cycle (see
+    // server::builder::add_listener()).
     {
         std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
         impl_->push_hub.reset();

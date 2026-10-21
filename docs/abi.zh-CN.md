@@ -79,6 +79,38 @@ struct connect_options {
 新版本库读取 `struct_size`，只访问调用方保证存在的字段。
 这就是 MINOR 版本在不破坏旧调用方的前提下新增字段的方式。
 
+
+最后一个已发布布局是 1.0.0（`bd006b2`）：`http_statistics` 只有 9 个字段，
+`sizeof` 为 72 字节，完全没有任何长轮询计数器。本未发布周期新增了 19 个字段：
+整个长轮询块（`longpoll_waiters`、`longpoll_subscribers`、
+`longpoll_replay_window`、`longpoll_events`、`longpoll_timeouts`、
+`longpoll_ack_clamped`、`longpoll_conflicts`、`longpoll_restarts`、
+`longpoll_overloaded`）以及 10 个 SSE/压缩/下载计数器。`sizeof` 从 72（9 字段）
+增长到 224（28 字段）。1.0.0 发布的 9 个字段偏移全部不变
+（`active_connections` 0 … `timed_out_connections` 64）。公开结构体新增字段属于
+MAJOR 变更（第 1 节），因此本周期属 ABI breaking。
+
+`longpoll_replay_window` 的移动只发生在这个未发布周期内部：它最初放在 offset 168
+（在 6 个计数器之前），后来被移到末尾（offset 216）。原先排在它后面的 6 个计数器
+各前移一个 `std::size_t`（审计所用 64 位构建上为 8 字节）：
+
+| 成员 | 移动前（`4adf359`） | 新偏移 |
+|---|---|---|
+| `longpoll_events` | 176 | 168 |
+| `longpoll_timeouts` | 184 | 176 |
+| `longpoll_ack_clamped` | 192 | 184 |
+| `longpoll_conflicts` | 200 | 192 |
+| `longpoll_restarts` | 208 | 200 |
+| `longpoll_overloaded` | 216 | 208 |
+
+该移动前后 `sizeof` 都是 224，原因是本次没有增删字段：`4adf359` 中 6 个计数器
+紧跟 `longpoll_replay_window`（结束于 offset 176），正好填满 224 字节，移动前的
+尾部填充为 0，移动后仍为 0。没有任何已发布头文件使用过 offset 168 的布局
+（无 tag、无 1.0.1），所以该内部移动不构成对已发布消费者的破坏；真正破坏兼容的是
+72 → 224 的增长。在尺寸标记选项结构体可用之前，任何公开结构体布局变更都按
+MAJOR 处理（见第 8 节）。
+
+
 增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 4 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。
 
 ## 5. 枚举值

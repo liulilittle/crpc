@@ -287,8 +287,11 @@ struct http_statistics {
     std::size_t longpoll_restarts = 0;
     std::size_t longpoll_overloaded = 0;
     // Effective replay bound after start() clamps it to `max_messages`; zero
-    // when the server is not running. Appended at the end so the field order
-    // of every pre-existing member is unchanged (docs/abi.md §4).
+    // when the server is not running, the start attempt failed, or the server
+    // has no long-poll routes. This whole long-poll block is new since 1.0.0
+    // (1.0.0 had 9 fields / sizeof 72); within the unreleased cycle the field
+    // was moved to the end after `longpoll_overloaded`, so the six counters
+    // above each moved one `std::size_t` earlier (docs/abi.md §4).
     std::size_t longpoll_replay_window = 0;
 };
 
@@ -309,6 +312,9 @@ public:
         builder& operator=(const builder&) = delete;
 
         // Binds a cleartext listener (HTTP/1.1 or h2c by preface sniffing).
+        // The backend must outlive the server, including every stop() ->
+        // start() cycle: the configuration is retained so a later start() can
+        // rebind it, and it holds a borrowed pointer.
         builder& add_listener(endpoint ep, backend_factory& backend);
         // Selects the MVC router. Must outlive the server. When unset the
         // process-wide `mvc::default_router()` is used.
@@ -349,6 +355,7 @@ public:
     // built without `CRPC_HAVE_OPENSSL` this returns a clear
     // `failed_precondition` error and nothing is registered. A TLS listener
     // requires ALPN: the negotiated "h2" or "http/1.1" selects the engine.
+    // The backend must outlive the server (same contract as add_listener()).
     [[nodiscard]] status listen_tls(const endpoint& ep, backend_factory& backend,
                                     io::tls_config config);
 
