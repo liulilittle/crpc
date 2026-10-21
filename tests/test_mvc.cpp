@@ -261,9 +261,21 @@ CRPC_TEST(mvc_route_metadata) {
     const auto matched = routes.match(method::get, "/users/5", nullptr);
     CRPC_CHECK(matched.kind == match_kind::matched);
     if (matched.kind == match_kind::matched) {
+#if CRPC_CAN_USE_TYPEID
         CRPC_CHECK(matched.match.route->controller_type != nullptr);
         CRPC_CHECK(matched.match.route->request_type != nullptr);
         CRPC_CHECK(matched.match.route->response_type != nullptr);
+#else
+        // Defensive only: this suite cannot run under -fno-rtti today -- with
+        // CRPC_HAVE_RTTI=1 the reflection dependency fails to compile, and with
+        // CRPC_HAVE_RTTI=0 the RTTI_DEFINE_* macros above are unavailable. The
+        // branch is kept so a future configuration that does compile here
+        // asserts the real contract instead of failing on the non-null checks.
+        CRPC_CHECK(matched.match.route->controller_type == nullptr);
+        CRPC_CHECK(matched.match.route->request_type == nullptr);
+        CRPC_CHECK(matched.match.route->response_type == nullptr);
+        CRPC_CHECK(matched.match.route->invoke != nullptr);
+#endif
         CRPC_CHECK_EQ(std::string("get_user"), matched.match.route->name);
     }
 }

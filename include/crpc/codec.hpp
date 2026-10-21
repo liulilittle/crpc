@@ -1,4 +1,4 @@
-﻿// CRPC -- codec registry and typed serialization interface.
+// CRPC -- codec registry and typed serialization interface.
 //
 // This header defines the type-erased `codec` boundary used by the RPC and HTTP
 // layers plus the typed helpers (`encode_into<T>` / `decode_from<T>`) that the
@@ -109,39 +109,59 @@
 #endif
 #endif
 
-// --- Compiler RTTI ------------------------------------------------------------
+// --- typeid availability ------------------------------------------------------
 //
 // `CRPC_HAVE_RTTI` above means "the rtti reflection headers are available". It
-// is orthogonal to the *compiler's* RTTI support, which `-fno-rtti` (GCC/Clang)
-// and `/GR-` (MSVC) remove. `typeid` is part of that compiler feature, so the
-// two switches must be tested separately: a build may have the reflection
-// headers on the include path while the compiler still rejects `typeid`.
+// is orthogonal to whether this translation unit can write `typeid`, which
+// `-fno-rtti` (GCC/Clang) and `/GR-` (MSVC) affect. A build can have the
+// reflection headers on the include path and still reject `typeid`, so the two
+// questions are tested separately.
 //
-// The type-erased `codec::encode`/`decode` boundary is keyed by
-// `std::type_info`, so it only exists when the compiler provides RTTI. Callers
-// may override the detection by defining CRPC_HAVE_COMPILER_RTTI themselves.
+// The macro below is derived from the compiler and must not be defined by the
+// caller: it selects which branch of inline function templates is compiled, so
+// two translation units that disagree would define the same specialization
+// twice -- an ODR violation the linker resolves silently, keeping one branch
+// and discarding the other's calls. Defining it is therefore a hard error.
 //
-// The test is per compiler, because "RTTI enabled" is not the same question
-// everywhere:
+// That #error only closes the -D route. Mixing RTTI flags across the translation
+// units of one binary (some built with -fno-rtti, some without) still diverges
+// the same way, and no header can detect it: the flag must be uniform for the
+// whole binary. Measured with two TUs sharing one inline instantiation, the
+// winner depended on link order (Clang: reversed order reported the other
+// branch's result).
 //
-//   * GCC/Clang `-fno-rtti` removes `typeid` entirely; `__cpp_rtti` is the
-//     documented feature-test macro and is absent there.
+// Per compiler:
+//
+//   * GCC/Clang `-fno-rtti` removes `typeid`; `__cpp_rtti` is the documented
+//     feature-test macro and is absent there.
 //   * clang-cl defines `__cpp_rtti` even under `/GR-` and still accepts the
 //     static form `typeid(T)`, which is the only form this library uses.
-//   * MSVC (cl) accepts the static form `typeid(T)` even under `/GR-` --
-//     `/GR-` only disables the *dynamic* forms (`typeid(expr)` on a polymorphic
-//     glvalue, `dynamic_cast`). Verified: a `/GR-` build registers and runs the
-//     type-erased encode/decode path, producing the same bytes as `/GR`. So cl
-//     always has what this header needs, and treating `/GR-` as "no RTTI" here
-//     would break a working configuration.
-#if !defined(CRPC_HAVE_COMPILER_RTTI)
-#if defined(_MSC_VER) && !defined(__clang__)
-#define CRPC_HAVE_COMPILER_RTTI 1
-#elif defined(__cpp_rtti)
-#define CRPC_HAVE_COMPILER_RTTI 1
-#else
-#define CRPC_HAVE_COMPILER_RTTI 0
+//   * MSVC (cl) also accepts the static form `typeid(T)` under `/GR-`. `/GR-`
+//     removes the RTTI *data* that the dynamic forms need; the static form is
+//     accepted (MSVC shows exactly that shape in its C4541 example) and a
+//     `/GR-` build registers and runs the type-erased path with bytes identical
+//     to `/GR`. This is verified by probe, not a formal guarantee, so re-run it
+//     when the toolchain changes:
+//
+//         cl /nologo /std:c++17 /GR- /EHsc /c probe.cpp  # probe: &typeid(T)
+//
+//     Treating `/GR-` as "no typeid" would turn that working configuration into
+//     an error, so cl always reports 1.
+//
+// `/GR-` is only usable when the reflection dependency is absent or warnings
+// are not errors: rtti/proto.hpp uses `dynamic_cast`, which `/GR-` turns into
+// C4541, and a `/WX` build then fails in that third-party header (C2220). The
+// capability this macro reports is the ability to write `typeid`, not a promise
+// that every dependency compiles under `/GR-`.
+#if defined(CRPC_CAN_USE_TYPEID)
+#error "CRPC_CAN_USE_TYPEID is derived from the compiler; do not define it"
 #endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#define CRPC_CAN_USE_TYPEID 1
+#elif defined(__cpp_rtti)
+#define CRPC_CAN_USE_TYPEID 1
+#else
+#define CRPC_CAN_USE_TYPEID 0
 #endif
 
 #if CRPC_HAVE_RTTI
@@ -940,8 +960,17 @@ status decode_erased(span<const std::byte> in, void* value,
 
 template <typename T>
 const type_ops* ops_for() noexcept {
+#if CRPC_CAN_USE_TYPEID
     static const type_ops ops{&typeid(T), &encode_erased<T>, &decode_erased<T>};
     return &ops;
+#else
+    // The static_assert always fires, so the return is unreachable; it exists
+    // only to keep the signature valid and the diagnostic actionable (a direct
+    // caller sees this message instead of "no member named ops_for").
+    static_assert(dependent_false<T>::value,
+                  "crpc-binary: the erased type table requires compiler RTTI");
+    return nullptr;
+#endif
 }
 #endif // CRPC_HAVE_RTTI
 
@@ -1012,13 +1041,18 @@ public:
     // require this. Registration is idempotent and thread-safe.
     template <typename T>
     void register_type() const {
-#if CRPC_HAVE_RTTI
+#if CRPC_HAVE_RTTI && CRPC_CAN_USE_TYPEID
         const detail::type_ops* ops = detail::ops_for<T>();
         std::unique_lock<std::shared_mutex> lock(types_mutex_);
         types_.emplace(std::type_index(typeid(T)), ops);
+#elif !CRPC_HAVE_RTTI
+        static_assert(detail::dependent_false<T>::value,
+                      "crpc-binary: register_type<T>() requires the RTTI "
+                      "reflection dependency (CRPC_HAVE_RTTI)");
 #else
         static_assert(detail::dependent_false<T>::value,
-                      "crpc-binary requires the RTTI dependency");
+                      "crpc-binary: register_type<T>() requires compiler RTTI "
+                      "(-fno-rtti)");
 #endif
     }
 
@@ -1268,9 +1302,17 @@ status decode_text_erased(span<const std::byte> in, void* value, std::size_t,
 
 template <typename Format, typename T>
 const type_ops* text_ops_for() noexcept {
+#if CRPC_CAN_USE_TYPEID
     static const type_ops ops{&typeid(T), &encode_text_erased<Format, T>,
                               &decode_text_erased<Format, T>};
     return &ops;
+#else
+    // Unreachable: the static_assert always fires. The return keeps the
+    // signature valid and the diagnostic actionable.
+    static_assert(dependent_false<T>::value,
+                  "text codec: the erased type table requires compiler RTTI");
+    return nullptr;
+#endif
 }
 
 } // namespace detail
@@ -1311,9 +1353,15 @@ public:
 
     template <typename T>
     void register_type() const {
+#if CRPC_CAN_USE_TYPEID
         const detail::type_ops* ops = detail::text_ops_for<Format, T>();
         std::unique_lock<std::shared_mutex> lock(types_mutex_);
         types_.emplace(std::type_index(typeid(T)), ops);
+#else
+        static_assert(detail::dependent_false<T>::value,
+                      "text codec: register_type<T>() requires compiler RTTI "
+                      "(-fno-rtti)");
+#endif
     }
 
     template <typename T>
@@ -1491,20 +1539,21 @@ template <typename T>
     default:
         break;
     }
-#if CRPC_HAVE_COMPILER_RTTI
+#if CRPC_CAN_USE_TYPEID
     // A custom codec registered under a non-built-in id: fall back to the
     // type-erased boundary, which is keyed by std::type_info.
     return target.encode(&value, typeid(T), out);
 #else
-    // Built without compiler RTTI: `std::type_info` cannot be formed, so the
-    // type-erased dispatch does not exist. Report the failure instead of
-    // silently succeeding.
-    const rpc_error failure(
-        rpc_code::encode_error,
-        "crpc: type-erased codec dispatch requires compiler RTTI; built with "
-        "-fno-rtti / /GR-");
+    // This translation unit cannot form std::type_info, so the type-erased
+    // dispatch does not exist. Report a precondition failure -- the build is
+    // missing a capability, the payload is not at fault -- instead of silently
+    // succeeding.
     (void)value;
     (void)out;
+    const rpc_error failure(
+        rpc_code::failed_precondition,
+        "crpc: type-erased codec dispatch requires compiler RTTI; this build "
+        "has none (-fno-rtti)");
     return status{failure};
 #endif
 }
@@ -1560,16 +1609,16 @@ template <typename T>
     default:
         break;
     }
-#if CRPC_HAVE_COMPILER_RTTI
+#if CRPC_CAN_USE_TYPEID
     // See encode_into above: the erased boundary needs std::type_info.
     return source.decode(in, &value, typeid(T));
 #else
-    const rpc_error failure(
-        rpc_code::decode_error,
-        "crpc: type-erased codec dispatch requires compiler RTTI; built with "
-        "-fno-rtti / /GR-");
     (void)in;
     (void)value;
+    const rpc_error failure(
+        rpc_code::failed_precondition,
+        "crpc: type-erased codec dispatch requires compiler RTTI; this build "
+        "has none (-fno-rtti)");
     return status{failure};
 #endif
 }
