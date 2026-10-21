@@ -112,14 +112,20 @@ The guards are not uniform across change kinds or across architectures, and the
 difference matters when judging whether a given change is caught:
 
 - A reorder, an insertion between two existing members, or a removal is caught
-  by the relative chains on the counter records, and by the member count on
-  every architecture. Neither guard depends on absolute numbers.
+  by the relative chains, on every architecture, but only on records that have
+  a chain. The member count does **not** help here: a reorder leaves the count
+  unchanged, so it provides no coverage for a reorder at all. `rpc_error` has no
+  relative chain, so a reorder inside `rpc_error` is not caught.
 - A rename is caught by the relative chains where a chain exists. The
   member-count guard does **not** validate names: a structured binding only
-  binds one local name per member in declaration order, so a rename in a record
-  with no relative chain (`rpc_error`, `status`, `http2::*`) is not caught here.
-  A rename in `rpc_error` is nevertheless a compile error in the header itself,
-  because its constructors initialize the renamed member.
+  binds one local name per member in declaration order. The only cross-ABI
+  record with no relative chain is `rpc_error`, so a rename there is not caught
+  by this unit (`status` has no public data member, so a rename cannot occur).
+  The four HTTP/2 value types `http2::h2_error`, `http2::connection_options`,
+  `http2::stream_snapshot` and `http2::window_credit` **do** have `CRPC_AFTER`
+  chains, so their renames are caught. A rename in `rpc_error` is nevertheless
+  a compile error in the header itself, because its constructors initialize the
+  renamed member.
 - A field appended at the end is caught by the member count on every
   architecture, and additionally by the absolute `sizeof` anchor on x86 and x64.
   The member count is what makes the x86 case work: on x86

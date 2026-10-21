@@ -224,6 +224,26 @@ CRPC_TEST(abi_docs_english_describes_the_member_count_guard) {
     CRPC_CHECK(has_phrase(text, "does **not** validate names"));
     CRPC_CHECK(has_phrase(text, "no relative chain"));
 
+    // The only record with no relative chain is `rpc_error`. The four HTTP/2
+    // value types do have CRPC_AFTER chains, so they must not be lumped in with
+    // `rpc_error` as "no chain"; that would understate the coverage and a
+    // reader would not know their renames are caught.
+    CRPC_CHECK_FALSE(has_phrase(
+        text, "no relative chain (`rpc_error`, `status`, `http2"));
+    CRPC_CHECK_FALSE(has_phrase(text, "(`rpc_error`, `status`, `http2::*`)"));
+    CRPC_CHECK(has_phrase(
+        text, "The only cross-ABI record with no relative chain is `rpc_error`"));
+    CRPC_CHECK(has_phrase(text, "**do** have `CRPC_AFTER` chains"));
+
+    // A reorder does not change the member count, so the count cannot catch
+    // one. The document must not claim it does, and must say that a reorder in
+    // `rpc_error` is not caught.
+    CRPC_CHECK_FALSE(has_phrase(
+        text, "and by the member count on every architecture"));
+    CRPC_CHECK(has_phrase(text, "provides no coverage for a reorder at all"));
+    CRPC_CHECK(has_phrase(
+        text, "a reorder inside `rpc_error` is not caught"));
+
     // The remaining blind spot (member type changes in rpc_error/status) must
     // stay stated rather than silently dropped.
     CRPC_CHECK(has_phrase(text, "Member **type** changes"));
@@ -244,6 +264,19 @@ CRPC_TEST(abi_docs_chinese_matches_the_english_guard_boundaries) {
     CRPC_CHECK(has_phrase(text, "尾部"));
     CRPC_CHECK(has_phrase(text, "不校验名字"));
     CRPC_CHECK_FALSE(has_phrase(text, "重命名成员：由相对成员链与成员数量"));
+
+    // The only record with no relative chain is `rpc_error`; the HTTP/2 value
+    // types are chained, so the Chinese text must not lump them together.
+    CRPC_CHECK_FALSE(has_phrase(text, "（`rpc_error`、`status`、`http2::*`）"));
+    CRPC_CHECK(has_phrase(text, "唯一没有相对链的跨 ABI 记录是"));
+    CRPC_CHECK(has_phrase(text, "**都有** `CRPC_AFTER` 链"));
+
+    // A reorder does not change the member count; the text must say the count
+    // gives no coverage for it and that `rpc_error` reorders are not caught.
+    CRPC_CHECK_FALSE(has_phrase(text, "以及所有架构上的成员数量捕获"));
+    CRPC_CHECK(has_phrase(text, "对重排恒为盲"));
+    CRPC_CHECK(has_phrase(text, "`rpc_error` 内部的重排不会被捕获"));
+
     // The rpc_error member-type limitation must be stated in both languages.
     CRPC_CHECK(has_phrase(text, "成员**类型**变更"));
 }

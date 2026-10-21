@@ -103,11 +103,15 @@ namespace {
 //
 //   * the binding names are new local names, not references to the member
 //     names, so a rename alone is NOT detected here. A rename is caught by the
-//     relative chains on records that have one; a rename in a record with no
-//     relative chain (`rpc_error`, `status`, `http2::*`) is not caught by this
-//     unit at all;
+//     relative chains on records that have one; the only record with no
+//     relative chain is `rpc_error`, so a rename there is not caught by this
+//     unit at all. (`status` has no public data member, so a rename cannot
+//     occur. `http2::h2_error`, `http2::connection_options`,
+//     `http2::stream_snapshot` and `http2::window_credit` DO have chains, so
+//     their renames are caught.)
 //   * a reorder that keeps the count is not detected here either; the relative
-//     chains cover it where they exist;
+//     chains cover it where they exist. `rpc_error` has no relative chain, so a
+//     reorder in `rpc_error` is not detected by this unit;
 //   * a member *type* change that keeps the count is not detected here. For
 //     `rpc_error` the explicit member-type assertions below cover it; for the
 //     counter records the absolute `sizeof`/`offsetof` anchors cover the
@@ -405,11 +409,12 @@ CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 // those targets.
 //
 // The member counts still catch an appended or removed field, and the relative
-// chains still catch a reorder or a mid-record insertion, so the layout of
-// every record below is guarded on every target. What is *not* guarded outside
-// x86/x64 is a change that preserves the member count and the relative order
-// but alters the absolute width, which in practice means a change to the
-// standard library's own types.
+// chains still catch a reorder or a mid-record insertion on every record that
+// has one. The only cross-ABI record without a relative chain is `rpc_error`, so
+// a reorder or a rename inside `rpc_error` is not caught on any target, this
+// branch included. What is *not* guarded outside x86/x64 is a change that
+// preserves the member count and the relative order but alters the absolute
+// width, which in practice means a change to the standard library's own types.
 
 #endif
 
