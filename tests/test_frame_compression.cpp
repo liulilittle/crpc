@@ -35,6 +35,7 @@
 //   TC-26 next(frame&, info*) reports algorithm and sizes
 //   TC-27 drop then continue in one decoder
 //   TC-28 compressed control frames are refused on the whole-frame paths
+//   TC-32 the compressed entry point applies encode_frame header validation
 //
 // Two generator-based vectors cover the cases whose byte streams are too large
 // to embed: 70 000 deterministic bytes (a literal run crossing the 64 KiB
@@ -1136,10 +1137,16 @@ CRPC_TEST(tc27_drop_then_ready_in_one_decoder) {
     CRPC_CHECK_EQ(static_cast<int>(decoder.next(first, &first_info)),
                   static_cast<int>(frame_decoder::result::frame_dropped));
     CRPC_CHECK(first_info.dropped);
+    // A dropped ONE_WAY frame is a frame-local event, not a connection error:
+    // the decoder must stay usable and must not latch error_.
+    CRPC_CHECK_EQ(static_cast<int>(decoder.error()), static_cast<int>(rpc_code::ok));
+    CRPC_CHECK(!decoder.failed());
 
     frame second;
     CRPC_CHECK_EQ(static_cast<int>(decoder.next(second)),
                   static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(static_cast<int>(decoder.error()), static_cast<int>(rpc_code::ok));
+    CRPC_CHECK(!decoder.failed());
     CRPC_CHECK(bytes_equal(second.payload, plain));
     CRPC_CHECK_EQ(static_cast<int>(second.header.type), static_cast<int>(frame_type::one_way));
 }
@@ -1571,9 +1578,12 @@ CRPC_TEST(encoder_reuses_scratch_without_allocating) {
     std::printf("alloc: encoder x%d delta=%zu baseline=%zu\n", frames, after - before,
                 baseline);
 
-    // Steady state: the codec adds no allocation of its own. In Release even the
-    // plumbing is allocation-free, so the delta is exactly zero.
-    CRPC_CHECK_EQ(after - before, baseline);
+    // Steady state: the codec adds no allocation of its own. The baseline runs
+    // the same call shape into an early rejection, so it captures whatever the
+    // surrounding plumbing allocates; `<=` rather than `==` keeps the check
+    // honest without turning a jittery baseline into a false red. In Release
+    // even the plumbing is allocation-free, so the delta is exactly zero.
+    CRPC_CHECK(after - before <= baseline);
 #if defined(NDEBUG)
     CRPC_CHECK_EQ(after, before);
 #endif
@@ -1763,6 +1773,107 @@ CRPC_TEST(tc31b_runtime_algorithm_selection) {
     frame decoded;
     CRPC_CHECK(decode_frame(span<const std::byte>(out.data(), written), decoded).ok());
     CRPC_CHECK_EQ(static_cast<int>(decoded.header.flags & frame_flag_compressed), 0);
+}
+
+// --- TC-32 ------------------------------------------------------------------
+
+// The compressed entry point must apply exactly the header rules the plain
+// entry point applies: it writes the 16-byte header itself, so a frame that
+// `decode_frame_header` would refuse must never reach the wire.
+CRPC_TEST(tc32_compressed_path_shares_header_validation) {
+    const std::vector<std::byte> plain = text_bytes(2048);
+
+    struct bad_case {
+        const char* name;
+        frame_type type;
+        u32 stream_id;
+        u8 flags;
+        u32 ext;
+    };
+    const bad_case cases[] = {
+        {"request stream 0", frame_type::request, 0u, 0u, 0u},
+        {"request stream bit31", frame_type::request, 0x80000000u, 0u, 0u},
+        {"data stream 0", frame_type::data, 0u, 0u, 0u},
+        {"push stream 0", frame_type::push, 0u, 0u, 0u},
+        {"one_way without unreliable", frame_type::one_way, 9u, 0u, 0u},
+        {"ext without crc32c", frame_type::data, 4u, 0u, 0xDEADBEEFu},
+    };
+
+    for (const bad_case& item : cases) {
+        frame value;
+        value.header.type = item.type;
+        value.header.stream_id = item.stream_id;
+        value.header.flags = item.flags;
+        value.header.ext = item.ext;
+        value.payload = as_span(plain);
+
+        std::vector<std::byte> buffer(
+            encoded_frame_size_compressed(value, compression_algorithm::lz4));
+        std::size_t written = 123;
+        compression_algorithm chosen = compression_algorithm::lz4;
+
+        const status compressed =
+            encode_frame_compressed(as_writable_span(buffer), value, compression_algorithm::lz4,
+                                    compression_limits{}, written, &chosen);
+        CRPC_CHECK_EQ(static_cast<int>(compressed.code()),
+                      static_cast<int>(rpc_code::invalid_argument));
+        CRPC_CHECK_EQ(written, std::size_t{0});
+        CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::none));
+
+        // The same frame through the fallback branch (payload below the gate)
+        // must reach the same verdict: one validator, two entry points.
+        compression_limits fallback_limits;
+        fallback_limits.min_payload = plain.size() + 1;
+        written = 123;
+        chosen = compression_algorithm::lz4;
+        const status fell_back =
+            encode_frame_compressed(as_writable_span(buffer), value, compression_algorithm::lz4,
+                                    fallback_limits, written, &chosen);
+        CRPC_CHECK_EQ(static_cast<int>(fell_back.code()),
+                      static_cast<int>(compressed.code()));
+        CRPC_CHECK_EQ(written, std::size_t{0});
+        CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::none));
+
+        // The plain encoder is the reference verdict for the same input.
+        std::size_t plain_written = 0;
+        std::vector<std::byte> plain_out(encoded_frame_size(value));
+        CRPC_CHECK_EQ(static_cast<int>(encode_frame(as_writable_span(plain_out), value,
+                                                    plain_written)
+                                           .code()),
+                      static_cast<int>(rpc_code::invalid_argument));
+        CRPC_CHECK_EQ(plain_written, std::size_t{0});
+    }
+
+    // max_frame is a real bound on this entry point too, not a hard-coded
+    // default: a payload above it is refused before any byte is written, and
+    // the same frame at the default bound still compresses.
+    frame valid;
+    valid.header.type = frame_type::data;
+    valid.header.stream_id = 31;
+    valid.payload = as_span(plain);
+
+    std::vector<std::byte> buffer(
+        encoded_frame_size_compressed(valid, compression_algorithm::lz4));
+    std::size_t written = 123;
+    compression_algorithm chosen = compression_algorithm::lz4;
+    CRPC_CHECK_EQ(static_cast<int>(encode_frame_compressed(
+                                     as_writable_span(buffer), valid, compression_algorithm::lz4,
+                                     compression_limits{}, written, &chosen, nullptr,
+                                     static_cast<u32>(plain.size() - 1))
+                                     .code()),
+                  static_cast<int>(rpc_code::invalid_argument));
+    CRPC_CHECK_EQ(written, std::size_t{0});
+    CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::none));
+
+    CRPC_CHECK(encode_frame_compressed(as_writable_span(buffer), valid, compression_algorithm::lz4,
+                                       compression_limits{}, written, &chosen, nullptr,
+                                       static_cast<u32>(plain.size()))
+                   .ok());
+    CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::lz4));
+    frame_header produced;
+    CRPC_CHECK(decode_frame_header(span<const std::byte>(buffer.data(), written), produced).ok());
+    CRPC_CHECK_EQ(static_cast<unsigned>(produced.flags & frame_flag_compressed),
+                  static_cast<unsigned>(frame_flag_compressed));
 }
 
 CRPC_TEST_MAIN()

@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) | **简体中文**
 
-## 1.0.0 - 2026-10-19
+## Unreleased
 
 ### 行为变更：COMPRESSED 帧不再被当作明文交付
 
@@ -15,6 +15,10 @@
 
 - `encode_frame` 对 `COMPRESSED` 标志或非零 `ALGO` 返回 `invalid_argument`；压缩帧只能由
   `encode_frame_compressed` 产生。
+- `encode_frame_compressed` 在写出任何字节之前执行与 `encode_frame` 相同的帧头校验
+  （已知类型、stream 作用域、`stream_id` bit 31、`ONE_WAY`/`UNRELIABLE`、`ext`/`CRC32C`、
+  `payload_len <= max_frame`），并新增 `max_frame` 形参；违规时在压缩分支与 identity 分支
+  都返回 `invalid_argument` 且不写入任何字节。调用方提供的 `ext` 不再被静默归一。
 - `decode_frame` 对 `COMPRESSED` 帧返回 `protocol_error`（它没有输出缓冲）；`frame_decoder`
   在拷贝模式下解压、借用模式下拒绝。解码后的帧头被规范化：清 `COMPRESSED`/`ALGO`，
   `payload_len` 与 `CRC32C` 改写为逻辑 payload 的对应值。
@@ -31,6 +35,7 @@
 手工构造压缩帧的对端现在会得到协议错误，而不是被静默误交付——这正是有意的收紧。详见
 `docs/protocol.md` 第 24 节。
 
+## 1.0.0 - 2026-10-19
 
 CRPC 首个正式版本。本版本覆盖核心原语、CRPC 调用/服务器门面，以及
 HTTP/1.1、HTTP/2 与 HTTPS 前门。这不表示所有设计目标均已达成；实测差距见“已知限制”。

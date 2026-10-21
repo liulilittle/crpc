@@ -99,7 +99,7 @@ The frame codec validates the header and the scope of every type. It does not pa
 | 4 | `0x10` | `UNRELIABLE` | best-effort delivery; no retransmission |
 | 5–7 | `0xE0` | `ALGO` | 0 none, 1 lz4, 2 zstd, 3 gzip, 4–7 reserved |
 
-`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a supported non-zero `ALGO` (`1` lz4, `3` gzip; `2` zstd and `4`-`7` are reserved and rejected); `ONE_WAY` requires `UNRELIABLE`. Frame-level compression is normative in section 24. A decoder that cannot decompress the advertised algorithm fails closed with `protocol_error`; it never delivers the compressed bytes as a payload. Compression is defined only for `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`; a `COMPRESSED` control frame is `protocol_error`. The header validator still accepts such a header (it checks flag consistency only) so the whole-frame paths can reject it with the payload in hand.
+`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a non-zero `ALGO` (`1` lz4 is implemented; `2` zstd and `3` gzip are reserved and fail closed with `protocol_error` in this build; `4`-`7` are reserved); `ONE_WAY` requires `UNRELIABLE`. Frame-level compression is normative in section 24. A decoder that cannot decompress the advertised algorithm fails closed with `protocol_error`; it never delivers the compressed bytes as a payload. Compression is defined only for `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`; a `COMPRESSED` control frame is `protocol_error`. The header validator still accepts such a header (it checks flag consistency only) so the whole-frame paths can reject it with the payload in hand.
 
 ## 6. Ordered extension <a id="s6"></a>
 
@@ -235,7 +235,7 @@ The decoders return `rpc_code::protocol_error` for every condition below. `rpc::
 | extension fields without `has_extensions` | `protocol_error` |
 | response status other than 0/1 | `protocol_error` |
 | `ONE_WAY` without `UNRELIABLE` | `protocol_error` |
-| unsupported `ALGO` (zstd, reserved) | `protocol_error` |
+| unsupported `ALGO` (zstd, gzip in this build, reserved) | `protocol_error` |
 | compressed payload shorter than 5 bytes | `protocol_error` |
 | `uncompressed_len` zero or above `max_frame` | `protocol_error` |
 | malformed codec stream or decoded length mismatch | `protocol_error` |
@@ -799,6 +799,14 @@ The algorithm is a runtime choice passed to `encode_frame_compressed` (`none` re
 An unsupported choice (zstd, gzip in this build, reserved ids) is `invalid_argument`, never a
 silent fallback to a different codec: "configured gzip, sent lz4" would be the same
 flag-versus-payload mismatch this section removes.
+
+`encode_frame_compressed` validates the header with exactly the same rules as `encode_frame`
+(known type, stream scope, `stream_id` bit 31 clear, `ONE_WAY` requires `UNRELIABLE`, non-zero
+`ext` requires `CRC32C`, `payload_len <= max_frame`) before it writes a byte, on both the
+compressing and the identity branch. A violation is `invalid_argument` with nothing written, so
+the compressed entry point can never emit a frame that this implementation's own
+`decode_frame_header` refuses. A caller-supplied `ext` is validated, not silently normalised to
+zero when `CRC32C` is absent.
 
 ### 24.5 Capability exchange
 

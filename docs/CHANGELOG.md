@@ -2,7 +2,7 @@
 
 [简体中文](CHANGELOG.zh-CN.md) | **English**
 
-## 1.0.0 - 2026-10-19
+## Unreleased
 
 ### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
 
@@ -16,6 +16,11 @@ What changed:
 
 - `encode_frame` rejects a `COMPRESSED` flag or a non-zero `ALGO` with `invalid_argument`; a
   compressed frame is produced only by `encode_frame_compressed`.
+- `encode_frame_compressed` applies the same header validation as `encode_frame` before it
+  writes a byte (known type, stream scope, `stream_id` bit 31, `ONE_WAY`/`UNRELIABLE`,
+  `ext`/`CRC32C`, `payload_len <= max_frame`) and takes `max_frame` as an argument; a
+  violation is `invalid_argument` with nothing written on both the compressing and the
+  identity branch. A caller-supplied `ext` is no longer silently normalised away.
 - `decode_frame` rejects a `COMPRESSED` frame with `protocol_error` (it has no output buffer);
   `frame_decoder` decompresses in copying mode and rejects in borrowing mode. A decoded frame's
   header is normalised: `COMPRESSED`/`ALGO` cleared, `payload_len` and `CRC32C` rewritten for the
@@ -36,6 +41,7 @@ borrowing mode, so no existing peer changes behaviour. A peer that hand-crafts a
 now gets a protocol error instead of silent misdelivery - that is the intended tightening. See
 `docs/protocol.md` section 24.
 
+## 1.0.0 - 2026-10-19
 
 The first CRPC release. It covers the core primitives, the CRPC call/server
 facade and the HTTP/1.1, HTTP/2 and HTTPS front ends. It is not a claim that

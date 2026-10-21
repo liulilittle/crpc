@@ -11,6 +11,8 @@
 #include <crpc/frame_compression.hpp>
 #include <crpc/wire.hpp>
 
+#include "../frame/frame_internal.hpp"
+
 namespace crpc {
 namespace detail {
 
@@ -148,7 +150,7 @@ std::size_t encoded_frame_size_compressed(const frame& value, compression_algori
 status encode_frame_compressed(span<std::byte> out, const frame& value,
                                compression_algorithm preferred, const compression_limits& limits,
                                std::size_t& written, compression_algorithm* chosen,
-                               compression_statistics* stats) noexcept {
+                               compression_statistics* stats, u32 max_frame) noexcept {
     written = 0;
     if (chosen != nullptr) {
         *chosen = compression_algorithm::none;
@@ -159,14 +161,30 @@ status encode_frame_compressed(span<std::byte> out, const frame& value,
         return rpc_code::invalid_argument;
     }
 
-    const std::size_t ceiling = effective_payload_ceiling(max_frame_default, limits);
+    const std::size_t ceiling = effective_payload_ceiling(max_frame, limits);
     if (value.payload.size() > ceiling ||
         value.payload.size() > static_cast<std::size_t>(std::numeric_limits<u32>::max())) {
         return rpc_code::invalid_argument;
     }
 
+    // This function writes the 16-byte header itself on the compressed path, so
+    // it must apply the same semantic rules as encode_frame before it writes
+    // anything. Without this, the compressed entry point could emit a frame
+    // (stream_id==0 on a stream frame, stream_id bit 31, ONE_WAY without
+    // UNRELIABLE, ext!=0 without CRC32C, unknown type) that this
+    // implementation's own decode_frame_header refuses. The caller's `ext` is
+    // validated here, before the compressed path replaces it with the payload
+    // checksum: a non-zero ext without CRC32C is a caller bug, not something to
+    // silently normalise away.
+    frame_header header = value.header;
+    header.payload_len = static_cast<u32>(value.payload.size());
+    const rpc_code header_code = detail::validate_header(header, max_frame);
+    if (header_code != rpc_code::ok) {
+        return detail::encode_error_for(header_code);
+    }
+
     const auto fall_back = [&]() noexcept {
-        return encode_frame(out, value, written);
+        return encode_frame(out, value, written, max_frame);
     };
 
     // An unusable algorithm is a configuration error, not a hint: silently

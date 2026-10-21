@@ -10,6 +10,8 @@
 #include <crpc/frame_compression.hpp>
 #include <crpc/wire.hpp>
 
+#include "frame_internal.hpp"
+
 namespace crpc {
 namespace {
 
@@ -38,6 +40,10 @@ constexpr crc32c_table make_crc32c_table() noexcept {
 }
 
 constexpr crc32c_table crc32c_lookup = make_crc32c_table();
+
+} // namespace
+
+namespace detail {
 
 // --- Validation --------------------------------------------------------------
 
@@ -107,6 +113,14 @@ constexpr crc32c_table crc32c_lookup = make_crc32c_table();
     return rpc_code::ok;
 }
 
+[[nodiscard]] rpc_code encode_error_for(rpc_code code) noexcept {
+    return code == rpc_code::protocol_error ? rpc_code::invalid_argument : code;
+}
+
+} // namespace detail
+
+namespace {
+
 [[nodiscard]] u32 clamp_max_frame(u32 value) noexcept {
     return value > max_frame_hard_cap ? max_frame_hard_cap : value;
 }
@@ -154,10 +168,6 @@ constexpr crc32c_table crc32c_lookup = make_crc32c_table();
         return rpc_code::protocol_error;
     }
     return rpc_code::ok;
-}
-
-[[nodiscard]] rpc_code encode_error_for(rpc_code code) noexcept {
-    return code == rpc_code::protocol_error ? rpc_code::invalid_argument : code;
 }
 
 // Whole-frame compression gate, shared by encode_frame/decode_frame and the
@@ -236,7 +246,7 @@ status decode_frame_header(span<const std::byte> in, frame_header& header, u32 m
     parsed.stream_id = stream_id;
     parsed.ext = ext;
 
-    const rpc_code code = validate_header(parsed, max_frame);
+    const rpc_code code = detail::validate_header(parsed, max_frame);
     if (code != rpc_code::ok) {
         return code;
     }
@@ -272,9 +282,9 @@ status encode_frame(span<std::byte> out, const frame& value, std::size_t& writte
         header.ext = crc32c(value.payload);
     }
 
-    const rpc_code code = validate_header(header, max_frame);
+    const rpc_code code = detail::validate_header(header, max_frame);
     if (code != rpc_code::ok) {
-        return encode_error_for(code);
+        return detail::encode_error_for(code);
     }
 
     const std::size_t extension_bytes =
@@ -382,7 +392,7 @@ status encode_call_envelope(span<std::byte> out, const call_envelope& value, std
     written = 0;
     const rpc_code code = validate_envelope(value);
     if (code != rpc_code::ok) {
-        return encode_error_for(code);
+        return detail::encode_error_for(code);
     }
 
     const std::size_t total = encoded_call_envelope_size(value);

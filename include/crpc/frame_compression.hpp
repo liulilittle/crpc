@@ -233,12 +233,23 @@ struct frame_compression_info {
 // the call is exactly encode_frame and `chosen` reports none: a sender never
 // inflates a frame.
 //
+// Header validation is the same as encode_frame's, on both branches: known type,
+// stream scope (stream frames need a non-zero stream_id, connection frames a
+// zero one, WINDOW_UPDATE either), stream_id bit 31 clear, ONE_WAY requires
+// UNRELIABLE, a non-zero ext requires CRC32C, and payload_len <= max_frame. A
+// violation is invalid_argument with nothing written - this entry point must
+// never emit a frame its own decode_frame_header would refuse. On the
+// compressed branch the caller's `ext` is validated before it is replaced by
+// the payload checksum; it is not silently normalised to zero.
+//
 // `chosen` (optional) receives the algorithm actually used. `stats` (optional)
-// receives the counters. On failure `written` is zero.
+// receives the counters. On failure `written` is zero. `max_frame` bounds the
+// logical payload exactly as it does for encode_frame.
 [[nodiscard]] CRPC_API status encode_frame_compressed(
     span<std::byte> out, const frame& value, compression_algorithm preferred,
     const compression_limits& limits, std::size_t& written,
-    compression_algorithm* chosen = nullptr, compression_statistics* stats = nullptr) noexcept;
+    compression_algorithm* chosen = nullptr, compression_statistics* stats = nullptr,
+    u32 max_frame = max_frame_default) noexcept;
 
 // Decodes exactly one frame, decompressing it into `payload_out`.
 //
