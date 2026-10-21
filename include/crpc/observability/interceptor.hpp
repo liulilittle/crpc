@@ -17,7 +17,8 @@
 // the translation unit is built with exception support, a hook that throws is
 // caught by the chain and converted to `rpc_code::internal`; no exception
 // escapes into the RPC path. In a `-fno-exceptions` / `/EHs-c-` build there is
-// no try/catch (see `run()`), so a throwing hook terminates the process.
+// no try/catch (see `run()`); a throwing hook is then undefined behaviour and in
+// practice terminates the process.
 //
 // Thread safety: `add()` and `freeze()` are startup-only and are not
 // synchronised. After `freeze()` the chain is immutable and `run()` may be
@@ -175,7 +176,8 @@ public:
     // exception-enabled build a thrown hook stops the chain, sets `result` to
     // `rpc_code::internal` and returns false. A hook returning false also stops
     // the chain and returns false; the hook is responsible for setting
-    // `context.result`.
+    // `context.result`. In a build without exception support there is no
+    // catch: see the comment on the `#else` branch below.
     [[nodiscard]] bool run(hook_point point, call_context& context) const noexcept {
         const std::size_t index = static_cast<std::size_t>(point);
         if (index >= hook_point_count()) {
@@ -202,12 +204,18 @@ public:
                 return false;
             }
 #else
-            // Built without exception support (-fno-exceptions, /EHs-c-): there
-            // is no way to observe a throw, so the hook is called directly.
-            // A hook that throws in such a build is undefined behaviour and
-            // terminates the process (std::terminate), as with any other
-            // throwing call in a no-exception translation unit. The
-            // short-circuit path is unchanged.
+            // Built without exception support (-fno-exceptions, /EHs-c-), and
+            // also MSVC with no /EH option at all: `_CPPUNWIND` is undefined in
+            // both, so this branch is taken. There is no way to observe a
+            // throw, so the hook is called directly. A hook that throws in such
+            // a build is undefined behaviour; in practice the implementation
+            // calls `std::terminate` (observed with MSVC /EHs-c- and with
+            // GCC/Clang -fno-exceptions). The short-circuit path is unchanged.
+            // Note: an MSVC build with no /EH option used to reach the catch
+            // above (only at /W3 without /WX, where C4530 is not an error);
+            // such a build now lets the exception escape. Under /W4 /WX both
+            // versions fail to compile at the call site, so there is no
+            // supported configuration with a silent behaviour change.
             if (!hook->on_hook(point, context)) {
                 if (context.ok()) {
                     context.set_error(rpc_code::canceled,
