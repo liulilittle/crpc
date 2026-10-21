@@ -16,9 +16,10 @@
 // metadata carried by the caller), or short-circuit by returning false. When
 // the translation unit is built with exception support, a hook that throws is
 // caught by the chain and converted to `rpc_code::internal`; no exception
-// escapes into the RPC path. In a `-fno-exceptions` / `/EHs-c-` build there is
-// no try/catch (see `run()`); a throwing hook is then undefined behaviour and in
-// practice terminates the process.
+// escapes into the RPC path. In a build without C++ exception support
+// (`-fno-exceptions`, or MSVC without an exception-enabling `/EH` option) there
+// is no try/catch (see `run()`); a throwing hook is then undefined behaviour and
+// in practice terminates the process.
 //
 // Thread safety: `add()` and `freeze()` are startup-only and are not
 // synchronised. After `freeze()` the chain is immutable and `run()` may be
@@ -211,11 +212,13 @@ public:
             // a build is undefined behaviour; in practice the implementation
             // calls `std::terminate` (observed with MSVC /EHs-c- and with
             // GCC/Clang -fno-exceptions). The short-circuit path is unchanged.
-            // Note: an MSVC build with no /EH option used to reach the catch
-            // above (only at /W3 without /WX, where C4530 is not an error);
-            // such a build now lets the exception escape. Under /W4 /WX both
-            // versions fail to compile at the call site, so there is no
-            // supported configuration with a silent behaviour change.
+            // Note: an MSVC build that does not enable C++ exceptions (no /EH
+            // option, or /EHc-, /EHs-, /EHa-, /EHs-c-, /EHa-c-) used to reach
+            // the catch above: C4530 is only a warning at /W1-/W4 and is silent
+            // at /W0. Such a build now lets the exception escape. Under /W4 /WX
+            // the old header failed inside this header, while this header
+            // compiles, so a consumer that never enabled /EH moves from "does
+            // not build" to "builds and terminates on throw".
             if (!hook->on_hook(point, context)) {
                 if (context.ok()) {
                     context.set_error(rpc_code::canceled,
