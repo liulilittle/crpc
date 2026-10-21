@@ -98,8 +98,8 @@ extension.
 
 The layout invariants that are checkable without header changes live in one
 internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
-the public records, an exact member count for every record that crosses the
-boundary, a relative member chain over the counters of `http_statistics`,
+13 of the public records, an exact member count for the 14 records listed in
+that file, a relative member chain over the counters of `http_statistics`,
 `client::statistics`, `client::resilience_statistics` and `server::statistics`
 (the chain follows each member's own width, so `server::statistics`, which mixes
 `std::size_t` and `std::uint64_t`, is checked on both 32-bit and 64-bit
@@ -107,6 +107,18 @@ targets), the total width and last-field position of `http_statistics`, and, on
 x86 and x64 only, absolute `sizeof` and key `offsetof` values for the records
 listed in that file. It is compiled as part of the library, so a layout change
 fails the build in the cases those guards cover.
+
+The guards do **not** cover every type that crosses the ABI boundary. These
+records are exported or passed across it and have **no compile-time layout
+guard at all**: `frame`, `call_envelope`, `trace_extension`,
+`ordered_extension`, `io::io_result`, `rpc::call_id` and `endpoint`. `frame` and
+`call_envelope` are parameters of `CRPC_API` functions
+(`include/crpc/frame.hpp:193/205/220/272/281/290`), and `io::io_result` is
+passed by value through the virtual `source`/`sink` interfaces
+(`include/crpc/io.hpp:93`), so they do cross the boundary. They are governed
+only by the policy in section 7 (any change to a public struct layout is a MAJOR
+change), not by a build-time check. Adding them to the guarded set is possible
+but is not done here.
 
 The guards are not uniform across change kinds or across architectures, and the
 difference matters when judging whether a given change is caught:
@@ -143,14 +155,35 @@ The unit does not pin the size of types that own standard-library members
 (`rpc_error`, `status`, `buffer`, `endpoint`), because their width is a property
 of the standard library configuration rather than of this library: `rpc_error`
 and `status` measure 80 bytes on x64 Release and 96 in Debug, and 56 versus 64
-on x86, with the same headers. They are guarded by their member count, their
-standard-layout precondition, and the `sizeof(status) == sizeof(rpc_error)`
-relation. Member **type** changes in `rpc_error` and `status` are not caught by
-those guards, because their absolute size is deliberately not pinned. The
-declared types of the `rpc_error` members are asserted individually instead
-(`code`, `message`, `retryable`, `retry_after`, `metadata`), which is
-independent of the build type; `status` has no public data member and is
-covered only by the `sizeof`/`alignof` relation.
+on x86, with the same headers. What actually guards each of them differs, and
+only the first is fully guarded:
+
+- `rpc_error` has public members, so it is covered by its member count and by an
+  assertion on the declared type of every member (`code`, `message`,
+  `retryable`, `retry_after`, `metadata`). Both are independent of the build
+  type.
+- `status` has no public data member, so neither a member count nor a member
+  type can be asserted. It is covered only by the
+  `sizeof(status) == sizeof(rpc_error)` and `alignof(status) ==
+  alignof(rpc_error)` relations, which catch added storage but not a change
+  inside the wrapped `rpc_error` that keeps its size.
+- `buffer` and `endpoint` have **no layout guard beyond a minimum alignment**
+  (`alignof` at least `alignof(void*)`). Their size and members are unguarded
+  and are governed only by the section 7 policy.
+
+None of the four is covered by a standard-layout assertion, and none carries an
+absolute `sizeof`. Member **type** changes in `status` are therefore not caught,
+because its absolute size is deliberately not pinned; `rpc_error` is the only
+one of the four whose member types are pinned.
+
+These four are not asserted to be standard-layout either, although `rpc_error`,
+`status` and `endpoint` in fact are on the toolchains audited here (MSVC 19.44,
+GCC 13, Clang 18), and `buffer` is on MSVC and GCC but not on Clang. The reason
+is not that `offsetof` would be ill-formed — it is well-formed and yields the
+expected values — but that the offsets are a property of the standard-library
+configuration, the same dependency that makes the absolute size unpinnable. An
+`is_standard_layout` assertion would also fire on `buffer` under Clang for a
+reason unrelated to any CRPC layout change.
 
 There is no size-tag pattern today. No public header declares a `struct_size`
 member; `crpc::connect_options` contains only the timeout, buffer and no-delay

@@ -83,13 +83,22 @@ C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计�
 MINOR 扩展。
 
 无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
-它断言公开记录的标准布局属性、每个跨边界记录的精确成员数量、
+它断言 13 个公开记录的标准布局属性、该文件中列出的 **14 个**记录的精确成员数量、
 `http_statistics` / `client::statistics` / `client::resilience_statistics` /
 `server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
 混用 `std::size_t` 与 `std::uint64_t` 的 `server::statistics` 在 32 位与 64 位
 目标上都能被检查）、`http_statistics` 的总宽度与尾字段位置，并且**仅在 x86 与
 x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof` 数值。它随库一起
 编译，因此在这些护栏覆盖的范围内，布局变更会导致构建失败。
+
+这些护栏**并未**覆盖所有跨越 ABI 边界的类型。以下记录会被导出或跨边界传递，却
+**没有任何编译期布局护栏**：`frame`、`call_envelope`、`trace_extension`、
+`ordered_extension`、`io::io_result`、`rpc::call_id`、`endpoint`。其中 `frame` 与
+`call_envelope` 是 `CRPC_API` 函数的参数
+（`include/crpc/frame.hpp:193/205/220/272/281/290`），`io::io_result` 经
+`source`/`sink` 虚接口按值传递（`include/crpc/io.hpp:93`），确实跨越了边界。它们
+只受第 7 节政策约束（任何公开结构体布局变更都属 MAJOR），没有构建期检查。把它们
+纳入受护集合是可行的，但本次未做。
 
 这些护栏并不对所有变更类型、所有架构一视同仁，判断某个变更是否会被捕获时必须区分：
 
@@ -115,12 +124,27 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 该翻译单元不锁定含有标准库成员的类型的尺寸（`rpc_error`、`status`、`buffer`、
 `endpoint`），因为它们的宽度属于标准库配置而非本库的属性：同一份头文件下，
 `rpc_error` 与 `status` 在 x64 Release 为 80 字节、Debug 为 96 字节，在 x86 上
-分别为 56 与 64 字节。它们由成员数量、标准布局前置条件以及
-`sizeof(status) == sizeof(rpc_error)` 关系来守护。`rpc_error` 与 `status` 的
-成员**类型**变更不被上述护栏捕获，因为它们绝对尺寸被刻意不锁定；因此改为对
-`rpc_error` 各成员（`code`、`message`、`retryable`、`retry_after`、`metadata`）
-的声明类型逐个断言，该断言与构建类型无关；`status` 没有公开数据成员，只由
-`sizeof`/`alignof` 关系覆盖。
+分别为 56 与 64 字节。这四者实际受到的守护并不相同，且只有第一个是完整的：
+
+- `rpc_error` 有公开成员，因此由成员数量以及每个成员的声明类型断言
+  （`code`、`message`、`retryable`、`retry_after`、`metadata`）覆盖，二者都与
+  构建类型无关。
+- `status` 没有公开数据成员，成员数量与成员类型都无法断言。它只由
+  `sizeof(status) == sizeof(rpc_error)` 与
+  `alignof(status) == alignof(rpc_error)` 关系覆盖；这能抓到新增存储，但抓不到
+  被包裹的 `rpc_error` 内部保持尺寸不变的变更。
+- `buffer` 与 `endpoint` **除最小对齐外没有任何布局护栏**（`alignof` 至少为
+  `alignof(void*)`）。其尺寸与成员不受保护，只受第 7 节政策约束。
+
+四者都不受标准布局断言覆盖，也都没有绝对 `sizeof`。因此 `status` 的成员**类型**
+变更不会被捕获，因为其绝对尺寸被刻意不锁定；四者中只有 `rpc_error` 的成员类型被
+锁定。
+
+这四者也没有被断言为标准布局，尽管在本次审计的工具链上（MSVC 19.44、GCC 13、
+Clang 18），`rpc_error`、`status` 与 `endpoint` 事实上都是标准布局，`buffer` 在
+MSVC 与 GCC 上是、在 Clang 上不是。原因并非 `offsetof` 会非法——它是合法的且能得到
+预期数值——而是偏移本身属于标准库配置，与导致绝对尺寸无法锁定的依赖相同。此外，
+`is_standard_layout` 断言会在 Clang 下因与本库布局变更无关的原因对 `buffer` 报错。
 
 **当前没有 size-tag 模式。** 没有任何公开头文件声明 `struct_size` 成员；
 `crpc::connect_options` 只有超时、缓冲区与 no-delay 字段

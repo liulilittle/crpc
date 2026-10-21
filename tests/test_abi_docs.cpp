@@ -61,24 +61,23 @@ bool has(const std::string& text, const char* needle) {
     return text.find(needle) != std::string::npos;
 }
 
-// Prose wraps at 80 columns, so a phrase can be split across lines or have its
-// runs of spaces changed by an edit that does not change the claim. Matching on
-// a whitespace-normalized copy keeps the checks about the wording and not about
-// the line breaks, which also means a forbidden phrase cannot be smuggled back
-// in by re-wrapping it.
-std::string normalize_space(const std::string& text) {
+// Prose wraps at 80 columns, so a phrase can be split across lines, and the
+// split can fall inside a word. Runs of spaces can also change without the
+// claim changing. Both the document and the needle are reduced to their
+// non-whitespace characters before comparing, so the checks are about the
+// words and not about the line breaks.
+//
+// Collapsing whitespace to a single space on both sides is not enough: it still
+// rejects a phrase that the document wraps inside a word while the needle does
+// not wrap there, and it accepts nothing that stripping does not. Stripping
+// compares the words only, which is the property the checks need. It also means
+// a forbidden phrase cannot be smuggled back in by re-wrapping it.
+std::string strip_space(const std::string& text) {
     std::string out;
     out.reserve(text.size());
-    bool pending_space = false;
     for (char c : text) {
-        const bool is_space = c == ' ' || c == '\t' || c == '\n' || c == '\r';
-        if (is_space) {
-            pending_space = !out.empty();
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             continue;
-        }
-        if (pending_space) {
-            out.push_back(' ');
-            pending_space = false;
         }
         out.push_back(c);
     }
@@ -86,7 +85,7 @@ std::string normalize_space(const std::string& text) {
 }
 
 bool has_phrase(const std::string& text, const char* needle) {
-    return normalize_space(text).find(needle) != std::string::npos;
+    return strip_space(text).find(strip_space(needle)) != std::string::npos;
 }
 
 } // namespace
@@ -279,6 +278,87 @@ CRPC_TEST(abi_docs_chinese_matches_the_english_guard_boundaries) {
 
     // The rpc_error member-type limitation must be stated in both languages.
     CRPC_CHECK(has_phrase(text, "成员**类型**变更"));
+}
+
+CRPC_TEST(abi_docs_english_scopes_the_guards_to_the_listed_records) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.md");
+
+    // The member count covers the 14 records the unit lists, not "every record
+    // that crosses the boundary". The old overstatement must not return.
+    CRPC_CHECK_FALSE(
+        has_phrase(text, "an exact member count for every record that crosses"));
+    CRPC_CHECK(has_phrase(text, "an exact member count for the 14 records"));
+    CRPC_CHECK(has_phrase(text, "13 of the public records"));
+
+    // The records that cross the boundary without any layout guard must be
+    // named, so a reader does not assume they are covered.
+    CRPC_CHECK(has_phrase(
+        text, "have **no compile-time layout guard at all**"));
+    for (const char* name : {"`frame`", "`call_envelope`", "`trace_extension`",
+                             "`ordered_extension`", "`io::io_result`",
+                             "`rpc::call_id`", "`endpoint`"}) {
+        CRPC_CHECK(has_phrase(text, name));
+    }
+
+    // The four standard-library-bearing records are not all guarded the same
+    // way. The old text claimed all four had a member count and a
+    // standard-layout precondition, which was false.
+    CRPC_CHECK_FALSE(has_phrase(
+        text, "They are guarded by their member count, their standard-layout"));
+    CRPC_CHECK(has_phrase(text, "only the first is fully guarded"));
+    CRPC_CHECK(has_phrase(
+        text, "have **no layout guard beyond a minimum alignment**"));
+    CRPC_CHECK(has_phrase(text, "`rpc_error` is the only one of the four"));
+
+    // The old text claimed these records are not standard-layout, so that
+    // `offsetof` would be ill-formed. That is false and must not return. The
+    // corrected text may mention the claim only to refute it, so the negative
+    // needles must be the assertion forms, not the bare phrase.
+    CRPC_CHECK_FALSE(has_phrase(
+        text, "standard-library types are not standard-layout, so neither"));
+    CRPC_CHECK_FALSE(has_phrase(text, "so `offsetof` on them would be ill-formed"));
+    CRPC_CHECK(has_phrase(text, "not asserted to be standard-layout either"));
+    // `buffer` is the one exception, so the text must not claim all four.
+    CRPC_CHECK(has_phrase(
+        text, "`buffer` is on MSVC and GCC but not on Clang"));
+}
+
+CRPC_TEST(abi_docs_chinese_scopes_the_guards_to_the_listed_records) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.zh-CN.md");
+    CRPC_CHECK(!text.empty());
+
+    // Same scope correction as the English document.
+    CRPC_CHECK_FALSE(
+        has_phrase(text, "每个跨边界记录的精确成员数量"));
+    CRPC_CHECK(has_phrase(text, "**14 个**记录的精确成员数量"));
+    CRPC_CHECK(has_phrase(text, "13 个公开记录"));
+
+    CRPC_CHECK(has_phrase(text, "**没有任何编译期布局护栏**"));
+    for (const char* name : {"`frame`", "`call_envelope`", "`trace_extension`",
+                             "`ordered_extension`", "`io::io_result`",
+                             "`rpc::call_id`", "`endpoint`"}) {
+        CRPC_CHECK(has_phrase(text, name));
+    }
+
+    CRPC_CHECK(has_phrase(text, "只有第一个是完整的"));
+    CRPC_CHECK(has_phrase(text, "**除最小对齐外没有任何布局护栏**"));
+    CRPC_CHECK(has_phrase(text, "四者中只有 `rpc_error` 的成员类型"));
+
+    // Same standard-layout correction as the English document.
+    CRPC_CHECK_FALSE(has_phrase(text, "标准库类型不是标准布局，因此两者都不是"));
+    CRPC_CHECK_FALSE(has_phrase(text, "因此对其成员取 `offsetof` 会非法"));
+    CRPC_CHECK(has_phrase(text, "也没有被断言为标准布局"));
+    CRPC_CHECK(has_phrase(text, "`buffer` 在\nMSVC 与 GCC 上是、在 Clang 上不是"));
 }
 
 CRPC_TEST_MAIN()

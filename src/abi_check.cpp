@@ -676,12 +676,24 @@ CRPC_STEP(server::statistics, push_dropped_overflow, push_acks);
 
 // --- Standard-library-bearing records ---------------------------------------
 //
-// `rpc_error` and `status` own `std::string` / `std::vector` members. Those
-// standard-library types are not standard-layout, so neither record is, and
-// `offsetof` on them would be ill-formed. They get the invariants that are
-// still meaningful without `offsetof`: `status` is exactly one `rpc_error` and
-// nothing else. Their absolute size belongs to the standard library and is
-// deliberately not pinned (docs/abi.md section 9).
+// `rpc_error`, `status` and `endpoint` ARE standard-layout on the toolchains
+// audited here (MSVC 19.44, GCC 13, Clang 18 all report is_standard_layout ==
+// true). `buffer` is standard-layout on MSVC and GCC but NOT on Clang, so it is
+// the one exception and no blanket claim covers all four.
+//
+// Because they are standard-layout, `offsetof` on their members is not
+// ill-formed: `offsetof(rpc_error, message)` compiles and yields 8 under
+// /W4 with all three compilers. It is nevertheless not *portable*: the offset
+// depends on how the standard library lays out its own types, which is the same
+// configuration dependency that makes their absolute size unpinnable. No
+// `offsetof` assertion is therefore made on them, and no `is_standard_layout`
+// assertion is added either (it would fire on `buffer` under Clang for a reason
+// that is not a CRPC layout change).
+//
+// What is asserted is only what does not name an offset or an absolute size:
+// `status` is exactly one `rpc_error` and nothing else, and `buffer` /
+// `endpoint` must be at least pointer-aligned. Their absolute size belongs to
+// the standard library and is deliberately not pinned (docs/abi.md section 9).
 
 static_assert(sizeof(status) == sizeof(rpc_error),
               "status must add no storage to rpc_error");
