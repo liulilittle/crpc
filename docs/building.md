@@ -118,18 +118,24 @@ Evidence: `.opencode/plan.md` P10, `.opencode/process.md:108-110`,
 **Exceptions.** Headers build without them; the library does not.
 
 - *Prebuilt library, `CRPC_HAVE_RTTI=0`:* all 52 public headers compile with `-fno-exceptions` and with MSVC `/EHs-c-`. The library itself must be the default exception-enabled build; only the consumer switches exceptions off.
-- *Rebuilding the library without exceptions is not supported:* 11 of the 46 `src/` TUs keep `try`/`catch` (GCC names the `catch` at `src/observability/log.cpp:270`, `src/c_api.cpp:291`, `src/rpc/dispatcher.cpp:368`; MSVC names the `try` two lines earlier): GCC fails, MSVC reports C4530 (C2220 under `/WX`). CMake has no switch that removes exception handling.
+- *Rebuilding the library without exceptions is not supported:* 13 of the 46 `src/` TUs contain a `try`/`catch` statement (e.g. `src/observability/log.cpp` catch `:270` / try `:268`, `src/rpc/dispatcher.cpp` catch `:368` / try `:366`, `src/c_api.cpp` catch `:291` / try `:248`; MSVC reports the `try` line). GCC fails on 11 of the 46, MSVC on 13: the two extra MSVC failures are `src/io/iocp_backend.cpp` (Windows-only code, an empty TU on GCC) and `src/http2/connection.cpp`, which has no `try`/`catch` of its own but trips C4530 inside MSVC's `<vector>(1224)` and fails under `/WX`. CMake has no switch that removes exception handling.
 - *`CRPC_RTTI_DIR` + `-fno-exceptions`:* fails at the header stage, before any `src/` file: MSVC reports C4530 (C2220 under `/WX`) at the `try` on `rtti/convert.hpp:2597`, GCC reports "exception handling disabled" at the `catch` on `:2599`.
 
 Throw semantics per boundary: [architecture §15](architecture.md#s15). These flags decide what builds, not how a throw is recovered.
 
-**RTTI.** `-fno-rtti` / `/GR-` work only with `CRPC_HAVE_RTTI=0`; with the reflection library the failure is inside the dependency.
+**RTTI.** What `-fno-rtti` does depends on whether the reflection dependency is present, and the two cases fail very differently.
 
-- MSVC `/GR-` + `CRPC_RTTI_DIR`: C4541 at `rtti/proto.hpp:2527,2529` (`dynamic_cast` is UB under `/GR-`); without `/WX` it exits 0 with two C4541 warnings (compiled, but UB), with `/WX` that becomes C2220.
-- GCC/Clang `-fno-rtti` + `CRPC_RTTI_DIR`: the first error is the dependency's `rtti/reflection.hpp:2183` (its own `typeid`), not a CRPC header.
-- Without the reflection library the 52 headers build: text/schema codecs are not registered and MVC binding returns `failed_precondition` (HTTP 409) "binding requires the RTTI dependency" (`mvc/binding.hpp:533`). Separately, under `-fno-rtti` the type-erased codec dispatch is compiled out behind the compiler-RTTI guard in `codec.hpp`, and `encode_into`/`decode_from` return `encode_error`/`decode_error` instead of reaching `typeid`.
+- *`CRPC_HAVE_RTTI=0`:* `encode_into`/`decode_from` are a **compile-time error**, not a returned status. The `crpc_binary` branch of the switch instantiates `binary_codec::encode_typed` unconditionally, and its `static_assert` fires: "crpc-binary requires the RTTI dependency" (`include/crpc/codec.hpp:1073`).
+- *Reflection present + `-fno-rtti`:* compilation dies inside the dependency before any CRPC template is instantiated. With GCC 13.3 and Clang 18.1.3 the first error is the dependency's own `rtti/reflection.hpp:2183` (`typeid`); GCC reports 34 errors (32 `typeid` sites plus 2 `dynamic_cast` at `rtti/proto.hpp:2527,2529`), while Clang stops at its default 20-error limit, so the `proto.hpp` pair only appears with `-ferror-limit=0`. A newer Clang may report the `proto.hpp` pair first; either way the failure is in the dependency, not in a CRPC header.
+- *Internal `CRPC_CAN_USE_TYPEID=0` build only:* an unrecognised custom codec id returns `failed_precondition` (HTTP 409) instead of reaching `typeid` (`include/crpc/codec.hpp:1553-1557`); built-in ids still encode and decode normally. The macro is derived from the compiler and cannot be overridden -- defining it is a hard `#error` (`codec.hpp:156-165`).
+- *MSVC `/GR-`:* usable when `CRPC_HAVE_RTTI=0` (cl accepts the static `typeid(T)` that this library writes even under `/GR-`). With the reflection library, `/GR-` reports C4541 at `rtti/proto.hpp:2527,2529` (`dynamic_cast` is UB under `/GR-`): without `/WX` the compile exits 0 with those two warnings -- it builds, with UB -- and with `/WX` the warning becomes C2220.
 
-`CRPC_HAVE_RTTI` means "the rtti reflection library is available", not compiler RTTI; the two are orthogonal. With no reflection checkout it is `0`: text/schema codecs are not registered, MVC field-attribute macros are undefined, and the binary codec is a stub reporting encode/decode errors.
+Two consistency requirements, neither of which a build error can enforce for you:
+
+- `codec.hpp`'s inline templates branch on `CRPC_HAVE_RTTI`, so the consumer's value must match the library's; `CMakeLists.txt:117-120` decides the library side from `CRPC_RTTI_DIR`.
+- Every translation unit in one binary must use the same RTTI flags. Flag-level mixing is invisible to the preprocessor, so no `#error` can catch it, and the linker keeps one copy of the inline body: which one depends on link order. Measured with a two-TU probe that branches on `__cpp_rtti` and is linked in both orders, `A(-frtti) B(-fno-rtti)` printed `b=1 a=1` while `B(-fno-rtti) A(-frtti)` printed `b=0 a=0`.
+
+`CRPC_HAVE_RTTI` means "the rtti reflection library is available", not compiler RTTI; the two are orthogonal. With no reflection checkout it is `0`: text/schema codecs are not registered, MVC field-attribute macros are undefined, and MVC binding returns `failed_precondition` (HTTP 409) "binding requires the RTTI dependency" (`mvc/binding.hpp:533`).
 
 ```bat
 rem MSVC: 52 headers, no exceptions, no compiler RTTI, warnings are errors.
@@ -142,7 +148,7 @@ find include -name '*.hpp' -o -name '*.h' | while read -r f; do
   g++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic -Werror \
       -fno-exceptions -I include "$f" || echo "FAIL $f"
 done
-# Rebuilding the library without exceptions must fail (11 of 46 TUs):
+# Rebuilding the library without exceptions must fail (11 of 46 TUs on GCC):
 g++ -std=c++17 -I include -fno-exceptions -c src/observability/log.cpp -o /tmp/log.o
 ```
 

@@ -83,18 +83,24 @@ export CRPC_COROCC_DIR=/path/to/corocc
 **异常。** 公共头可在无异常下构建；库本身不行。
 
 - *使用预编译库、`CRPC_HAVE_RTTI=0`：* 52 个公共头都可用 `-fno-exceptions` 与 MSVC `/EHs-c-` 编译。库本身必须是默认的启用异常构建；只有消费方关闭异常。
-- *在无异常下重建库不受支持：* `src/` 的 46 个 TU 中有 11 个保留 `try`/`catch`（GCC 指向 `src/observability/log.cpp:270`、`src/c_api.cpp:291`、`src/rpc/dispatcher.cpp:368` 的 `catch`，MSVC 指向早两行的 `try`）：GCC 失败，MSVC 报 C4530（`/WX` 下为 C2220）。CMake 没有移除异常处理的开关。
+- *在无异常下重建库不受支持：* `src/` 的 46 个 TU 中有 13 个含 `try`/`catch` 语句（例如 `src/observability/log.cpp` catch `:270` / try `:268`、`src/rpc/dispatcher.cpp` catch `:368` / try `:366`、`src/c_api.cpp` catch `:291` / try `:248`；MSVC 报的是 `try` 所在行）。GCC 在 46 个中有 11 个失败，MSVC 有 13 个：多出的两个 MSVC 失败是 `src/io/iocp_backend.cpp`（Windows 专用代码，在 GCC 上是空 TU）与 `src/http2/connection.cpp`——后者自身没有 `try`/`catch`，但会触发 MSVC `<vector>(1224)` 里的 C4530，在 `/WX` 下失败。CMake 没有移除异常处理的开关。
 - *`CRPC_RTTI_DIR` + `-fno-exceptions`：* 在**头阶段**失败（早于任何 `src/` 文件）：MSVC 在 `rtti/convert.hpp:2597` 的 `try` 报 C4530（`/WX` 下为 C2220），GCC 在 `:2599` 的 `catch` 报 "exception handling disabled"。
 
 各边界上抛出的语义见[架构 §15](architecture.zh-CN.md#s15)；这些开关只决定什么能编译，不决定异常如何被恢复。
 
-**RTTI。** `-fno-rtti` / `/GR-` 仅在 `CRPC_HAVE_RTTI=0` 时可用；启用反射库后，失败位于依赖内部。
+**RTTI。** `-fno-rtti` 的实际行为取决于反射依赖是否存在，两种情形的失败方式差别很大。
 
-- MSVC `/GR-` + `CRPC_RTTI_DIR`：`rtti/proto.hpp:2527,2529` 报 C4541（`/GR-` 下的 `dynamic_cast` 属未定义行为）；不加 `/WX` 时 EXIT=0 但带两条 C4541 警告（能编译但含 UB），加 `/WX` 后转为 C2220。
-- GCC/Clang `-fno-rtti` + `CRPC_RTTI_DIR`：首个错误在依赖自身的 `rtti/reflection.hpp:2183`（依赖自己用了 `typeid`），不在 CRPC 头里。
-- 不配反射库：52 个头可编译——文本/模式编解码器不注册，MVC 绑定返回 `failed_precondition`（HTTP 409）"binding requires the RTTI dependency"（`mvc/binding.hpp:533`）。另外，`-fno-rtti` 下类型擦除的编解码分派由 `codec.hpp` 中的编译器 RTTI 守卫编译掉，`encode_into`/`decode_from` 返回 `encode_error`/`decode_error`，不会走到 `typeid`。
+- *`CRPC_HAVE_RTTI=0`：* `encode_into`/`decode_from` 是**编译期错误**，不是返回错误状态。switch 的 `crpc_binary` 分支会无条件实例化 `binary_codec::encode_typed`，其 `static_assert` 直接触发："crpc-binary requires the RTTI dependency"（`include/crpc/codec.hpp:1073`）。
+- *反射开启 + `-fno-rtti`：* 编译在任何 CRPC 模板实例化之前就死在依赖里。在 GCC 13.3 与 Clang 18.1.3 上首个错误都是依赖自身的 `rtti/reflection.hpp:2183`（`typeid`）；GCC 共报 34 条（32 处 `typeid` 加 2 处 `rtti/proto.hpp:2527,2529` 的 `dynamic_cast`），Clang 默认在 20 条错误处截断，只有加 `-ferror-limit=0` 才会看到 `proto.hpp` 那两条。更新的 Clang 可能先报 `proto.hpp` 那对错误；无论哪种，失败都在依赖里，不在 CRPC 头里。
+- *仅在内部 `CRPC_CAN_USE_TYPEID=0` 构建中：* 未识别的自定义 codec id 返回 `failed_precondition`（HTTP 409）而不是走到 `typeid`（`include/crpc/codec.hpp:1553-1557`）；内置 id 仍正常编解码。该宏由编译器推导，不能覆盖——定义它会触发硬 `#error`（`codec.hpp:156-165`）。
+- *MSVC `/GR-`：* 在 `CRPC_HAVE_RTTI=0` 时可用（cl 在 `/GR-` 下仍接受本库使用的静态 `typeid(T)`）。启用反射库时，`/GR-` 在 `rtti/proto.hpp:2527,2529` 报 C4541（`/GR-` 下的 `dynamic_cast` 属未定义行为）：不加 `/WX` 时编译 EXIT=0 但带这两条警告——能编译，但含 UB；加 `/WX` 后转为 C2220。
 
-`CRPC_HAVE_RTTI` 的含义是「rtti 反射库可用」，不是编译器 RTTI；两者正交。没有反射仓库时它为 `0`：文本/模式编解码器不注册，MVC 字段 attribute 宏不定义，二进制编解码器退化为报告编解码错误的桩。
+另有两条一致性要求，构建错误都无法替你兜住：
+
+- `codec.hpp` 的 inline 模板按 `CRPC_HAVE_RTTI` 分支，因此消费方该宏的值必须与库一致；库侧由 `CMakeLists.txt:117-120` 根据 `CRPC_RTTI_DIR` 决定。
+- 同一个二进制内所有翻译单元的 RTTI 开关必须一致。flag 级混编对预处理器不可见，没有 `#error` 能抓住；链接器只会保留一份 inline 函数体，保留哪一份取决于链接顺序。用两个按 `__cpp_rtti` 分支的 TU 实测：`A(-frtti) B(-fno-rtti)` 输出 `b=1 a=1`，反序 `B(-fno-rtti) A(-frtti)` 输出 `b=0 a=0`。
+
+`CRPC_HAVE_RTTI` 的含义是「rtti 反射库可用」，不是编译器 RTTI；两者正交。没有反射仓库时它为 `0`：文本/模式编解码器不注册，MVC 字段 attribute 宏不定义，MVC 绑定返回 `failed_precondition`（HTTP 409）"binding requires the RTTI dependency"（`mvc/binding.hpp:533`）。
 
 ```bat
 rem MSVC：52 个头、无异常、无编译器 RTTI、告警即错误。
@@ -107,7 +113,7 @@ find include -name '*.hpp' -o -name '*.h' | while read -r f; do
   g++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic -Werror \
       -fno-exceptions -I include "$f" || echo "FAIL $f"
 done
-# 重建库在无异常下必须失败（46 个 TU 中 11 个）：
+# 重建库在无异常下必须失败（GCC 上 46 个 TU 中 11 个）：
 g++ -std=c++17 -I include -fno-exceptions -c src/observability/log.cpp -o /tmp/log.o
 ```
 
