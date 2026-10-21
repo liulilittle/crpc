@@ -7,19 +7,25 @@
 //
 //   * every type listed here is standard-layout, which is the precondition for
 //     `offsetof` and for the "no base-class trickery" part of the policy;
+//   * every record listed here has exactly the declared number of direct
+//     members (a structured binding, so an append or a removal breaks the build
+//     on every target, including where tail padding would hide it);
 //   * adjacent members of the plain-`std::size_t` records keep their order and
 //     stay one `std::size_t` apart (a relative STEP chain, not absolute
 //     offsets, so a 32-bit build is checked with the same source);
 //   * the total width of `http_statistics` is exactly its field count times
 //     `sizeof(std::size_t)`, and the last field ends the struct (no trailing
-//     padding).
+//     padding);
+//   * on x86 and x64 only, each record has the absolute `sizeof` and the key
+//     `offsetof` values measured on that architecture. Other targets keep the
+//     architecture-independent guards above and no absolute numbers.
 //
 // Types that carry standard-library members (`buffer`, `endpoint`, `rpc_error`,
-// `status`) only get relative-order assertions: their absolute size is an
-// implementation detail of the standard library, which docs/abi.md section 9
-// explicitly does not guarantee. `result<T>` is deliberately absent: it stores
-// a `std::variant`, is therefore not standard-layout, and `offsetof` on it
-// would be ill-formed.
+// `status`) get relative-order and member-count assertions but no absolute size:
+// their width is an implementation detail of the standard library configuration,
+// which docs/abi.md section 9 explicitly does not guarantee. `result<T>` is
+// deliberately absent: it stores a `std::variant`, is therefore not
+// standard-layout, and `offsetof` on it would be ill-formed.
 
 #include <cstddef>
 #include <type_traits>
@@ -28,7 +34,9 @@
 #include <crpc/client_facade.hpp>
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
+#include <crpc/frame_compression.hpp>
 #include <crpc/http/server.hpp>
+#include <crpc/http2/connection.hpp>
 #include <crpc/io.hpp>
 #include <crpc/rpc/client.hpp>
 #include <crpc/server.hpp>
@@ -74,6 +82,333 @@ namespace {
                           alignof(decltype(((T*)0)->b)),                     \
                   #T " " #a "->" #b)
 
+// An exact member count, independent of padding and of the target ABI. The
+// structured binding decomposes `T` into exactly the listed names; if a member
+// is appended, prepended or removed the number of names no longer matches the
+// number of direct members and the binding is ill-formed, so the definition
+// fails to compile. The body is always compiled even though the function is
+// never called.
+//
+// This is the only guard that sees a tail append on a 32-bit target. An
+// absolute `sizeof` assertion cannot: on x86 `server::statistics` is 104 bytes
+// with 4 bytes of tail padding after `push_acks`, so an appended
+// `std::size_t` lands in that padding and `sizeof` stays 104. The relative
+// STEP chains cannot see it either, because they only relate existing members.
+// A count does not care where the bytes go.
+//
+// It also covers every other target (ARM64 included), where no absolute size
+// is maintained. Reordering and mid-record insertion are caught by the relative
+// chains, so the two mechanisms together cover every layout change.
+#define CRPC_MEMBER_COUNT(tag, T, ...)                                       \
+    [[maybe_unused]] void crpc_member_count_##tag() {                        \
+        T value{};                                                           \
+        [[maybe_unused]] auto& [__VA_ARGS__] = value;                        \
+    }
+
+// --- Exact member counts ----------------------------------------------------
+//
+// One call per cross-ABI record. These are the padding-independent half of the
+// guard: they catch an appended field on every target, including x86 and the
+// architectures for which no absolute size is maintained below. The listed
+// names are the real member names, so a rename is caught here as well.
+//
+// `rpc_error` and `status` are handled separately: `rpc_error` has public
+// members and decomposes, while `status` wraps a single private `rpc_error` and
+// cannot be decomposed at all (its shape is pinned by the sizeof/alignof pair
+// further down).
+
+CRPC_MEMBER_COUNT(frame_header, frame_header, payload_len, type, flags,
+                  stream_id, ext)
+CRPC_MEMBER_COUNT(connect_options, ::crpc::connect_options, connect_timeout,
+                  recv_buffer_bytes, send_buffer_bytes, tcp_no_delay)
+CRPC_MEMBER_COUNT(listen_options, ::crpc::listen_options, backlog, reuse_port,
+                  recv_buffer_bytes, send_buffer_bytes)
+CRPC_MEMBER_COUNT(client_options, rpc::client_options, slot_capacity,
+                  max_pending_write_bytes, clock, clock_ctx, default_timeout,
+                  client_id, client_epoch)
+CRPC_MEMBER_COUNT(http_statistics, http::http_statistics, active_connections,
+                  accepted_connections, requests_handled, responses_written,
+                  bad_requests, h2_connections, tls_connections,
+                  rejected_connections, timed_out_connections,
+                  sse_connections, sse_events_delivered, sse_slow_closes,
+                  sse_hub_published, sse_hub_delivered, sse_hub_queued,
+                  sse_hub_dropped, responses_compressed, requests_decoded,
+                  downloads_served, longpoll_waiters, longpoll_subscribers,
+                  longpoll_events, longpoll_timeouts, longpoll_ack_clamped,
+                  longpoll_conflicts, longpoll_restarts, longpoll_overloaded,
+                  longpoll_replay_window)
+CRPC_MEMBER_COUNT(client_statistics, client::statistics, active_connections,
+                  in_flight_calls, failed_connections, calls_started, retries,
+                  breaker_rejections)
+CRPC_MEMBER_COUNT(resilience_statistics, client::resilience_statistics,
+                  rate_limited, bulkhead_rejected, local_gate_rejected,
+                  endpoint_open, lb_unavailable, pre_send_retries,
+                  probe_admitted, retries_delayed_by_hint, bulkhead_in_use)
+CRPC_MEMBER_COUNT(server_statistics, server::statistics, active_connections,
+                  in_flight_calls, accepted_connections, requests_handled,
+                  rejected_overload, handler_failures,
+                  rate_limited_connection, rate_limited_service,
+                  bulkhead_rejected, breaker_open, deadline_rejected,
+                  probe_admitted, push_active_connections,
+                  push_queued_messages, push_queued_bytes, push_egress_bytes,
+                  push_egress_high_water, push_dropped_overflow, push_acks)
+CRPC_MEMBER_COUNT(rpc_error, rpc_error, code, message, retryable, retry_after,
+                  metadata)
+CRPC_MEMBER_COUNT(h2_error, http2::h2_error, code, scope, stream_id)
+CRPC_MEMBER_COUNT(connection_options, http2::connection_options, role,
+                  local_settings, initial_connection_send_window,
+                  initial_connection_recv_window, max_send_queue_bytes,
+                  reject_unknown_frame_types)
+CRPC_MEMBER_COUNT(stream_snapshot, http2::stream_snapshot, id, state,
+                  send_window, recv_window, local_end_stream,
+                  remote_end_stream, queued_bytes)
+CRPC_MEMBER_COUNT(window_credit, http2::window_credit, connection, stream)
+CRPC_MEMBER_COUNT(frame_compression_info, frame_compression_info, algorithm,
+                  wire_size, logical_size, dropped, drop_reason)
+
+// --- Per-architecture absolute layout anchors -------------------------------
+//
+// The relative chains above and the member counts are architecture-independent,
+// but they cannot state the absolute width of a record. An absolute width is
+// what a consumer compiled against an older release needs: it detects a change
+// that a same-release rebuild would silently absorb.
+//
+// These numbers were measured, not derived: MSVC 19.44 compiled the same
+// headers once for x64 and once for x86, in both Release and Debug
+// (`_ITERATOR_DEBUG_LEVEL=2`), and the resulting `sizeof`/`offsetof` values were
+// copied from that run. Every type below reported the same width in both
+// configurations; `rpc_error` and `status` did not, and are therefore excluded
+// (see the note after the block). GCC 13 and Clang 18 on x86-64 report the same
+// numbers as MSVC x64.
+//
+// They are pinned per architecture because the values differ: `std::size_t` is
+// 8 bytes on x64 and 4 on x86, and the `std::uint64_t` resilience block of
+// `server::statistics` forces 8-byte alignment on both, which leaves 4 bytes of
+// tail padding on x86 and none on x64. Only x86 and x64 are maintained; see the
+// `#else` branch.
+
+#if defined(_M_IX86) || defined(__i386__)
+#define CRPC_ABI_ARCH_X86 1
+#elif defined(_M_X64) || defined(__x86_64__)
+#define CRPC_ABI_ARCH_X64 1
+#endif
+
+#if defined(CRPC_ABI_ARCH_X86)
+
+// 32-bit: measured with MSVC 19.44, x86, Release and Debug identical.
+#define CRPC_ABS_SIZE(T, n) static_assert(sizeof(T) == n, #T " absolute size")
+#define CRPC_ABS_OFF(T, m, n)                                                \
+    static_assert(offsetof(T, m) == n, #T "::" #m " absolute offset")
+
+CRPC_ABS_SIZE(frame_header, 16);
+CRPC_ABS_OFF(frame_header, payload_len, 0);
+CRPC_ABS_OFF(frame_header, type, 4);
+CRPC_ABS_OFF(frame_header, flags, 5);
+CRPC_ABS_OFF(frame_header, stream_id, 8);
+CRPC_ABS_OFF(frame_header, ext, 12);
+
+CRPC_ABS_SIZE(::crpc::connect_options, 24);
+CRPC_ABS_OFF(::crpc::connect_options, connect_timeout, 0);
+CRPC_ABS_OFF(::crpc::connect_options, recv_buffer_bytes, 8);
+CRPC_ABS_OFF(::crpc::connect_options, send_buffer_bytes, 12);
+CRPC_ABS_OFF(::crpc::connect_options, tcp_no_delay, 16);
+
+CRPC_ABS_SIZE(::crpc::listen_options, 16);
+CRPC_ABS_OFF(::crpc::listen_options, backlog, 0);
+CRPC_ABS_OFF(::crpc::listen_options, reuse_port, 4);
+CRPC_ABS_OFF(::crpc::listen_options, recv_buffer_bytes, 8);
+CRPC_ABS_OFF(::crpc::listen_options, send_buffer_bytes, 12);
+
+CRPC_ABS_SIZE(rpc::client_options, 48);
+CRPC_ABS_OFF(rpc::client_options, slot_capacity, 0);
+CRPC_ABS_OFF(rpc::client_options, max_pending_write_bytes, 4);
+CRPC_ABS_OFF(rpc::client_options, clock, 8);
+CRPC_ABS_OFF(rpc::client_options, clock_ctx, 12);
+CRPC_ABS_OFF(rpc::client_options, default_timeout, 16);
+CRPC_ABS_OFF(rpc::client_options, client_id, 24);
+CRPC_ABS_OFF(rpc::client_options, client_epoch, 40);
+
+CRPC_ABS_SIZE(http::http_statistics, 112);
+CRPC_ABS_OFF(http::http_statistics, active_connections, 0);
+CRPC_ABS_OFF(http::http_statistics, longpoll_replay_window, 108);
+
+CRPC_ABS_SIZE(client::statistics, 24);
+CRPC_ABS_OFF(client::statistics, active_connections, 0);
+CRPC_ABS_OFF(client::statistics, breaker_rejections, 20);
+
+CRPC_ABS_SIZE(client::resilience_statistics, 36);
+CRPC_ABS_OFF(client::resilience_statistics, rate_limited, 0);
+CRPC_ABS_OFF(client::resilience_statistics, bulkhead_in_use, 32);
+
+// 104, not 100: `push_acks` ends at 100 and the record is 8-byte aligned, so
+// the last 4 bytes are tail padding. This padding is exactly why an absolute
+// size alone cannot catch an appended field on x86; the member count above
+// does. The anchor still has to exist, because a *reordering* that moves a
+// `std::uint64_t` into the tail would change the width.
+CRPC_ABS_SIZE(server::statistics, 104);
+CRPC_ABS_OFF(server::statistics, active_connections, 0);
+CRPC_ABS_OFF(server::statistics, handler_failures, 20);
+CRPC_ABS_OFF(server::statistics, rate_limited_connection, 24);
+CRPC_ABS_OFF(server::statistics, probe_admitted, 64);
+CRPC_ABS_OFF(server::statistics, push_active_connections, 72);
+CRPC_ABS_OFF(server::statistics, push_acks, 96);
+
+CRPC_ABS_SIZE(http2::h2_error, 12);
+CRPC_ABS_OFF(http2::h2_error, code, 0);
+CRPC_ABS_OFF(http2::h2_error, scope, 4);
+CRPC_ABS_OFF(http2::h2_error, stream_id, 8);
+
+CRPC_ABS_SIZE(http2::connection_options, 44);
+CRPC_ABS_OFF(http2::connection_options, role, 0);
+CRPC_ABS_OFF(http2::connection_options, local_settings, 4);
+CRPC_ABS_OFF(http2::connection_options, initial_connection_send_window, 28);
+CRPC_ABS_OFF(http2::connection_options, initial_connection_recv_window, 32);
+CRPC_ABS_OFF(http2::connection_options, max_send_queue_bytes, 36);
+CRPC_ABS_OFF(http2::connection_options, reject_unknown_frame_types, 40);
+
+CRPC_ABS_SIZE(http2::stream_snapshot, 32);
+CRPC_ABS_OFF(http2::stream_snapshot, id, 0);
+CRPC_ABS_OFF(http2::stream_snapshot, state, 4);
+CRPC_ABS_OFF(http2::stream_snapshot, send_window, 8);
+CRPC_ABS_OFF(http2::stream_snapshot, recv_window, 16);
+CRPC_ABS_OFF(http2::stream_snapshot, local_end_stream, 24);
+CRPC_ABS_OFF(http2::stream_snapshot, remote_end_stream, 25);
+CRPC_ABS_OFF(http2::stream_snapshot, queued_bytes, 28);
+
+CRPC_ABS_SIZE(http2::window_credit, 8);
+CRPC_ABS_OFF(http2::window_credit, connection, 0);
+CRPC_ABS_OFF(http2::window_credit, stream, 4);
+
+CRPC_ABS_SIZE(frame_compression_info, 16);
+CRPC_ABS_OFF(frame_compression_info, algorithm, 0);
+CRPC_ABS_OFF(frame_compression_info, wire_size, 4);
+CRPC_ABS_OFF(frame_compression_info, logical_size, 8);
+CRPC_ABS_OFF(frame_compression_info, dropped, 12);
+CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
+
+#elif defined(CRPC_ABI_ARCH_X64)
+
+// 64-bit: measured with MSVC 19.44, x64, Release and Debug identical.
+#define CRPC_ABS_SIZE(T, n) static_assert(sizeof(T) == n, #T " absolute size")
+#define CRPC_ABS_OFF(T, m, n)                                                \
+    static_assert(offsetof(T, m) == n, #T "::" #m " absolute offset")
+
+CRPC_ABS_SIZE(frame_header, 16);
+CRPC_ABS_OFF(frame_header, payload_len, 0);
+CRPC_ABS_OFF(frame_header, type, 4);
+CRPC_ABS_OFF(frame_header, flags, 5);
+CRPC_ABS_OFF(frame_header, stream_id, 8);
+CRPC_ABS_OFF(frame_header, ext, 12);
+
+CRPC_ABS_SIZE(::crpc::connect_options, 32);
+CRPC_ABS_OFF(::crpc::connect_options, connect_timeout, 0);
+CRPC_ABS_OFF(::crpc::connect_options, recv_buffer_bytes, 8);
+CRPC_ABS_OFF(::crpc::connect_options, send_buffer_bytes, 16);
+CRPC_ABS_OFF(::crpc::connect_options, tcp_no_delay, 24);
+
+CRPC_ABS_SIZE(::crpc::listen_options, 32);
+CRPC_ABS_OFF(::crpc::listen_options, backlog, 0);
+CRPC_ABS_OFF(::crpc::listen_options, reuse_port, 8);
+CRPC_ABS_OFF(::crpc::listen_options, recv_buffer_bytes, 16);
+CRPC_ABS_OFF(::crpc::listen_options, send_buffer_bytes, 24);
+
+CRPC_ABS_SIZE(rpc::client_options, 64);
+CRPC_ABS_OFF(rpc::client_options, slot_capacity, 0);
+CRPC_ABS_OFF(rpc::client_options, max_pending_write_bytes, 8);
+CRPC_ABS_OFF(rpc::client_options, clock, 16);
+CRPC_ABS_OFF(rpc::client_options, clock_ctx, 24);
+CRPC_ABS_OFF(rpc::client_options, default_timeout, 32);
+CRPC_ABS_OFF(rpc::client_options, client_id, 40);
+CRPC_ABS_OFF(rpc::client_options, client_epoch, 56);
+
+CRPC_ABS_SIZE(http::http_statistics, 224);
+CRPC_ABS_OFF(http::http_statistics, active_connections, 0);
+CRPC_ABS_OFF(http::http_statistics, longpoll_replay_window, 216);
+
+CRPC_ABS_SIZE(client::statistics, 48);
+CRPC_ABS_OFF(client::statistics, active_connections, 0);
+CRPC_ABS_OFF(client::statistics, breaker_rejections, 40);
+
+CRPC_ABS_SIZE(client::resilience_statistics, 72);
+CRPC_ABS_OFF(client::resilience_statistics, rate_limited, 0);
+CRPC_ABS_OFF(client::resilience_statistics, bulkhead_in_use, 64);
+
+// 152 with no tail padding: `push_acks` ends exactly at the end of the record.
+// An appended field therefore changes the width on x64 even without the member
+// count; on x86 it does not. That asymmetry is why both halves exist.
+CRPC_ABS_SIZE(server::statistics, 152);
+CRPC_ABS_OFF(server::statistics, active_connections, 0);
+CRPC_ABS_OFF(server::statistics, handler_failures, 40);
+CRPC_ABS_OFF(server::statistics, rate_limited_connection, 48);
+CRPC_ABS_OFF(server::statistics, probe_admitted, 88);
+CRPC_ABS_OFF(server::statistics, push_active_connections, 96);
+CRPC_ABS_OFF(server::statistics, push_acks, 144);
+
+CRPC_ABS_SIZE(http2::h2_error, 12);
+CRPC_ABS_OFF(http2::h2_error, code, 0);
+CRPC_ABS_OFF(http2::h2_error, scope, 4);
+CRPC_ABS_OFF(http2::h2_error, stream_id, 8);
+
+CRPC_ABS_SIZE(http2::connection_options, 56);
+CRPC_ABS_OFF(http2::connection_options, role, 0);
+CRPC_ABS_OFF(http2::connection_options, local_settings, 4);
+CRPC_ABS_OFF(http2::connection_options, initial_connection_send_window, 28);
+CRPC_ABS_OFF(http2::connection_options, initial_connection_recv_window, 32);
+CRPC_ABS_OFF(http2::connection_options, max_send_queue_bytes, 40);
+CRPC_ABS_OFF(http2::connection_options, reject_unknown_frame_types, 48);
+
+CRPC_ABS_SIZE(http2::stream_snapshot, 40);
+CRPC_ABS_OFF(http2::stream_snapshot, id, 0);
+CRPC_ABS_OFF(http2::stream_snapshot, state, 4);
+CRPC_ABS_OFF(http2::stream_snapshot, send_window, 8);
+CRPC_ABS_OFF(http2::stream_snapshot, recv_window, 16);
+CRPC_ABS_OFF(http2::stream_snapshot, local_end_stream, 24);
+CRPC_ABS_OFF(http2::stream_snapshot, remote_end_stream, 25);
+CRPC_ABS_OFF(http2::stream_snapshot, queued_bytes, 32);
+
+CRPC_ABS_SIZE(http2::window_credit, 8);
+CRPC_ABS_OFF(http2::window_credit, connection, 0);
+CRPC_ABS_OFF(http2::window_credit, stream, 4);
+
+CRPC_ABS_SIZE(frame_compression_info, 16);
+CRPC_ABS_OFF(frame_compression_info, algorithm, 0);
+CRPC_ABS_OFF(frame_compression_info, wire_size, 4);
+CRPC_ABS_OFF(frame_compression_info, logical_size, 8);
+CRPC_ABS_OFF(frame_compression_info, dropped, 12);
+CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
+
+#else
+
+// Any other target (ARM64, RISC-V, ...) keeps the architecture-independent
+// guards only: standard-layout, the relative chains and the exact member
+// counts. Absolute sizes are maintained for x86 and x64 only, so no absolute
+// anchor is asserted here and this translation unit must keep compiling on
+// those targets.
+//
+// The member counts still catch an appended or removed field, and the relative
+// chains still catch a reorder or a mid-record insertion, so the layout of
+// every record below is guarded on every target. What is *not* guarded outside
+// x86/x64 is a change that preserves the member count and the relative order
+// but alters the absolute width, which in practice means a change to the
+// standard library's own types.
+
+#endif
+
+#undef CRPC_ABS_SIZE
+#undef CRPC_ABS_OFF
+#undef CRPC_ABI_ARCH_X86
+#undef CRPC_ABI_ARCH_X64
+
+// `rpc_error` and `status` deliberately carry no absolute size. Both own
+// `std::string` and `std::vector` members, whose width is a property of the
+// standard library configuration, not of this library: measured with MSVC
+// 19.44 the pair is 80 bytes on x64 Release and 96 in Debug
+// (`_ITERATOR_DEBUG_LEVEL=2`), 56 on x86 Release and 64 in Debug, and 112 with
+// libstdc++ in `_GLIBCXX_DEBUG` mode. Pinning any one of those numbers would
+// break the other required configurations, so these two records are guarded by
+// their member count, their standard-layout precondition and the
+// `sizeof(status) == sizeof(rpc_error)` relation instead.
+
 // --- Standard-layout preconditions ------------------------------------------
 //
 // `offsetof` is only well-defined for standard-layout types, so this block is
@@ -96,6 +431,19 @@ static_assert(std::is_standard_layout<client::resilience_statistics>::value,
               "client::resilience_statistics must be standard-layout");
 static_assert(std::is_standard_layout<server::statistics>::value,
               "server::statistics must be standard-layout");
+// The HTTP/2 value types below cross the `CRPC_API connection` boundary by value
+// (returned or accepted), so they are subject to the same rules as the records
+// above even though they live in a protocol layer rather than the facade.
+static_assert(std::is_standard_layout<http2::h2_error>::value,
+              "http2::h2_error must be standard-layout");
+static_assert(std::is_standard_layout<http2::connection_options>::value,
+              "http2::connection_options must be standard-layout");
+static_assert(std::is_standard_layout<http2::stream_snapshot>::value,
+              "http2::stream_snapshot must be standard-layout");
+static_assert(std::is_standard_layout<http2::window_credit>::value,
+              "http2::window_credit must be standard-layout");
+static_assert(std::is_standard_layout<frame_compression_info>::value,
+              "frame_compression_info must be standard-layout");
 // `buffer` is intentionally *not* asserted standard-layout. It owns a
 // `std::unique_ptr`, and in C++17 a class is only standard-layout when every
 // non-static data member is standard-layout too. MSVC and GCC happen to accept
@@ -139,6 +487,43 @@ CRPC_AFTER(rpc::client_options, clock, clock_ctx);
 CRPC_AFTER(rpc::client_options, clock_ctx, default_timeout);
 CRPC_AFTER(rpc::client_options, default_timeout, client_id);
 CRPC_AFTER(rpc::client_options, client_id, client_epoch);
+
+// --- HTTP/2 and compression value types -------------------------------------
+//
+// `class CRPC_API connection` returns `h2_error`, `stream_snapshot` and
+// `window_credit` by value and takes `connection_options` by value, so these
+// four records cross the exported ABI in the same sense as the option records
+// above. They were previously unguarded.
+//
+// The chains use `CRPC_AFTER` where the member types differ, and
+// `CRPC_STEP_SAME` where two adjacent members share a type.
+
+CRPC_AFTER(http2::h2_error, code, scope);
+CRPC_AFTER(http2::h2_error, scope, stream_id);
+
+CRPC_AFTER(http2::connection_options, role, local_settings);
+CRPC_AFTER(http2::connection_options, local_settings,
+           initial_connection_send_window);
+CRPC_AFTER(http2::connection_options, initial_connection_send_window,
+           initial_connection_recv_window);
+CRPC_AFTER(http2::connection_options, initial_connection_recv_window,
+           max_send_queue_bytes);
+CRPC_AFTER(http2::connection_options, max_send_queue_bytes,
+           reject_unknown_frame_types);
+
+CRPC_AFTER(http2::stream_snapshot, id, state);
+CRPC_AFTER(http2::stream_snapshot, state, send_window);
+CRPC_AFTER(http2::stream_snapshot, send_window, recv_window);
+CRPC_AFTER(http2::stream_snapshot, recv_window, local_end_stream);
+CRPC_AFTER(http2::stream_snapshot, local_end_stream, remote_end_stream);
+CRPC_AFTER(http2::stream_snapshot, remote_end_stream, queued_bytes);
+
+CRPC_STEP_SAME(http2::window_credit, connection, stream);
+
+CRPC_AFTER(frame_compression_info, algorithm, wire_size);
+CRPC_AFTER(frame_compression_info, wire_size, logical_size);
+CRPC_AFTER(frame_compression_info, logical_size, dropped);
+CRPC_AFTER(frame_compression_info, dropped, drop_reason);
 
 // --- http_statistics: the 28-counter STEP chain -----------------------------
 //
@@ -217,8 +602,9 @@ static_assert(sizeof(client::resilience_statistics) == 9 * sizeof(std::size_t),
 // `std::uint64_t` resilience counters, then seven `std::size_t` push counters.
 // A uniform STEP would be wrong on 32-bit targets, where the `std::size_t` runs
 // are 4 bytes wide but the `std::uint64_t` block is 8-byte aligned. The chain
-// therefore uses the matching macro at each boundary, and no total-width
-// assertion is made because the width legitimately differs between targets.
+// therefore uses the matching macro at each boundary. The total width differs
+// between targets (104 on x86, 152 on x64), so it is asserted in the
+// per-architecture block above rather than here.
 CRPC_STEP(server::statistics, active_connections, in_flight_calls);
 CRPC_STEP(server::statistics, in_flight_calls, accepted_connections);
 CRPC_STEP(server::statistics, accepted_connections, requests_handled);
@@ -264,6 +650,7 @@ static_assert(alignof(endpoint) >= alignof(void*),
 #undef CRPC_STEP_SAME
 #undef CRPC_STEP_MIXED
 #undef CRPC_AFTER
+#undef CRPC_MEMBER_COUNT
 
 // A named symbol keeps MSVC from emitting LNK4221 ("no public symbols found")
 // for this translation unit. It is internal detail, not part of the ABI, and is

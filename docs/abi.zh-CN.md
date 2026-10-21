@@ -83,12 +83,32 @@ C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计�
 MINOR 扩展。
 
 无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
-它断言公开记录的标准布局属性、`http_statistics` / `client::statistics` /
-`client::resilience_statistics` / `server::statistics` 各计数器的相对成员链
-（链条按每个成员自身的宽度推进，因此混用 `std::size_t` 与 `std::uint64_t` 的
-`server::statistics` 在 32 位与 64 位目标上都能被检查），以及 `http_statistics`
-的总宽度与尾字段位置。它随库一起编译，因此布局变更会导致构建失败。它只断言
-相对偏移、不断言绝对偏移，也不锁定含有标准库成员的类型的尺寸。
+它断言公开记录的标准布局属性、每个跨边界记录的精确成员数量、
+`http_statistics` / `client::statistics` / `client::resilience_statistics` /
+`server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
+混用 `std::size_t` 与 `std::uint64_t` 的 `server::statistics` 在 32 位与 64 位
+目标上都能被检查）、`http_statistics` 的总宽度与尾字段位置，并且**仅在 x86 与
+x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof` 数值。它随库一起
+编译，因此在这些护栏覆盖的范围内，布局变更会导致构建失败。
+
+这些护栏并不对所有变更类型、所有架构一视同仁，判断某个变更是否会被捕获时必须区分：
+
+- 重排、在两个既有成员之间插入、删除、重命名成员：由相对成员链与成员数量在所有
+  架构上捕获，因为这些护栏不依赖绝对数值。
+- 在末尾追加字段：由成员数量在所有架构上捕获，并且在 x86 与 x64 上还会被绝对
+  `sizeof` 锚额外捕获。x86 之所以必须依赖成员数量，是因为 x86 上
+  `server::statistics` 为 104 字节而最后一个字段结束于 100，末尾 4 字节是填充；
+  追加一个 `std::size_t` 会被这段填充吸收，`sizeof` 不变。因此**单靠绝对
+  `sizeof` 断言在 x86 上抓不到尾追加**，这正是成员数量存在的理由。
+- 在 x86 与 x64 之外的架构（例如 ARM64）上，不维护任何绝对 `sizeof` /
+  `offsetof` 数值。尾追加仍由成员数量捕获，但如果某个变更同时保持成员数量与相对
+  顺序不变、只改变绝对宽度，则在这些目标上**不会**在编译期被捕获。
+
+该翻译单元不锁定含有标准库成员的类型的尺寸（`rpc_error`、`status`、`buffer`、
+`endpoint`），因为它们的宽度属于标准库配置而非本库的属性：同一份头文件下，
+`rpc_error` 与 `status` 在 x64 Release 为 80 字节、Debug 为 96 字节，在 x86 上
+分别为 56 与 64 字节。它们由成员数量、标准布局前置条件以及
+`sizeof(status) == sizeof(rpc_error)` 关系来守护。
 
 **当前没有 size-tag 模式。** 没有任何公开头文件声明 `struct_size` 成员；
 `crpc::connect_options` 只有超时、缓冲区与 no-delay 字段

@@ -98,14 +98,42 @@ extension.
 
 The layout invariants that are checkable without header changes live in one
 internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
-the public records, a relative member chain over the counters of
-`http_statistics`, `client::statistics`, `client::resilience_statistics` and
-`server::statistics` (the chain follows each member's own width, so
-`server::statistics`, which mixes `std::size_t` and `std::uint64_t`, is checked
-on both 32-bit and 64-bit targets), and the total width and last-field position
-of `http_statistics`. It is compiled as part of the library, so a layout change
-fails the build. It asserts relative offsets only, never absolute ones, and it
-does not pin the size of types that own standard-library members.
+the public records, an exact member count for every record that crosses the
+boundary, a relative member chain over the counters of `http_statistics`,
+`client::statistics`, `client::resilience_statistics` and `server::statistics`
+(the chain follows each member's own width, so `server::statistics`, which mixes
+`std::size_t` and `std::uint64_t`, is checked on both 32-bit and 64-bit
+targets), the total width and last-field position of `http_statistics`, and, on
+x86 and x64 only, absolute `sizeof` and key `offsetof` values for the records
+listed in that file. It is compiled as part of the library, so a layout change
+fails the build in the cases those guards cover.
+
+The guards are not uniform across change kinds or across architectures, and the
+difference matters when judging whether a given change is caught:
+
+- A reorder, an insertion between two existing members, a removal, or a renamed
+  member is caught by the relative chains and the member counts on every
+  architecture, because those guards do not depend on absolute numbers.
+- A field appended at the end is caught by the member count on every
+  architecture, and additionally by the absolute `sizeof` anchor on x86 and x64.
+  The member count is what makes the x86 case work: on x86
+  `server::statistics` is 104 bytes while its last field ends at 100, so an
+  appended `std::size_t` is absorbed by the 4 bytes of tail padding and
+  `sizeof` does not change. An absolute `sizeof` assertion alone is therefore
+  blind to a tail append on x86, which is why the member count exists.
+- On architectures other than x86 and x64 (for example ARM64) no absolute
+  `sizeof` or `offsetof` value is maintained. A tail append is still caught by
+  the member count, but a change that preserves both the member count and the
+  relative order while altering the absolute width is **not** caught at compile
+  time on those targets.
+
+The unit does not pin the size of types that own standard-library members
+(`rpc_error`, `status`, `buffer`, `endpoint`), because their width is a property
+of the standard library configuration rather than of this library: `rpc_error`
+and `status` measure 80 bytes on x64 Release and 96 in Debug, and 56 versus 64
+on x86, with the same headers. They are guarded by their member count, their
+standard-layout precondition, and the `sizeof(status) == sizeof(rpc_error)`
+relation.
 
 There is no size-tag pattern today. No public header declares a `struct_size`
 member; `crpc::connect_options` contains only the timeout, buffer and no-delay
