@@ -345,6 +345,11 @@ status finish_call(const codec& response_codec, Callable&& call,
 // Type-checked handler adapter. `Method` is `&Controller::method`, so the
 // compiler rejects a macro that names a method the controller does not have and
 // every signature mismatch is caught at compile time.
+//
+// In an exception-enabled translation unit a handler that throws is caught here
+// and reported as `rpc_code::internal`. In a `-fno-exceptions` / `/EHs-c-` build
+// there is no try/catch, so a throwing handler is undefined behaviour and in
+// practice terminates the process (`std::terminate`).
 template <typename Controller, auto Method>
 status invoke_http(void* self, const http::request& request,
                    const route_params& params, const codec& response_codec,
@@ -353,6 +358,7 @@ status invoke_http(void* self, const http::request& request,
     using request_type = typename traits::request_type;
     using response_type = typename traits::response_type;
     Controller* controller = static_cast<Controller*>(self);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     try {
         if constexpr (std::is_void_v<request_type>) {
             return detail::finish_call<response_type>(
@@ -379,6 +385,34 @@ status invoke_http(void* self, const http::request& request,
                     request.path);
         return status{};
     }
+#else
+    // Built without exception support (-fno-exceptions, /EHs-c-). MSVC without
+    // any /EH option also lands here: neither `__cpp_exceptions` nor
+    // `_CPPUNWIND` is defined then. The body below is the same control flow as
+    // the guarded branch above, minus try/catch: every `if constexpr` branch is
+    // still instantiated and every return path (finish_call, bind_request
+    // failure, write_body) is preserved. The `internal` error path is
+    // unreachable in this build; a throwing handler is undefined behaviour and
+    // in practice terminates the process (`std::terminate`).
+    if constexpr (std::is_void_v<request_type>) {
+        return detail::finish_call<response_type>(
+            response_codec,
+            [&]() -> decltype(auto) { return (controller->*Method)(); },
+            response, request.path);
+    } else {
+        request_type dto{};
+        const status bound = bind_request<request_type>(
+            request, params, registry, default_binding_limits(), dto);
+        if (!bound.ok()) {
+            write_error(response, bound.error(), request.path);
+            return status{};
+        }
+        return detail::finish_call<response_type>(
+            response_codec,
+            [&]() -> decltype(auto) { return (controller->*Method)(dto); },
+            response, request.path);
+    }
+#endif
 }
 
 // --- Registration ------------------------------------------------------------
