@@ -83,7 +83,7 @@ export CRPC_COROCC_DIR=/path/to/corocc
 **异常。** 公共头可在无异常下构建；库本身不行。
 
 - *使用预编译库、`CRPC_HAVE_RTTI=0`：* 52 个公共头都可用 `-fno-exceptions` 与 MSVC `/EHs-c-` 编译。库本身必须是默认的启用异常构建；只有消费方关闭异常。
-- *在无异常下重建库不受支持：* `src/` 的 46 个 TU 中有 13 个含 `try`/`catch` 语句（例如 `src/observability/log.cpp` catch `:270` / try `:268`、`src/rpc/dispatcher.cpp` catch `:368` / try `:366`、`src/c_api.cpp` catch `:291` / try `:248`；MSVC 报的是 `try` 所在行）。GCC 在 46 个中有 11 个失败，MSVC 有 13 个：多出的两个 MSVC 失败是 `src/io/iocp_backend.cpp`（Windows 专用代码，在 GCC 上是空 TU）与 `src/http2/connection.cpp`——后者自身没有 `try`/`catch`，但会触发 MSVC `<vector>(1224)` 里的 C4530，在 `/WX` 下失败。CMake 没有移除异常处理的开关。
+- *在无异常下重建库不受支持：* `src/` 的 46 个 TU 中有 13 个含 `try`/`catch` 语句（例如 `src/observability/log.cpp` catch `:270` / try `:268`、`src/rpc/dispatcher.cpp` catch `:368` / try `:366`、`src/c_api.cpp` catch `:291` / try `:248`；MSVC 报的是 `try` 所在行）。失败数按目标不同：Linux GCC 46 个中 11 个、MinGW GCC 12 个、MSVC 13 个。算式：`src/io/iocp_backend.cpp` 只在**非 Windows** GCC 上是空 TU；MinGW GCC 会编译它，并在 `:1257` 的 `try`/`catch` 处失败，因此 MinGW GCC 在 46 个中失败 12 个。相对 Linux GCC，MSVC 多出 `src/http2/connection.cpp`——它自身没有 `try`/`catch`，但会触发 MSVC `<vector>(1224)` 里的 C4530，在 `/WX` 下失败；同时少了 `src/io/tls_openssl.cpp`——没有 OpenSSL 时其 `catch` 被预处理掉：11 + 1 + 1 = 13。CMake 没有移除异常处理的开关。
 - *`CRPC_RTTI_DIR` + `-fno-exceptions`：* 在**头阶段**失败（早于任何 `src/` 文件）：MSVC 在 `rtti/convert.hpp:2597` 的 `try` 报 C4530（`/WX` 下为 C2220），GCC 在 `:2599` 的 `catch` 报 "exception handling disabled"。
 
 各边界上抛出的语义见[架构 §15](architecture.zh-CN.md#s15)；这些开关只决定什么能编译，不决定异常如何被恢复。
@@ -92,7 +92,7 @@ export CRPC_COROCC_DIR=/path/to/corocc
 
 - *`CRPC_HAVE_RTTI=0`：* `encode_into`/`decode_from` 是**编译期错误**，不是返回错误状态。switch 的 `crpc_binary` 分支会无条件实例化 `binary_codec::encode_typed`，其 `static_assert` 直接触发："crpc-binary requires the RTTI dependency"（`include/crpc/codec.hpp:1073`）。
 - *反射开启 + `-fno-rtti`：* 编译在任何 CRPC 模板实例化之前就死在依赖里。在 GCC 13.3 与 Clang 18.1.3 上首个错误都是依赖自身的 `rtti/reflection.hpp:2183`（`typeid`）；GCC 共报 34 条（32 处 `typeid` 加 2 处 `rtti/proto.hpp:2527,2529` 的 `dynamic_cast`），Clang 默认在 20 条错误处截断，只有加 `-ferror-limit=0` 才会看到 `proto.hpp` 那两条。更新的 Clang 可能先报 `proto.hpp` 那对错误；无论哪种，失败都在依赖里，不在 CRPC 头里。
-- *仅在内部 `CRPC_CAN_USE_TYPEID=0` 构建中：* 未识别的自定义 codec id 返回 `failed_precondition`（HTTP 409）而不是走到 `typeid`（`include/crpc/codec.hpp:1553-1557`）；内置 id 仍正常编解码。该宏由编译器推导，不能覆盖——定义它会触发硬 `#error`（`codec.hpp:156-165`）。
+- *`CRPC_CAN_USE_TYPEID=0` 分支：* 未识别的自定义 codec id 返回 `failed_precondition`（HTTP 409）而不是走到 `typeid`（`include/crpc/codec.hpp:1553-1557`）；内置 id 仍正常编解码。该分支**当前在所有已文档化的配置下都不可达**：`CRPC_HAVE_RTTI=0` 会先撞上 `codec.hpp:1073` 的 `static_assert`（自定义 id 的调用同样会实例化 `crpc_binary` 分支），反射开启但无 `typeid` 则死在依赖里，MSVC 与 clang-cl 恒推导为 `1`，自行定义该宏会触发硬 `#error`（`codec.hpp:156-165`）。保留它是为了将来某个缺少 `typeid` 但具备反射库的工具链。
 - *MSVC `/GR-`：* 在 `CRPC_HAVE_RTTI=0` 时可用（cl 在 `/GR-` 下仍接受本库使用的静态 `typeid(T)`）。启用反射库时，`/GR-` 在 `rtti/proto.hpp:2527,2529` 报 C4541（`/GR-` 下的 `dynamic_cast` 属未定义行为）：不加 `/WX` 时编译 EXIT=0 但带这两条警告——能编译，但含 UB；加 `/WX` 后转为 C2220。
 
 另有两条一致性要求，构建错误都无法替你兜住：
