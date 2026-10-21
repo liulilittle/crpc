@@ -288,9 +288,10 @@ struct http_statistics {
     std::size_t longpoll_overloaded = 0;
     // Effective replay bound after start() clamps it to `max_messages`; zero
     // when the server is not running, the start attempt failed, or the server
-    // has no long-poll routes. Moved to the end after `longpoll_overloaded`, so
-    // the members declared before it keep their offsets while the six trailing
-    // long-poll counters each move one `std::size_t` earlier (docs/abi.md §4).
+    // has no long-poll routes. This whole long-poll block is new since 1.0.0
+    // (1.0.0 had 9 fields / sizeof 72); within the unreleased cycle the field
+    // was moved to the end after `longpoll_overloaded`, so the six counters
+    // above each moved one `std::size_t` earlier (docs/abi.md §4).
     std::size_t longpoll_replay_window = 0;
 };
 

@@ -54,17 +54,21 @@
 
 ### ABI breaking: `http_statistics` layout
 
-- `http_statistics` has carried `longpoll_replay_window` since 1.0.0 (offset
-  168); in this release it was **moved** to the end (offset 216). The six
-  pre-existing long-poll counters that followed it each moved one `std::size_t`
-  earlier: `longpoll_events` 176→168, `longpoll_timeouts` 184→176,
-  `longpoll_ack_clamped` 192→184, `longpoll_conflicts` 200→192,
-  `longpoll_restarts` 208→200, `longpoll_overloaded` 216→208. `sizeof` is
-  unchanged (224 on 64-bit builds) because no field was added or removed: at
-  1.0.0 the six counters followed `longpoll_replay_window` and filled the struct
-  to 224, so there was no trailing padding. A consumer built against the old
-  header reads all seven affected fields at the wrong offsets, so this is ABI
-  breaking and needs the MAJOR bump described in [abi.md](abi.md) §4.
+- Relative to the released 1.0.0 (`bd006b2`), `http_statistics` gained 19
+  fields in this unreleased cycle: the whole long-poll block
+  (`longpoll_waiters`, `longpoll_subscribers`, `longpoll_replay_window`,
+  `longpoll_events`, `longpoll_timeouts`, `longpoll_ack_clamped`,
+  `longpoll_conflicts`, `longpoll_restarts`, `longpoll_overloaded`) plus ten
+  SSE/compression/download counters. `sizeof` grew from 72 (9 fields) to 224
+  (28 fields); the nine fields 1.0.0 shipped keep their offsets (0 … 64).
+  Adding fields to a public struct is a MAJOR change ([abi.md](abi.md) §1/§4).
+- Inside that cycle `longpoll_replay_window` was first placed at offset 168 and
+  later moved to the end (offset 216); the six counters that followed it each
+  moved 8 bytes earlier (`longpoll_events` 176→168 … `longpoll_overloaded`
+  216→208). `sizeof` was already 224 before and after that move because the
+  struct had no trailing padding then either. No released header ever carried
+  the offset-168 layout (no tag, no 1.0.1), so the internal move is not itself a
+  break for published consumers; the 72 → 224 growth is.
 
 ### Behaviour change: COMPRESSED frames are no longer delivered as plaintext
 
