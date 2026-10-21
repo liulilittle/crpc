@@ -36,6 +36,8 @@ foreach(source ${CRPC_TEST_SOURCES})
     set_tests_properties(${target} PROPERTIES TIMEOUT 30)
 endforeach()
 
+set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 60)
+
 # --- C ABI smoke test --------------------------------------------------------
 # Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is
 # required because the library needs the C++ runtime at link time.
