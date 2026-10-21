@@ -358,8 +358,9 @@ status invoke_http(void* self, const http::request& request,
     using request_type = typename traits::request_type;
     using response_type = typename traits::response_type;
     Controller* controller = static_cast<Controller*>(self);
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-    try {
+    // The handler body is shared by both builds; only the ability to observe a
+    // throw differs.
+    auto invoke = [&]() -> status {
         if constexpr (std::is_void_v<request_type>) {
             return detail::finish_call<response_type>(
                 response_codec,
@@ -380,6 +381,10 @@ status invoke_http(void* self, const http::request& request,
                 },
                 response, request.path);
         }
+    };
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+    try {
+        return invoke();
     } catch (...) {
         write_error(response, rpc_error(rpc_code::internal, "internal error"),
                     request.path);
@@ -388,30 +393,10 @@ status invoke_http(void* self, const http::request& request,
 #else
     // Built without exception support (-fno-exceptions, /EHs-c-). MSVC without
     // any /EH option also lands here: neither `__cpp_exceptions` nor
-    // `_CPPUNWIND` is defined then. The body below is the same control flow as
-    // the guarded branch above, minus try/catch: every `if constexpr` branch is
-    // still instantiated and every return path (finish_call, bind_request
-    // failure, write_body) is preserved. The `internal` error path is
-    // unreachable in this build; a throwing handler is undefined behaviour and
-    // in practice terminates the process (`std::terminate`).
-    if constexpr (std::is_void_v<request_type>) {
-        return detail::finish_call<response_type>(
-            response_codec,
-            [&]() -> decltype(auto) { return (controller->*Method)(); },
-            response, request.path);
-    } else {
-        request_type dto{};
-        const status bound = bind_request<request_type>(
-            request, params, registry, default_binding_limits(), dto);
-        if (!bound.ok()) {
-            write_error(response, bound.error(), request.path);
-            return status{};
-        }
-        return detail::finish_call<response_type>(
-            response_codec,
-            [&]() -> decltype(auto) { return (controller->*Method)(dto); },
-            response, request.path);
-    }
+    // `_CPPUNWIND` is defined then. A throwing handler is undefined behaviour
+    // and in practice terminates the process (`std::terminate`); the `internal`
+    // error path above is unreachable in this build.
+    return invoke();
 #endif
 }
 
