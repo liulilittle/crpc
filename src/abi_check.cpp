@@ -108,7 +108,7 @@ namespace {
 //     the five `decltype` assertions below, so a rename of any of them fails
 //     this translation unit. Its constructors name only `code`, `message` and
 //     `retryable`, so they do not catch a rename of `retry_after` or
-//     `metadata`. (`status` has no data member; HTTP/2 records have chains.)
+//     `metadata`. (`status` has no public data member; HTTP/2 records have chains.)
 //   * a reorder that keeps the count is not detected here either; the relative
 //     chains cover it where they exist. `rpc_error` has no relative chain, so a
 //     reorder in `rpc_error` is not detected by this unit;
