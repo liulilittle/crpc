@@ -1177,4 +1177,106 @@ CRPC_TEST(degradable_resilience_disabled_keeps_service_cap_marker) {
                   f.srv->stats().rejected_overload);
 }
 
+CRPC_TEST(degradable_breaker_refusal_with_expired_wire_deadline_is_not_marked) {
+    // Given: a breaker that opens after one dependency failure.
+    server_under_test f;
+    setup cfg;
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.0;
+    breaker.slow_call_threshold = 10s;
+    breaker.open_duration = 5s;
+    cfg.breaker = breaker;
+    CRPC_CHECK(start(f, cfg));
+    tee_client c = make_client(f);
+    CRPC_CHECK(c.client != nullptr);
+    if (!c.client) {
+        return;
+    }
+
+    // Open the breaker with a plain call.
+    const call_outcome first = call_int(c, kFail, 1);
+    CRPC_CHECK(first.started);
+
+    // When: the breaker refusal is asked with 990 us of wire deadline left,
+    // below the 1 ms floor.
+    const call_outcome out =
+        call_int(c, kFail, 2, std::chrono::microseconds(990));
+
+    // Then: it is still a breaker refusal, but it is not marked: a fallback
+    // value could not reach the caller in time.
+    CRPC_CHECK(out.started);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  static_cast<int>(out.error.code));
+    CRPC_CHECK_EQ(std::string("service circuit breaker is open"),
+                  out.error.message);
+    CRPC_CHECK_FALSE(has_degradable_marker(out.error));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), out.error.metadata.size());
+}
+
+CRPC_TEST(degradable_bulkhead_refusal_with_expired_wire_deadline_is_not_marked) {
+    // Given: a per-service bulkhead of one slot, two shards and two connections
+    // so the two handlers truly overlap.
+    server_under_test f;
+    setup cfg;
+    cfg.shards = 2;
+    crpc::resilience::bulkhead_config bulkhead;
+    bulkhead.capacity = 1;
+    bulkhead.retry_after = 10ms;
+    cfg.service_bulkhead = bulkhead;
+    CRPC_CHECK(start(f, cfg));
+    tee_client first = make_client(f);
+    tee_client second = make_client(f);
+    CRPC_CHECK(first.client != nullptr);
+    CRPC_CHECK(second.client != nullptr);
+    if (!first.client || !second.client) {
+        return;
+    }
+
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    crpc::buffer first_body;
+    crpc::buffer second_body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, first_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(2, second_body).ok());
+    auto first_started = first.client->start_call<int>(kService, kBlocking,
+                                                       first_body.readable());
+    CRPC_CHECK(first_started.ok());
+    if (!first_started.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first_started).value();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
+
+    // When: the second request arrives with 990 us of wire deadline left, below
+    // the 1 ms floor.
+    crpc::rpc::call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+    auto second_started =
+        second.client->start_call<int>(kService, kBlocking, second_body.readable(), ctx);
+    CRPC_CHECK(second_started.ok());
+    crpc::rpc_error second_error;
+    if (second_started.ok()) {
+        auto handle = std::move(second_started).value();
+        auto result = handle.get();
+        CRPC_CHECK_FALSE(result.ok());
+        if (!result.ok()) {
+            second_error = result.error();
+        }
+    }
+    f.service.blocking_gate.store(1, std::memory_order_release);
+    (void)first_handle.get();
+
+    // Then: the bulkhead still refuses, but the refusal is not marked.
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::overload),
+                  static_cast<int>(second_error.code));
+    CRPC_CHECK_EQ(std::string("service bulkhead is full"),
+                  second_error.message);
+    CRPC_CHECK_FALSE(has_degradable_marker(second_error));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), second_error.metadata.size());
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1),
+                  f.srv->stats().bulkhead_rejected);
+}
+
 CRPC_TEST_MAIN()
