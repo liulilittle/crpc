@@ -865,6 +865,11 @@ public:
                     rpc_error(rpc_code::shutting_down, "client is closed"));
             }
             if (core.canceled.load(std::memory_order_acquire)) {
+                // A canceled result is never degraded. The state is fresh
+                // here and every attempt clears the flag in begin_attempt,
+                // so this is belt-and-braces: it keeps the invariant local
+                // to every canceled return.
+                core.clear_degraded();
                 return rpc::rpc_result<call<Resp>>(
                     rpc_error(rpc_code::canceled, "call canceled"));
             }
@@ -885,6 +890,7 @@ public:
             }
             sleep_for(core, delay);
             if (core.canceled.load(std::memory_order_acquire)) {
+                core.clear_degraded();
                 return rpc::rpc_result<call<Resp>>(
                     rpc_error(rpc_code::canceled, "call canceled"));
             }
