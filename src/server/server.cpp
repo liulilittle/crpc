@@ -19,6 +19,7 @@
 
 #include <crpc/endian.hpp>
 #include <crpc/resilience/admission.hpp>
+#include <crpc/resilience/fallback.hpp>
 #include <crpc/rpc/call.hpp>
 
 namespace crpc {
@@ -869,15 +870,40 @@ struct server::impl {
 
     void send_error(const std::shared_ptr<server_connection>& sc, std::uint32_t stream_id,
                     rpc_code code, std::chrono::milliseconds retry_after,
-                    const char* message) noexcept {
+                    const char* message, bool degradable = false) noexcept {
         rpc_error error(code, message != nullptr ? std::string(message) : std::string());
         error.retryable = is_retryable(code);
         error.retry_after = retry_after;
+        // The single place the reserved marker is written. Only the four
+        // pre-execution admission refusals pass `degradable = true`; every other
+        // call site leaves it false, so a handler that returns the same code
+        // never advertises degradability. See resilience/admission.hpp (6).
+        if (degradable) {
+            error.metadata.set(resilience::degradable_metadata_key,
+                               resilience::degraded_metadata_value);
+        }
         buffer payload;
         if (!rpc::encode_response(code, error, span<const std::byte>(), payload).ok()) {
             return;
         }
         (void)send_payload(sc, stream_id, frame_type::response, payload.readable());
+    }
+
+    // True when the request's wire deadline is below the floor the dispatcher
+    // uses to refuse work (resilience::min_remaining_ns). Such a request may
+    // still be refused by an admission stage that runs first (the breaker, or
+    // the rate bucket whose hint happens to fit the remaining time), but a
+    // fallback value could not reach the caller in time either, so those
+    // refusals must not advertise degradability.
+    //
+    // All four marked call sites pass `one_way = false` as a literal: each sits
+    // inside `if (wants_response)`, so the request is never one-way there.
+    // `fallback_eligible` still takes the flag so the one-way decision stays in
+    // one place; do not replace the literal with a second test of the frame
+    // type, which could drift from `wants_response`.
+    [[nodiscard]] static bool wire_deadline_expired(const call_envelope& envelope) noexcept {
+        return envelope.extensions.has(trace_extension::has_deadline) &&
+               envelope.extensions.deadline_ns < resilience::min_remaining_ns;
     }
 
     void handle_request(request_job& job) noexcept {
@@ -974,10 +1000,14 @@ struct server::impl {
             if (!permit.allowed()) {
                 breaker_open.fetch_add(1, std::memory_order_relaxed);
                 if (wants_response) {
-                    send_error(sc, job.header.stream_id,
-                               resilience::reject_code(
-                                   resilience::stage_kind::breaker),
-                               permit.retry_after(), "service circuit breaker is open");
+                    const rpc_code code = resilience::reject_code(
+                        resilience::stage_kind::breaker);
+                    send_error(sc, job.header.stream_id, code,
+                               permit.retry_after(), "service circuit breaker is open",
+                               !wire_deadline_expired(envelope) &&
+                                   resilience::fallback_eligible(
+                                       code, resilience::stage_kind::breaker,
+                                       /*one_way=*/false));
                 }
                 complete_call(sc, job.counted);
                 return;
@@ -1029,12 +1059,17 @@ struct server::impl {
                                            "service rate limit cannot meet the deadline");
                             }
                         } else if (wants_response) {
-                            send_error(sc, job.header.stream_id,
-                                       resilience::reject_code(
-                                           resilience::stage_kind::service_rate,
-                                           limited.deadline_met),
+                            const rpc_code code = resilience::reject_code(
+                                resilience::stage_kind::service_rate,
+                                limited.deadline_met);
+                            send_error(sc, job.header.stream_id, code,
                                        limited.retry_after,
-                                       "service rate limit reached");
+                                       "service rate limit reached",
+                                       !wire_deadline_expired(envelope) &&
+                                           resilience::fallback_eligible(
+                                               code,
+                                               resilience::stage_kind::service_rate,
+                                               /*one_way=*/false));
                         }
                         complete_call(sc, job.counted);
                         return;
@@ -1050,10 +1085,15 @@ struct server::impl {
                                 bulkhead_permit.retry_after().count() > 0
                                     ? bulkhead_permit.retry_after()
                                     : opt.overload_retry_after;
-                            send_error(sc, job.header.stream_id,
-                                       resilience::reject_code(
-                                           resilience::stage_kind::service_bulkhead),
-                                       hint, "service bulkhead is full");
+                            const rpc_code code = resilience::reject_code(
+                                resilience::stage_kind::service_bulkhead);
+                            send_error(sc, job.header.stream_id, code, hint,
+                                       "service bulkhead is full",
+                                       !wire_deadline_expired(envelope) &&
+                                           resilience::fallback_eligible(
+                                               code,
+                                               resilience::stage_kind::service_bulkhead,
+                                               /*one_way=*/false));
                         }
                         complete_call(sc, job.counted);
                         return;
@@ -1064,11 +1104,16 @@ struct server::impl {
                 permit.ignore();
                 rejected.fetch_add(1, std::memory_order_relaxed);
                 if (wants_response) {
-                    send_error(sc, job.header.stream_id,
-                               resilience::reject_code(
-                                   resilience::stage_kind::service_capacity),
+                    const rpc_code code = resilience::reject_code(
+                        resilience::stage_kind::service_capacity);
+                    send_error(sc, job.header.stream_id, code,
                                opt.overload_retry_after,
-                               "service concurrency limit reached");
+                               "service concurrency limit reached",
+                               !wire_deadline_expired(envelope) &&
+                                   resilience::fallback_eligible(
+                                       code,
+                                       resilience::stage_kind::service_capacity,
+                                       /*one_way=*/false));
                 }
                 complete_call(sc, job.counted);
                 return;

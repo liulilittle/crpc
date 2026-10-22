@@ -68,6 +68,26 @@
 //    every send_error() call site is inside `if (wants_response)`). It can
 //    never be degraded and can never carry crpc-degradable, so
 //    fallback_eligible() rejects `one_way` unconditionally.
+// 6. Four admission refusals DO write the reserved `crpc-degradable: true`
+//    response meta entry, and only when the request still has at least
+//    min_remaining_ns of wire deadline left:
+//      - the per-service breaker (server.cpp, `!permit.allowed()`, 977);
+//      - the per-service rate bucket, success exit (1032);
+//      - the per-service bulkhead (1053);
+//      - the per-service in-flight cap (1067).
+//    The rate bucket's OTHER exit -- deadline not met (1024) -- never sets it:
+//    a deadline miss is not degradable (fallback_eligible() rejects
+//    deadline_exceeded first). The connection-level flood bucket and the
+//    per-connection cap (both reach send_error() through the forced-error job)
+//    never set it either: they are load shedding with no eligible stage, and a
+//    fallback response would cost exactly what the shed exists to avoid.
+//    `crpc-degraded` (the client-side "a fallback value was used" key) is still
+//    set by nobody on the server. `fallback_execute` is still never called from
+//    the server: the marker advertises that a refusal COULD be degraded, it does
+//    not perform the degradation.
+//    This is why fallback_eligible() cannot be used to derive the marker from
+//    the code alone: `overload` from a handler is not marked, `overload` from
+//    the bulkhead or the cap is. Only the branch knows.
 //
 // fallback_eligible() answers only "may this (code, stage) pair be degraded?".
 // The idempotency gate for a path that may already have been sent is the
@@ -82,6 +102,15 @@
 #include <crpc/error.hpp>
 
 namespace crpc::resilience {
+
+// The minimum remaining time, in nanoseconds, for the server to start work on a
+// request. A wire deadline below this floor is already unusable: the dispatcher
+// refuses it before the handler runs (dispatcher.cpp, "deadline already
+// passed") and the server's admission refusals withhold the crpc-degradable
+// marker for it, because a fallback value could not be delivered before the
+// caller's deadline either. Both readers share this constant; a second literal
+// would be a second deadline policy.
+inline constexpr u64 min_remaining_ns = 1'000'000;
 
 // Where a request was refused. The names follow the real branches in
 // src/server/server.cpp and src/client/client_facade.cpp, not an abstract

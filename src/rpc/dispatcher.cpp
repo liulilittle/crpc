@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include <crpc/resilience/admission.hpp>
 #include <crpc/wire.hpp>
 
 namespace crpc::rpc {
@@ -345,9 +346,9 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
 
     if (envelope.extensions.has(trace_extension::has_deadline)) {
         // Relative deadline (design section 8.5): refuse to start work that
-        // cannot finish. 1 ms is the documented minimum remaining time.
-        constexpr u64 min_remaining_ns = 1'000'000;
-        if (envelope.extensions.deadline_ns < min_remaining_ns) {
+        // cannot finish. The floor is shared with the server's admission
+        // refusals so the two cannot drift (resilience::min_remaining_ns).
+        if (envelope.extensions.deadline_ns < resilience::min_remaining_ns) {
             return respond_error(response_out, has_response, wants_response,
                                  rpc_code::deadline_exceeded, "deadline already passed");
         }
