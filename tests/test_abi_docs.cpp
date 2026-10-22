@@ -1127,6 +1127,15 @@ CRPC_TEST(abi_docs_section_2_does_not_call_internal_layout_invisible) {
     // Who allocates what: the two library-only types must not be described as
     // consumer-allocated, and the library-only fact must be stated.
     CRPC_CHECK(has_phrase(english, "allocated only by the library"));
+    // Allocating in the library does NOT make the layout invisible: the member
+    // offsets are baked into the consumer translation unit by header-inline
+    // code, so a field added to either type still breaks an older consumer.
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "does not break a consumer built from older headers"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "never allocates them by value"));
+    CRPC_CHECK(has_phrase(
+        english, "member offsets are still baked into consumer"));
     // Only two of the four are polymorphic; the other two are plain structs.
     CRPC_CHECK(has_phrase(
         english, "Only `call_state_base` and `call_state<Resp>` are"));
@@ -1142,6 +1151,11 @@ CRPC_TEST(abi_docs_section_2_does_not_call_internal_layout_invisible) {
     CRPC_CHECK(has_phrase(chinese, "同一份头文件"));
     CRPC_CHECK(has_phrase(chinese, "padding 只有 4 字节"));
     CRPC_CHECK(has_phrase(chinese, "只由库分配"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        chinese, "不会破坏用旧头文件构建的消费方"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        chinese, "消费方从不会按值分配它们"));
+    CRPC_CHECK(has_phrase(chinese, "成员偏移仍被头内代码烘焙进消费方"));
     CRPC_CHECK(has_phrase(chinese, "没有 vptr 的普通结构体"));
     CRPC_CHECK(has_phrase(chinese, "只覆盖句柄，不覆盖它指向的堆对象"));
 }
