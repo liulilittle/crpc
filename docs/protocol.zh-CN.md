@@ -173,7 +173,7 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 
 编码器把 `message_len`、`key_len`、`value_len`、`meta_count` 钳制到 `uint16_t`；设计中的 512 字节消息和 1 KiB 元数据限制是目标策略，不是此编解码器强制的限制。大于 `application`（21）的未知 `rpc_code` 解码为 `internal`，原值放入 `metadata["crpc.raw_code"]`。`RST_STREAM` 负载是 `u32` 小端的 `rpc_code`；客户端取消时发送它，并忽略同一 stream 的迟到响应。
 
-**服务端准入错误。** 准入阶段复用该错误信封，不新增线上字段。可选的连接级令牌桶返回 `resource_exhausted`（13）和非零 `retry_after_ms`。服务级令牌桶返回同样的码；若等待会越过请求 deadline，则返回 `deadline_exceeded`（2）且 `retry_after_ms = 0`。服务级 bulkhead 满载返回 `overload`（8）并带其提示；breaker open 返回 `unavailable`（3）并带剩余打开时长；dispatcher 的执行前 deadline 拒绝仍是 `deadline_exceeded` 且 `retry_after_ms = 0`。HTTP 映射：`resource_exhausted`/`overload` 为 429，`unavailable` 为 503，`deadline_exceeded` 为 504。`retry_after_ms` 是服务端给出的建议下界，不保证重试一定成功。未知服务 id 仍是 `not_found`（9），且不会创建服务端状态。响应 meta 保留键 `crpc-degraded=true` 留给 fallback（已设计，未实现）；准入阶段不会设置它。
+**服务端准入错误。** 准入阶段复用该错误信封，不新增线上字段。可选的连接级令牌桶返回 `resource_exhausted`（13）和非零 `retry_after_ms`。服务级令牌桶返回同样的码；若等待会越过请求 deadline，则返回 `deadline_exceeded`（2）且 `retry_after_ms = 0`。服务级 bulkhead 满载返回 `overload`（8）并带其提示；breaker open 返回 `unavailable`（3）并带剩余打开时长；dispatcher 的执行前 deadline 拒绝仍是 `deadline_exceeded` 且 `retry_after_ms = 0`。HTTP 映射：`resource_exhausted`/`overload` 为 429，`unavailable` 为 503，`deadline_exceeded` 为 504。`retry_after_ms` 是服务端给出的建议下界，不保证重试一定成功。未知服务 id 仍是 `not_found`（9），且不会创建服务端状态。响应 meta 保留键 `crpc-degraded` 与 `crpc-degradable` 留给 fallback（原语已实现、未接线）；准入阶段不会设置它们。
 
 ## 11. varint 与 zigzag <a id="s11"></a>
 

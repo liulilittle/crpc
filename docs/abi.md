@@ -274,7 +274,11 @@ is ABI breaking (MAJOR) unless a size-tagged options struct exists (§7).
 Additive types do not change existing layouts. `client::resilience_statistics`
 (a standard-layout, trivially copyable value type, §4) and
 `client::resilience_stats()` are MINOR additions; they add symbols only.
-`client::statistics` keeps its field order, size and meaning.
+`client::statistics` keeps its field order, size and meaning. Likewise,
+`resilience::fallback_statistics` (a standard-layout, trivially copyable
+seven-counter value type) and `client::fallback_stats()` are MINOR additions.
+The fallback primitives in `crpc/resilience/fallback.hpp` are header-only and
+add no exported symbol; only the by-value return adds one.
 
 ## 5. Enum values
 

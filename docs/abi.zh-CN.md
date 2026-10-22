@@ -221,7 +221,7 @@ MAJOR 变更（第 1 节），因此本周期属 ABI breaking。
 MAJOR 处理（见第 8 节）。
 
 
-增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 4 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。
+增补类型不改变既有布局：`client::resilience_statistics`（标准布局、可平凡拷贝的值类型，见第 4 节）与 `client::resilience_stats()` 是 MINOR 新增符号，只增加导出；`client::statistics` 的字段顺序、大小与含义保持不变。同样，`resilience::fallback_statistics`（标准布局、可平凡拷贝的七计数器值类型）与 `client::fallback_stats()` 也是 MINOR 新增符号。`crpc/resilience/fallback.hpp` 中的 fallback 原语是 header-only，不新增导出符号；按值返回的统计类型是唯一新增符号。
 
 ## 5. 枚举值
 

@@ -13,6 +13,12 @@
   `bulkhead_in_use`). No existing structure changes: `client::statistics` keeps
   its field order, size and meaning, and no C ABI entry point changes. See
   [abi.md](abi.md) §4 and §8.
+- `resilience::fallback_statistics` and `client::fallback_stats()`: the
+  seven-counter snapshot (`ineligible`, `skipped_deadline`, `attempted`,
+  `failed`, `canceled`, `overrun`, `applied`) for the fallback primitives in
+  `crpc/resilience/fallback.hpp`. The primitives are header-only and are not
+  wired into the call path in this slice, so every counter stays zero. The
+  by-value return is the only new symbol. See [abi.md](abi.md) §4.
 
 ### Compile-time layout guards
 

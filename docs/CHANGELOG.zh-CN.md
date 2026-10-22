@@ -7,6 +7,7 @@
 ### 新增（MINOR，仅新增符号）
 
 - `client::resilience_statistics` 与 `client::resilience_stats()`：客户端韧性流水线的增补可观测性（`rate_limited`、`bulkhead_rejected`、`local_gate_rejected`、`endpoint_open`、`lb_unavailable`、`pre_send_retries`、`probe_admitted`、`retries_delayed_by_hint`、`bulkhead_in_use`）。不改变既有结构：`client::statistics` 的字段顺序、大小与含义保持不变，C ABI 入口不变。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
+- `resilience::fallback_statistics` 与 `client::fallback_stats()`：`crpc/resilience/fallback.hpp` 中 fallback 原语的七计数器快照（`ineligible`、`skipped_deadline`、`attempted`、`failed`、`canceled`、`overrun`、`applied`）。本切片只提供原语，未接入调用路径，因此所有计数保持为 0；按值返回是该切片唯一新增的符号。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
 
 ### 编译期布局护栏
 
