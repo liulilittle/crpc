@@ -795,6 +795,17 @@ CRPC_TEST(degradable_rate_deadline_exit_is_not_marked) {
 // with one token, spend it on an untimed call, and only then send the timed
 // call. `initial_tokens = 0` is not stable, because the bucket refills from the
 // wall clock and may already hold a token by the time the first call arrives.
+//
+// The two calls are pipelined on one connection: both bodies are encoded up
+// front and the timed call is handed to the transport immediately after the
+// burn, without waiting for the burn's reply. This branch only exists while the
+// bucket is empty, and one token takes `1 / rate_per_second` (909 us here) to
+// refill, so the gap between the two admissions must stay below that. A blocking
+// round trip adds a condition-variable wakeup and a scheduler round trip, which
+// under load can exceed 909 us: the bucket then refills, the request is
+// admitted, and it falls through to the dispatcher's 1 ms floor
+// (`deadline already passed`) instead of this branch. Pipelining on one
+// single-shard connection keeps the two admissions adjacent.
 
 CRPC_TEST(degradable_rate_refusal_with_expired_wire_deadline_is_not_marked) {
     // Given: a bucket that needs ~909 us to refill one token, starting full.
@@ -812,25 +823,52 @@ CRPC_TEST(degradable_rate_refusal_with_expired_wire_deadline_is_not_marked) {
         return;
     }
 
+    // Both request bodies are encoded before the first call, so the gap between
+    // the two admissions contains no encoding work.
+    crpc::buffer burn_body;
+    crpc::buffer timed_body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(0, burn_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, timed_body).ok());
+
     // Spend the only token so the next call is certain to be rate limited.
-    const call_outcome burned = call_int(c, kEcho, 0);
-    CRPC_CHECK(burned.started);
-    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
-                  static_cast<int>(burned.error.code));
+    auto burn_started = c.client->start_call<int>(kService, kEcho,
+                                                  burn_body.readable(),
+                                                  crpc::rpc::call_context{});
+    CRPC_CHECK(burn_started.ok());
+    if (!burn_started.ok()) {
+        return;
+    }
+    crpc::rpc::call<int> burned = std::move(burn_started).value();
 
     // When: the wire deadline has 990 us left, below the 1 ms floor, while the
     // hint (one token at 1100/s = 909 us) still fits inside it.
-    const call_outcome out = call_int(c, kEcho, 1, std::chrono::microseconds(990));
+    crpc::rpc::call_context timed_ctx;
+    timed_ctx.has_deadline = true;
+    timed_ctx.deadline =
+        std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+    auto timed_started = c.client->start_call<int>(kService, kEcho,
+                                                   timed_body.readable(),
+                                                   timed_ctx);
+    CRPC_CHECK(timed_started.ok());
+    if (!timed_started.ok()) {
+        return;
+    }
+    crpc::rpc::call<int> out = std::move(timed_started).value();
 
-    // Then: the answer is `resource_exhausted` (the success exit), but it is
-    // not marked: a deadline that cannot be met is never degradable.
-    CRPC_CHECK(out.started);
+    // Then: the burn is admitted and the answer is `resource_exhausted` (the
+    // success exit), but it is not marked: a deadline that cannot be met is
+    // never degradable.
+    const crpc::rpc::rpc_result<int> burn_result = burned.get();
+    CRPC_CHECK(burn_result.ok());
+    const crpc::rpc::rpc_result<int> out_result = out.get();
+    CRPC_CHECK(!out_result.ok());
+    const crpc::rpc_error& error = out_result.error();
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted),
-                  static_cast<int>(out.error.code));
-    CRPC_CHECK_EQ(std::string("service rate limit reached"), out.error.message);
-    CRPC_CHECK_FALSE(has_degradable_marker(out.error));
-    CRPC_CHECK_EQ(static_cast<std::size_t>(0), out.error.metadata.size());
-    // This proves the deadline exit (`:1024`) was NOT taken.
+                  static_cast<int>(error.code));
+    CRPC_CHECK_EQ(std::string("service rate limit reached"), error.message);
+    CRPC_CHECK_FALSE(has_degradable_marker(error));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), error.metadata.size());
+    // This proves the deadline exit (`:1054`) was NOT taken.
     CRPC_CHECK_EQ(static_cast<std::uint64_t>(0),
                   f.srv->stats().deadline_rejected);
     CRPC_CHECK_EQ(static_cast<std::uint64_t>(1),
