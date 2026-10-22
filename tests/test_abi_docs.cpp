@@ -1052,9 +1052,6 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
         text, "MSVC、GCC 与 Clang 上都是"));
 }
 
-// Returns the slice of `text` between two heading prefixes, or the whole text when
-// either heading is missing (so a renamed heading fails loudly instead of
-// silently disabling the checks).
 std::string between_headings(const std::string& text, const char* begin,
                              const char* end) {
     const std::size_t from = text.find(begin);
@@ -1068,7 +1065,7 @@ std::string between_headings(const std::string& text, const char* begin,
     return text.substr(from, to - from);
 }
 
-CRPC_TEST(abi_docs_does_not_call_internal_layout_invisible) {
+CRPC_TEST(abi_docs_section_2_does_not_call_internal_layout_invisible) {
     const fs::path root = repo_root();
     CRPC_CHECK(!root.empty());
     if (root.empty()) {
@@ -1078,50 +1075,74 @@ CRPC_TEST(abi_docs_does_not_call_internal_layout_invisible) {
         between_headings(read_text(root / "docs" / "abi.md"), "## 2.", "## 3.");
     const std::string chinese =
         between_headings(read_text(root / "docs" / "abi.zh-CN.md"), "## 2.", "## 3.");
-    // A missing or renamed heading must not silently disable the section.
     CRPC_CHECK(!english.empty());
     CRPC_CHECK(!chinese.empty());
 
-    // The old text claimed a consumer cannot construct, hold or name these types
-    // and that a layout change is therefore not an ABI break. Both are false: a
-    // header-inline template allocates `call_state<Resp>` in the consumer's own
-    // translation unit and holds `call_core` by value.
+    // Meta-assertion: without this, deleting the whole section would leave every
+    // forbidden phrase absent and the test would pass vacuously.
+    CRPC_CHECK(has_phrase(english, "implementation-internal"));
+    CRPC_CHECK(has_phrase(chinese, "实现内部细节"));
+
+    // EN: every claim measured false in this cycle.
     CRPC_CHECK_FALSE(forbidden_phrase(
         english, "cannot construct, hold or name"));
     CRPC_CHECK_FALSE(forbidden_phrase(english, "not an ABI break"));
     CRPC_CHECK_FALSE(forbidden_phrase(english, "is a MINOR change"));
     CRPC_CHECK_FALSE(forbidden_phrase(
         english, "no consumer may depend on their layout"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "any further field crosses the 488-byte boundary"));
+    CRPC_CHECK_FALSE(forbidden_phrase(english, "subject to the same vptr"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "allocates or holds them by value"));
+    // Carried over from 6227530: the old text also claimed the library itself
+    // instantiates these types (it does for connection_slot/client_liveness, but
+    // not for call_state<Resp>, which is the one that matters).
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "the library itself instantiates"));
+
+    // ZH mirrors.
     CRPC_CHECK_FALSE(forbidden_phrase(chinese, "无法构造、持有或命名"));
     CRPC_CHECK_FALSE(forbidden_phrase(chinese, "不构成 ABI 破坏"));
     CRPC_CHECK_FALSE(forbidden_phrase(chinese, "属于 MINOR 变更"));
-
-    // Deleting the claim is not enough; the replacement must name the real
-    // mechanism and the load-bearing rule.
-    CRPC_CHECK(has_phrase(english, "inside the consumer's own translation unit"));
-    CRPC_CHECK(has_phrase(english, "built from the same headers"));
-    CRPC_CHECK(has_phrase(english, "inner_mutex"));
-    CRPC_CHECK(has_phrase(chinese, "在消费方自己的翻译单元内实例化"));
-    CRPC_CHECK(has_phrase(chinese, "同一份头文件"));
-
-    // The x86 escape hatch is a padding budget, not a boundary: three bytes remain
-    // after `degraded_`, so a fourth one-byte field already crosses.
-    CRPC_CHECK_FALSE(forbidden_phrase(
-        english, "any further field crosses the 488-byte boundary"));
     CRPC_CHECK_FALSE(forbidden_phrase(chinese, "再追加任何字段就会跨过 488"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "同受 vptr"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "按值分配或持有它们"));
+
+    // The replacement must name the real mechanism, the load-bearing rule, and
+    // the x86 padding budget (not a boundary).
+    CRPC_CHECK(has_phrase(english, "inside the consumer's own translation unit"));
+    CRPC_CHECK(has_phrase(english, "rebuilt from the same headers"));
+    CRPC_CHECK(has_phrase(english, "inner_mutex"));
     CRPC_CHECK(has_phrase(
         english, "the padding is only four bytes and three remain"));
-    CRPC_CHECK(has_phrase(english, "wider than the three"));
+    CRPC_CHECK(has_phrase(english, "wider than the three remaining bytes"));
 
-    // Only two of the four internal types are polymorphic.
-    CRPC_CHECK_FALSE(forbidden_phrase(english, "subject to the same vptr"));
-    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "同受 vptr"));
+    // The x86 tail-padding sentence is only true while `retry` ends at 484 and
+    // `sizeof(call_core)` is 488; both numbers are stated so a layout change
+    // forces this sentence to be revisited.
+    CRPC_CHECK(has_phrase(english, "retry` ends at 484"));
+    CRPC_CHECK(has_phrase(english, "stays 488"));
+
+    // Who allocates what: the two library-only types must not be described as
+    // consumer-allocated, and the library-only fact must be stated.
+    CRPC_CHECK(has_phrase(english, "allocated only by the library"));
+    // Only two of the four are polymorphic; the other two are plain structs.
     CRPC_CHECK(has_phrase(
-        english, "Only `call_state_base` and `call_state<Resp>` are polymorphic"));
-    CRPC_CHECK(has_phrase(english, "plain structs with no vptr"));
+        english, "Only `call_state_base` and `call_state<Resp>` are"));
+    CRPC_CHECK(has_phrase(english, "polymorphic"));
+    CRPC_CHECK(has_phrase(english, "plain structs with"));
+    CRPC_CHECK(has_phrase(english, "no vptr"));
+    CRPC_CHECK(has_phrase(english, "is the polymorphic base of `call_state<Resp>`"));
 
     // Handle size stability must not be read as heap-object safety.
-    CRPC_CHECK(has_phrase(english, "covers the handle, not the heap object"));
+    CRPC_CHECK(has_phrase(english, "covers the handle, not the heap"));
+
+    CRPC_CHECK(has_phrase(chinese, "在消费方自己的翻译单元内实例化"));
+    CRPC_CHECK(has_phrase(chinese, "同一份头文件"));
+    CRPC_CHECK(has_phrase(chinese, "padding 只有 4 字节"));
+    CRPC_CHECK(has_phrase(chinese, "只由库分配"));
+    CRPC_CHECK(has_phrase(chinese, "没有 vptr 的普通结构体"));
     CRPC_CHECK(has_phrase(chinese, "只覆盖句柄，不覆盖它指向的堆对象"));
 }
 
