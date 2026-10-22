@@ -2841,6 +2841,55 @@ CRPC_TEST(client_cancel_during_backoff) {
     f.cli->close();
 }
 
+// G22 Slice 2b: a `canceled` result must never be reported as degraded. The
+// canceled early return inside get() does not pass through begin_attempt(), so
+// it must clear the flag itself; otherwise a flag left by an earlier attempt
+// would survive into a `canceled` answer once S4 starts calling mark_degraded().
+// Nothing calls mark_degraded() in this slice, so the assertion below can only
+// fail under a mutation that sets the flag on this path (verified: swapping
+// clear_degraded() for mark_degraded() makes this case fail).
+CRPC_TEST(client_canceled_result_is_not_degraded) {
+    fixture f;
+    fixture_config cfg;
+    cfg.default_deadline = 5s;
+    cfg.default_idempotent = true;
+    cfg.configure_retry = true;
+    cfg.retry.max_attempts = 3;
+    cfg.retry.initial_backoff = 100ms;
+    cfg.retry.max_backoff = 100ms;
+    cfg.retry.jitter_ratio = 0.0;
+    cfg.retry.retry_budget = 10.0;
+    CRPC_CHECK(start_inproc(f, cfg));
+    f.service.flaky_failures_remaining.store(1);
+
+    auto started = f.cli->service<int, int>(kService, kFlaky).call(1);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.service.flaky_calls.load(std::memory_order_acquire) >= 1; },
+        2000));
+
+    // Cancel from another thread once the retry loop is inside its backoff.
+    std::atomic<bool> canceled{false};
+    std::thread canceler([&] {
+        (void)crpc_test::wait_for([&] { return f.cli->stats().retries >= 1; }, 2000);
+        handle.cancel();
+        canceled.store(true, std::memory_order_release);
+    });
+
+    const auto result = handle.get();
+    canceler.join();
+    CRPC_CHECK(canceled.load(std::memory_order_acquire));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled),
+                  result.ok() ? 0 : static_cast<int>(result.code()));
+    CRPC_CHECK_FALSE(handle.degraded());
+
+    f.cli->close();
+}
+
 // G22 Slice 2a: a low-level timer timeout is a local observation. `try_get`
 // must classify it as an endpoint failure (metadata marker), unlike a
 // server-reported deadline.
