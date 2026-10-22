@@ -670,6 +670,83 @@ CRPC_TEST(degradable_service_capacity_refusal_is_marked) {
     check_golden(payloads.back(), plain, "service_capacity");
 }
 
+// --- T4b: the cap with an expired wire deadline ------------------------------
+//
+// The cap branch shares the `!wire_deadline_expired` guard with the rate
+// branch, but the rate case cannot discriminate the cap's copy. A cap refusal
+// for a request whose wire deadline is already below the 1 ms floor must not
+// advertise degradability: the client could not deliver a fallback value in
+// time either. Without this case, deleting the guard from the cap branch would
+// leave every test green.
+//
+// Same shape as the marked cap case: two shards and two connections, never a
+// single-drain in-process reentry (that deadlocks; recorded defect).
+
+CRPC_TEST(degradable_service_capacity_refusal_with_expired_wire_deadline_is_not_marked) {
+    // Given: a per-service cap of one and nothing else configured, so the cap
+    // is the first refusal the second request meets.
+    server_under_test f;
+    setup cfg;
+    cfg.shards = 2;
+    cfg.per_service = 1;
+    cfg.overload_retry = 10ms;
+    CRPC_CHECK(start(f, cfg));
+    tee_client first = make_client(f);
+    tee_client second = make_client(f);
+    CRPC_CHECK(first.client != nullptr);
+    CRPC_CHECK(second.client != nullptr);
+    if (!first.client || !second.client) {
+        return;
+    }
+
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    crpc::buffer first_body;
+    crpc::buffer second_body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, first_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(2, second_body).ok());
+    auto first_started = first.client->start_call<int>(kService, kBlocking,
+                                                       first_body.readable());
+    CRPC_CHECK(first_started.ok());
+    if (!first_started.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first_started).value();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
+
+    // When: the second request arrives with 990 us of wire deadline left, below
+    // the 1 ms floor.
+    crpc::rpc::call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+    auto second_started =
+        second.client->start_call<int>(kService, kBlocking, second_body.readable(), ctx);
+    CRPC_CHECK(second_started.ok());
+    crpc::rpc_error second_error;
+    if (second_started.ok()) {
+        auto handle = std::move(second_started).value();
+        auto result = handle.get();
+        CRPC_CHECK_FALSE(result.ok());
+        if (!result.ok()) {
+            second_error = result.error();
+        }
+    }
+    f.service.blocking_gate.store(1, std::memory_order_release);
+    (void)first_handle.get();
+
+    // Then: the cap still refuses, but the refusal is not marked.
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::overload),
+                  static_cast<int>(second_error.code));
+    CRPC_CHECK_EQ(std::string("service concurrency limit reached"),
+                  second_error.message);
+    CRPC_CHECK_FALSE(has_degradable_marker(second_error));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), second_error.metadata.size());
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1),
+                  f.srv->stats().rejected_overload);
+    // The handler ran exactly once: only the holder got through.
+    CRPC_CHECK_EQ(1, f.service.blocking_calls.load());
+}
+
 // --- T5: the rate branch that answers deadline_exceeded ----------------------
 
 CRPC_TEST(degradable_rate_deadline_exit_is_not_marked) {
