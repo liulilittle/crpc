@@ -122,6 +122,18 @@ thread_local const void* timer_thread_local = nullptr;
 } // namespace
 
 struct client::impl {
+    // Fallback primitive counters. They live in the implementation, not in
+    // `client`, so the public `client` layout does not change. Nothing in this
+    // slice increments them: the entries stay zero until S4 wires the
+    // primitives into the call path.
+    std::atomic<std::size_t> fallback_ineligible{0};
+    std::atomic<std::size_t> fallback_skipped_deadline{0};
+    std::atomic<std::size_t> fallback_attempted{0};
+    std::atomic<std::size_t> fallback_failed{0};
+    std::atomic<std::size_t> fallback_canceled{0};
+    std::atomic<std::size_t> fallback_overrun{0};
+    std::atomic<std::size_t> fallback_applied{0};
+
     struct endpoint_pool {
         endpoint_pool(endpoint ep, backend_factory* backend,
                       const resilience::breaker_config& config,
@@ -452,12 +464,33 @@ client::resilience_statistics client::resilience_stats() const noexcept {
     return out;
 }
 
+resilience::fallback_statistics client::fallback_stats() const noexcept {
+    // Same independent relaxed snapshot as resilience_stats(): the seven
+    // counters are not a transaction and no cross-counter equality is promised.
+    resilience::fallback_statistics out;
+    out.ineligible =
+        impl_->fallback_ineligible.load(std::memory_order_relaxed);
+    out.skipped_deadline =
+        impl_->fallback_skipped_deadline.load(std::memory_order_relaxed);
+    out.attempted = impl_->fallback_attempted.load(std::memory_order_relaxed);
+    out.failed = impl_->fallback_failed.load(std::memory_order_relaxed);
+    out.canceled = impl_->fallback_canceled.load(std::memory_order_relaxed);
+    out.overrun = impl_->fallback_overrun.load(std::memory_order_relaxed);
+    out.applied = impl_->fallback_applied.load(std::memory_order_relaxed);
+    return out;
+}
+
 // --- admission and pools -----------------------------------------------------
 
 bool client::begin_attempt(
     client_detail::call_core& core,
     const std::shared_ptr<client_detail::call_state_base>& keep,
     rpc_error& failure) {
+    // A new attempt starts un-degraded. This is the only point every attempt
+    // passes through, including the two early returns below; clearing here (as
+    // well as in reset_for_attempt()) means a second get() cannot inherit the
+    // previous attempt's flag.
+    core.clear_degraded();
     const auto now = steady_now();
     if (core.has_deadline && now >= core.deadline) {
         core.origin = client_detail::failure_origin::local_lifecycle;

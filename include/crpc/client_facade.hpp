@@ -58,6 +58,7 @@
 #include <crpc/io.hpp>
 #include <crpc/resilience/bulkhead.hpp>
 #include <crpc/resilience/circuit_breaker.hpp>
+#include <crpc/resilience/fallback.hpp>
 #include <crpc/resilience/load_balancer.hpp>
 #include <crpc/resilience/rate_limiter.hpp>
 #include <crpc/resilience/retry.hpp>
@@ -336,11 +337,36 @@ struct call_core {
     std::unique_ptr<resilience::retry_sequence> retry;
 
     void signal() noexcept;
+    // True when the last completed attempt was answered by a fallback value.
+    // The flag is cleared when the next attempt is armed.
+    [[nodiscard]] bool degraded() const noexcept {
+        return degraded_.load(std::memory_order_acquire);
+    }
     void reset_for_attempt() noexcept {
         done.store(false, std::memory_order_release);
         finalized.store(false, std::memory_order_release);
         terminal.store(rpc_code::ok, std::memory_order_release);
+        degraded_.store(false, std::memory_order_release);
     }
+
+private:
+    friend class crpc::client;
+
+    // Set by the future fallback consumer after `fallback_execute` returns
+    // `applied` (S4). Private so only the client can observe the terminal
+    // outcome; the public handle exposes the read side.
+    void mark_degraded() noexcept {
+        degraded_.store(true, std::memory_order_release);
+    }
+
+    // Called at the top of every attempt, so a new attempt never inherits the
+    // previous one's flag. `reset_for_attempt()` also clears it, but the
+    // success exit of get() returns without going through that path.
+    void clear_degraded() noexcept {
+        degraded_.store(false, std::memory_order_relaxed);
+    }
+
+    std::atomic<bool> degraded_{false};
 };
 
 // Type-erased owner for one call. The client keeps a strong reference to it
@@ -502,6 +528,12 @@ public:
         }
         [[nodiscard]] std::uint32_t attempts() const noexcept {
             return state_ != nullptr ? state_->core.attempts : 0;
+        }
+
+        // True when the terminal result was produced by a fallback function.
+        // Always false in this slice: nothing calls mark_degraded() yet.
+        [[nodiscard]] bool degraded() const noexcept {
+            return state_ != nullptr && state_->core.degraded();
         }
 
         // Suspends (or blocks) until a terminal result is available. Returns
@@ -788,6 +820,9 @@ public:
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
     [[nodiscard]] resilience_statistics resilience_stats() const noexcept;
+    // Additive fallback counters. The primitives are not wired in this slice,
+    // so every field is zero; the accessor is the MINOR ABI addition.
+    [[nodiscard]] resilience::fallback_statistics fallback_stats() const noexcept;
 
     // Low-level path used by `stub`. Encodes are the caller's responsibility.
     template <typename Resp>

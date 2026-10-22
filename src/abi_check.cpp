@@ -263,6 +263,10 @@ CRPC_ABS_SIZE(client::resilience_statistics, 36);
 CRPC_ABS_OFF(client::resilience_statistics, rate_limited, 0);
 CRPC_ABS_OFF(client::resilience_statistics, bulkhead_in_use, 32);
 
+CRPC_ABS_SIZE(resilience::fallback_statistics, 28);
+CRPC_ABS_OFF(resilience::fallback_statistics, ineligible, 0);
+CRPC_ABS_OFF(resilience::fallback_statistics, applied, 24);
+
 // 104, not 100: `push_acks` ends at 100 and the record is 8-byte aligned, so
 // the last 4 bytes are tail padding. This padding is exactly why an absolute
 // size alone cannot catch an appended field on x86; the member count above
@@ -355,6 +359,10 @@ CRPC_ABS_OFF(client::statistics, breaker_rejections, 40);
 CRPC_ABS_SIZE(client::resilience_statistics, 72);
 CRPC_ABS_OFF(client::resilience_statistics, rate_limited, 0);
 CRPC_ABS_OFF(client::resilience_statistics, bulkhead_in_use, 64);
+
+CRPC_ABS_SIZE(resilience::fallback_statistics, 56);
+CRPC_ABS_OFF(resilience::fallback_statistics, ineligible, 0);
+CRPC_ABS_OFF(resilience::fallback_statistics, applied, 48);
 
 // 152 with no tail padding: `push_acks` ends exactly at the end of the record.
 // An appended field therefore changes the width on x64 even without the member
@@ -478,6 +486,8 @@ static_assert(std::is_standard_layout<client::statistics>::value,
               "client::statistics must be standard-layout");
 static_assert(std::is_standard_layout<client::resilience_statistics>::value,
               "client::resilience_statistics must be standard-layout");
+static_assert(std::is_standard_layout<resilience::fallback_statistics>::value,
+              "resilience::fallback_statistics must be standard-layout");
 static_assert(std::is_standard_layout<server::statistics>::value,
               "server::statistics must be standard-layout");
 // The HTTP/2 value types below cross the `CRPC_API connection` boundary by value
@@ -646,6 +656,49 @@ CRPC_STEP(client::resilience_statistics, retries_delayed_by_hint,
           bulkhead_in_use);
 static_assert(sizeof(client::resilience_statistics) == 9 * sizeof(std::size_t),
               "client::resilience_statistics must be exactly 9 counters");
+
+// The fallback snapshot is seven plain `std::size_t` counters. Three guards
+// cover three different changes: ABS_SIZE above catches an append (seven
+// size_t values have no tail padding), the STEP chain catches an insertion, a
+// removal or a reorder, and the `decltype` assertions below catch a width or
+// type change. The last one is not redundant: CRPC_STEP hardcodes
+// `sizeof(std::size_t)`, so narrowing `applied` to `std::uint32_t` keeps the
+// step, the absolute offset and the total width unchanged on x64.
+CRPC_STEP(resilience::fallback_statistics, ineligible, skipped_deadline);
+CRPC_STEP(resilience::fallback_statistics, skipped_deadline, attempted);
+CRPC_STEP(resilience::fallback_statistics, attempted, failed);
+CRPC_STEP(resilience::fallback_statistics, failed, canceled);
+CRPC_STEP(resilience::fallback_statistics, canceled, overrun);
+CRPC_STEP(resilience::fallback_statistics, overrun, applied);
+
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::ineligible),
+                 std::size_t>::value,
+    "fallback_statistics::ineligible must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::skipped_deadline),
+                 std::size_t>::value,
+    "fallback_statistics::skipped_deadline must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::attempted),
+                 std::size_t>::value,
+    "fallback_statistics::attempted must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::failed),
+                 std::size_t>::value,
+    "fallback_statistics::failed must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::canceled),
+                 std::size_t>::value,
+    "fallback_statistics::canceled must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::overrun),
+                 std::size_t>::value,
+    "fallback_statistics::overrun must be std::size_t");
+static_assert(
+    std::is_same<decltype(resilience::fallback_statistics::applied),
+                 std::size_t>::value,
+    "fallback_statistics::applied must be std::size_t");
 
 // `server::statistics` mixes widths: six `std::size_t` counters, six
 // `std::uint64_t` resilience counters, then seven `std::size_t` push counters.

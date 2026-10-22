@@ -2627,6 +2627,7 @@ CRPC_TEST(client_initial_open_endpoint_reselects) {
     auto stub = cli->service<int, int>(kService, kEcho);
     int first_code = -1;
     std::vector<int> later_codes;
+    bool any_degraded = false;
     {
         auto started = stub.call(0);
         first_code = started.ok() ? 0 : static_cast<int>(started.code());
@@ -2639,6 +2640,7 @@ CRPC_TEST(client_initial_open_endpoint_reselects) {
         }
         auto handle = std::move(started).value();
         auto result = handle.get();
+        any_degraded = any_degraded || handle.degraded();
         later_codes.push_back(result.ok() ? 0 : static_cast<int>(result.code()));
     }
 
@@ -2648,6 +2650,18 @@ CRPC_TEST(client_initial_open_endpoint_reselects) {
         CRPC_CHECK_EQ(0, code);
     }
     CRPC_CHECK_EQ(5, service.echo_calls.load());
+
+    // Slice 2 adds the fallback primitives but wires nothing: no handle is
+    // marked degraded and every fallback counter stays zero.
+    CRPC_CHECK_FALSE(any_degraded);
+    const crpc::resilience::fallback_statistics fallback = cli->fallback_stats();
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.ineligible);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.skipped_deadline);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.failed);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.canceled);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.overrun);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.applied);
 
     cli->close();
     srv->stop();
