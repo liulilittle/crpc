@@ -99,7 +99,7 @@ Rules that hold today:
 - `io` depends only on `base`; the RPC layer accepts a `backend_factory&` and never tests whether the transport is TCP or in-process.
 - `rpc/client.hpp` includes `frame.hpp`, `io.hpp`, `rpc/call.hpp` and `rpc/dispatcher.hpp`; `rpc/dispatcher.hpp` includes `frame.hpp` and `rpc/call.hpp`.
 - `mvc/router.hpp` includes `http/message.hpp`, `codec.hpp` and `mvc/binding.hpp`; `http2/connection.hpp` includes `http2/frame.hpp`, `http2/hpack.hpp` and `http/message.hpp`.
-- `cluster`, `push` and `flow` are independent of `rpc` today. `resilience` is partly integrated: `client_facade` wires load balancing, per-endpoint rate/bulkhead/breaker, retry and the deadline; `rpc::server` wires the admission half of the pipeline (per-connection rate, per-service rate, bulkhead, breaker, cap). The fallback primitives are implemented but not wired. The observability interceptor chain is not wired.
+- `cluster`, `push` and `flow` are independent of `rpc` today. `resilience` is partly integrated: `client_facade` wires load balancing, per-endpoint rate/bulkhead/breaker, retry and the deadline; `rpc::server` wires the admission half of the pipeline (per-connection rate, per-service rate, bulkhead, breaker, cap). The fallback primitives are implemented but not wired into the call path. The observability interceptor chain is not wired into the call path.
 - No script enforces these directions. The design's context-dependency rule is a review rule; a build-time dependency check is **specified, not implemented**.
 
 ## 5. Base layer <a id="s5"></a>
@@ -189,7 +189,7 @@ Evidence: `include/crpc/runtime.hpp:55-69`, `src/runtime/runtime.cpp:108-118,246
 
 `rpc::method_traits` derives request/response types from a member pointer; the typed trampoline decodes with `call_codec<T>` and encodes the response. `call_codec` has no primary definition for an unsupported type, so a missing specialization is a compile error rather than a silent empty payload. The typed registration path is implemented (`service_registry::register_service`/`register_method` and `register_typed_method`), and the RTTI-driven declaration macros (`CRPC_ROUTE`, `CRPC_HTTP_*`, `CRPC_FROM_*`) live in `mvc/attributes.hpp` for the MVC/HTTP side. They are macros over an explicitly named controller and member, not a separate code-generation step. Evidence: `include/crpc/rpc/dispatcher.hpp:167-174,226-289,316-322`; `include/crpc/mvc/attributes.hpp:45-90`.
 
-The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in §14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side pipeline is wired per endpoint; the fallback primitives are implemented but **not wired**. Evidence: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
+The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in §14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side pipeline is wired per endpoint; the fallback primitives are implemented but **not wired into the call path**. Evidence: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
 
 ## 10. Call state machine <a id="s10"></a>
 
@@ -252,7 +252,7 @@ Five components are implemented independently:
   backoff and jitter, plus a shared token-bucket budget; `unknown_side_effect`
   is retryable only when idempotent.
 
-The design names six logical stages, `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`. The server admission half is wired; the client wires the same stages per endpoint, but not in that literal order: it has to select an endpoint (load balance) and admit it through the breaker before it can apply that endpoint's rate and bulkhead, so the executed order is `select + allow -> probe check -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`. The fallback primitives are implemented but **not wired**, and the global rate stage belongs to slice 2c.
+The design names six logical stages, `rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`. The server admission half is wired; the client wires the same stages per endpoint, but not in that literal order: it has to select an endpoint (load balance) and admit it through the breaker before it can apply that endpoint's rate and bulkhead, so the executed order is `select + allow -> probe check -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`. The fallback primitives are implemented but **not wired into the call path**, and the global rate stage belongs to slice 2c.
 
 On the client, one logical call runs:
 
@@ -334,10 +334,10 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Multipart and files | `http/multipart.hpp`, `http/file_transfer.hpp` | implemented, no dedicated suite |
 | Registry | `cluster/registry.hpp`, `src/cluster/registry.cpp` | implemented, tested |
 | Lease/election/health/watch | `cluster/*` | implemented primitives |
-| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired |
+| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired into the call path |
 | Push hub/streams | `push/*` | implemented, not wired to frames/HTTP |
-| Tracing/logging/AOP | `observability/*` | implemented, AOP not wired |
-| Flow control | `flow/estimator.hpp` | implemented primitives, not wired |
+| Tracing/logging/AOP | `observability/*` | implemented, AOP not wired into the call path |
+| Flow control | `flow/estimator.hpp` | implemented primitives, not wired into the call path |
 | Shard/coroutines/MPSC inbox | `runtime.hpp`, `src/runtime/runtime.cpp` | implemented primitive; automatic shard-count policy and per-shard I/O ownership not implemented |
 
 ## 19. Status matrix <a id="s19"></a>
@@ -352,8 +352,8 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
 | MVC | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
 | cluster primitives | implemented | `test_cluster.cpp`; no network registry service |
-| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired |
-| observability | partial | `test_observability.cpp`; AOP not wired, no metrics |
+| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired into the call path |
+| observability | partial | `test_observability.cpp`; AOP not wired into the call path, no metrics |
 | push | partial | `test_push.cpp`; no PUSH frame/HTTP integration |
 | flow | partial | `test_flow.cpp`; not wired to transport |
 | shard/coroutines | implemented | `test_server_client.cpp`; `src/runtime/runtime.cpp` calls `coro_rt_*`; automatic `clamp(cores-1,1,32)` shard count not implemented |
