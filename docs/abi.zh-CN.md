@@ -51,13 +51,16 @@ MAJOR.MINOR.PATCH
 确实需要容器时，API 使用 `span`、或 `const char*` 加长度，
 或返回一个被文档标注为不透明的 CRPC 自有类型。
 
-`crpc::client_detail` 与 `crpc::rpc_detail` 命名空间下、以及其它头文件中匿名或嵌套 `detail` 命名空间下的类型是**实现内部细节**：它们不出现在*消费方面向*的导出签名中。但它们对消费方的编译器并非不可见：`client_facade.hpp:845` 在消费方自己的翻译单元内实例化 `client_detail::call_state<Resp>`（头内模板中的 `std::make_shared<client_detail::call_state<Resp>>()`），而 `call_state` 以**值**持有 `call_core`。因此这些类型的布局变更**要求消费方与库用同一份头文件重建**（见第 4 节「调用方与库必须使用同一份头文件构建」）。按第 1 节表格（「改变任何公开结构体的布局，包括增加字段 | MAJOR」），这属于布局变更，是 MAJOR；本周期整体已是 MAJOR（第 4 节），本切片不新增兼容性缺口。
+`crpc::client_detail` 与 `crpc::rpc_detail` 命名空间下、以及其它头文件中匿名或嵌套 `detail` 命名空间下的类型是**实现内部细节**：它们不出现在*消费方面向*的导出签名中。但它们对消费方的编译器并非**全部**不可见：`client_facade.hpp:845` 在消费方自己的翻译单元内实例化 `client_detail::call_state<Resp>`（头内模板中的 `std::make_shared<client_detail::call_state<Resp>>()`），而 `call_state` 以**值**持有 `call_core`。因此 `call_core` 或 `call_state` 的布局变更**要求消费方与库用同一份头文件重建**（见第 4 节「调用方与库必须使用同一份头文件构建」）。按第 1 节表格（「改变任何公开结构体的布局，包括增加字段 | MAJOR」），这属于布局变更，是 MAJOR；本周期整体已是 MAJOR（第 4 节），本切片不新增兼容性缺口。
 
-具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，且该引用的唯一产生者是 `client` 自身。这并不意味着布局无关：给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）会移动其后所有字段。MSVC x64 实测（`call_core` 664 -> 672 字节，`call_state<Resp>` 760 -> 768）：用旧头文件构建的消费方链接新库时，新字段会覆写旧 `inner_mutex` 的首字节，因为该字段的绝对偏移是 8 + 旧 `sizeof(call_core)`——`/MD` 下 672、`/MDd` 下 696。x86 上新字段恰好落进 `call_core` **自身尾部**的 4 字节内部 padding（`retry` 占 480..484，`sizeof(call_core)` 仍为 488），故 `sizeof` 未变、今天不触发覆写；这是**运气而非保证**，再追加任何字段就会跨过 488。
+具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，且该引用的唯一产生者是 `client` 自身。这并不意味着布局无关：给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）会移动其后所有字段。MSVC x64 实测（`call_core` 664 -> 672 字节，`call_state<Resp>` 760 -> 768）：用旧头文件构建的消费方链接新库时，新字段会覆写旧 `inner_mutex` 的首字节，因为该字段的绝对偏移是 8 + 旧 `sizeof(call_core)`——`/MD` 下 672、`/MDd` 下 696。x86 上新字段恰好落进 `call_core` **自身尾部**的 4 字节内部 padding（`retry` 占 480..484，`sizeof(call_core)` 仍为 488），故 `sizeof` 未变、今天不触发覆写。这是**运气而非保证**：padding 只有 4 字节，`degraded_` 之后仅余 3 字节，第 4 个 1 字节字段就会把 `sizeof(call_core)` 推到 496，而单个宽度超过剩余 3 字节的字段则会立即跨过。两种情况下 x64 的失效模式都会在 x86 上重现。
 
-`client_detail` 中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）同属此类（同受 vptr 与成员偏移影响），`rpc_detail::always_false`（`rpc/call.hpp`）亦然。
+其它内部类型并非以同样方式跨越边界，这一区别很重要。只有 `call_state_base` 与 `call_state<Resp>` 是多态类型；`connection_slot` 与 `client_liveness` 是没有 vptr 的普通结构体，`rpc_detail::always_false` 则无状态。
+- `call_state_base` 是 `call_state<Resp>` 的多态基类；消费方的翻译单元会分配派生对象，因此改动这两者中任何一个的布局，都是改动消费方分配的尺寸。
+- `connection_slot` 与 `client_liveness` **只由库分配**（`src/client/client_facade.cpp:845` 与 `:212`；任何头文件里都没有构造点），只经 `std::shared_ptr<connection_slot>` 与 `std::weak_ptr<client_liveness>` 访问。消费方从不会按值分配它们，因此给这两个类型增加字段不会破坏用旧头文件构建的消费方。它们被列在此处，是因为消费方仍不得*命名*或*依赖*它们（见第 2 节），而不是因为它们的尺寸跨越边界。
+- `rpc_detail::always_false`（`rpc/call.hpp`）是无状态的 trait，没有可变的布局。
 
-`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`，因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——无论 `call_state` 里有什么。
+`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`，因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——无论 `call_state` 里有什么。这份稳定性只覆盖句柄，不覆盖它指向的堆对象：该对象的大小仍取决于分配它时所用的头文件，上文实测的正是这种情况。
 
 ## 3. 符号可见性
 

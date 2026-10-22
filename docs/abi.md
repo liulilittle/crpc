@@ -61,40 +61,60 @@ as opaque.
 Types in the `crpc::client_detail` and `crpc::rpc_detail` namespaces, and in
 the anonymous or nested `detail` namespaces of the other headers, are
 **implementation-internal**: they do not appear in a *consumer-facing* exported
-signature. They are not, however, invisible to the consumer's compiler.
-`client_facade.hpp:845` instantiates `client_detail::call_state<Resp>` inside the
-consumer's own translation unit (`std::make_shared<client_detail::call_state<Resp>>()`
-in a header-inline template), and `call_state` holds `call_core` **by value**.
-A layout change in these types therefore requires the consumer and the library to
-be rebuilt from the same headers (§4, "callers and the library must be built from
-the same headers"). Under the §1 table ("Change the layout of any public struct,
-including adding a field | MAJOR") such a change is a layout change and is MAJOR;
-this cycle is already MAJOR (§4), so this slice adds no new compatibility gap.
+signature. They are not, however, all invisible to the consumer's compiler.
+`client_facade.hpp:845` instantiates `client_detail::call_state<Resp>` inside
+the consumer's own translation unit
+(`std::make_shared<client_detail::call_state<Resp>>()` in a header-inline
+template), and `call_state` holds `call_core` **by value**. A layout change in
+`call_core` or `call_state` therefore requires the consumer and the library to
+be rebuilt from the same headers (§4, "callers and the library must be built
+from the same headers"). Under the §1 table ("Change the layout of any public
+struct, including adding a field | MAJOR") such a change is a layout change and
+is MAJOR; this cycle is already MAJOR (§4), so this slice adds no new
+compatibility gap.
 
 Concretely, `client::finish_attempt(client_detail::call_core&, ...)` and
-`client::begin_attempt(client_detail::call_core&, ...)` mention `call_core` in an
-exported signature, and the only producer of that reference is `client` itself.
-That does not make the layout irrelevant: adding a field to `call_core` (for
-example the `degraded_` flag that records a fallback-answered attempt) moves
-every field after it. Measured on MSVC x64 (`call_core` 664 -> 672 bytes,
+`client::begin_attempt(client_detail::call_core&, ...)` mention `call_core` in
+an exported signature, and the only producer of that reference is `client`
+itself. That does not make the layout irrelevant: adding a field to `call_core`
+(for example the `degraded_` flag that records a fallback-answered attempt)
+moves every field after it. Measured on MSVC x64 (`call_core` 664 -> 672 bytes,
 `call_state<Resp>` 760 -> 768), a consumer built from the old header and linked
 against the new library writes the new field over the first byte of the old
 `inner_mutex`, because the field lands at absolute offset 8 + old
-`sizeof(call_core)` — 672 under `/MD`, 696 under `/MDd`. On x86 the write happens
-to fall into four bytes of internal tail padding inside `call_core` (`retry` ends
-at 484 while `sizeof(call_core)` stays 488), so `sizeof` is unchanged and no
-overwrite is observed today; that is luck, not a guarantee, since any further
-field crosses the 488-byte boundary.
+`sizeof(call_core)` — 672 under `/MD`, 696 under `/MDd`. On x86 the write
+happens to fall into four bytes of internal tail padding inside `call_core`
+(`retry` ends at 484 while `sizeof(call_core)` stays 488), so `sizeof` is
+unchanged and no overwrite is observed today. That is luck, not a guarantee:
+the padding is only four bytes and three remain after `degraded_`, so a fourth
+one-byte field already pushes `sizeof(call_core)` to 496, and a single field
+wider than the three remaining bytes crosses immediately. Either way the x64
+failure mode returns on x86.
 
-The same applies to the other types in `client_detail` (`call_state`,
-`call_state_base`, `connection_slot`, `client_liveness`), which are subject to
-the same vptr and member offsets, and to `rpc_detail::always_false`
-(`rpc/call.hpp`).
+The other internal types do not all cross the boundary the same way, and the
+difference matters. Only `call_state_base` and `call_state<Resp>` are
+polymorphic; `connection_slot` and `client_liveness` are plain structs with
+no vptr, and `rpc_detail::always_false` is stateless.
+- `call_state_base` is the polymorphic base of `call_state<Resp>`; a consumer
+  translation unit allocates the derived object, so a layout change to either
+  is a change to a consumer-allocated size.
+- `connection_slot` and `client_liveness` are plain structs with no vptr, and
+  they are **allocated only by the library** (`src/client/client_facade.cpp:845`
+  and `:212`; there is no construction site in any header) and reached through
+  `std::shared_ptr<connection_slot>` and `std::weak_ptr<client_liveness>`. A
+  consumer never allocates them by value, so adding a field to those two does
+  not break a consumer built from older headers. They are listed here because a
+  consumer must still not *name* or *depend on* them (§2), not because their
+  size crosses the boundary.
+- `rpc_detail::always_false` (`rpc/call.hpp`) is a stateless trait, so it has no
+  layout to change.
 
 `client::call<Resp>` holds exactly one member, a
 `std::shared_ptr<client_detail::call_state<Resp>>`, so its size is always
 `sizeof(std::shared_ptr<T>)` for some `T` — 16 bytes on x64 and 8 bytes on x86 —
-whatever `call_state` contains.
+whatever `call_state` contains. That stability covers the handle, not the heap
+object it points at: the object's size still follows the headers it was
+allocated with, which is the case measured above.
 
 ## 3. Symbol visibility
 
