@@ -109,7 +109,10 @@ for san in "${SAN_LIST[@]}"; do
         if [[ ! -x "$PROBE" ]]; then
           log ERROR "shared link gate missing: $PROBE"
           FAILURES=$((FAILURES + 1))
-        elif ! "$PROBE" 2>&1 | tee -a "$LOG"; then
+        # Run from the build root: the loader resolves crpc.so/crpc.dll from
+        # the working directory, which is what ctest's WORKING_DIRECTORY
+        # property provides for the registered test.
+        elif ! ( cd "$BUILD_DIR" && "$PROBE" ) 2>&1 | tee -a "$LOG"; then
           log ERROR "shared link gate FAILED"
           FAILURES=$((FAILURES + 1))
         else

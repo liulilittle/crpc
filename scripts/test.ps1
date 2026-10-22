@@ -170,7 +170,16 @@ foreach ($san in $sanList) {
                     Write-Log "shared link gate missing: $probe" 'ERROR'
                     $script:Failures++
                 } else {
-                    $probeOut = & $probe 2>&1
+                    # The probe imports crpc.dll from the build root, so run it
+                    # there: the loader searches the working directory after the
+                    # executable's own directory. ctest gets the same directory
+                    # from the WORKING_DIRECTORY property on the test.
+                    Push-Location -LiteralPath $buildDir
+                    try {
+                        $probeOut = & $probe 2>&1
+                    } finally {
+                        Pop-Location
+                    }
                     $probeOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
                     if ($LASTEXITCODE -ne 0) {
                         Write-Log "shared link gate FAILED" 'ERROR'
