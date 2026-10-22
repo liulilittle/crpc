@@ -24,7 +24,7 @@
 //        `per_connection_inflight`, 1383);
 //      - the client connection pool capacity (client_facade.cpp acquire_slot,
 //        `"connection pool is saturated"` / `"connection pool is exhausted"`,
-//        787/793). It HAS a stage name (pool_capacity, this file, 123), so it
+//        787/793). It HAS a stage name (pool_capacity, this file, 128), so it
 //        is "named but not converted", unlike the entry below, which has no
 //        stage at all;
 //      - `cannot track endpoint candidates` (client_facade.cpp begin_attempt,
