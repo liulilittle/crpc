@@ -234,6 +234,12 @@ inline void fallback_apply_overrun(rpc_error& error) noexcept {
 //   overrun          out cleared, error replaced by deadline_exceeded;
 //   applied          value in out, error untouched (S4 marks the call degraded).
 //
+// `applied` means only "the function returned ok and the value is not late".
+// It does not promise that `out` decodes: a function that returns ok without
+// writing anything yields an empty body, and the consumer's own decode step
+// then fails with `decode_error`. A consumer must therefore mark the call
+// degraded only after its decode succeeded, not on `applied` alone.
+//
 // Cancellation is checked once at entry and once after the function returns.
 // An entry-time cancellation is reported as `ineligible`, not `canceled`.
 [[nodiscard]] inline fallback_outcome fallback_execute(

@@ -531,7 +531,9 @@ public:
         }
 
         // True when the terminal result was produced by a fallback function.
-        // Always false in this slice: nothing calls mark_degraded() yet.
+        // Always false in this slice: nothing calls mark_degraded() yet. It is
+        // only meaningful after get() returned; try_get() moves the state out,
+        // so a later call reads false.
         [[nodiscard]] bool degraded() const noexcept {
             return state_ != nullptr && state_->core.degraded();
         }
