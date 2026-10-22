@@ -65,10 +65,16 @@
 
 namespace crpc::resilience {
 
-// The two response metadata keys that describe a degraded result. Both are
-// reserved: the admission stages set neither. `degraded()` / `degradable()`
-// only test for the key's presence; the value is documentation for a human
-// reading the frame.
+// The two response metadata keys that describe a degraded result. `degraded()`
+// / `degradable()` only test for the key's presence; the value is documentation
+// for a human reading the frame.
+//
+// `crpc-degradable` is written by the server on four pre-execution admission
+// refusals (breaker, rate, bulkhead, per-service cap) and by nothing else; it
+// advertises that the refusal COULD be answered by a fallback, it does not mean
+// one was. `crpc-degraded` is written by the client when a fallback value was
+// actually used, so the server still sets it nowhere. See
+// crpc/resilience/admission.hpp (6).
 inline constexpr char degraded_metadata_key[] = "crpc-degraded";
 inline constexpr char degradable_metadata_key[] = "crpc-degradable";
 inline constexpr char degraded_metadata_value[] = "true";

@@ -4,6 +4,11 @@
 
 ## 未发布
 
+### 变更（MINOR，仅行为）
+
+- 服务端现在会在四个执行前准入拒绝点写出保留的响应 meta 条目 `crpc-degradable: true`：服务级熔断器（`unavailable`）、deadline 仍可达时的服务级令牌桶（`resource_exhausted`）、服务级 bulkhead（`overload`）与服务级在途上限（`overload`）。只有当请求剩余的线上 deadline 至少 1 ms 时才写（`resilience::min_remaining_ns`，现已与 dispatcher 自身的执行前 deadline 拒绝共用，不再有第二个字面量）。它让客户端能区分「handler 执行前被拒绝，降级值有意义」与「handler 执行后以同一个码失败」：handler 返回的 `overload` 与 bulkhead 返回的 `overload` 在线上除该条目外完全相同。五条错误路径永不携带它（连接级泛洪令牌桶、连接级在途上限、令牌桶的 deadline 不满足出口、dispatcher 的 deadline 拒绝、以及所有 handler 产生的错误），one-way 请求因没有响应帧也无法携带。`crpc-degraded` 在服务端仍无人写入，服务端仍从不调用 `fallback_execute`。
+- 影响：MINOR，且属于**行为变更，不是 ABI 变更**。不新增、不移除、不改签名任何导出符号；没有公开记录改变布局或大小；不新增 `server::options` 字段，因此消费者在栈上分配 `server::builder` 不受影响。只有四个既有错误响应的负载各增长 23 字节（两字节 `meta_count` 由 `0x0000` 变为 `0x0001`，并追加一个 TLV 条目）。忽略未知 meta 键的客户端不受影响。见 [protocol.zh-CN.md](protocol.zh-CN.md) §10 与 [abi.zh-CN.md](abi.zh-CN.md) §4。
+
 ### 新增（MINOR，仅新增符号）
 
 - `client::resilience_statistics` 与 `client::resilience_stats()`：客户端韧性流水线的增补可观测性（`rate_limited`、`bulkhead_rejected`、`local_gate_rejected`、`endpoint_open`、`lb_unavailable`、`pre_send_retries`、`probe_admitted`、`retries_delayed_by_hint`、`bulkhead_in_use`）。不改变既有结构：`client::statistics` 的字段顺序、大小与含义保持不变，C ABI 入口不变。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。

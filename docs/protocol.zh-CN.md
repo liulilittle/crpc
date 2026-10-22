@@ -173,7 +173,18 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 
 编码器把 `message_len`、`key_len`、`value_len`、`meta_count` 钳制到 `uint16_t`；设计中的 512 字节消息和 1 KiB 元数据限制是目标策略，不是此编解码器强制的限制。大于 `application`（21）的未知 `rpc_code` 解码为 `internal`，原值放入 `metadata["crpc.raw_code"]`。`RST_STREAM` 负载是 `u32` 小端的 `rpc_code`；客户端取消时发送它，并忽略同一 stream 的迟到响应。
 
-**服务端准入错误。** 准入阶段复用该错误信封，不新增线上字段。可选的连接级令牌桶返回 `resource_exhausted`（13）和非零 `retry_after_ms`。服务级令牌桶返回同样的码；若等待会越过请求 deadline，则返回 `deadline_exceeded`（2）且 `retry_after_ms = 0`。服务级 bulkhead 满载返回 `overload`（8）并带其提示；breaker open 返回 `unavailable`（3）并带剩余打开时长；dispatcher 的执行前 deadline 拒绝仍是 `deadline_exceeded` 且 `retry_after_ms = 0`。HTTP 映射：`resource_exhausted`/`overload` 为 429，`unavailable` 为 503，`deadline_exceeded` 为 504。`retry_after_ms` 是服务端给出的建议下界，不保证重试一定成功。未知服务 id 仍是 `not_found`（9），且不会创建服务端状态。响应 meta 保留键 `crpc-degraded` 与 `crpc-degradable` 留给 fallback（原语已实现、未接线）；准入阶段不会设置它们。
+**服务端准入错误。** 准入阶段复用该错误信封，不新增线上字段。可选的连接级令牌桶返回 `resource_exhausted`（13）和非零 `retry_after_ms`。服务级令牌桶返回同样的码；若等待会越过请求 deadline，则返回 `deadline_exceeded`（2）且 `retry_after_ms = 0`。服务级 bulkhead 满载返回 `overload`（8）并带其提示；breaker open 返回 `unavailable`（3）并带剩余打开时长；dispatcher 的执行前 deadline 拒绝仍是 `deadline_exceeded` 且 `retry_after_ms = 0`。HTTP 映射：`resource_exhausted`/`overload` 为 429，`unavailable` 为 503，`deadline_exceeded` 为 504。`retry_after_ms` 是服务端给出的建议下界，不保证重试一定成功。未知服务 id 仍是 `not_found`（9），且不会创建服务端状态。
+
+**`crpc-degradable` 标记。** handler 执行前的拒绝可以由持有降级值的客户端用降级值回答；handler 执行后的失败则不能。两者可能带同一个 `rpc_code`，所以服务端用一个保留的响应 meta 条目声明差别：`crpc-degradable: true`（key 长 15，value 长 4）。它只在恰好四个执行前拒绝点写出，且要求请求剩余的线上 deadline 至少 1 ms：
+
+| 拒绝点 | `rpc_code` |
+|---|---|
+| 服务级熔断器打开 | `unavailable`（3） |
+| 服务级令牌桶为空、deadline 仍可达 | `resource_exhausted`（13） |
+| 服务级 bulkhead 满载 | `overload`（8） |
+| 服务级在途上限已满 | `overload`（8） |
+
+另外五条错误路径永不携带它：连接级泛洪令牌桶（`resource_exhausted`）、连接级在途上限（`overload`）、服务级令牌桶的「无法满足 deadline」出口（`deadline_exceeded`）、dispatcher 自身的执行前 deadline 拒绝（`deadline_exceeded`），以及所有 handler 产生的错误（包括 `overload` 与 `unavailable`）。one-way 请求也永不携带：它没有响应帧。该标记**不可由 code 推导**——handler 返回的 `overload` 与 bulkhead 返回的 `overload` 除该条目外完全相同。客户端把它用作降级闸的前置条件：是否可降级（`(code, stage)` 表）、入口时间下界与超时检查仍决定降级是否可以执行。`crpc-degraded`（声明「降级值确实产生」的伴随键）在服务端仍无人写入，服务端自身也仍不执行降级。
 
 ## 11. varint 与 zigzag <a id="s11"></a>
 

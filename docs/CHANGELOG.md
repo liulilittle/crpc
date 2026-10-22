@@ -4,6 +4,34 @@
 
 ## Unreleased
 
+### Changed (MINOR, behaviour only)
+
+- The server now writes the reserved response meta entry `crpc-degradable:
+  true` on four pre-execution admission refusals: the per-service circuit
+  breaker (`unavailable`), the per-service rate bucket when the deadline is
+  still reachable (`resource_exhausted`), the per-service bulkhead (`overload`)
+  and the per-service in-flight cap (`overload`). The entry is written only
+  when the request's remaining wire deadline is at least 1 ms
+  (`resilience::min_remaining_ns`, now shared with the dispatcher's own
+  pre-execution deadline refusal instead of being a second literal). It lets a
+  client tell "refused before the handler ran, so a fallback value is
+  meaningful" from "the handler ran and then failed with the same code": an
+  `overload` from a handler and an `overload` from the bulkhead are otherwise
+  identical on the wire. Five error paths never carry it (the per-connection
+  flood bucket, the per-connection in-flight cap, the rate bucket's
+  deadline-miss exit, the dispatcher's deadline refusal, and every
+  handler-produced error), and a one-way request cannot carry it because it has
+  no response frame. `crpc-degraded` is still written by nobody on the server
+  and `fallback_execute` is still never called from it.
+- Impact: MINOR, and it is a **behaviour change, not an ABI change**. No
+  exported symbol is added, removed or resignatured; no public record changes
+  layout or size; no `server::options` field is added, so a consumer's stack
+  allocation of `server::builder` is unaffected. Only the payload of four
+  existing error responses grows by 23 bytes (the two-byte `meta_count` becomes
+  `0x0001` and one TLV entry is appended). A client that ignores unknown meta
+  keys is unaffected. See [protocol.md](protocol.md) §10 and
+  [abi.md](abi.md) §4.
+
 ### Added (MINOR, symbols only)
 
 - `client::resilience_statistics` and `client::resilience_stats()`: additive
