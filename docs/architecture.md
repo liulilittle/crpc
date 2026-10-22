@@ -334,7 +334,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | Multipart and files | `http/multipart.hpp`, `http/file_transfer.hpp` | implemented, no dedicated suite |
 | Registry | `cluster/registry.hpp`, `src/cluster/registry.cpp` | implemented, tested |
 | Lease/election/health/watch | `cluster/*` | implemented primitives |
-| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline and per-endpoint client pipeline wired; fallback missing |
+| Resilience policies | `resilience/*` | implemented primitives; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired |
 | Push hub/streams | `push/*` | implemented, not wired to frames/HTTP |
 | Tracing/logging/AOP | `observability/*` | implemented, AOP not wired |
 | Flow control | `flow/estimator.hpp` | implemented primitives, not wired |
@@ -352,7 +352,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
 | MVC | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
 | cluster primitives | implemented | `test_cluster.cpp`; no network registry service |
-| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback missing |
+| resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented, not wired |
 | observability | partial | `test_observability.cpp`; AOP not wired, no metrics |
 | push | partial | `test_push.cpp`; no PUSH frame/HTTP integration |
 | flow | partial | `test_flow.cpp`; not wired to transport |

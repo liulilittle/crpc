@@ -45,10 +45,17 @@ MAJOR.MINOR.PATCH
 - `std::function`、`std::any`、含非平凡备选项的 `std::variant`；
 - 跨越边界抛出的异常（本库从不抛出）；
 - `long`、`unsigned long`、`wchar_t`、未指定固定宽度的 `size_t`；
-- 位域、匿名联合、packed 结构体。
+- 位域、匿名联合、packed 结构体；
+- 作为*消费方面向类型*的 `client_detail` / `server_detail` 下的任何类型：它们只能作为库自己产生的参数出现。
 
 确实需要容器时，API 使用 `span`、或 `const char*` 加长度，
 或返回一个被文档标注为不透明的 CRPC 自有类型。
+
+`crpc::client_detail` 与 `crpc::server_detail` 命名空间下的类型是**实现内部细节**：即使它们出现在 `CRPC_API` 类成员的签名中，也**不跨越 ABI 边界**，因为消费方无法构造、持有或命名它们；它们只能以引用形式由库持有的对象传入。因此改变其布局不构成 ABI 破坏。
+
+具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，但没有任何消费方能提供该引用：唯一的产生者是 `client` 自身。给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）属于 MINOR 变更。这两个命名空间中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）同理：它们都不作为消费方面向的类型出现在 `CRPC_API` 签名中，只被库自身实例化的头内模板使用，消费方不得依赖其布局、大小或成员。
+
+有一处例外需要明确写出，因为这是消费方可见尺寸唯一可能看似依赖这些内部类型的地方：`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`。因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——并且当 `call_core`、`call_state` 或 `connection_slot` 增加字段时不会改变。
 
 ## 3. 符号可见性
 
@@ -83,9 +90,9 @@ C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计�
 MINOR 扩展。
 
 无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
-它断言 13 个公开记录的标准布局属性、该文件中列出的 **14 个**记录的精确成员数量、
+它断言 14 个公开记录的标准布局属性、该文件中列出的 **14 个**记录的精确成员数量、
 `http_statistics` / `client::statistics` / `client::resilience_statistics` /
-`server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
+`resilience::fallback_statistics` / `server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
 混用 `std::size_t` 与 `std::uint64_t` 的 `server::statistics` 在 32 位与 64 位
 目标上都能被检查）、`http_statistics` 的总宽度与尾字段位置，并且**仅在 x86 与
 x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof` 数值。它随库一起

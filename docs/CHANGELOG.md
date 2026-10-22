@@ -24,7 +24,7 @@
 
 - The internal translation unit `src/abi_check.cpp` (in no header, exporting no
   symbol) now asserts the layout of a subset of the public records that cross the
-  ABI boundary: standard-layout for 13 records; an exact member count for 14
+  ABI boundary: standard-layout for 14 records; an exact member count for 14
   records (`CRPC_MEMBER_COUNT`), which catches an append, an insertion or a
   removal; relative member chains (`CRPC_STEP`, `CRPC_STEP_SAME`,
   `CRPC_STEP_MIXED`, `CRPC_AFTER`) that catch a reorder or a rename; the total

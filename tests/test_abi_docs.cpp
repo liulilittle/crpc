@@ -979,7 +979,7 @@ CRPC_TEST(abi_docs_english_states_the_guard_facts) {
     const std::string text = read_text(root / "docs" / "abi.md");
 
     // Counts and scope wording.
-    CRPC_CHECK(has_phrase(text, "13 of the public records"));
+    CRPC_CHECK(has_phrase(text, "14 of the public records"));
     CRPC_CHECK(has_phrase(text, "an exact member count for the 14 records"));
     CRPC_CHECK(has_phrase(text, "have **no compile-time layout guard at all**"));
 
@@ -1021,7 +1021,7 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
     CRPC_CHECK(!text.empty());
 
     // Counts and scope wording, mirroring the English document.
-    CRPC_CHECK(has_phrase(text, "13 个公开记录"));
+    CRPC_CHECK(has_phrase(text, "14 个公开记录"));
     CRPC_CHECK(has_phrase(text, "**14 个**记录的精确成员数量"));
     CRPC_CHECK(has_phrase(text, "**没有任何编译期布局护栏**"));
 

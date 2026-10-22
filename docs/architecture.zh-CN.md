@@ -330,7 +330,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | multipart 与文件 | `http/multipart.hpp`、`http/file_transfer.hpp` | 已实现，无专用测试套件 |
 | Registry | `cluster/registry.hpp`、`src/cluster/registry.cpp` | 已实现，有测试 |
 | 租约/选举/健康/watch | `cluster/*` | 已实现的原语 |
-| 韧性策略 | `resilience/*` | 已实现的原语；服务端准入流水线与每端点客户端流水线均已接线；fallback 缺失 |
+| 韧性策略 | `resilience/*` | 已实现的原语；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现，未接线 |
 | 推送 hub/流 | `push/*` | 已实现，未接入帧/HTTP |
 | 追踪/日志/AOP | `observability/*` | 已实现，AOP 未接线 |
 | 流控 | `flow/estimator.hpp` | 已实现原语，未接线 |
@@ -348,7 +348,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | HTTP/2 + HPACK | 已实现 | `test_http2.cpp`；`test_http_server.cpp` 覆盖 inproc 上的 h2c |
 | MVC | 已实现 | `test_mvc.cpp`；`test_http_server.cpp` 经 inproc 走路由器分派 |
 | 集群原语 | 已实现 | `test_cluster.cpp`；无网络 registry 服务 |
-| 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 缺失 |
+| 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现，未接线 |
 | 可观测性 | 部分 | `test_observability.cpp`；AOP 未接线，无指标 |
 | 推送 | 部分 | `test_push.cpp`；无 PUSH 帧/HTTP 集成 |
 | 流控 | 部分 | `test_flow.cpp`；未接入传输 |
