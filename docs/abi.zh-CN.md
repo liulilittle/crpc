@@ -51,11 +51,13 @@ MAJOR.MINOR.PATCH
 确实需要容器时，API 使用 `span`、或 `const char*` 加长度，
 或返回一个被文档标注为不透明的 CRPC 自有类型。
 
-`crpc::client_detail` 与 `crpc::rpc_detail` 命名空间下、以及其它头文件中匿名或嵌套 `detail` 命名空间下的类型是**实现内部细节**：即使它们出现在 `CRPC_API` 类成员的签名中，也**不跨越 ABI 边界**，因为消费方无法构造、持有或命名它们；它们只能以引用形式由库持有的对象传入。因此改变其布局不构成 ABI 破坏。
+`crpc::client_detail` 与 `crpc::rpc_detail` 命名空间下、以及其它头文件中匿名或嵌套 `detail` 命名空间下的类型是**实现内部细节**：它们不出现在*消费方面向*的导出签名中。但它们对消费方的编译器并非不可见：`client_facade.hpp:845` 在消费方自己的翻译单元内实例化 `client_detail::call_state<Resp>`（头内模板中的 `std::make_shared<client_detail::call_state<Resp>>()`），而 `call_state` 以**值**持有 `call_core`。因此这些类型的布局变更**要求消费方与库用同一份头文件重建**（见第 4 节「调用方与库必须使用同一份头文件构建」）。按第 1 节表格（「改变任何公开结构体的布局，包括增加字段 | MAJOR」），这属于布局变更，是 MAJOR；本周期整体已是 MAJOR（第 4 节），本切片不新增兼容性缺口。
 
-具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，但没有任何消费方能提供该引用：唯一的产生者是 `client` 自身。给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）属于 MINOR 变更。`client_detail` 中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）以及 `rpc_detail::always_false`（`rpc/call.hpp`）同理：它们都不作为消费方面向的类型出现在 `CRPC_API` 签名中，只被库自身实例化的头内模板使用，消费方不得依赖其布局、大小或成员。
+具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，且该引用的唯一产生者是 `client` 自身。这并不意味着布局无关：给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）会移动其后所有字段。MSVC x64 实测（`call_core` 664 -> 672 字节，`call_state<Resp>` 760 -> 768）：用旧头文件构建的消费方链接新库时，新字段会覆写旧 `inner_mutex` 的首字节，因为该字段的绝对偏移是 8 + 旧 `sizeof(call_core)`——`/MD` 下 672、`/MDd` 下 696。x86 上新字段恰好落进 `call_core` **自身尾部**的 4 字节内部 padding（`retry` 占 480..484，`sizeof(call_core)` 仍为 488），故 `sizeof` 未变、今天不触发覆写；这是**运气而非保证**，再追加任何字段就会跨过 488。
 
-有一处例外需要明确写出，因为这是消费方可见尺寸唯一可能看似依赖这些内部类型的地方：`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`。因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——并且当 `call_core`、`call_state` 或 `connection_slot` 增加字段时不会改变。
+`client_detail` 中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）同属此类（同受 vptr 与成员偏移影响），`rpc_detail::always_false`（`rpc/call.hpp`）亦然。
+
+`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`，因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——无论 `call_state` 里有什么。
 
 ## 3. 符号可见性
 
@@ -269,6 +271,8 @@ C ABI 独立版本化（`CRPC_C_ABI_VERSION`），遵循相同的 MAJOR/MINOR �
 | 同一 MAJOR，Y.MINOR ≥ X.MINOR | 是（向前兼容） |
 | 同一 MAJOR，Y.MINOR < X.MINOR | 否（新构建可能使用新符号） |
 | 不同 MAJOR | 否 |
+
+本表每一行仅在消费方与库由**同一份头文件**构建时成立。向前兼容的组合并不允许把旧头文件与新二进制混用：第 2 节已说明，头内模板会在消费方翻译单元内实例化 `client_detail` 类型，因此这些类型的布局变更即使在同一个 MAJOR 内也会破坏这种混编。
 
 编译器与标准库：CRPC 不承诺跨标准库（MSVC STL / libstdc++ / libc++）
 或跨不同 `_ITERATOR_DEBUG_LEVEL` / `_GLIBCXX_DEBUG` 设置的 ABI 兼容。

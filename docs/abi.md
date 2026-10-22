@@ -60,30 +60,41 @@ as opaque.
 
 Types in the `crpc::client_detail` and `crpc::rpc_detail` namespaces, and in
 the anonymous or nested `detail` namespaces of the other headers, are
-**implementation-internal**. They do not cross the ABI boundary even when they
-appear in the signature of a `CRPC_API` class member, because a consumer cannot
-construct, hold or name them: they are only reachable as references passed
-*into* the library by library-owned objects. A change to their layout is
-therefore not an ABI break.
+**implementation-internal**: they do not appear in a *consumer-facing* exported
+signature. They are not, however, invisible to the consumer's compiler.
+`client_facade.hpp:845` instantiates `client_detail::call_state<Resp>` inside the
+consumer's own translation unit (`std::make_shared<client_detail::call_state<Resp>>()`
+in a header-inline template), and `call_state` holds `call_core` **by value**.
+A layout change in these types therefore requires the consumer and the library to
+be rebuilt from the same headers (§4, "callers and the library must be built from
+the same headers"). Under the §1 table ("Change the layout of any public struct,
+including adding a field | MAJOR") such a change is a layout change and is MAJOR;
+this cycle is already MAJOR (§4), so this slice adds no new compatibility gap.
 
 Concretely, `client::finish_attempt(client_detail::call_core&, ...)` and
-`client::begin_attempt(client_detail::call_core&, ...)` mention `call_core` in
-an exported signature, but no consumer can supply that reference: the only
-producer is `client` itself. Adding a field to `call_core` (for example the
-`degraded_` flag that records a fallback-answered attempt) is a MINOR change.
-The same holds for the other types in `client_detail` (`call_state`,
-`call_state_base`, `connection_slot`, `client_liveness`) and for
-`rpc_detail::always_false` (`rpc/call.hpp`): none of them appears in a
-`CRPC_API` signature as a consumer-facing type, they are only used by the
-header-inline templates that the library itself instantiates, and no consumer
-may depend on their layout, size or members.
+`client::begin_attempt(client_detail::call_core&, ...)` mention `call_core` in an
+exported signature, and the only producer of that reference is `client` itself.
+That does not make the layout irrelevant: adding a field to `call_core` (for
+example the `degraded_` flag that records a fallback-answered attempt) moves
+every field after it. Measured on MSVC x64 (`call_core` 664 -> 672 bytes,
+`call_state<Resp>` 760 -> 768), a consumer built from the old header and linked
+against the new library writes the new field over the first byte of the old
+`inner_mutex`, because the field lands at absolute offset 8 + old
+`sizeof(call_core)` — 672 under `/MD`, 696 under `/MDd`. On x86 the write happens
+to fall into four bytes of internal tail padding inside `call_core` (`retry` ends
+at 480 while `sizeof(call_core)` stays 488), so `sizeof` is unchanged and no
+overwrite is observed today; that is luck, not a guarantee, since any further
+field crosses the 488-byte boundary.
 
-One exception is worth stating explicitly, because it is the only place where
-consumer-visible size could appear to depend on those internals: `client::call<Resp>`
-holds exactly one member, a `std::shared_ptr<client_detail::call_state<Resp>>`.
-Its size is therefore always `sizeof(std::shared_ptr<T>)` for some `T` — 16 bytes
-on x64 and 8 bytes on x86 — and it does not change when a field is added to
-`call_core`, `call_state` or `connection_slot`.
+The same applies to the other types in `client_detail` (`call_state`,
+`call_state_base`, `connection_slot`, `client_liveness`), which are subject to
+the same vptr and member offsets, and to `rpc_detail::always_false`
+(`rpc/call.hpp`).
+
+`client::call<Resp>` holds exactly one member, a
+`std::shared_ptr<client_detail::call_state<Resp>>`, so its size is always
+`sizeof(std::shared_ptr<T>)` for some `T` — 16 bytes on x64 and 8 bytes on x86 —
+whatever `call_state` contains.
 
 ## 3. Symbol visibility
 
@@ -356,6 +367,12 @@ A binary built against version X must link and run against version Y when:
 | same MAJOR, Y.MINOR ≥ X.MINOR | Yes (forward compatible) |
 | same MAJOR, Y.MINOR < X.MINOR | No (a newer build may use newer symbols) |
 | different MAJOR | No |
+
+Every row of this table holds only when the consumer and the library are built
+from the same headers. A forward-compatible pairing does not license mixing an
+old header with a newer binary: §2 shows that the header-inline templates
+instantiate `client_detail` types in the consumer's translation unit, so a
+layout change in those types breaks that mix even inside one MAJOR version.
 
 Compiler and standard library: CRPC does not promise ABI compatibility across
 different standard libraries (MSVC STL vs libstdc++ vs libc++) or across
