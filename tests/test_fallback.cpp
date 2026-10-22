@@ -725,6 +725,39 @@ CRPC_TEST(fallback_sink_counts_each_outcome_exactly_once) {
                fb::fallback_outcome::applied);
 }
 
+// A sink whose `self` is set but whose `add` is null must be treated as "do not
+// count": the guard in `fallback_record` tests both members. A sink with only
+// `self` set is easy to build by accident (a partially filled struct), and
+// calling through a null `add` would crash the terminal path of a real call.
+CRPC_TEST(fallback_sink_without_add_is_not_called) {
+    fb::fallback_context ctx =
+        context_for(crpc::rpc_code::unavailable, fb::stage_kind::breaker);
+    fn_state state;
+    fb::fallback_policy policy = policy_for(state);
+    std::atomic<bool> canceled{false};
+    crpc::rpc_error error = decorated_error(crpc::rpc_code::unavailable);
+    crpc::buffer out;
+
+    counter_box box;
+    fb::fallback_counter_sink sink;
+    sink.self = &box;
+    sink.add = nullptr;
+
+    CRPC_CHECK(fb::fallback_execute(policy, ctx, canceled, out, error,
+                                    &fake_clock, &sink) ==
+               fb::fallback_outcome::applied);
+    CRPC_CHECK_EQ(1, state.calls);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(5), out.size());
+    // Nothing may reach the sink, not even through `self`.
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.ineligible);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.skipped_deadline);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.failed);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.canceled);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.overrun);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.applied);
+}
+
 // --- 6. Counter mapping ------------------------------------------------------
 
 CRPC_TEST(fallback_outcome_counter_mapping_is_total) {
