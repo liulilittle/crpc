@@ -1052,54 +1052,77 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
         text, "MSVC、GCC 与 Clang 上都是"));
 }
 
-// The N-9 regression guard. `docs/abi.md` §2 once claimed that `client_detail`
-// types are invisible to the consumer's compiler and that adding a field to
-// `call_core` is a MINOR change. Both claims are false: `call_state<Resp>` is
-// instantiated in the consumer's own translation unit and holds `call_core` by
-// value, so a layout change there corrupts an old consumer's `inner_mutex`.
-// Restoring either claim must fail here. `forbidden_phrase` strips all
-// whitespace, which is required: the document wraps at 80 columns and two of
-// these phrases straddle a line break, so a line-oriented grep is a false green.
-CRPC_TEST(abi_docs_english_rejects_the_internal_layout_claims) {
-    const fs::path root = repo_root();
-    CRPC_CHECK(!root.empty());
-    if (root.empty()) {
-        return;
+// Returns the slice of `text` between two heading prefixes, or the whole text when
+// either heading is missing (so a renamed heading fails loudly instead of
+// silently disabling the checks).
+std::string between_headings(const std::string& text, const char* begin,
+                             const char* end) {
+    const std::size_t from = text.find(begin);
+    if (from == std::string::npos) {
+        return {};
     }
-    const std::string text = read_text(root / "docs" / "abi.md");
-
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "cannot construct, hold or name"));
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "not an ABI break"));
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "is a MINOR change"));
-    CRPC_CHECK_FALSE(
-        forbidden_phrase(text, "no consumer may depend on their layout"));
-    CRPC_CHECK_FALSE(
-        forbidden_phrase(text, "the library itself instantiates"));
-
-    CRPC_CHECK(has_phrase(text, "consumer's own translation unit"));
-    CRPC_CHECK(has_phrase(text, "rebuilt from the same headers"));
-    CRPC_CHECK(has_phrase(text, "inner_mutex"));
-    CRPC_CHECK(has_phrase(text, "luck, not a guarantee"));
-    CRPC_CHECK(has_phrase(text, "four bytes of internal tail padding"));
+    const std::size_t to = text.find(end, from + 1);
+    if (to == std::string::npos) {
+        return text.substr(from);
+    }
+    return text.substr(from, to - from);
 }
 
-CRPC_TEST(abi_docs_chinese_rejects_the_internal_layout_claims) {
+CRPC_TEST(abi_docs_does_not_call_internal_layout_invisible) {
     const fs::path root = repo_root();
     CRPC_CHECK(!root.empty());
     if (root.empty()) {
         return;
     }
-    const std::string text = read_text(root / "docs" / "abi.zh-CN.md");
+    const std::string english =
+        between_headings(read_text(root / "docs" / "abi.md"), "## 2.", "## 3.");
+    const std::string chinese =
+        between_headings(read_text(root / "docs" / "abi.zh-CN.md"), "## 2.", "## 3.");
+    // A missing or renamed heading must not silently disable the section.
+    CRPC_CHECK(!english.empty());
+    CRPC_CHECK(!chinese.empty());
 
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "无法构造、持有或命名"));
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "不构成 ABI 破坏"));
-    CRPC_CHECK_FALSE(forbidden_phrase(text, "属于 MINOR 变更"));
+    // The old text claimed a consumer cannot construct, hold or name these types
+    // and that a layout change is therefore not an ABI break. Both are false: a
+    // header-inline template allocates `call_state<Resp>` in the consumer's own
+    // translation unit and holds `call_core` by value.
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "cannot construct, hold or name"));
+    CRPC_CHECK_FALSE(forbidden_phrase(english, "not an ABI break"));
+    CRPC_CHECK_FALSE(forbidden_phrase(english, "is a MINOR change"));
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "no consumer may depend on their layout"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "无法构造、持有或命名"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "不构成 ABI 破坏"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "属于 MINOR 变更"));
 
-    CRPC_CHECK(has_phrase(text, "消费方自己的翻译单元"));
-    CRPC_CHECK(has_phrase(text, "同一份头文件"));
-    CRPC_CHECK(has_phrase(text, "inner_mutex"));
-    CRPC_CHECK(has_phrase(text, "运气而非保证"));
-    CRPC_CHECK(has_phrase(text, "内部 padding"));
+    // Deleting the claim is not enough; the replacement must name the real
+    // mechanism and the load-bearing rule.
+    CRPC_CHECK(has_phrase(english, "inside the consumer's own translation unit"));
+    CRPC_CHECK(has_phrase(english, "built from the same headers"));
+    CRPC_CHECK(has_phrase(english, "inner_mutex"));
+    CRPC_CHECK(has_phrase(chinese, "在消费方自己的翻译单元内实例化"));
+    CRPC_CHECK(has_phrase(chinese, "同一份头文件"));
+
+    // The x86 escape hatch is a padding budget, not a boundary: three bytes remain
+    // after `degraded_`, so a fourth one-byte field already crosses.
+    CRPC_CHECK_FALSE(forbidden_phrase(
+        english, "any further field crosses the 488-byte boundary"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "再追加任何字段就会跨过 488"));
+    CRPC_CHECK(has_phrase(
+        english, "the padding is only four bytes and three remain"));
+    CRPC_CHECK(has_phrase(english, "wider than the three"));
+
+    // Only two of the four internal types are polymorphic.
+    CRPC_CHECK_FALSE(forbidden_phrase(english, "subject to the same vptr"));
+    CRPC_CHECK_FALSE(forbidden_phrase(chinese, "同受 vptr"));
+    CRPC_CHECK(has_phrase(
+        english, "Only `call_state_base` and `call_state<Resp>` are polymorphic"));
+    CRPC_CHECK(has_phrase(english, "plain structs with no vptr"));
+
+    // Handle size stability must not be read as heap-object safety.
+    CRPC_CHECK(has_phrase(english, "covers the handle, not the heap object"));
+    CRPC_CHECK(has_phrase(chinese, "只覆盖句柄，不覆盖它指向的堆对象"));
 }
 
 CRPC_TEST_MAIN()
