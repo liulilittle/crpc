@@ -183,13 +183,20 @@ inline void fallback_record(fallback_counter_sink* sink,
 // G1: true when there is no deadline or when the time left is strictly above
 // the floor. Equality is already too late, matching a caller that would have to
 // answer deadline_exceeded.
+//
+// A negative floor is clamped to zero so a passed deadline is never admitted:
+// `deadline - now > -1s` holds after the deadline, which would call fn and
+// count an attempt that the deadline forbids (D7).
 [[nodiscard]] inline bool fallback_has_room(
     const fallback_context& ctx, std::chrono::nanoseconds min_remaining,
     fallback_clock clock) noexcept {
     if (!ctx.has_deadline) {
         return true;
     }
-    return ctx.deadline - clock() > min_remaining;
+    const auto floor = min_remaining > std::chrono::nanoseconds::zero()
+                           ? min_remaining
+                           : std::chrono::nanoseconds::zero();
+    return ctx.deadline - clock() > floor;
 }
 
 // G3: true when the deadline has passed. Deliberately ignores the G1 floor: a

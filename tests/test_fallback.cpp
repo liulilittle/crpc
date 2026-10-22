@@ -384,6 +384,46 @@ CRPC_TEST(fallback_has_room_is_the_entry_floor_only) {
     CRPC_CHECK(fb::fallback_overran(ctx, &fake_clock));
 }
 
+CRPC_TEST(fallback_negative_floor_never_admits_a_passed_deadline) {
+    // A negative floor must not turn "already past the deadline" into room:
+    // `deadline - now > -1s` is true when 500 ms have already elapsed, which
+    // would call fn after the deadline and count an attempt that D7 forbids.
+    const auto t0 = std::chrono::steady_clock::time_point{} + 5000s;
+    fb::fallback_context ctx =
+        context_for(crpc::rpc_code::unavailable, fb::stage_kind::breaker);
+    ctx.has_deadline = true;
+    ctx.deadline = t0;
+    fn_state state;
+    fb::fallback_policy policy = policy_for(state);
+    policy.min_remaining = -1s;
+    std::atomic<bool> canceled{false};
+    crpc::rpc_error error = decorated_error(crpc::rpc_code::unavailable);
+    const crpc::rpc_error original = error;
+    crpc::buffer out = buffer_with_residue();
+
+    g_fake_now = t0 + 500ms;
+    CRPC_CHECK_FALSE(fb::fallback_has_room(ctx, policy.min_remaining, &fake_clock));
+    counter_box box;
+    fb::fallback_counter_sink sink = box.sink();
+    CRPC_CHECK(fb::fallback_execute(policy, ctx, canceled, out, error,
+                                    &fake_clock, &sink) ==
+               fb::fallback_outcome::skipped_deadline);
+    CRPC_CHECK_EQ(0, state.calls);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), box.skipped_deadline);
+    CRPC_CHECK(out.empty());
+    check_error_unchanged(original, error);
+
+    // The clamp only removes the negative floor: with time left the same
+    // policy still applies, so this is not a blanket refusal.
+    g_fake_now = t0 - 1ms;
+    CRPC_CHECK(fb::fallback_has_room(ctx, policy.min_remaining, &fake_clock));
+    CRPC_CHECK(fb::fallback_execute(policy, ctx, canceled, out, error,
+                                    &fake_clock) ==
+               fb::fallback_outcome::applied);
+    CRPC_CHECK_EQ(1, state.calls);
+}
+
 CRPC_TEST(fallback_g3_reads_only_the_deadline) {
     // Regression guard for the v2 P1: a value returned with 40 ms left is a
     // success even though the 50 ms entry floor would have refused to start.
