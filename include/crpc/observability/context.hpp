@@ -114,7 +114,7 @@ enum class traceparent_status : u8 {
     invalid_span_id
 };
 
-[[nodiscard]] const char* to_string(traceparent_status status) noexcept;
+[[nodiscard]] CRPC_API const char* to_string(traceparent_status status) noexcept;
 
 struct traceparent_result {
     traceparent_status status = traceparent_status::invalid_length;
@@ -133,7 +133,7 @@ struct traceparent_result {
 //   * an all-zero trace id or span id is rejected.
 //
 // Allocation: none. No exceptions.
-[[nodiscard]] traceparent_result parse_traceparent(std::string_view text) noexcept;
+[[nodiscard]] CRPC_API traceparent_result parse_traceparent(std::string_view text) noexcept;
 
 // Writes the version-`00` form into `out` and returns the number of bytes
 // written (always 55). Returns 0 when the buffer is too small or either id is
@@ -141,7 +141,7 @@ struct traceparent_result {
 // length rather than relying on it.
 //
 // Allocation: none. No exceptions.
-[[nodiscard]] std::size_t format_traceparent(const trace_context& context, char* out,
+[[nodiscard]] CRPC_API std::size_t format_traceparent(const trace_context& context, char* out,
                                              std::size_t capacity) noexcept;
 
 // --- Deadline ----------------------------------------------------------------
@@ -190,7 +190,7 @@ struct deadline {
 // true and the dropped counters record the loss.
 //
 // Thread safety: value type, not synchronised. Allocation: none, ever.
-class baggage {
+class CRPC_API baggage {
 public:
     static constexpr std::size_t max_entries = 32;
     static constexpr std::size_t max_bytes = 8u * 1024u;

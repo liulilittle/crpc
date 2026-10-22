@@ -329,13 +329,13 @@ static_assert(sizeof(log_record) <= 512, "log_record must stay within one 512-by
 // Builds a record with the current timestamp and thread id. The message is
 // truncated to the inline capacity; the truncation flag is set when that
 // happens.
-[[nodiscard]] log_record make_record(log_level level, std::string_view message,
+[[nodiscard]] CRPC_API log_record make_record(log_level level, std::string_view message,
                                      const trace_context& trace = trace_context{}) noexcept;
 
 // Appends a bounded key/value pair. Returns false when the record already
 // holds `max_fields` entries. Key/value truncation is reflected in
 // `log_field::truncated` and `log_record::flags`.
-[[nodiscard]] bool record_add_field(log_record& record, std::string_view key,
+[[nodiscard]] CRPC_API bool record_add_field(log_record& record, std::string_view key,
                                     std::string_view value) noexcept;
 
 template <typename T, std::enable_if_t<std::is_integral<T>::value, int> = 0>
@@ -396,7 +396,7 @@ struct logger_config {
 
 class log_ring;
 
-class logger {
+class CRPC_API logger {
 public:
     // The one documented mutable singleton of this module. Constructed on
     // first use; destroyed at process exit (its destructor calls shutdown()).
@@ -514,7 +514,7 @@ private:
 //     log_event(log_level::info, "login").field("user", name);
 //
 // The constructor checks the runtime level; a disabled event does no work.
-class log_event {
+class CRPC_API log_event {
 public:
     log_event(log_level level, std::string_view message) noexcept;
     ~log_event();

@@ -192,7 +192,7 @@ struct hub_stats {
 [[nodiscard]] CRPC_API u32 topic_shard(std::string_view topic, u64 shard_key,
                                        u32 shard_count) noexcept;
 
-class hub {
+class CRPC_API hub {
 public:
     using connection_id = u64;
     static constexpr connection_id invalid_connection = 0;

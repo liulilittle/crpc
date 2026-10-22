@@ -172,7 +172,7 @@ struct match_result {
 
 // --- Router ------------------------------------------------------------------
 
-class router {
+class CRPC_API router {
 public:
     struct options {
         bool case_insensitive_routes = false;
@@ -222,14 +222,14 @@ private:
 };
 
 // Convenience wrapper around `router::handle`.
-[[nodiscard]] status dispatch(const router& routes,
+[[nodiscard]] CRPC_API status dispatch(const router& routes,
                               const http::request& request,
                               http::response& response);
 
 // --- Startup registry --------------------------------------------------------
 
 // The process-wide pending list the CRPC_HTTP_* macros append to before main.
-[[nodiscard]] std::vector<route_entry>& pending_routes();
+[[nodiscard]] CRPC_API std::vector<route_entry>& pending_routes();
 
 // The shared controller instance for a controller type. Stateless controllers
 // are the norm; a caller that needs per-request state should register a router
@@ -253,20 +253,20 @@ struct route_prefix_of<C, std::void_t<decltype(C::crpc_route_meta)>> {
 };
 
 // The shared, frozen router built from `pending_routes()` on first use.
-[[nodiscard]] router& default_router();
+[[nodiscard]] CRPC_API router& default_router();
 
 // Joins a controller prefix and an action path into a single normalized
 // pattern ("/users" + "/:id" -> "/users/:id"; "/users" + "/" -> "/users").
-[[nodiscard]] std::string join_route_path(std::string_view prefix,
+[[nodiscard]] CRPC_API std::string join_route_path(std::string_view prefix,
                                           std::string_view path);
 
 // --- Non-template helpers (implemented in src/mvc/router.cpp) ----------------
 
-[[nodiscard]] const char* reason_phrase(int status_code) noexcept;
-void write_error(http::response& response, const rpc_error& error,
+[[nodiscard]] CRPC_API const char* reason_phrase(int status_code) noexcept;
+CRPC_API void write_error(http::response& response, const rpc_error& error,
                  std::string_view instance);
-[[nodiscard]] std::string normalize_path(std::string_view path, bool lower);
-[[nodiscard]] http::method effective_method(const http::request& request);
+[[nodiscard]] CRPC_API std::string normalize_path(std::string_view path, bool lower);
+[[nodiscard]] CRPC_API http::method effective_method(const http::request& request);
 
 // --- Invocation --------------------------------------------------------------
 

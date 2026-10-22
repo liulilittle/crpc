@@ -46,7 +46,7 @@ struct rate_limit_result {
     [[nodiscard]] explicit operator bool() const noexcept { return ok(); }
 };
 
-class rate_limiter {
+class CRPC_API rate_limiter {
 public:
     explicit rate_limiter(const rate_limit_config& config,
                           clock_source clock = monotonic_clock()) noexcept;

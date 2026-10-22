@@ -304,7 +304,7 @@ public:
         backend_factory* backend = nullptr;
     };
 
-    class builder {
+    class CRPC_API builder {
     public:
         builder();
         ~builder();

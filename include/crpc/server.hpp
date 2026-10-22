@@ -150,7 +150,7 @@ public:
         std::size_t push_acks = 0;
     };
 
-    class builder {
+    class CRPC_API builder {
     public:
         // The backend must outlive the server, including every stop() ->
         // start() cycle: the listener configuration is retained so a later

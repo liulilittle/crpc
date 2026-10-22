@@ -114,7 +114,7 @@ enum class instance_state : u8 {
     deregistered = 4
 };
 
-[[nodiscard]] const char* to_string(instance_state state) noexcept;
+[[nodiscard]] CRPC_API const char* to_string(instance_state state) noexcept;
 
 struct service_instance {
     std::string service;

@@ -97,7 +97,7 @@ inline constexpr timer_id invalid_timer = 0;
 // Construction is fallible and never throws: `create()` returns a `result`
 // carrying `rpc_code::internal` when the epoll fd, doorbell or timerfd cannot
 // be created.
-class epoll_backend final : public backend_factory {
+class CRPC_API epoll_backend final : public backend_factory {
 public:
     [[nodiscard]] static result<std::unique_ptr<epoll_backend>> create(
         epoll_options opt = epoll_options{});

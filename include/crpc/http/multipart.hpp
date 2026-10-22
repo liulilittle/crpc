@@ -79,7 +79,7 @@ struct multipart_limits {
     std::size_t max_parameter_bytes = 4u * 1024u;
 };
 
-[[nodiscard]] const multipart_limits& default_multipart_limits() noexcept;
+[[nodiscard]] CRPC_API const multipart_limits& default_multipart_limits() noexcept;
 
 // --- Part metadata ----------------------------------------------------------
 
@@ -113,19 +113,19 @@ public:
 // empty, "." or "..", or contains NUL/control characters. Both '/' and '\\'
 // are treated as separators so a Windows-style path cannot smuggle a directory
 // component through a server running on POSIX (and vice versa).
-[[nodiscard]] result<std::string> sanitize_filename(std::string_view raw);
+[[nodiscard]] CRPC_API result<std::string> sanitize_filename(std::string_view raw);
 
 // --- Boundary extraction ----------------------------------------------------
 
 // Extracts the boundary parameter from a multipart Content-Type value. The
 // media type must be multipart/form-data (case-insensitive). The boundary is
 // validated against the RFC 2046 character set and length limit.
-[[nodiscard]] result<std::string> multipart_boundary(std::string_view content_type,
+[[nodiscard]] CRPC_API result<std::string> multipart_boundary(std::string_view content_type,
                                                      std::size_t max_bytes = 70);
 
 // --- Parser -----------------------------------------------------------------
 
-class multipart_parser {
+class CRPC_API multipart_parser {
 public:
     // `boundary` must be a validated boundary without the leading "--".
     // Prefer `create`, which validates the Content-Type value.

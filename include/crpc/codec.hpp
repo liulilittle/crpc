@@ -1440,7 +1440,7 @@ using flatbuffers_codec = text_codec<flatbuffers_format>;
 
 // --- codec registry ----------------------------------------------------------
 
-class codec_registry {
+class CRPC_API codec_registry {
 public:
     codec_registry() = default;
     ~codec_registry();
@@ -1478,7 +1478,7 @@ private:
 
 // The process-wide default registry: crpc-binary plus every available RTTI
 // format, frozen on first use.
-[[nodiscard]] codec_registry& default_codec_registry();
+[[nodiscard]] CRPC_API codec_registry& default_codec_registry();
 
 // --- typed helpers -----------------------------------------------------------
 

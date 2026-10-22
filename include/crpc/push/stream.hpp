@@ -53,7 +53,7 @@ enum class stream_shape : u8 {
 
 // Shared lifecycle of one stream. Owned by the endpoint; referenced (not owned)
 // by its reader and writer.
-class stream_state {
+class CRPC_API stream_state {
 public:
     stream_state(u32 stream_id, stream_shape shape) noexcept;
 
@@ -124,7 +124,7 @@ public:
     virtual void send_reset(u32 stream_id, rpc_code code) noexcept = 0;
 };
 
-class stream_reader {
+class CRPC_API stream_reader {
 public:
     stream_reader(stream_transport& transport, stream_state& state) noexcept;
 
@@ -146,7 +146,7 @@ private:
     std::size_t offset_ = 0;
 };
 
-class stream_writer {
+class CRPC_API stream_writer {
 public:
     stream_writer(stream_transport& transport, stream_state& state) noexcept;
 

@@ -95,7 +95,7 @@ struct iocp_options {
 
 // A Windows IOCP backend.  It implements `backend_factory` and additionally
 // exposes a sub-millisecond timer facility.
-class iocp_backend final : public backend_factory {
+class CRPC_API iocp_backend final : public backend_factory {
 public:
     // A one-shot timer callback.  It runs on the backend pump thread.
     using timer_callback = void (*)(void* arg) noexcept;

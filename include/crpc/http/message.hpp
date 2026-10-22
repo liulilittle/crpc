@@ -50,19 +50,19 @@ enum class method : std::uint8_t {
     extension
 };
 
-[[nodiscard]] method method_from_token(std::string_view token) noexcept;
+[[nodiscard]] CRPC_API method method_from_token(std::string_view token) noexcept;
 
 // Returns the canonical upper-case token, or "" for `extension`.
-[[nodiscard]] const char* to_token(method value) noexcept;
+[[nodiscard]] CRPC_API const char* to_token(method value) noexcept;
 
 // True when the string is a non-empty RFC 9110 token.
-[[nodiscard]] bool is_token(std::string_view text) noexcept;
+[[nodiscard]] CRPC_API bool is_token(std::string_view text) noexcept;
 
 // --- Versions and target forms -----------------------------------------------
 
 enum class http_version : std::uint8_t { http_1_0, http_1_1 };
 
-[[nodiscard]] const char* to_string(http_version version) noexcept;
+[[nodiscard]] CRPC_API const char* to_string(http_version version) noexcept;
 
 enum class target_form : std::uint8_t {
     origin,    // /path?query
@@ -74,14 +74,14 @@ enum class target_form : std::uint8_t {
 // Splits a request target into its raw (not percent-decoded) path and query.
 // `path` excludes the query, `query` is everything after the first '?'.
 // A fragment ('#') is rejected: request targets must not carry one.
-[[nodiscard]] status split_target(std::string_view target, target_form& form,
+[[nodiscard]] CRPC_API status split_target(std::string_view target, target_form& form,
                                   std::string& path, std::string& query);
 
 // Strict percent decoding. Invalid escapes ("%zz", a trailing "%"), a raw NUL
 // and a decoded NUL are rejected with `rpc_code::invalid_argument`. '+' is
 // passed through unchanged; form decoding is an MVC concern, not an HTTP
 // message concern.
-[[nodiscard]] status percent_decode(std::string_view input, std::string& output);
+[[nodiscard]] CRPC_API status percent_decode(std::string_view input, std::string& output);
 
 // --- Header container --------------------------------------------------------
 
@@ -93,7 +93,7 @@ struct header {
 // Ordered, case-insensitive header list. Insertion order is preserved on the
 // wire. Duplicate fields are preserved (HTTP permits them, e.g. Set-Cookie);
 // `find` returns the first match and `get_all` returns every value.
-class header_list {
+class CRPC_API header_list {
 public:
     using container_type = std::vector<header>;
     using const_iterator = container_type::const_iterator;
@@ -176,7 +176,7 @@ enum class chunk_status : std::uint8_t { need_more, complete, error };
 // `consumed`), appends decoded body bytes to `out`, and keeps any partial
 // chunk-size or trailer line in an internal buffer. Bytes after the final
 // empty line are not consumed, so a caller can feed a pipelined message next.
-class chunked_decoder {
+class CRPC_API chunked_decoder {
 public:
     explicit chunked_decoder(parser_limits limits = parser_limits{});
 
@@ -212,7 +212,7 @@ private:
 // Chunked transfer encoder. `append` emits zero or more complete chunks;
 // `finish` emits the terminating zero chunk and optional trailers. All output
 // uses CRLF, regardless of how lenient the input side is.
-class chunked_encoder {
+class CRPC_API chunked_encoder {
 public:
     explicit chunked_encoder(std::size_t max_chunk_bytes = 16u * 1024u) noexcept
         : max_chunk_bytes_(max_chunk_bytes) {}
@@ -234,7 +234,7 @@ enum class parse_status : std::uint8_t {
     error
 };
 
-class http_parser {
+class CRPC_API http_parser {
 public:
     enum class kind : std::uint8_t { request, response };
 
@@ -326,9 +326,9 @@ struct serialize_options {
 // Content-Length is added when the body is not chunked. Header names and values
 // are validated and CR/LF injection is rejected with `rpc_code::encode_error`.
 // On failure `out` is left unchanged.
-[[nodiscard]] status serialize(const request& message, std::string& out,
+[[nodiscard]] CRPC_API status serialize(const request& message, std::string& out,
                                serialize_options options = serialize_options{});
-[[nodiscard]] status serialize(const response& message, std::string& out,
+[[nodiscard]] CRPC_API status serialize(const response& message, std::string& out,
                                serialize_options options = serialize_options{});
 
 } // namespace crpc::http

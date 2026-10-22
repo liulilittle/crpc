@@ -35,7 +35,7 @@ class bulkhead;
 // Thread safety: a permit is owned by one thread at a time and is not
 // internally synchronized. Moving it between threads is safe if the move itself
 // is synchronized.
-class [[nodiscard]] bulkhead_permit {
+class CRPC_API [[nodiscard]] bulkhead_permit {
 public:
     bulkhead_permit() noexcept = default;
     bulkhead_permit(bulkhead_permit&& other) noexcept;
@@ -64,7 +64,7 @@ private:
     std::chrono::milliseconds retry_after_{0};
 };
 
-class bulkhead {
+class CRPC_API bulkhead {
 public:
     explicit bulkhead(const bulkhead_config& config) noexcept;
 

@@ -63,7 +63,7 @@ using retry_predicate = bool (*)(rpc_code code, bool idempotent,
 
 // Default policy: transient transport codes are retryable; caller errors and
 // `canceled` are not; `unknown_side_effect` is retryable only when idempotent.
-[[nodiscard]] bool default_retryable(rpc_code code, bool idempotent) noexcept;
+[[nodiscard]] CRPC_API bool default_retryable(rpc_code code, bool idempotent) noexcept;
 
 // Thread safety: a plain value type; copy it before sharing between threads.
 struct retry_policy {
@@ -106,7 +106,7 @@ struct retry_budget_config {
 }
 
 // Shared retry budget. Starts empty; call `on_request()` once per logical call.
-class retry_budget {
+class CRPC_API retry_budget {
 public:
     explicit retry_budget(const retry_budget_config& config,
                           clock_source clock = monotonic_clock()) noexcept;
@@ -137,7 +137,7 @@ private:
 };
 
 // Per-call retry state machine.
-class [[nodiscard]] retry_sequence {
+class CRPC_API [[nodiscard]] retry_sequence {
 public:
     // `budget` may be null, in which case the storm guard is disabled for this
     // call. Production callers should pass a shared budget.

@@ -59,7 +59,7 @@ namespace crpc::mvc {
 
 // Ordered list of decoded name/value pairs. `find` returns the first match, so
 // a repeated query key yields the first value; all pairs stay in the list.
-struct route_params {
+struct CRPC_API route_params {
     std::vector<std::pair<std::string, std::string>> entries;
 
     [[nodiscard]] const std::string* find(std::string_view name) const noexcept;
@@ -71,7 +71,7 @@ struct route_params {
 
 // One multipart part that carried a filename. v1 keeps the bytes in memory;
 // the spill-to-disk path described in the design spec is out of v1 scope.
-struct file_part {
+struct CRPC_API file_part {
     std::string name;
     std::string filename;
     std::string content_type;
@@ -96,32 +96,32 @@ struct binding_limits {
     std::size_t max_part_header_bytes = 8u * 1024u;
 };
 
-[[nodiscard]] const binding_limits& default_binding_limits() noexcept;
+[[nodiscard]] CRPC_API const binding_limits& default_binding_limits() noexcept;
 
 // --- Decoding helpers (implemented in src/mvc/binding.cpp) -------------------
 
 // The media type of a Content-Type value with parameters stripped and
 // surrounding whitespace removed. Case is preserved; callers compare with
 // detail::ascii_iequals.
-[[nodiscard]] std::string_view media_type(std::string_view content_type) noexcept;
+[[nodiscard]] CRPC_API std::string_view media_type(std::string_view content_type) noexcept;
 
 // Parses `a=1&b=2`. Percent-decoded, '+' is a space. Empty pairs are skipped.
-[[nodiscard]] status parse_query(std::string_view query, route_params& out,
+[[nodiscard]] CRPC_API status parse_query(std::string_view query, route_params& out,
                                  std::size_t limit);
 
 // Parses an application/x-www-form-urlencoded body. Same rules as parse_query.
-[[nodiscard]] status parse_form(std::string_view body, route_params& out,
+[[nodiscard]] CRPC_API status parse_form(std::string_view body, route_params& out,
                                 std::size_t limit);
 
 // Parses a multipart/form-data body. Form fields land in `fields`, parts with a
 // filename land in `files`. A missing boundary or a malformed part is 400.
-[[nodiscard]] status parse_multipart(std::string_view body,
+[[nodiscard]] CRPC_API status parse_multipart(std::string_view body,
                                      std::string_view content_type,
                                      const binding_limits& limits,
                                      std::vector<file_part>& files,
                                      route_params& fields);
 
-[[nodiscard]] const file_part* find_file(const std::vector<file_part>& files,
+[[nodiscard]] CRPC_API const file_part* find_file(const std::vector<file_part>& files,
                                          std::string_view name) noexcept;
 
 // --- Scalar conversion -------------------------------------------------------

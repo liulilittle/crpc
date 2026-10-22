@@ -55,7 +55,7 @@ struct clock_source {
 // covariance matrix and no process model: the directional gate is what makes
 // the estimate robust, and adding an unobservable model on top of an
 // unobservable state buys nothing.
-class rtt_estimator {
+class CRPC_API rtt_estimator {
 public:
     struct config {
         // Starting point when the first sample is much larger than expected.
@@ -127,7 +127,7 @@ private:
 // that fills a shallow queue in one instant; spreading the same bytes over time
 // keeps the queue empty without reducing throughput. This is the practical form
 // of "send at the rate of the bottleneck, not as fast as the window allows".
-class pacer {
+class CRPC_API pacer {
 public:
     struct config {
         u64 initial_rate_bytes_per_second = 1u * 1024u * 1024u;
@@ -173,7 +173,7 @@ private:
 //
 // The window is expressed in bytes and bounded below by one maximum segment so
 // that a shrinking path can always make progress.
-class congestion_window {
+class CRPC_API congestion_window {
 public:
     struct config {
         u64 initial_bytes = 64u * 1024u;
@@ -229,7 +229,7 @@ private:
 // arrives. This is where the observation delay becomes explicit: the sample
 // describes a moment in the past, and every consumer of the sample must know
 // that. The tracker does not try to compensate for it; it records it.
-class rtt_tracker {
+class CRPC_API rtt_tracker {
 public:
     // Records a send and returns a token to be handed back on acknowledgement.
     u64 on_send(u64 now_ns) noexcept;

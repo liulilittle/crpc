@@ -130,8 +130,8 @@ enum class tls_errc : int {
     ssl_not_available = 7
 };
 
-[[nodiscard]] const std::error_category& tls_error_category() noexcept;
-[[nodiscard]] std::error_code make_error_code(tls_errc code) noexcept;
+[[nodiscard]] CRPC_API const std::error_category& tls_error_category() noexcept;
+[[nodiscard]] CRPC_API std::error_code make_error_code(tls_errc code) noexcept;
 
 // Configuration snapshot.  Paths are read when the context is created or
 // reloaded; the strings themselves are not consulted again, so a reload that
@@ -164,7 +164,7 @@ struct tls_config {
 
 // An immutable, thread-safe credential set.  Creation and reload are the only
 // operations that touch files; connection setup only reads shared state.
-class tls_context {
+class CRPC_API tls_context {
 public:
     // The definition lives in the translation unit.  It is declared here so
     // that the out-of-line code can name it; no OpenSSL type crosses this
@@ -197,17 +197,17 @@ private:
 
     friend class tls_stream;
     friend struct tls_context_access;
-    friend std::unique_ptr<source> make_tls_source(io::sink& transport,
-                                                    tls_context& context,
-                                                    std::string hostname);
-    friend std::unique_ptr<sink> make_tls_sink(io::sink& transport,
-                                               tls_context& context,
-                                               std::string hostname);
+    friend CRPC_API std::unique_ptr<source> make_tls_source(io::sink& transport,
+                                                           tls_context& context,
+                                                           std::string hostname);
+    friend CRPC_API std::unique_ptr<sink> make_tls_sink(io::sink& transport,
+                                                       tls_context& context,
+                                                       std::string hostname);
 };
 
 // A TLS endpoint implementing both halves of the R1 contract.  It owns the SSL
 // object, both memory BIOs and the bounded encrypt/decrypt queues.
-class tls_stream final : public source, public sink {
+class CRPC_API tls_stream final : public source, public sink {
 public:
     [[nodiscard]] static std::unique_ptr<tls_stream> create(
         io::sink& transport, tls_context& context, std::string hostname,
@@ -266,16 +266,22 @@ private:
 // `make_tls_sink` is the application-facing sink.  `bind_tls_source` attaches
 // the plaintext consumer to the source half.  The functions return nullptr when
 // the context is not usable or allocation fails.
-[[nodiscard]] std::unique_ptr<source> make_tls_source(io::sink& transport,
-                                                     tls_context& context,
-                                                     std::string hostname);
-[[nodiscard]] std::unique_ptr<sink> make_tls_sink(io::sink& transport,
-                                                  tls_context& context,
-                                                  std::string hostname);
+//
+// `make_tls_source` and `make_tls_sink` are also friend declarations inside
+// `tls_context`. A friend declaration introduces the name into the enclosing
+// namespace, so the decoration must agree with these declarations: marking
+// only one side of the pair produces C2375 (redefinition; different linkage)
+// on MSVC. Both sides therefore carry CRPC_API.
+[[nodiscard]] CRPC_API std::unique_ptr<source> make_tls_source(io::sink& transport,
+                                                              tls_context& context,
+                                                              std::string hostname);
+[[nodiscard]] CRPC_API std::unique_ptr<sink> make_tls_sink(io::sink& transport,
+                                                           tls_context& context,
+                                                           std::string hostname);
 
 // No-op when the source was not produced by `make_tls_source`.
-void bind_tls_source(source& tls_source, source* plaintext) noexcept;
-void tls_resume_read(source& tls_source) noexcept;
+CRPC_API void bind_tls_source(source& tls_source, source* plaintext) noexcept;
+CRPC_API void tls_resume_read(source& tls_source) noexcept;
 
 } // namespace crpc::io
 

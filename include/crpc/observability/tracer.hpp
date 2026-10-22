@@ -123,7 +123,7 @@ class tracer;
 
 // RAII span. Not copyable; movable. A span is tied to the thread that created
 // it and must be finished (or destroyed) on that thread.
-class [[nodiscard]] span {
+class CRPC_API [[nodiscard]] span {
 public:
     span() noexcept;
     span(span&& other) noexcept;
@@ -161,7 +161,7 @@ private:
     bool sampled_;
 };
 
-class tracer {
+class CRPC_API tracer {
 public:
     static tracer& instance() noexcept {
         static tracer value;

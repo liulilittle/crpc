@@ -81,7 +81,7 @@ struct io_result {
 };
 
 // One outstanding write.  Exactly one `complete` call per `sink::push`.
-class completion {
+class CRPC_API completion {
 public:
     completion() = default;
     virtual ~completion() = default;
@@ -95,7 +95,7 @@ public:
 
 // Backend -> framework.  The framework implements this interface and binds it
 // to a connection with `connection::bind_source`.
-class source {
+class CRPC_API source {
 public:
     virtual ~source() = default;
 
@@ -115,7 +115,7 @@ public:
 // Framework -> backend.  `push` must eventually call `c->complete` exactly
 // once.  The span stays valid until `complete` returns.  `complete` must not
 // synchronously start another push on the same connection.
-class sink {
+class CRPC_API sink {
 public:
     virtual ~sink() = default;
 
@@ -201,13 +201,13 @@ struct listen_options {
 
 class connection;
 
-class accept_sink {
+class CRPC_API accept_sink {
 public:
     virtual ~accept_sink() = default;
     virtual void on_accept(std::unique_ptr<connection> c) noexcept = 0;
 };
 
-class connection {
+class CRPC_API connection {
 public:
     virtual ~connection() = default;
 
@@ -235,14 +235,14 @@ public:
     [[nodiscard]] virtual endpoint remote() const = 0;
 };
 
-class listener {
+class CRPC_API listener {
 public:
     virtual ~listener() = default;
     virtual void start(accept_sink* sink) = 0;
     virtual void stop() noexcept = 0;
 };
 
-class backend_factory {
+class CRPC_API backend_factory {
 public:
     virtual ~backend_factory() = default;
     virtual std::unique_ptr<connection> connect(const endpoint& ep,
@@ -305,7 +305,7 @@ struct inproc_state;
 
 class inproc_pair;
 
-class inproc_connection final : public connection {
+class CRPC_API inproc_connection final : public connection {
 public:
     ~inproc_connection() override;
 
@@ -359,7 +359,7 @@ private:
     sink_adapter sink_adapter_;
 };
 
-class inproc_pair {
+class CRPC_API inproc_pair {
 public:
     [[nodiscard]] static std::pair<std::unique_ptr<connection>,
                                    std::unique_ptr<connection>>
@@ -374,7 +374,7 @@ public:
 // name; `connect` to that name creates a pair and hands the server side to the
 // listener's accept sink synchronously on the connecting thread.  There is no
 // global registry: endpoints only find each other through this object.
-class inproc_backend final : public backend_factory {
+class CRPC_API inproc_backend final : public backend_factory {
 public:
     explicit inproc_backend(inproc_options opt = inproc_options{});
     ~inproc_backend() override;

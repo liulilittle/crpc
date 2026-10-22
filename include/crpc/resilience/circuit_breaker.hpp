@@ -148,7 +148,7 @@ class circuit_breaker;
 // Thread safety: a permit is owned by one thread at a time and is not
 // internally synchronized. Moving it between threads is safe if the move itself
 // is synchronized; concurrent recording on the same permit is not.
-class [[nodiscard]] breaker_permit {
+class CRPC_API [[nodiscard]] breaker_permit {
 public:
     breaker_permit() noexcept = default;
 
@@ -194,7 +194,7 @@ private:
 
 // Thread-safe circuit breaker. Non-copyable and non-movable because its state
 // is shared with outstanding permits.
-class circuit_breaker {
+class CRPC_API circuit_breaker {
 public:
     explicit circuit_breaker(
         const breaker_config& config, clock_source clock = monotonic_clock(),

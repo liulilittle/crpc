@@ -70,7 +70,7 @@ enum class lb_strategy : u8 {
     weighted_round_robin = 4
 };
 
-class load_balancer {
+class CRPC_API load_balancer {
 public:
     explicit load_balancer(lb_strategy strategy = lb_strategy::round_robin,
                            u32 virtual_nodes = 160,

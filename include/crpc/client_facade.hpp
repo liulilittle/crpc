@@ -218,12 +218,12 @@ enum class failure_origin : u8 {
 };
 
 // Maps an origin and the terminal code to the single breaker outcome.
-[[nodiscard]] breaker_record breaker_record_for(failure_origin origin,
+[[nodiscard]] CRPC_API breaker_record breaker_record_for(failure_origin origin,
                                                 rpc_code code) noexcept;
 
 // Classifies a completed low-level call. A local timeout carries the
 // `crpc.local_timeout` metadata marker; a peer deadline does not.
-[[nodiscard]] failure_origin result_origin(const rpc_error& error) noexcept;
+[[nodiscard]] CRPC_API failure_origin result_origin(const rpc_error& error) noexcept;
 
 // Candidate bookkeeping for the endpoint selection loop. One logical attempt
 // must visit each endpoint at most once, so the loop keeps one bit per
@@ -292,7 +292,7 @@ private:
 };
 
 // Type-independent per-call state.
-struct call_core {
+struct CRPC_API call_core {
     // Atomic: the completion callback may read it on a backend thread while
     // close()/~client detaches it (CF-1).
     std::atomic<client*> owner{nullptr};
@@ -478,7 +478,7 @@ public:
         std::size_t bulkhead_in_use = 0;
     };
 
-    class builder {
+    class CRPC_API builder {
     public:
         builder& add_endpoint(endpoint ep, backend_factory& backend);
         builder& pool_size(std::size_t value);

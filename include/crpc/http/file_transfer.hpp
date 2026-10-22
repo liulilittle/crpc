@@ -67,7 +67,7 @@ struct upload_options {
 
 // One stored upload part. Move-only. If `temp_path` is non-empty the payload
 // lives on disk; otherwise it is in `data`.
-struct file_part {
+struct CRPC_API file_part {
     std::string name;
     std::string filename;
     std::string content_type;
@@ -102,7 +102,7 @@ private:
     bool kept_ = false;
 };
 
-class upload_sink {
+class CRPC_API upload_sink {
 public:
     upload_sink(std::string name, std::string filename,
                 std::string content_type, upload_options options = {});
@@ -183,10 +183,10 @@ struct range_parse_result {
 // `multiple` (the caller ignores the header and serves 200). A well-formed but
 // unsatisfiable range (e.g. `first >= entity_size`, `bytes=-0`) yields
 // `unsatisfiable` (the caller sends 416 with `bytes */<size>`).
-[[nodiscard]] range_parse_result parse_range_header(std::string_view value,
+[[nodiscard]] CRPC_API range_parse_result parse_range_header(std::string_view value,
                                                     std::uint64_t entity_size);
 
-class download_source {
+class CRPC_API download_source {
 public:
     download_source() noexcept = default;
     download_source(const download_source&) = delete;

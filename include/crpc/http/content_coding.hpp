@@ -70,8 +70,8 @@ namespace crpc::http {
 
 enum class content_coding : std::uint8_t { identity, gzip, deflate };
 
-[[nodiscard]] const char* to_string(content_coding coding) noexcept;
-[[nodiscard]] bool content_coding_from_token(std::string_view token,
+[[nodiscard]] CRPC_API const char* to_string(content_coding coding) noexcept;
+[[nodiscard]] CRPC_API bool content_coding_from_token(std::string_view token,
                                              content_coding& coding) noexcept;
 
 struct coding_limits {
@@ -85,7 +85,7 @@ struct coding_limits {
     bool fallback_identity = false;
 };
 
-[[nodiscard]] const coding_limits& default_coding_limits() noexcept;
+[[nodiscard]] CRPC_API const coding_limits& default_coding_limits() noexcept;
 
 // --- Response negotiation ---------------------------------------------------
 
@@ -99,21 +99,21 @@ struct negotiation {
     double quality = 1.0;
 };
 
-[[nodiscard]] negotiation negotiate_response(
+[[nodiscard]] CRPC_API negotiation negotiate_response(
     std::string_view accept_encoding,
     const coding_limits& limits = default_coding_limits()) noexcept;
 
-[[nodiscard]] int negotiation_http_status(const negotiation& result) noexcept;
+[[nodiscard]] CRPC_API int negotiation_http_status(const negotiation& result) noexcept;
 
 // True when the response body should be compressed: a coding was selected and
 // the body is at least `min_response_bytes`.
-[[nodiscard]] bool should_compress(
+[[nodiscard]] CRPC_API bool should_compress(
     const negotiation& result, std::size_t body_size,
     const coding_limits& limits = default_coding_limits()) noexcept;
 
 // --- Request decoding -------------------------------------------------------
 
-struct request_encoding_plan {
+struct CRPC_API request_encoding_plan {
     bool ok = true;
     bool encoded = false;
     content_coding coding = content_coding::identity;
@@ -126,12 +126,12 @@ struct request_encoding_plan {
     [[nodiscard]] rpc_error error() const;
 };
 
-[[nodiscard]] request_encoding_plan plan_request_decoding(
+[[nodiscard]] CRPC_API request_encoding_plan plan_request_decoding(
     std::string_view content_encoding);
 
 // --- Streaming decoder ------------------------------------------------------
 
-class content_decoder {
+class CRPC_API content_decoder {
 public:
     content_decoder() noexcept;
 
@@ -165,7 +165,7 @@ private:
 
 // --- Streaming encoder ------------------------------------------------------
 
-class content_encoder {
+class CRPC_API content_encoder {
 public:
     content_encoder() noexcept;
 
@@ -199,11 +199,11 @@ private:
 
 // --- One-shot helpers -------------------------------------------------------
 
-[[nodiscard]] status compress_all(
+[[nodiscard]] CRPC_API status compress_all(
     content_coding coding, span<const std::byte> data, std::string& out,
     const coding_limits& limits = default_coding_limits());
 
-[[nodiscard]] result<std::string> decompress_all(
+[[nodiscard]] CRPC_API result<std::string> decompress_all(
     content_coding coding, span<const std::byte> data,
     const coding_limits& limits = default_coding_limits());
 
