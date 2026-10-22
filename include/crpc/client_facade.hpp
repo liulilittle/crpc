@@ -639,6 +639,11 @@ public:
                     }
                     current->sleep_for(st->core, delay);
                     if (st->core.canceled.load(std::memory_order_acquire)) {
+                        // This attempt produced no fallback value: it ended
+                        // before the next attempt was armed, so the flag from a
+                        // previous attempt must not survive into a `canceled`
+                        // result (same rule as begin_attempt).
+                        st->core.clear_degraded();
                         return rpc::rpc_result<Resp>(
                             rpc_error(rpc_code::canceled, "call canceled"));
                     }
@@ -647,6 +652,7 @@ public:
                 }
 
                 if (st->core.canceled.load(std::memory_order_acquire)) {
+                    st->core.clear_degraded();
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::canceled, "call canceled"));
                 }
@@ -669,6 +675,7 @@ public:
                 }
                 owner->sleep_for(st->core, delay);
                 if (st->core.canceled.load(std::memory_order_acquire)) {
+                    st->core.clear_degraded();
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::canceled, "call canceled"));
                 }
