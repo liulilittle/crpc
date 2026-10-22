@@ -71,16 +71,16 @@
 // 6. Four admission refusals DO write the reserved `crpc-degradable: true`
 //    response meta entry, and only when the request still has at least
 //    min_remaining_ns of wire deadline left:
-//      - the per-service breaker (server.cpp, `!permit.allowed()`, 977);
-//      - the per-service rate bucket, success exit (1032);
-//      - the per-service bulkhead (1053);
-//      - the per-service in-flight cap (1067).
-//    The rate bucket's OTHER exit -- deadline not met (1024) -- never sets it:
-//    a deadline miss is not degradable (fallback_eligible() rejects
-//    deadline_exceeded first). The connection-level flood bucket and the
-//    per-connection cap (both reach send_error() through the forced-error job)
-//    never set it either: they are load shedding with no eligible stage, and a
-//    fallback response would cost exactly what the shed exists to avoid.
+//      - the per-service breaker (`!permit.allowed()`, send_error at 1005);
+//      - the per-service rate bucket, success exit (send_error at 1065);
+//      - the per-service bulkhead (send_error at 1090);
+//      - the per-service in-flight cap (send_error at 1109).
+//    The rate bucket's OTHER exit -- deadline not met (send_error at 1054) --
+//    never sets it: a deadline miss is not degradable (fallback_eligible()
+//    rejects deadline_exceeded first). The connection-level flood bucket and
+//    the per-connection cap (both reach send_error() through the forced-error
+//    job) never set it either: they are load shedding with no eligible stage,
+//    and a fallback response would cost exactly what the shed exists to avoid.
 //    `crpc-degraded` (the client-side "a fallback value was used" key) is still
 //    set by nobody on the server. `fallback_execute` is still never called from
 //    the server: the marker advertises that a refusal COULD be degraded, it does

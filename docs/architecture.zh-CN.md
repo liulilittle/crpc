@@ -277,7 +277,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:911-915`，`on_response` 在 `:947-951` 与 `:1152-1156`），它不是可观测性链。
+`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:937-941`，`on_response` 在 `:973-977` 与 `:1197-1201`），它不是可观测性链。
 
 **异常契约。** HTTP 与 RPC 路径跨越两种不同的边界，它们的行为并不相同。头内联边界编译进消费方，跟随**消费方**的异常选项；库翻译单元是预编译的，保留**库**的选项。
 

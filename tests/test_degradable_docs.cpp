@@ -19,10 +19,13 @@
 #endif
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "test_framework.hpp"
 
@@ -161,6 +164,11 @@ CRPC_TEST(degradable_protocol_english_names_the_four_marked_refusals) {
     // The count itself, not just the names: "four" becoming "five" must fail.
     CRPC_CHECK(has_phrase(text, "exactly four pre-execution refusal points"));
 
+    // The deadline floor is a contract, not prose: it is
+    // resilience::min_remaining_ns (1'000'000 ns). "1 ms" becoming "2 ms" must
+    // fail.
+    CRPC_CHECK(has_phrase(text, "at least 1 ms"));
+
     // Each refusal row, including the rpc_code it answers with. Checking the
     // whole row is what catches a row whose code is silently changed (for
     // example the bulkhead row's (8) becoming (13)).
@@ -218,6 +226,9 @@ CRPC_TEST(degradable_protocol_chinese_matches_the_english_claims) {
 
     // The count itself, and each row with its code.
     CRPC_CHECK(has_phrase(text, "恰好四个执行前拒绝点"));
+
+    // The deadline floor (resilience::min_remaining_ns == 1 ms).
+    CRPC_CHECK(has_phrase(text, "至少 1 ms"));
     CRPC_CHECK(has_phrase(text, "| 服务级熔断器打开 | `unavailable`（3） |"));
     CRPC_CHECK(has_phrase(
         text, "| 服务级令牌桶为空、deadline 仍可达 | `resource_exhausted`（13） |"));
@@ -335,6 +346,139 @@ CRPC_TEST(degradable_deadline_floor_has_a_single_source) {
     CRPC_CHECK(has_phrase(server, "stage_kind::service_bulkhead"));
     CRPC_CHECK(has_phrase(server, "stage_kind::service_capacity"));
     CRPC_CHECK(has_phrase(server, "degradable_metadata_key"));
+}
+
+CRPC_TEST(degradable_docs_line_references_still_point_at_the_code) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+
+    // The documents cite line ranges in server.cpp. Those ranges are not
+    // normative, but a stale range sends a reader to the wrong code, and this
+    // change shifted `handle_request` down by ~26 lines. Check the citation,
+    // not the number: each cited range must contain the call it describes.
+    const std::string server = read_text(root / "src" / "server" / "server.cpp");
+    std::vector<std::string> lines;
+    {
+        std::string current;
+        for (const char c : server) {
+            if (c == '\n') {
+                lines.push_back(current);
+                current.clear();
+            } else if (c != '\r') {
+                current.push_back(c);
+            }
+        }
+        if (!current.empty()) {
+            lines.push_back(current);
+        }
+    }
+    CRPC_CHECK(!lines.empty());
+
+    const auto line_has = [&lines](std::size_t number, const char* needle) {
+        if (number == 0 || number > lines.size()) {
+            return false;
+        }
+        return lines[number - 1].find(needle) != std::string::npos;
+    };
+    // A range [first, last] must contain `needle` somewhere.
+    const auto range_has = [&](std::size_t first, std::size_t last,
+                               const char* needle) {
+        for (std::size_t n = first; n <= last && n <= lines.size(); ++n) {
+            if (line_has(n, needle)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // architecture.md / zh: the three server_interceptor hook ranges, in order
+    // on_request, on_response (push path), on_response (dispatch path).
+    const char* const needles[] = {"interceptor->on_request",
+                                   "interceptor->on_response",
+                                   "interceptor->on_response"};
+    for (const char* doc : {"docs/architecture.md", "docs/architecture.zh-CN.md"}) {
+        const std::string text = read_text(root / doc);
+        // Locate the sentence that names the hook.
+        std::size_t at = text.find("server_interceptor");
+        CRPC_CHECK(at != std::string::npos);
+        if (at == std::string::npos) {
+            continue;
+        }
+        const std::size_t end = text.find('\n', at);
+        const std::string sentence =
+            text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        // Every `:A-B` in that sentence is a cited range.
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        for (std::size_t i = 0; i + 1 < sentence.size(); ++i) {
+            if (sentence[i] != ':') {
+                continue;
+            }
+            std::size_t p = i + 1;
+            std::size_t first = 0;
+            bool digits = false;
+            while (p < sentence.size() && sentence[p] >= '0' && sentence[p] <= '9') {
+                first = first * 10 + static_cast<std::size_t>(sentence[p] - '0');
+                ++p;
+                digits = true;
+            }
+            if (!digits || p >= sentence.size() || sentence[p] != '-') {
+                continue;
+            }
+            ++p;
+            std::size_t last = 0;
+            bool last_digits = false;
+            while (p < sentence.size() && sentence[p] >= '0' && sentence[p] <= '9') {
+                last = last * 10 + static_cast<std::size_t>(sentence[p] - '0');
+                ++p;
+                last_digits = true;
+            }
+            if (last_digits) {
+                ranges.emplace_back(first, last);
+            }
+        }
+        CRPC_CHECK_EQ(static_cast<std::size_t>(3), ranges.size());
+        if (ranges.size() != 3) {
+            continue;
+        }
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            if (!range_has(ranges[i].first, ranges[i].second, needles[i])) {
+                std::fprintf(stderr, "%s cites %zu-%zu but it has no %s\n", doc,
+                             ranges[i].first, ranges[i].second, needles[i]);
+            }
+            CRPC_CHECK(range_has(ranges[i].first, ranges[i].second, needles[i]));
+        }
+    }
+
+    // admission.hpp cites the send_error call line of each marked branch and of
+    // the rate deadline exit. Each cited line must actually be a send_error
+    // call.
+    const std::string header =
+        read_text(root / "include" / "crpc" / "resilience" / "admission.hpp");
+    std::size_t cited = 0;
+    for (std::size_t at = header.find("send_error at ");
+         at != std::string::npos; at = header.find("send_error at ", at + 1)) {
+        const std::size_t p = at + std::strlen("send_error at ");
+        std::size_t number = 0;
+        bool digits = false;
+        for (std::size_t i = p; i < header.size() && header[i] >= '0' && header[i] <= '9';
+             ++i) {
+            number = number * 10 + static_cast<std::size_t>(header[i] - '0');
+            digits = true;
+        }
+        if (!digits) {
+            continue;
+        }
+        ++cited;
+        if (!line_has(number, "send_error")) {
+            std::fprintf(stderr, "admission.hpp cites send_error at %zu\n", number);
+        }
+        CRPC_CHECK(line_has(number, "send_error"));
+    }
+    // Four marked branches plus the rate deadline exit.
+    CRPC_CHECK_EQ(static_cast<std::size_t>(5), cited);
 }
 
 CRPC_TEST_MAIN()
