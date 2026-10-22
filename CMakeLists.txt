@@ -69,6 +69,7 @@ if(MSVC)
         add_compile_options(
             "$<$<COMPILE_LANGUAGE:C,CXX>:/W4>"
             "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>"
+            "$<$<COMPILE_LANGUAGE:C,CXX>:/we4062>"
         )
     else()
         add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/W4>")
