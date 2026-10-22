@@ -60,7 +60,7 @@
   `longpoll_ack_clamped`、`longpoll_conflicts`、`longpoll_restarts`、
   `longpoll_overloaded`）以及 10 个 SSE/压缩/下载计数器。`sizeof` 从 72（9 字段）
   增长到 224（28 字段）；1.0.0 发布的 9 个字段偏移保持不变（0 … 64）。公开
-  结构体新增字段属于 MAJOR 变更（[abi.zh-CN.md](abi.zh-CN.md) 第 1/4 节）。
+  结构体新增字段属于 MAJOR 变更（[abi.zh-CN.md](abi.zh-CN.md) §1/§4）。
 - 在该周期内部，`longpoll_replay_window` 最初放在 offset 168，后来被移到末尾
   （offset 216）；原先排在它后面的 6 个计数器各前移 8 字节
   （`longpoll_events` 176→168 … `longpoll_overloaded` 216→208）。移动前后
