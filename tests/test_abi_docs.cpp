@@ -1052,4 +1052,54 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
         text, "MSVC、GCC 与 Clang 上都是"));
 }
 
+// The N-9 regression guard. `docs/abi.md` §2 once claimed that `client_detail`
+// types are invisible to the consumer's compiler and that adding a field to
+// `call_core` is a MINOR change. Both claims are false: `call_state<Resp>` is
+// instantiated in the consumer's own translation unit and holds `call_core` by
+// value, so a layout change there corrupts an old consumer's `inner_mutex`.
+// Restoring either claim must fail here. `forbidden_phrase` strips all
+// whitespace, which is required: the document wraps at 80 columns and two of
+// these phrases straddle a line break, so a line-oriented grep is a false green.
+CRPC_TEST(abi_docs_english_rejects_the_internal_layout_claims) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.md");
+
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "cannot construct, hold or name"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "not an ABI break"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "is a MINOR change"));
+    CRPC_CHECK_FALSE(
+        forbidden_phrase(text, "no consumer may depend on their layout"));
+    CRPC_CHECK_FALSE(
+        forbidden_phrase(text, "the library itself instantiates"));
+
+    CRPC_CHECK(has_phrase(text, "consumer's own translation unit"));
+    CRPC_CHECK(has_phrase(text, "rebuilt from the same headers"));
+    CRPC_CHECK(has_phrase(text, "inner_mutex"));
+    CRPC_CHECK(has_phrase(text, "luck, not a guarantee"));
+    CRPC_CHECK(has_phrase(text, "four bytes of internal tail padding"));
+}
+
+CRPC_TEST(abi_docs_chinese_rejects_the_internal_layout_claims) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string text = read_text(root / "docs" / "abi.zh-CN.md");
+
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "无法构造、持有或命名"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "不构成 ABI 破坏"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "属于 MINOR 变更"));
+
+    CRPC_CHECK(has_phrase(text, "消费方自己的翻译单元"));
+    CRPC_CHECK(has_phrase(text, "同一份头文件"));
+    CRPC_CHECK(has_phrase(text, "inner_mutex"));
+    CRPC_CHECK(has_phrase(text, "运气而非保证"));
+    CRPC_CHECK(has_phrase(text, "内部 padding"));
+}
+
 CRPC_TEST_MAIN()
