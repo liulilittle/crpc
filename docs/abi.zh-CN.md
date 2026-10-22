@@ -57,7 +57,7 @@ MAJOR.MINOR.PATCH
 
 其它内部类型并非以同样方式跨越边界，这一区别很重要。只有 `call_state_base` 与 `call_state<Resp>` 是多态类型；`connection_slot` 与 `client_liveness` 是没有 vptr 的普通结构体，`rpc_detail::always_false` 则无状态。
 - `call_state_base` 是 `call_state<Resp>` 的多态基类；消费方的翻译单元会分配派生对象，因此改动这两者中任何一个的布局，都是改动消费方分配的尺寸。
-- `connection_slot` 与 `client_liveness` **只由库分配**（`src/client/client_facade.cpp:845` 与 `:212`；任何头文件里都没有构造点），只经 `std::shared_ptr<connection_slot>` 与 `std::weak_ptr<client_liveness>` 访问。消费方从不会按值分配它们，因此给这两个类型增加字段不会破坏用旧头文件构建的消费方。它们被列在此处，是因为消费方仍不得*命名*或*依赖*它们（见第 2 节），而不是因为它们的尺寸跨越边界。
+- `connection_slot` 与 `client_liveness` **只由库分配**（`src/client/client_facade.cpp:845` 与 `:212`；任何头文件里都没有构造点），只经 `std::shared_ptr<connection_slot>` 与 `std::weak_ptr<client_liveness>` 访问。因此它们的尺寸不会作为消费方分配的对象跨越边界。但它们的**成员偏移仍被头内代码烘焙进消费方的翻译单元**：`live_owner` 读取 `client_liveness::alive`（`client_facade.hpp:399`），`client::issue` 读取 `connection_slot::mutex`、`healthy` 与 `conn`（`client_facade.hpp:1019-1021`），这两处都在消费方自己的翻译单元内编译。给这两个类型增加字段仍会破坏用旧头文件构建的消费方；对 `client_liveness::alive` 而言，失效形式是漏掉死亡检查并交出一个悬垂的 `client*`。它们被列在此处，是因为消费方仍不得*命名*或*依赖*它们（见第 2 节），也因为对它们的布局变更同样并非不可见。
 - `rpc_detail::always_false`（`rpc/call.hpp`）是无状态的 trait，没有可变的布局。
 
 `client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`，因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——无论 `call_state` 里有什么。这份稳定性只覆盖句柄，不覆盖它指向的堆对象：该对象的大小仍取决于分配它时所用的头文件，上文实测的正是这种情况。

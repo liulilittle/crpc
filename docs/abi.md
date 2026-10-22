@@ -101,11 +101,18 @@ no vptr, and `rpc_detail::always_false` is stateless.
 - `connection_slot` and `client_liveness` are plain structs with no vptr, and
   they are **allocated only by the library** (`src/client/client_facade.cpp:845`
   and `:212`; there is no construction site in any header) and reached through
-  `std::shared_ptr<connection_slot>` and `std::weak_ptr<client_liveness>`. A
-  consumer never allocates them by value, so adding a field to those two does
-  not break a consumer built from older headers. They are listed here because a
-  consumer must still not *name* or *depend on* them (§2), not because their
-  size crosses the boundary.
+  `std::shared_ptr<connection_slot>` and `std::weak_ptr<client_liveness>`.
+  Their size therefore never crosses the boundary as a consumer-allocated
+  object. Their **member offsets are still baked into consumer translation
+  units** by header-inline code, though: `live_owner` reads
+  `client_liveness::alive` (`client_facade.hpp:399`) and `client::issue`
+  reads `connection_slot::mutex`, `healthy` and `conn`
+  (`client_facade.hpp:1019-1021`), both compiled in the consumer's own
+  translation unit. Adding a field to either type still breaks a consumer built
+  from older headers; for `client_liveness::alive` the failure is a missed
+  death check that hands out a dangling `client*`. They are listed here
+  because a consumer must still not *name* or *depend on* them (§2), and
+  because a layout change to them is not invisible either.
 - `rpc_detail::always_false` (`rpc/call.hpp`) is a stateless trait, so it has no
   layout to change.
 
