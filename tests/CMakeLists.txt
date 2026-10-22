@@ -21,6 +21,14 @@ foreach(source ${CRPC_TEST_SOURCES})
     get_filename_component(dir_name "${source}" DIRECTORY)
     get_filename_component(dir_name "${dir_name}" NAME)
 
+    # test_shared_link is the shared-build consumer gate. It is registered
+    # explicitly below, and only when CRPC_BUILD_SHARED=ON: in a static build
+    # every symbol is in the archive by definition, so the probe would not
+    # test anything the other targets do not already cover.
+    if(file_name STREQUAL "test_shared_link")
+        continue()
+    endif()
+
     if(dir_name STREQUAL "tests")
         set(target "crpc_${file_name}")
         set(sources "${source}")
@@ -49,3 +57,30 @@ set_target_properties(crpc_test_c_api PROPERTIES
 target_link_libraries(crpc_test_c_api PRIVATE crpc_core)
 add_test(NAME crpc_test_c_api COMMAND crpc_test_c_api)
 set_tests_properties(crpc_test_c_api PROPERTIES TIMEOUT 30)
+
+# --- Shared-build link gate --------------------------------------------------
+#
+# A shared build only works if every public symbol a consumer can reference is
+# in the export table. That is not something a runtime assertion can check: the
+# failure mode is an unresolved external at *consumer* link time, and it can be
+# reached through header-inline templates that no hand-written call list
+# mentions (client_detail::wake_functor calls call_core::signal; mvc's
+# bind_request calls route_params::find and header_list::find/add).
+#
+# Building this target against the shared library turns that into a build
+# failure. It is registered only for CRPC_BUILD_SHARED=ON; a static build has no
+# export table to get wrong, and docs/abi.md section 3 records the rule.
+if(CRPC_BUILD_SHARED)
+    add_executable(crpc_test_shared_link
+        "${CMAKE_CURRENT_SOURCE_DIR}/test_shared_link.cpp")
+    target_link_libraries(crpc_test_shared_link PRIVATE crpc_core)
+    target_include_directories(crpc_test_shared_link
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME crpc_test_shared_link COMMAND crpc_test_shared_link)
+    # crpc.dll is written to the build root, so the test's working directory
+    # must be there for the loader to resolve it (Windows searches the
+    # executable's directory first, then the current directory).
+    set_tests_properties(crpc_test_shared_link PROPERTIES
+        TIMEOUT 60
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
