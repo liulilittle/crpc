@@ -82,7 +82,7 @@ against the new library writes the new field over the first byte of the old
 `inner_mutex`, because the field lands at absolute offset 8 + old
 `sizeof(call_core)` — 672 under `/MD`, 696 under `/MDd`. On x86 the write happens
 to fall into four bytes of internal tail padding inside `call_core` (`retry` ends
-at 480 while `sizeof(call_core)` stays 488), so `sizeof` is unchanged and no
+at 484 while `sizeof(call_core)` stays 488), so `sizeof` is unchanged and no
 overwrite is observed today; that is luck, not a guarantee, since any further
 field crosses the 488-byte boundary.
 
