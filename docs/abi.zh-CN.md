@@ -46,14 +46,14 @@ MAJOR.MINOR.PATCH
 - 跨越边界抛出的异常（本库从不抛出）；
 - `long`、`unsigned long`、`wchar_t`、未指定固定宽度的 `size_t`；
 - 位域、匿名联合、packed 结构体；
-- 作为*消费方面向类型*的 `client_detail` / `server_detail` 下的任何类型：它们只能作为库自己产生的参数出现。
+- 作为*消费方面向类型*的实现内部命名空间（`client_detail`、`rpc_detail`，或其它 `detail` 命名空间）下的任何类型：它们只能作为库自己产生的参数出现。
 
 确实需要容器时，API 使用 `span`、或 `const char*` 加长度，
 或返回一个被文档标注为不透明的 CRPC 自有类型。
 
-`crpc::client_detail` 与 `crpc::server_detail` 命名空间下的类型是**实现内部细节**：即使它们出现在 `CRPC_API` 类成员的签名中，也**不跨越 ABI 边界**，因为消费方无法构造、持有或命名它们；它们只能以引用形式由库持有的对象传入。因此改变其布局不构成 ABI 破坏。
+`crpc::client_detail` 与 `crpc::rpc_detail` 命名空间下、以及其它头文件中匿名或嵌套 `detail` 命名空间下的类型是**实现内部细节**：即使它们出现在 `CRPC_API` 类成员的签名中，也**不跨越 ABI 边界**，因为消费方无法构造、持有或命名它们；它们只能以引用形式由库持有的对象传入。因此改变其布局不构成 ABI 破坏。
 
-具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，但没有任何消费方能提供该引用：唯一的产生者是 `client` 自身。给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）属于 MINOR 变更。这两个命名空间中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）同理：它们都不作为消费方面向的类型出现在 `CRPC_API` 签名中，只被库自身实例化的头内模板使用，消费方不得依赖其布局、大小或成员。
+具体地，`client::finish_attempt(client_detail::call_core&, ...)` 与 `client::begin_attempt(client_detail::call_core&, ...)` 在导出签名中提及 `call_core`，但没有任何消费方能提供该引用：唯一的产生者是 `client` 自身。给 `call_core` 增加字段（例如记录本次调用是否由 fallback 应答的 `degraded_` 标志）属于 MINOR 变更。`client_detail` 中的其它类型（`call_state`、`call_state_base`、`connection_slot`、`client_liveness`）以及 `rpc_detail::always_false`（`rpc/call.hpp`）同理：它们都不作为消费方面向的类型出现在 `CRPC_API` 签名中，只被库自身实例化的头内模板使用，消费方不得依赖其布局、大小或成员。
 
 有一处例外需要明确写出，因为这是消费方可见尺寸唯一可能看似依赖这些内部类型的地方：`client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`。因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——并且当 `call_core`、`call_state` 或 `connection_slot` 增加字段时不会改变。
 

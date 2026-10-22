@@ -579,6 +579,41 @@ CRPC_TEST(fallback_cancellation_never_returns_a_value) {
     check_error_unchanged(original, error);
 }
 
+CRPC_TEST(fallback_cancellation_wins_over_an_overrun) {
+    // The header states "cancellation wins over an overrun". Without this case
+    // the two checks could be swapped and every other test would still pass.
+    const auto t0 = std::chrono::steady_clock::time_point{} + 7000s;
+    fb::fallback_context ctx =
+        context_for(crpc::rpc_code::unavailable, fb::stage_kind::breaker);
+    ctx.has_deadline = true;
+    ctx.deadline = t0;
+
+    std::atomic<bool> running{false};
+    fn_state state;
+    state.canceled = &running;
+    state.cancel_during = true;
+    state.move_clock = true;
+    state.new_now = t0 + 1ms;
+    fb::fallback_policy policy = policy_for(state);
+    crpc::rpc_error error = decorated_error(crpc::rpc_code::unavailable);
+    const crpc::rpc_error original = error;
+    counter_box box;
+    fb::fallback_counter_sink sink = box.sink();
+    crpc::buffer out;
+
+    g_fake_now = t0 - 1ms;
+    CRPC_CHECK(fb::fallback_execute(policy, ctx, running, out, error,
+                                    &fake_clock, &sink) ==
+               fb::fallback_outcome::canceled);
+    CRPC_CHECK_EQ(1, state.calls);
+    CRPC_CHECK(out.empty());
+    // The error must not be rewritten: only an overrun does that.
+    check_error_unchanged(original, error);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), box.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), box.canceled);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), box.overrun);
+}
+
 CRPC_TEST(fallback_success_leaves_the_error_alone) {
     fb::fallback_context ctx =
         context_for(crpc::rpc_code::overload, fb::stage_kind::service_bulkhead);

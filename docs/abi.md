@@ -50,14 +50,16 @@ Everything else is forbidden in an exported signature:
 - exceptions thrown across the boundary (the library never throws),
 - `long`, `unsigned long`, `wchar_t`, `size_t` spelled without a fixed width,
 - bit-fields, anonymous unions, packed structs,
-- anything under `client_detail` / `server_detail` as a *consumer-facing* type:
+- anything under an implementation-internal namespace (`client_detail`,
+  `rpc_detail`, or any other `detail` namespace) as a *consumer-facing* type:
   these may appear only as parameters the library itself produces.
 
 Where a container is genuinely needed, the API takes a `span` or a
 `const char*` plus a length, or returns an owning CRPC type that is documented
 as opaque.
 
-Types in the `crpc::client_detail` and `crpc::server_detail` namespaces are
+Types in the `crpc::client_detail` and `crpc::rpc_detail` namespaces, and in
+the anonymous or nested `detail` namespaces of the other headers, are
 **implementation-internal**. They do not cross the ABI boundary even when they
 appear in the signature of a `CRPC_API` class member, because a consumer cannot
 construct, hold or name them: they are only reachable as references passed
@@ -69,9 +71,10 @@ Concretely, `client::finish_attempt(client_detail::call_core&, ...)` and
 an exported signature, but no consumer can supply that reference: the only
 producer is `client` itself. Adding a field to `call_core` (for example the
 `degraded_` flag that records a fallback-answered attempt) is a MINOR change.
-The same holds for the other types in those namespaces (`call_state`,
-`call_state_base`, `connection_slot`, `client_liveness`): none of them appears
-in a `CRPC_API` signature as a consumer-facing type, they are only used by the
+The same holds for the other types in `client_detail` (`call_state`,
+`call_state_base`, `connection_slot`, `client_liveness`) and for
+`rpc_detail::always_false` (`rpc/call.hpp`): none of them appears in a
+`CRPC_API` signature as a consumer-facing type, they are only used by the
 header-inline templates that the library itself instantiates, and no consumer
 may depend on their layout, size or members.
 
