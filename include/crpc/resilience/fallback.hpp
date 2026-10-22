@@ -37,8 +37,8 @@
 // terminal counter before every return, so a consumer cannot forget a
 // denominator. `ineligible` also covers an entry-time cancellation: the two
 // cases share one counter, so the counter alone cannot separate them. A
-// consumer that needs the distinction must test `canceled` before calling;
-// one that only needs the rate can use `ineligible` as-is.
+// consumer that needs an eligibility rate must test `canceled` before calling,
+// not subtract afterwards.
 //
 // `sink->self` is NOT kept alive and its lifetime is not constrained by this
 // API. A consumer must point it at an object that outlives the synchronous
