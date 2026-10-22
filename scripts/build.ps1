@@ -4,7 +4,11 @@
 # Usage:
 #   .\scripts\build.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
 #                       [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean]
-#                       [-SourceDir <path>] [-BuildRoot <path>]
+#                       [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
+#
+# -Shared selects CRPC_BUILD_SHARED=ON (a crpc.dll/crpc.so plus the
+# crpc_test_shared_link consumer gate). Without it the library is a static
+# archive, which is the default and needs no runtime deployment.
 #
 # Guarantees:
 #   * toolchain auto-detected (vswhere/vcvars for MSVC, PATH for clang/gcc)
@@ -27,6 +31,8 @@ param(
     [int]$Jobs = 0,
 
     [switch]$Clean,
+
+    [switch]$Shared,
 
     [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
 
@@ -87,10 +93,15 @@ function Find-Ninja {
 function Get-BuildDirName {
     param([string]$Cfg, [string]$San)
     $suffix = if ($San -eq 'none') { '' } else { "-$San" }
-    return "build/$Arch-$Cfg$suffix"
+    # A shared build is a different configuration of the same sources, so it
+    # gets its own directory: reusing the static one would leave a stale
+    # crpc.lib in place and silently link the wrong library type.
+    $kind = if ($script:SharedBuild) { '-shared' } else { '' }
+    return "build/$Arch-$Cfg$suffix$kind"
 }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+$script:SharedBuild = [bool]$Shared
 
 if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir '.opencode/tmp/out' }
 $logDir = Join-Path $BuildRoot 'logs'
@@ -98,7 +109,7 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "build-$Arch-$Config-$Sanitizer-$stamp.log"
 
-Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer"
+Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer shared=$($script:SharedBuild)"
 Write-Log "log=$script:LogPath"
 
 $cmake = Find-CMake
@@ -141,6 +152,11 @@ foreach ($cfg in $configs) {
         '-DCRPC_BUILD_TESTS=ON'
     )
     $configureArgs += $sanFlags[$Sanitizer]
+    if ($script:SharedBuild) {
+        $configureArgs += '-DCRPC_BUILD_SHARED=ON'
+    } else {
+        $configureArgs += '-DCRPC_BUILD_SHARED=OFF'
+    }
 
     if ($vcvars) {
         # Run cmake inside a vcvars environment so the compiler is on PATH.

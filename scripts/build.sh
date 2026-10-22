@@ -5,7 +5,12 @@
 # Usage:
 #   scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
-#                    [--jobs N] [--clean] [--source DIR] [--build-root DIR]
+#                    [--jobs N] [--clean] [--shared]
+#                    [--source DIR] [--build-root DIR]
+#
+# --shared selects CRPC_BUILD_SHARED=ON (a crpc.so/dll plus the
+# crpc_test_shared_link consumer gate). Without it the library is a static
+# archive, which is the default and needs no runtime deployment.
 #
 # Guarantees: toolchain auto-detect, -Wall -Wextra -Wpedantic -Werror,
 # idempotent, UTF-8 logs, non-zero exit on failure.
@@ -18,6 +23,7 @@ COMPILER="gcc"
 SANITIZER="none"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 CLEAN=0
+SHARED=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_ROOT=""
@@ -30,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --sanitizer) SANITIZER="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     --clean) CLEAN=1; shift ;;
+    --shared) SHARED=1; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -84,7 +91,10 @@ case "$SANITIZER" in
   *) log ERROR "bad sanitizer: $SANITIZER"; exit 2 ;;
 esac
 
-log INFO "source=$SOURCE_DIR arch=$ARCH config=$CONFIG sanitizer=$SANITIZER compiler=$COMPILER"
+SHARED_ARGS=(-DCRPC_BUILD_SHARED=OFF)
+[[ $SHARED -eq 1 ]] && SHARED_ARGS=(-DCRPC_BUILD_SHARED=ON)
+
+log INFO "source=$SOURCE_DIR arch=$ARCH config=$CONFIG sanitizer=$SANITIZER compiler=$COMPILER shared=$SHARED"
 log INFO "cmake=$CMAKE cxx=$CXX_COMPILER log=$LOG"
 
 FAILURES=0
@@ -93,6 +103,10 @@ IFS=',' read -r -a CONFIGS <<< "$( [[ "$CONFIG" == "Both" ]] && echo 'Debug,Rele
 for cfg in "${CONFIGS[@]}"; do
   suffix=""
   [[ "$SANITIZER" != "none" ]] && suffix="-$SANITIZER"
+  # A shared build is a different configuration of the same sources, so it
+  # gets its own directory: reusing the static one would leave a stale archive
+  # in place and silently link the wrong library type.
+  [[ $SHARED -eq 1 ]] && suffix="$suffix-shared"
   BUILD_DIR="$BUILD_ROOT/build/$ARCH-$cfg$suffix"
   if [[ $CLEAN -eq 1 && -d "$BUILD_DIR" ]]; then
     log INFO "clean: $BUILD_DIR"
@@ -105,6 +119,7 @@ for cfg in "${CONFIGS[@]}"; do
       -DCMAKE_BUILD_TYPE="$cfg" \
       -DCMAKE_C_COMPILER="$CC_COMPILER" -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
       -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON \
+      "${SHARED_ARGS[@]}" \
       "${ARCH_ARGS[@]}" "${SAN_ARGS[@]}" >>"$LOG" 2>&1; then
     log ERROR "configure failed ($cfg), see $LOG"
     FAILURES=$((FAILURES + 1))

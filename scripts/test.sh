@@ -5,8 +5,12 @@
 # Usage:
 #   scripts/test.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                   [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
-#                   [--filter REGEX] [--repeat N]
+#                   [--filter REGEX] [--repeat N] [--shared]
 #                   [--source DIR] [--build-root DIR]
+#
+# --shared builds and tests CRPC_BUILD_SHARED=ON. In that mode the run also
+# executes crpc_test_shared_link directly: it is the consumer link gate, and
+# running it explicitly keeps a filtered ctest invocation from skipping it.
 #
 # Runs CTest per build dir, then each test binary for per-case output.
 # Detects sanitizer reports. Non-zero exit on any failure.
@@ -19,6 +23,7 @@ COMPILER="gcc"
 SANITIZER="none"
 FILTER=""
 REPEAT=1
+SHARED=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_ROOT=""
@@ -31,9 +36,10 @@ while [[ $# -gt 0 ]]; do
     --sanitizer) SANITIZER="$2"; shift 2 ;;
     --filter) FILTER="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
+    --shared) SHARED=1; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -68,11 +74,15 @@ case "$CONFIG" in
   *) CFG_LIST=("$CONFIG") ;;
 esac
 
+SHARED_ARG=()
+[[ $SHARED -eq 1 ]] && SHARED_ARG=(--shared)
+
 for san in "${SAN_LIST[@]}"; do
   for cfg in "${CFG_LIST[@]}"; do
-    log INFO "=== build $ARCH/$cfg/$san ==="
+    log INFO "=== build $ARCH/$cfg/$san shared=$SHARED ==="
     if ! "$BUILD_SH" --config "$cfg" --arch "$ARCH" --compiler "$COMPILER" \
-         --sanitizer "$san" --source "$SOURCE_DIR" --build-root "$BUILD_ROOT"; then
+         --sanitizer "$san" --source "$SOURCE_DIR" --build-root "$BUILD_ROOT" \
+         "${SHARED_ARG[@]}"; then
       log ERROR "build failed $ARCH/$cfg/$san"
       FAILURES=$((FAILURES + 1))
       continue
@@ -80,6 +90,7 @@ for san in "${SAN_LIST[@]}"; do
 
     suffix=""
     [[ "$san" != "none" ]] && suffix="-$san"
+    [[ $SHARED -eq 1 ]] && suffix="$suffix-shared"
     BUILD_DIR="$BUILD_ROOT/build/$ARCH-$cfg$suffix"
 
     for ((r = 1; r <= REPEAT; ++r)); do
@@ -89,6 +100,21 @@ for san in "${SAN_LIST[@]}"; do
       if ! "$CTEST" "${CTEST_ARGS[@]}" 2>&1 | tee -a "$LOG"; then
         log ERROR "ctest failed $ARCH/$cfg/$san run $r"
         FAILURES=$((FAILURES + 1))
+      fi
+      # The shared-build consumer gate is part of the ctest set, but a
+      # --filter run can exclude it. Run it unconditionally in shared mode so
+      # a filtered invocation cannot skip the export check.
+      if [[ $SHARED -eq 1 ]]; then
+        PROBE="$BUILD_DIR/tests/crpc_test_shared_link"
+        if [[ ! -x "$PROBE" ]]; then
+          log ERROR "shared link gate missing: $PROBE"
+          FAILURES=$((FAILURES + 1))
+        elif ! "$PROBE" 2>&1 | tee -a "$LOG"; then
+          log ERROR "shared link gate FAILED"
+          FAILURES=$((FAILURES + 1))
+        else
+          log INFO "shared link gate OK"
+        fi
       fi
       if grep -qE 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)' "$LOG"; then
         log ERROR "sanitizer report detected"

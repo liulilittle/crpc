@@ -4,7 +4,12 @@
 # Usage:
 #   .\scripts\test.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
 #                      [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-#                      [-Repeat N] [-SourceDir <path>] [-BuildRoot <path>]
+#                      [-Repeat N] [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
+#
+# -Shared builds and tests CRPC_BUILD_SHARED=ON. In that mode the run also
+# executes crpc_test_shared_link directly: it is the consumer link gate, and
+# running it as a ctest entry as well keeps a filtered ctest invocation from
+# silently skipping it.
 #
 # Behavior:
 #   * runs CTest per build dir, then every test executable directly for per-case output
@@ -19,6 +24,7 @@ param(
     [ValidateSet('none', 'asan', 'ubsan', 'tsan', 'all')] [string]$Sanitizer = 'none',
     [string]$Filter = '',
     [int]$Repeat = 1,
+    [switch]$Shared,
     [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$BuildRoot = ''
 )
@@ -67,7 +73,7 @@ $logDir = Join-Path $BuildRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "test-$Arch-$Config-$Sanitizer-$stamp.log"
-Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat"
+Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat shared=$([bool]$Shared)"
 
 # --- Unattended-run guards ---------------------------------------------------
 #
@@ -112,7 +118,10 @@ $buildScript = Join-Path $PSScriptRoot 'build.ps1'
 foreach ($san in $sanList) {
     foreach ($cfg in $cfgList) {
         Write-Log "=== build $Arch/$cfg/$san ==="
-        & $buildScript -Config $cfg -Arch $Arch -Sanitizer $san -SourceDir $SourceDir -BuildRoot $BuildRoot
+        $buildArgs = @{ Config = $cfg; Arch = $Arch; Sanitizer = $san
+                        SourceDir = $SourceDir; BuildRoot = $BuildRoot }
+        if ($Shared) { $buildArgs['Shared'] = $true }
+        & $buildScript @buildArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Log "build failed for $Arch/$cfg/$san" 'ERROR'
             $script:Failures++
@@ -120,6 +129,7 @@ foreach ($san in $sanList) {
         }
 
         $dirName = if ($san -eq 'none') { "build/$Arch-$cfg" } else { "build/$Arch-$cfg-$san" }
+        if ($Shared) { $dirName = "$dirName-shared" }
         $buildDir = Join-Path $BuildRoot $dirName
         if (-not (Test-Path -LiteralPath $buildDir)) {
             Write-Log "build dir missing: $buildDir" 'ERROR'
@@ -150,6 +160,27 @@ foreach ($san in $sanList) {
                     Write-Log "killing leftover test process $($_.ProcessName) (pid $($_.Id))" 'WARN'
                     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
                 }
+
+            # The shared-build consumer gate is part of the ctest set, but a
+            # -Filter run can exclude it. Execute it unconditionally in shared
+            # mode so a filtered invocation cannot skip the export check.
+            if ($Shared) {
+                $probe = Join-Path $buildDir "tests\crpc_test_shared_link.exe"
+                if (-not (Test-Path -LiteralPath $probe)) {
+                    Write-Log "shared link gate missing: $probe" 'ERROR'
+                    $script:Failures++
+                } else {
+                    $probeOut = & $probe 2>&1
+                    $probeOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Log "shared link gate FAILED" 'ERROR'
+                        $probeOut | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                        $script:Failures++
+                    } else {
+                        Write-Log "shared link gate OK"
+                    }
+                }
+            }
 
             $sanPattern = 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)'
             $sanHits = @($out | Select-String -Pattern $sanPattern)
