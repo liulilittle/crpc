@@ -135,6 +135,33 @@ allocated with, which is the case measured above.
   statically are not subject to the visibility rules but are still subject to
   the layout rules in §2.
 
+Two rules follow from the first bullet, and both are easy to get wrong:
+
+1. **Every public class that has an out-of-line member must carry `CRPC_API`
+   itself.** Exporting a member function requires the decoration on that
+   class's own declaration; a base class, a namespace or a sibling declaration
+   does not export it. A class with only inline members needs nothing: the
+   consumer compiles those into its own object file.
+2. **The macro on an outer class does not cover a nested class.** `class
+   CRPC_API outer { class nested { void f(); }; };` exports `outer`'s members
+   but not `outer::nested::f`. Each nested class with out-of-line members must
+   be decorated on its own declaration, as `server::builder`,
+   `client::builder` and `http::http_server::builder` are.
+
+The same applies to namespace-scope functions: a free function that is
+declared in a public header and defined in `src/` must carry `CRPC_API` on its
+declaration. A friend declaration inside a class introduces the name into the
+enclosing namespace, so when a function is both a friend and a namespace-scope
+entry point, both declarations must agree on the decoration (MSVC reports
+C2375 otherwise).
+
+`tests/test_shared_link.cpp`, built only under `CRPC_BUILD_SHARED=ON`, is the
+gate for these rules. It is a consumer: it links against the import library and
+calls the documented API directly, including two header-inline templates
+(`client_detail::wake_functor` and `mvc::bind_request`) whose bodies reference
+out-of-line members. A missing decoration therefore fails the build instead of
+a downstream consumer. See [building.md](building.md) §4.
+
 ## 4. Struct layout
 
 The rule for a public struct that crosses the ABI boundary is:
@@ -207,6 +234,7 @@ is guarded.
 - `::crpc::cluster::vote_result`
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
+- `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
 - `::crpc::http2::goaway_payload`
@@ -215,8 +243,24 @@ is guarded.
 - `::crpc::http2::priority_payload`
 - `::crpc::http2::push_promise_payload`
 - `::crpc::http2::setting`
+- `::crpc::http::coding_limits`
+- `::crpc::http::multipart_limits`
+- `::crpc::http::negotiation`
+- `::crpc::http::range_parse_result`
+- `::crpc::http::request`
+- `::crpc::http::request_encoding_plan`
+- `::crpc::http::response`
+- `::crpc::http::serialize_options`
 - `::crpc::http::sse::event_id`
+- `::crpc::inproc_pair`
 - `::crpc::io::io_result`
+- `::crpc::mvc::binding_limits`
+- `::crpc::mvc::file_part`
+- `::crpc::mvc::route_entry`
+- `::crpc::mvc::route_params`
+- `::crpc::obs::log_record`
+- `::crpc::obs::trace_context`
+- `::crpc::obs::traceparent_result`
 - `::crpc::push::push_envelope`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`

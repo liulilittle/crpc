@@ -133,17 +133,32 @@ ctest --test-dir .opencode/tmp/out/build/x64-Debug --output-on-failure
 
 默认是静态归档。`-DCRPC_BUILD_SHARED=ON` 构建共享库，并定义 `CRPC_SHARED`（公开）与 `CRPC_BUILDING`（私有）。共享构建设置隐藏可见性、隐藏内联符号、关闭 Windows 的全符号导出，并在非 MSVC 上加入 `-Wl,--no-undefined`。MSVC 上抑制 C4251，因为私有 STL 成员从不出现在签名中；[ABI 策略](abi.zh-CN.md)中的布局规则仍然适用，共享库必须与消费方使用同一工具链族与调试设置。
 
+共享构建带有**链接门禁**：只要 `CRPC_BUILD_SHARED=ON`，`tests/test_shared_link.cpp`
+就会针对导入库编译，并以 `crpc_test_shared_link` 注册进 CTest。该文件是**消费者**
+而不是单元测试：它只包含公开头文件并直接调用文档化的 API，因此共享构建漏导出的
+任何公开符号都会在链接期变成未解析外部符号。它覆盖三类手写调用清单无法覆盖的
+情况：头内联模板 `client_detail::wake_functor`（会把对 `call_core::signal` 的调用
+编译进消费者自己的目标文件）、按值持有 `std::optional<bulkhead_permit>` 的类型
+（其隐式析构函数在消费者侧生成）、以及 `parse_query`、`default_router`、`serialize`
+等命名空间级辅助函数。`CRPC_BUILD_SHARED=OFF` 时该目标根本不会创建：静态库没有
+导出表可出错。
+
+`scripts/build.ps1 -Shared` 与 `scripts/build.sh --shared` 选择共享构建；
+`scripts/test.ps1 -Shared` / `scripts/test.sh --shared` 还会直接运行该链接门禁，
+因此带过滤的 CTest 调用无法跳过它。这条门禁强制的装饰规则见
+[ABI 策略](abi.zh-CN.md) 第 3 节。
+
 ## 5. 一键脚本 <a id="s5"></a>
 
 Windows：
 
 ```powershell
 .\scripts\build.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
-                    [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean]
+                    [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean] [-Shared]
                     [-SourceDir <path>] [-BuildRoot <path>]
 .\scripts\test.ps1  [-Config Debug|Release|Both] [-Arch x86|x64]
                     [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-                    [-Repeat N] [-SourceDir <path>] [-BuildRoot <path>]
+                    [-Repeat N] [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
 ```
 
 Linux/macOS：
@@ -151,10 +166,12 @@ Linux/macOS：
 ```sh
 ./scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
-                   [--jobs N] [--clean] [--source DIR] [--build-root DIR]
+                   [--jobs N] [--clean] [--shared]
+                   [--source DIR] [--build-root DIR]
 ./scripts/test.sh  [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
-                   [--filter REGEX] [--repeat N] [--source DIR] [--build-root DIR]
+                   [--filter REGEX] [--repeat N] [--shared]
+                   [--source DIR] [--build-root DIR]
 ```
 
 构建行为：`Config Both` 在独立目录中构建 Debug 与 Release。`-Jobs`/`--jobs` 默认为处理器数量。`-Clean`/`--clean` 只删除所选构建目录，绝不删除源码或整个产物根。Windows 脚本在检测到 `vcvars` 时于其中运行 CMake；POSIX 脚本显式选择 `g++`/`clang++`，`--arch x86` 会传 `-m32`。
@@ -169,6 +186,8 @@ Linux/macOS：
 - `-Jobs`/`--jobs`：并行编译任务数；零或省略表示处理器数量。
 - `-Filter`/`--filter`：传给 CTest `-R` 的正则，只影响测试选择。
 - `-Clean`/`--clean`：只删除所选构建目录，可安全重复执行。
+- `-Shared`/`--shared`：选择共享构建（`CRPC_BUILD_SHARED=ON`），产物目录带 `-shared`
+  后缀；测试脚本在该模式下额外直接运行 `crpc_test_shared_link` 链接门禁。
 - `-SourceDir`/`--source` 与 `-BuildRoot`/`--build-root`：覆盖源码根与产物根。
 
 每个脚本写出带时间戳的 UTF-8 日志，并在出现失败汇总时以非零退出。PowerShell 使用 `[System.IO.File]::AppendAllText` 写 UTF-8，而不是 `Tee-Object`，后者在 PowerShell 5.1 上写 UTF-16。

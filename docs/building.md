@@ -167,17 +167,35 @@ never appear in a signature; the layout rules in [ABI policy](abi.md) still
 apply, and a shared library must use the same toolchain family and debug setting
 as its consumer.
 
+A shared build carries a **link gate**: `tests/test_shared_link.cpp` is built
+against the import library whenever `CRPC_BUILD_SHARED=ON`, and registered as
+`crpc_test_shared_link` in CTest. The file is a consumer, not a unit test: it
+includes only public headers and calls the documented API directly, so any
+public symbol the shared build fails to export becomes an unresolved external at
+link time. It covers three cases a hand-written call list cannot: the
+header-inline template `client_detail::wake_functor` (which compiles a call to
+`call_core::signal` into the consumer's object file), a type that holds
+`std::optional<bulkhead_permit>` by value (whose implicit destructor is emitted
+in the consumer), and the namespace-scope helpers such as `parse_query`,
+`default_router` and `serialize`. With `CRPC_BUILD_SHARED=OFF` the target is not
+created at all: a static archive has no export table to get wrong.
+
+`scripts/build.ps1 -Shared` and `scripts/build.sh --shared` select the shared
+build; `scripts/test.ps1 -Shared` / `scripts/test.sh --shared` also run the link
+gate directly, so a filtered CTest invocation cannot skip it. See
+[ABI policy](abi.md) section 3 for the decoration rule this gate enforces.
+
 ## 5. One-click scripts <a id="s5"></a>
 
 Windows:
 
 ```powershell
 .\scripts\build.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
-                    [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean]
+                    [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean] [-Shared]
                     [-SourceDir <path>] [-BuildRoot <path>]
 .\scripts\test.ps1  [-Config Debug|Release|Both] [-Arch x86|x64]
                     [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-                    [-Repeat N] [-SourceDir <path>] [-BuildRoot <path>]
+                    [-Repeat N] [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
 ```
 
 Linux/macOS:
@@ -185,10 +203,12 @@ Linux/macOS:
 ```sh
 ./scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
-                   [--jobs N] [--clean] [--source DIR] [--build-root DIR]
+                   [--jobs N] [--clean] [--shared]
+                   [--source DIR] [--build-root DIR]
 ./scripts/test.sh  [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
-                   [--filter REGEX] [--repeat N] [--source DIR] [--build-root DIR]
+                   [--filter REGEX] [--repeat N] [--shared]
+                   [--source DIR] [--build-root DIR]
 ```
 
 Build behavior: `Config Both` builds Debug and Release in separate directories.

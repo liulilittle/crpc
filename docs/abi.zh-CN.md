@@ -71,6 +71,27 @@ MAJOR.MINOR.PATCH
 - 静态库按定义导出全部符号；静态链接的消费方不受可见性规则约束，
   但仍受第 2 节的布局规则约束。
 
+由第一条可推出两条规则，两条都很容易出错：
+
+1. **每个含 out-of-line 成员的公开类都必须自己标 `CRPC_API`。**
+   导出成员函数需要在该类**自己**的声明上加装饰；基类、命名空间或兄弟声明都不会导出它。
+   只有内联成员的类不需要：消费者会把它们编译进自己的目标文件。
+2. **外层类上的宏不覆盖嵌套类。**
+   `class CRPC_API outer { class nested { void f(); }; };` 导出了 `outer` 的成员，
+   但不导出 `outer::nested::f`。每个含 out-of-line 成员的嵌套类都必须在自己的声明上加装饰，
+   `server::builder`、`client::builder` 与 `http::http_server::builder` 就是这样处理的。
+
+命名空间级函数同理：在公开头文件中声明、在 `src/` 中定义的自由函数，
+必须在其声明上标 `CRPC_API`。类内的 friend 声明会把名字引入外层命名空间，
+因此当一个函数既是 friend 又是命名空间级入口时，两处声明的装饰必须一致
+（否则 MSVC 报 C2375）。
+
+`tests/test_shared_link.cpp`（仅在 `CRPC_BUILD_SHARED=ON` 时构建）是这些规则的门禁。
+它是一个消费者：链接导入库并直接调用文档化 API，包括两个头内联模板
+（`client_detail::wake_functor` 与 `mvc::bind_request`），它们的函数体引用了
+out-of-line 成员。因此缺少装饰会在构建期失败，而不是在下游消费者那里。
+参见 [building.zh-CN.md](building.zh-CN.md) 第 4 节。
+
 ## 4. 结构体布局
 
 每个跨越 ABI 边界的公开结构体必须：
@@ -128,6 +149,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::cluster::vote_result`
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
+- `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
 - `::crpc::http2::goaway_payload`
@@ -136,8 +158,24 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::http2::priority_payload`
 - `::crpc::http2::push_promise_payload`
 - `::crpc::http2::setting`
+- `::crpc::http::coding_limits`
+- `::crpc::http::multipart_limits`
+- `::crpc::http::negotiation`
+- `::crpc::http::range_parse_result`
+- `::crpc::http::request`
+- `::crpc::http::request_encoding_plan`
+- `::crpc::http::response`
+- `::crpc::http::serialize_options`
 - `::crpc::http::sse::event_id`
+- `::crpc::inproc_pair`
 - `::crpc::io::io_result`
+- `::crpc::mvc::binding_limits`
+- `::crpc::mvc::file_part`
+- `::crpc::mvc::route_entry`
+- `::crpc::mvc::route_params`
+- `::crpc::obs::log_record`
+- `::crpc::obs::trace_context`
+- `::crpc::obs::traceparent_result`
 - `::crpc::push::push_envelope`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`

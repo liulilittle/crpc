@@ -32,6 +32,34 @@
   keys is unaffected. See [protocol.md](protocol.md) §10 and
   [abi.md](abi.md) §4.
 
+### Fixed (MINOR, symbols only)
+
+- A `CRPC_BUILD_SHARED=ON` build now exports the whole documented public API.
+  Before this change only 27 classes carried `CRPC_API`, so a consumer that
+  linked `crpc.dll` / `crpc.so` the way the README shows failed at link time
+  with unresolved externals for the builders, the in-process backend, every
+  resilience primitive, the push hub, the MVC router, the logger and tracer,
+  the HTTP message/coding/file layers, the flow-control estimators, the codec
+  registry and the `obs` span type. 46 public classes (43 top level plus the
+  nested `server::builder`, `client::builder` and `http::http_server::builder`)
+  and 51 namespace-scope functions with out-of-line definitions now carry the
+  decoration on their own declaration. Six cross-DLL interface classes
+  (`io::completion`, `io::source`, `io::sink`, `io::accept_sink`,
+  `io::listener`, `io::backend_factory`) are decorated as well: consumers
+  inherit from them and pass objects back across the boundary, so their
+  destructor vtable slot and RTTI must be exported.
+- Impact: MINOR, and it is a **symbol-only change**. No symbol is removed or
+  resignatured, no public record changes layout or size, and no behaviour
+  changes. A shared build's export table grows from 586 to 1258 names on
+  Windows x64; a static build is unaffected because an archive exports
+  everything by definition.
+- A new build-time gate, `tests/test_shared_link.cpp`, is built and run only
+  when `CRPC_BUILD_SHARED=ON`. It is a consumer that links the import library
+  and calls the documented API directly, including header-inline templates whose
+  bodies reference out-of-line members, so a missing decoration fails the build
+  instead of a downstream consumer. See [abi.md](abi.md) §3 and
+  [building.md](building.md) §4.
+
 ### Added (MINOR, symbols only)
 
 - `client::resilience_statistics` and `client::resilience_stats()`: additive
