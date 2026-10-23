@@ -64,8 +64,12 @@ export CRPC_COROCC_DIR=/path/to/corocc
 ./scripts/build.sh --config Debug --arch x64
 ```
 
-The variables are read at configure time only when the cache value is empty;
-the scripts forward the environment and need no extra arguments. Each root is
+The variables are read at configure time only when the cache value is empty. The
+scripts also forward an existing environment value explicitly as
+`-DCRPC_RTTI_DIR=...` / `-DCRPC_COROCC_DIR=...`; when `CRPC_RTTI_DIR` is absent
+they print a warning and stop before configuring, because this repository always
+builds the test suite and the tests that use the reflection macros cannot be
+compiled without it. Each root is
 validated (`include/rtti/reflect.hpp`, `include/corocc/coro.h`) and added with
 `add_subdirectory(... EXCLUDE_FROM_ALL)` under the build tree's `_deps`
 directory. RTTI's own test entries are excluded by name from CTest because they
@@ -79,7 +83,10 @@ crpc's `-Wpedantic` is not imposed on third-party code.
 
 If a dependency is absent, the corresponding `CRPC_HAVE_*` macro is off:
 RTTI-dependent codecs are not registered, the MVC field-attribute macros are not
-defined, and coroutine-backed components are not compiled. The current CRPC sources do
+defined, and coroutine-backed components are not compiled. The test targets that
+register reflected types unconditionally (`test_codec`, `test_mvc`, and in a
+shared build `test_shared_link`) are skipped with a `STATUS` message; every other
+test still builds and runs. The current CRPC sources do
 not call `coro_rt_*`; corocc is linked but its runtime is not yet used. This is
 stated so a build without corocc is not mistaken for a broken build.
 
@@ -88,8 +95,8 @@ stated so a build without corocc is not mistaken for a broken build.
 | Option | Default | Meaning |
 |---|---|---|
 | `CRPC_BUILD_TESTS` | `ON` | build `tests/` and register CTest entries |
-| `CRPC_BUILD_BENCH` | `OFF` | add `bench/`; the directory currently has no `CMakeLists.txt`, so keep it off |
-| `CRPC_BUILD_EXAMPLES` | `OFF` | add `examples/`; same caveat |
+| `CRPC_BUILD_BENCH` | `OFF` | build `bench/`; benchmarks are not registered in CTest, and in a shared build the benchmark executables sit in the build root next to `crpc.dll` |
+| `CRPC_BUILD_EXAMPLES` | `OFF` | add `examples/`; the directory has no `CMakeLists.txt` yet, so keep it off |
 | `CRPC_WARNINGS_AS_ERRORS` | `ON` | `/W4 /WX` or `-Werror` |
 | `CRPC_ENABLE_LTO` | `ON` | IPO/LTO for Release when supported and no sanitizer is active |
 | `CRPC_BUILD_SHARED` | `OFF` | build a shared library instead of a static archive |
@@ -168,7 +175,8 @@ apply, and a shared library must use the same toolchain family and debug setting
 as its consumer.
 
 A shared build carries a **link gate**: `tests/test_shared_link.cpp` is built
-against the import library whenever `CRPC_BUILD_SHARED=ON`, and registered as
+against the import library whenever `CRPC_BUILD_SHARED=ON` and the RTTI checkout
+is present (the probe registers a reflected DTO), and registered as
 `crpc_test_shared_link` in CTest. The file is a consumer, not a unit test: it
 includes only public headers and calls the documented API directly, so any
 public symbol the shared build fails to export becomes an unresolved external at
@@ -239,7 +247,11 @@ The default artifact root is `<source>/.opencode/tmp/out`. A build directory is
 The library is `crpc.lib`/`crpc.dll` on Windows or `libcrpc.a`/`libcrpc.so` on
 Linux, inside the selected build directory. Test executables are
 `crpc_test_<area>` and are registered one per source by `tests/CMakeLists.txt`.
-Dependency builds live under `<build>/_deps`. There are no `install()` rules, so
+Every consumer executable (tests and, when enabled, benchmarks) is written to
+the build root, next to the library, through `RUNTIME_OUTPUT_DIRECTORY`; there
+is no copy step, so an incremental rebuild of the library alone always leaves
+the executable running against the freshly linked `crpc.dll`. Dependency builds
+live under `<build>/_deps`. There are no `install()` rules, so
 `cmake --install` is not a supported deployment path yet.
 
 ## 7. Sanitizers <a id="s7"></a>
@@ -304,7 +316,7 @@ green on x64 Debug and x86 Debug; rerun the scripts to confirm the current tree.
 |---|---|
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | point it at the checkout root, not `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | point it at the root containing `include/corocc/coro.h` |
-| configure fails on `bench`/`examples` | keep `CRPC_BUILD_BENCH`/`CRPC_BUILD_EXAMPLES` off; the trees are empty |
+| configure fails on `examples` | keep `CRPC_BUILD_EXAMPLES` off; the tree has no `CMakeLists.txt` |
 | a sanitizer is requested on MSVC | TSan is unavailable; use Linux/Clang for the TSan job |
 | `cmake` or `ninja` not found | the scripts search `PATH`, Program Files and the VS bundle; install CMake/Ninja or add them to `PATH` |
 | a test hangs on Windows | inspect `.opencode/tmp/out/dumps`, the test log, and the 300 s CTest timeout |

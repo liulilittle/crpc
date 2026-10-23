@@ -120,6 +120,12 @@ struct null_multipart_handler final : crpc::http::multipart_handler {
 // a route parameter, a query parameter, a header and a form field. It lives at
 // namespace scope (not in the anonymous namespace above) because RTTI's
 // registration macros emit namespace-scope definitions.
+//
+// Guarded, because `RTTI_DEFINE_TYPE` needs the reflection dependency. The rest
+// of this file must build without it: this target is the only runtime check
+// that a public symbol really is in the export table, so losing it in a
+// no-RTTI shared build would leave that build with no export gate at all.
+#if CRPC_HAVE_RTTI
 struct link_req {
     std::int64_t id = 0;
     std::int64_t page = 0;
@@ -132,6 +138,7 @@ RTTI_DEFINE_FIELD_ATTRS(link_req,
                         RTTI_FIELD_ATTR_ENTRY(page, CRPC_FROM_QUERY("page")),
                         RTTI_FIELD_ATTR_ENTRY(token, CRPC_FROM_HEADER("x-token")),
                         RTTI_FIELD_ATTR_ENTRY(title, CRPC_FROM_FORM("title")))
+#endif // CRPC_HAVE_RTTI
 
 // Case 1: the whole documented builder/transport/resilience surface, called
 // directly (never via sizeof or an address-of, which a vtable could satisfy).
@@ -376,6 +383,13 @@ CRPC_TEST(shared_link_header_template_calls_core) {
 // `route_params::find`, `header_list::find` and (through the response path)
 // `header_list::add`, so those symbols must be exported too.
 CRPC_TEST(shared_link_header_template_binds_request) {
+#if !CRPC_HAVE_RTTI
+    // `bind_request` needs the reflection dependency for the DTO. Case 1 has
+    // already exercised `route_params::find`, `header_list::find` and
+    // `header_list::add` directly, so the export check for those symbols is
+    // not lost; only this reflection-driven path is.
+    ::crpc_test::skip("bind_request requires CRPC_HAVE_RTTI");
+#else
     crpc::mvc::route_params route;
     route.entries.emplace_back("id", "42");
 
@@ -394,6 +408,7 @@ CRPC_TEST(shared_link_header_template_binds_request) {
     CRPC_CHECK_EQ(std::int64_t{3}, out.page);
     CRPC_CHECK_EQ(std::string("secret"), out.token);
     CRPC_CHECK_EQ(std::string("hello"), out.title);
+#endif
 }
 
 // Case 4: a full call through the typed facade. `stub::call` -> `issue` ->

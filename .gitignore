@@ -67,3 +67,7 @@ scratch/
 obs_rotation.log*
 *.dmp
 crash-*.txt
+
+# Python bytecode from scripts/export_gate.py
+__pycache__/
+*.pyc

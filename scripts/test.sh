@@ -104,19 +104,38 @@ for san in "${SAN_LIST[@]}"; do
       # The shared-build consumer gate is part of the ctest set, but a
       # --filter run can exclude it. Run it unconditionally in shared mode so
       # a filtered invocation cannot skip the export check.
+      #
+      # Every executable is written to the build root (see
+      # tests/CMakeLists.txt), beside crpc.so/crpc.dll, so the probe is there.
       if [[ $SHARED -eq 1 ]]; then
-        PROBE="$BUILD_DIR/tests/crpc_test_shared_link"
+        PROBE="$BUILD_DIR/crpc_test_shared_link"
         if [[ ! -x "$PROBE" ]]; then
           log ERROR "shared link gate missing: $PROBE"
           FAILURES=$((FAILURES + 1))
-        # Run from the build root: the loader resolves crpc.so/crpc.dll from
-        # the working directory, which is what ctest's WORKING_DIRECTORY
-        # property provides for the registered test.
         elif ! ( cd "$BUILD_DIR" && "$PROBE" ) 2>&1 | tee -a "$LOG"; then
           log ERROR "shared link gate FAILED"
           FAILURES=$((FAILURES + 1))
         else
           log INFO "shared link gate OK"
+        fi
+
+        # The probe proves only that the symbols it names are exported. A new
+        # public class with a forgotten CRPC_API builds cleanly, exports
+        # nothing and passes every suite, so the headers are also compared
+        # against the export table. See scripts/export_gate.py.
+        GATE="$SOURCE_DIR/scripts/export_gate.py"
+        if [[ ! -f "$GATE" ]]; then
+          log ERROR "export gate missing: $GATE"
+          FAILURES=$((FAILURES + 1))
+        elif command -v python3 >/dev/null 2>&1; then
+          if ! python3 "$GATE" --root "$SOURCE_DIR" --build-dir "$BUILD_DIR" 2>&1 | tee -a "$LOG"; then
+            log ERROR "export gate FAILED"
+            FAILURES=$((FAILURES + 1))
+          else
+            log INFO "export gate OK"
+          fi
+        else
+          log WARN "export gate skipped: python3 not on PATH"
         fi
       fi
       if grep -qE 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)' "$LOG"; then

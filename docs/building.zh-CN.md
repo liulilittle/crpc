@@ -55,19 +55,19 @@ export CRPC_COROCC_DIR=/path/to/corocc
 ./scripts/build.sh --config Debug --arch x64
 ```
 
-变量只在缓存值为空时于配置期读取；脚本转发环境，不需要额外参数。每个根都会校验（`include/rtti/reflect.hpp`、`include/corocc/coro.h`），并以 `add_subdirectory(... EXCLUDE_FROM_ALL)` 加入构建树的 `_deps` 目录。RTTI 自带的测试条目在 `EXCLUDE_FROM_ALL` 下不会构建，因此按名称从 CTest 排除。`COROCC_BUILD_TESTS` 被强制关闭。
+变量只在缓存值为空时于配置期读取。脚本还会把已存在的环境值显式转成 `-DCRPC_RTTI_DIR=...` / `-DCRPC_COROCC_DIR=...`；当 `CRPC_RTTI_DIR` 缺失时，脚本打印警告并在配置前停止，因为本仓库总是构建测试套件，而使用反射宏的测试在没有它时无法编译。每个根都会校验（`include/rtti/reflect.hpp`、`include/corocc/coro.h`），并以 `add_subdirectory(... EXCLUDE_FROM_ALL)` 加入构建树的 `_deps` 目录。RTTI 自带的测试条目在 `EXCLUDE_FROM_ALL` 下不会构建，因此按名称从 CTest 排除。`COROCC_BUILD_TESTS` 被强制关闭。
 
 严格的告警策略（GCC/Clang 的 `-Wall -Wextra -Wpedantic -Werror`，MSVC 的 `/W4 /WX`）通过 `target_compile_options` 挂在 crpc 自身的目标上，而不是目录上，因此不会传到这些 vendored 仓库：依赖的告警不会让 crpc 构建失败，crpc 的 `-Wpedantic` 也不会强加到第三方代码。
 
-缺少依赖时，对应的 `CRPC_HAVE_*` 宏关闭：依赖 RTTI 的编解码器不注册，MVC 字段 attribute 宏不定义，协程相关组件不参与编译。当前 CRPC 源码不调用 `coro_rt_*`；corocc 会被链接，但运行时尚未使用。写明这一点是为了避免把“没有 corocc 的构建”误判为损坏的构建。
+缺少依赖时，对应的 `CRPC_HAVE_*` 宏关闭：依赖 RTTI 的编解码器不注册，MVC 字段 attribute 宏不定义，协程相关组件不参与编译。无条件使用反射宏的测试目标（`test_codec`、`test_mvc`，shared 构建下还有 `test_shared_link`）会以 `STATUS` 提示跳过，其余测试照常构建并运行。当前 CRPC 源码不调用 `coro_rt_*`；corocc 会被链接，但运行时尚未使用。写明这一点是为了避免把“没有 corocc 的构建”误判为损坏的构建。
 
 ## 3. CMake 选项 <a id="s3"></a>
 
 | 选项 | 默认 | 含义 |
 |---|---|---|
 | `CRPC_BUILD_TESTS` | `ON` | 构建 `tests/` 并注册 CTest 条目 |
-| `CRPC_BUILD_BENCH` | `OFF` | 加入 `bench/`；该目录目前没有 `CMakeLists.txt`，保持关闭 |
-| `CRPC_BUILD_EXAMPLES` | `OFF` | 加入 `examples/`；同样如此 |
+| `CRPC_BUILD_BENCH` | `OFF` | 构建 `bench/`；基准程序不注册进 CTest，shared 构建下基准可执行文件与 `crpc.dll` 同处构建根目录 |
+| `CRPC_BUILD_EXAMPLES` | `OFF` | 加入 `examples/`；该目录尚无 `CMakeLists.txt`，保持关闭 |
 | `CRPC_WARNINGS_AS_ERRORS` | `ON` | `/W4 /WX` 或 `-Werror` |
 | `CRPC_ENABLE_LTO` | `ON` | 支持且未启用消毒器时，Release 使用 IPO/LTO |
 | `CRPC_BUILD_SHARED` | `OFF` | 构建共享库而不是静态归档 |
@@ -133,7 +133,7 @@ ctest --test-dir .opencode/tmp/out/build/x64-Debug --output-on-failure
 
 默认是静态归档。`-DCRPC_BUILD_SHARED=ON` 构建共享库，并定义 `CRPC_SHARED`（公开）与 `CRPC_BUILDING`（私有）。共享构建设置隐藏可见性、隐藏内联符号、关闭 Windows 的全符号导出，并在非 MSVC 上加入 `-Wl,--no-undefined`。MSVC 上抑制 C4251，因为私有 STL 成员从不出现在签名中；[ABI 策略](abi.zh-CN.md)中的布局规则仍然适用，共享库必须与消费方使用同一工具链族与调试设置。
 
-共享构建带有**链接门禁**：只要 `CRPC_BUILD_SHARED=ON`，`tests/test_shared_link.cpp`
+共享构建带有**链接门禁**：只要 `CRPC_BUILD_SHARED=ON` 且存在 RTTI 仓库（探针会注册反射 DTO），`tests/test_shared_link.cpp`
 就会针对导入库编译，并以 `crpc_test_shared_link` 注册进 CTest。该文件是**消费者**
 而不是单元测试：它只包含公开头文件并直接调用文档化的 API，因此共享构建漏导出的
 任何公开符号都会在链接期变成未解析外部符号。它覆盖三类手写调用清单无法覆盖的
@@ -196,7 +196,7 @@ Linux/macOS：
 
 默认产物根是 `<source>/.opencode/tmp/out`。构建目录是 `build/<arch>-<config>[-<sanitizer>]`，例如 `.opencode/tmp/out/build/x64-Debug-asan`。日志位于 `.opencode/tmp/out/logs/build-<arch>-<config>-<sanitizer>-<timestamp>.log` 与 `test-...log`。测试期间的 minidump 写入 `.opencode/tmp/out/dumps`。
 
-库文件是 Windows 的 `crpc.lib`/`crpc.dll` 或 Linux 的 `libcrpc.a`/`libcrpc.so`，位于所选构建目录。测试可执行文件为 `crpc_test_<area>`，由 `tests/CMakeLists.txt` 按源文件逐个注册。依赖构建位于 `<build>/_deps`。当前没有 `install()` 规则，因此 `cmake --install` 尚不是受支持的部署路径。
+库文件是 Windows 的 `crpc.lib`/`crpc.dll` 或 Linux 的 `libcrpc.a`/`libcrpc.so`，位于所选构建目录。测试可执行文件为 `crpc_test_<area>`，由 `tests/CMakeLists.txt` 按源文件逐个注册。所有消费者可执行文件（测试以及启用后的基准）通过 `RUNTIME_OUTPUT_DIRECTORY` 输出到构建根目录，与库同目录；不存在复制步骤，因此只重建库的增量构建也总是让可执行文件加载新链接出的 `crpc.dll`。依赖构建位于 `<build>/_deps`。当前没有 `install()` 规则，因此 `cmake --install` 尚不是受支持的部署路径。
 
 ## 7. 消毒器 <a id="s7"></a>
 
@@ -246,7 +246,7 @@ Debug 构建遇到 CRT 断言、无效参数、纯虚调用或访问违例时可
 |---|---|
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | 指向仓库根，而不是 `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | 指向包含 `include/corocc/coro.h` 的根 |
-| 配置在 `bench`/`examples` 失败 | 保持 `CRPC_BUILD_BENCH`/`CRPC_BUILD_EXAMPLES` 关闭；目录为空 |
+| 配置在 `examples` 失败 | 保持 `CRPC_BUILD_EXAMPLES` 关闭；该目录没有 `CMakeLists.txt` |
 | 在 MSVC 上请求消毒器 | TSan 不可用；TSan 任务使用 Linux/Clang |
 | 找不到 `cmake` 或 `ninja` | 脚本搜索 `PATH`、Program Files 与 VS 包；安装或加入 `PATH` |
 | Windows 上测试挂起 | 检查 `.opencode/tmp/out/dumps`、测试日志与 300 秒 CTest 超时 |

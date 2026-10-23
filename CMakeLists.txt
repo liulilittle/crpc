@@ -133,6 +133,16 @@ else()
     set(CRPC_HAVE_COROCC OFF)
 endif()
 
+# Without the RTTI checkout the suite still builds and runs: only the targets
+# that register reflected types are dropped (see tests/CMakeLists.txt). A
+# FATAL_ERROR here would reject a configuration that is known to work, so the
+# gate is per target and this block only reports the consequence.
+if(CRPC_BUILD_TESTS AND NOT CRPC_HAVE_RTTI)
+    message(STATUS
+        "CRPC: tests that use the RTTI reflection macros are skipped; "
+        "set CRPC_RTTI_DIR (CMake variable or environment) to include them")
+endif()
+
 # ---------------------------------------------------------------------------
 # Core library
 # ---------------------------------------------------------------------------
@@ -201,28 +211,30 @@ if(CRPC_BUILD_SHARED)
         # Every exported symbol is marked CRPC_API; anything else stays hidden.
         target_link_options(crpc PRIVATE -Wl,--no-undefined)
     endif()
-
-    # In a shared build every consumer executable imports crpc.dll, which is
-    # written to the build root. Windows resolves an import from the
-    # executable's own directory (then the system directories, then the current
-    # directory); it never searches the *parent* of the executable's directory.
-    # An executable staged into a subdirectory (tests/, bench/) therefore dies
-    # before main() with STATUS_DLL_NOT_FOUND (0xC0000135), which a test runner
-    # reports as a bare exit code with no output -- indistinguishable from a
-    # hang.
-    #
-    # Every subdirectory that creates executables must call this for each
-    # target. Copying is preferred over a PATH entry or a working-directory
-    # property because it holds for a direct run, a debugger, and a CI step
-    # that bypasses this project's runner.
-    function(crpc_copy_dll_beside target)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:crpc>
-                $<TARGET_FILE_DIR:${target}>
-            VERBATIM)
-    endfunction()
 endif()
+
+# ---------------------------------------------------------------------------
+# Executable placement
+# ---------------------------------------------------------------------------
+#
+# In a shared build every consumer executable imports crpc.dll, which is
+# written to the build root. Windows resolves an import from the executable's
+# own directory (then the system directories, then the current directory); it
+# never searches the *parent* of the executable's directory. An executable left
+# in its per-directory default location (tests/, bench/) would therefore die
+# before main() with STATUS_DLL_NOT_FOUND (0xC0000135), which a test runner
+# reports as a bare exit code with no output -- indistinguishable from a hang.
+#
+# The fix is placement, not copying: every consumer executable sets
+# RUNTIME_OUTPUT_DIRECTORY to the build root (see tests/CMakeLists.txt and
+# bench/CMakeLists.txt), so it is written next to crpc.dll and the loader finds
+# the import with no PATH entry and no working-directory property. A POST_BUILD
+# copy of the DLL would only run when the executable itself relinks, so a
+# library-only rebuild would leave a stale crpc.dll beside the executable and a
+# test run could pass against the old binary.
+#
+# Static builds use the same property: the executables sit next to crpc.lib and
+# the layout is identical in both modes.
 
 # Platform libraries the transport and timing layers need.
 if(WIN32)

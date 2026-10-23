@@ -143,6 +143,13 @@ foreach ($san in $sanList) {
             $script:Failures++
             continue
         }
+        # Resolve to an absolute path before it is used to name an executable.
+        # `& $probe` with a relative path that does not start with `.\` is not
+        # a path invocation: PowerShell reads the first segment as a module or
+        # command name, so a `-BuildRoot .opencode\tmp\x` run fails the probe
+        # with "cannot find module '.opencode'" even though the file is there
+        # and `ctest --test-dir` (which accepts relative paths) passes.
+        $buildDir = (Resolve-Path -LiteralPath $buildDir).Path
 
         for ($r = 1; $r -le $Repeat; ++$r) {
             Write-Log "--- ctest $Arch/$cfg/$san run $r/$Repeat ---"
@@ -150,12 +157,25 @@ foreach ($san in $sanList) {
                            '--timeout', "$testTimeoutSeconds",
                            '--no-tests=error')
             if ($Filter) { $ctestArgs += @('-R', $Filter) }
-            $out = & $ctest @ctestArgs 2>&1
+            # `2>&1` on a native command turns each stderr line into an
+            # ErrorRecord, and with $ErrorActionPreference='Stop' (set at the
+            # top of this script) the first one becomes a terminating error:
+            # the remaining output, the log append and the failure report below
+            # would all be skipped, so a red gate would print nothing about
+            # why. `Continue` is scoped to this block only.
+            $savedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = & $ctest @ctestArgs 2>&1
+                $ctestExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $savedPreference
+            }
             $out | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
             $out | Where-Object { $_ -match 'Test\s+#|tests passed|tests failed|Failed|Timeout|\*\*\*' } | ForEach-Object { Write-Host $_ }
 
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "ctest FAILED $Arch/$cfg/$san run $r" 'ERROR'
+            if ($ctestExit -ne 0) {
+                Write-Log "ctest FAILED $Arch/$cfg/$san run $r (exit $ctestExit)" 'ERROR'
                 $script:Failures++
             }
 
@@ -171,16 +191,15 @@ foreach ($san in $sanList) {
             # The shared-build consumer gate is part of the ctest set, but a
             # -Filter run can exclude it. Execute it unconditionally in shared
             # mode so a filtered invocation cannot skip the export check.
+            #
+            # Every executable is written to the build root (see
+            # tests/CMakeLists.txt), beside crpc.dll, so the probe is there too.
             if ($Shared) {
-                $probe = Join-Path $buildDir "tests\crpc_test_shared_link.exe"
+                $probe = Join-Path $buildDir "crpc_test_shared_link.exe"
                 if (-not (Test-Path -LiteralPath $probe)) {
                     Write-Log "shared link gate missing: $probe" 'ERROR'
                     $script:Failures++
                 } else {
-                    # The probe imports crpc.dll from the build root, so run it
-                    # there: the loader searches the working directory after the
-                    # executable's own directory. ctest gets the same directory
-                    # from the WORKING_DIRECTORY property on the test.
                     Push-Location -LiteralPath $buildDir
                     try {
                         $probeOut = & $probe 2>&1
@@ -195,6 +214,36 @@ foreach ($san in $sanList) {
                     } else {
                         Write-Log "shared link gate OK"
                     }
+                }
+
+                # The consumer probe proves that the symbols it names are
+                # exported. It cannot prove that the symbols it does NOT name
+                # are exported, and a new public class with a forgotten
+                # CRPC_API builds cleanly, exports nothing and passes every
+                # suite. scripts/export_gate.py closes that gap by comparing the
+                # headers against the export table; run it in the same place.
+                $gate = Join-Path $SourceDir 'scripts\export_gate.py'
+                if (Test-Path -LiteralPath $gate) {
+                    $python = Get-Command python -ErrorAction SilentlyContinue
+                    if (-not $python) {
+                        Write-Log "export gate skipped: python not on PATH" 'WARN'
+                    } else {
+                        $gateOut = & $python.Source $gate --root $SourceDir --build-dir $buildDir 2>&1
+                        # Read $LASTEXITCODE before anything else can run: a
+                        # pipeline or another native call would overwrite it.
+                        $gateExit = $LASTEXITCODE
+                        $gateOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
+                        $gateOut | ForEach-Object { Write-Host $_ }
+                        if ($gateExit -ne 0) {
+                            Write-Log "export gate FAILED (exit $gateExit)" 'ERROR'
+                            $script:Failures++
+                        } else {
+                            Write-Log "export gate OK"
+                        }
+                    }
+                } else {
+                    Write-Log "export gate missing: $gate" 'ERROR'
+                    $script:Failures++
                 }
             }
 

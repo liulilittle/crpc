@@ -4,6 +4,13 @@
 # never part of the CI pass/fail gate (a shared runner's numbers are not
 # comparable and must not turn a green build red). They are still built with the
 # same warning policy so that benchmark code cannot rot.
+#
+# The executables are written to the build root, next to crpc.dll (shared) and
+# crpc.lib (static). In a shared build the import is then resolved from the
+# executable's own directory; Windows never searches the parent directory, so
+# staging them into <build>/bench/ would need a copy of the DLL. A copy would be
+# wrong under incremental builds: it only runs when the executable relinks, so a
+# library-only rebuild would leave a stale crpc.dll in place.
 
 file(GLOB CRPC_BENCH_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/bench_*.cpp")
@@ -14,11 +21,8 @@ foreach(source ${CRPC_BENCH_SOURCES})
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE crpc)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    # A multi-configuration generator appends `/<CONFIG>` to this directory
+    # automatically, so the plain form is correct for those too.
     set_target_properties(${target} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench")
-    # A shared build stages these into <build>/bench/, one level below
-    # crpc.dll, and the Windows loader does not search the parent directory.
-    if(CRPC_BUILD_SHARED)
-        crpc_copy_dll_beside(${target})
-    endif()
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endforeach()

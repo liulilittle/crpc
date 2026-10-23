@@ -130,6 +130,31 @@ Write-Log "vcvars=$(if ($vcvars) { $vcvars } else { 'n/a' })"
 
 if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 
+# Dependency checkouts are CMake cache variables (CRPC_RTTI_DIR,
+# CRPC_COROCC_DIR). The top-level CMakeLists.txt also falls back to the
+# environment, but forwarding them as -D arguments keeps the configure line
+# self-documenting and independent of how the cmake process is started.
+# A missing RTTI checkout is reported here rather than left to the compiler:
+# without it the tests that use RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot build,
+# and the failure surfaces as a wall of unrelated C2065 errors in test_mvc.cpp.
+$depArgs = @()
+foreach ($dep in @('CRPC_RTTI_DIR', 'CRPC_COROCC_DIR')) {
+    $value = [Environment]::GetEnvironmentVariable($dep)
+    if ($value) {
+        $depArgs += "-D${dep}=$value"
+        Write-Log "$dep=$value"
+    } else {
+        Write-Log "$dep is not set in the environment" 'WARN'
+    }
+}
+if (-not [Environment]::GetEnvironmentVariable('CRPC_RTTI_DIR')) {
+    Write-Log ('CRPC_RTTI_DIR is required for the test suite: set it to the RTTI ' +
+               'checkout root before running this script, for example ' +
+               '$env:CRPC_RTTI_DIR = ''F:\RTTI''. Without it the tests that use ' +
+               'RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot be compiled.') 'ERROR'
+    exit 3
+}
+
 $configs = if ($Config -eq 'Both') { @('Debug', 'Release') } else { @($Config) }
 
 $sanFlags = @{
@@ -159,6 +184,7 @@ foreach ($cfg in $configs) {
         '-DCRPC_BUILD_TESTS=ON'
     )
     $configureArgs += $sanFlags[$Sanitizer]
+    $configureArgs += $depArgs
     if ($script:SharedBuild) {
         $configureArgs += '-DCRPC_BUILD_SHARED=ON'
     } else {

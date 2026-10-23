@@ -94,6 +94,29 @@ esac
 SHARED_ARGS=(-DCRPC_BUILD_SHARED=OFF)
 [[ $SHARED -eq 1 ]] && SHARED_ARGS=(-DCRPC_BUILD_SHARED=ON)
 
+# Dependency checkouts are CMake cache variables (CRPC_RTTI_DIR,
+# CRPC_COROCC_DIR). The top-level CMakeLists.txt also falls back to the
+# environment, but forwarding them as -D arguments keeps the configure line
+# self-documenting and independent of how cmake is started.
+# This script always passes -DCRPC_BUILD_TESTS=ON, and tests that use the
+# RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM macros cannot be compiled without the RTTI
+# checkout. Report that here instead of letting the compiler emit a wall of
+# unrelated errors in test_mvc.cpp.
+DEP_ARGS=()
+for dep in CRPC_RTTI_DIR CRPC_COROCC_DIR; do
+  value="${!dep:-}"
+  if [[ -n "$value" ]]; then
+    DEP_ARGS+=("-D${dep}=$value")
+    log INFO "$dep=$value"
+  else
+    log WARN "$dep is not set in the environment"
+  fi
+done
+if [[ -z "${CRPC_RTTI_DIR:-}" ]]; then
+  log ERROR "CRPC_RTTI_DIR is required for the test suite: export CRPC_RTTI_DIR=/path/to/RTTI before running this script. Without it the tests that use RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot be compiled."
+  exit 3
+fi
+
 log INFO "source=$SOURCE_DIR arch=$ARCH config=$CONFIG sanitizer=$SANITIZER compiler=$COMPILER shared=$SHARED"
 log INFO "cmake=$CMAKE cxx=$CXX_COMPILER log=$LOG"
 
@@ -120,6 +143,7 @@ for cfg in "${CONFIGS[@]}"; do
       -DCMAKE_C_COMPILER="$CC_COMPILER" -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
       -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON \
       "${SHARED_ARGS[@]}" \
+      "${DEP_ARGS[@]}" \
       "${ARCH_ARGS[@]}" "${SAN_ARGS[@]}" >>"$LOG" 2>&1; then
     log ERROR "configure failed ($cfg), see $LOG"
     FAILURES=$((FAILURES + 1))
