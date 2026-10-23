@@ -1,4 +1,4 @@
-﻿# build.ps1 -- one-click build for CRPC (reference implementation, validated).
+# build.ps1 -- one-click build for CRPC (reference implementation, validated).
 # Location in the final repo: <repo>/scripts/build.ps1
 #
 # Usage:

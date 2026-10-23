@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # build.sh -- one-click build for CRPC (Linux/macOS reference implementation).
 # Location in the final repo: <repo>/scripts/build.sh
 #

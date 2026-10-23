@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # test.sh -- one-click test for CRPC (Linux/macOS).
 # Location in the final repo: <repo>/scripts/test.sh
 #
