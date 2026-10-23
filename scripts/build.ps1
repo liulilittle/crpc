@@ -34,12 +34,19 @@ param(
 
     [switch]$Shared,
 
-    [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
+    # parameter defaults before $PSScriptRoot is populated, so a default of
+    # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
+    # argument to parameter 'Path' because it is an empty string" on 5.1.
+    [string]$SourceDir = '',
 
     [string]$BuildRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $SourceDir) {
+    $SourceDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $script:Failures = 0
 $script:Warnings = 0
 
