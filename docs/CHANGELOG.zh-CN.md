@@ -17,9 +17,9 @@
   logger 与 tracer、HTTP 报文/编码/文件层、流控估计器、codec registry 以及 `obs`
   的 span 类型。现在 46 个公开类（43 个顶层类，加上嵌套的 `server::builder`、
   `client::builder`、`http::http_server::builder`）与 51 个含 out-of-line 定义的
-  命名空间级函数，都在自己的声明上带上了装饰。另有 6 个跨 DLL 接口类
-  （`io::completion`、`io::source`、`io::sink`、`io::accept_sink`、`io::listener`、
-  `io::backend_factory`）一并导出：消费者会继承它们并把对象传回库内，因此其析构
+  命名空间级函数，都在自己的声明上带上了装饰。另有 7 个跨 DLL 接口类
+  （`io::completion`、`io::source`、`io::sink`、`io::connection`、`io::accept_sink`、
+  `io::listener`、`io::backend_factory`）一并导出：消费者会继承它们并把对象传回库内，因此其析构
   vtable 槽与 RTTI 必须导出。
 - 影响：MINOR，且是**纯符号变化**。没有符号被删除或改签名，没有公开记录改变布局
   或大小，也没有行为变化。Windows x64 上共享构建的导出表从 586 个名字增长到 1258

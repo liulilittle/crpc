@@ -43,11 +43,11 @@
   registry and the `obs` span type. 46 public classes (43 top level plus the
   nested `server::builder`, `client::builder` and `http::http_server::builder`)
   and 51 namespace-scope functions with out-of-line definitions now carry the
-  decoration on their own declaration. Six cross-DLL interface classes
-  (`io::completion`, `io::source`, `io::sink`, `io::accept_sink`,
-  `io::listener`, `io::backend_factory`) are decorated as well: consumers
-  inherit from them and pass objects back across the boundary, so their
-  destructor vtable slot and RTTI must be exported.
+  decoration on their own declaration. Seven cross-DLL interface classes
+  (`io::completion`, `io::source`, `io::sink`, `io::connection`,
+  `io::accept_sink`, `io::listener`, `io::backend_factory`) are decorated as
+  well: consumers inherit from them and pass objects back across the boundary,
+  so their destructor vtable slot and RTTI must be exported.
 - Impact: MINOR, and it is a **symbol-only change**. No symbol is removed or
   resignatured, no public record changes layout or size, and no behaviour
   changes. A shared build's export table grows from 586 to 1258 names on
