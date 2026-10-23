@@ -9,6 +9,27 @@
 # driver), so the C language must be enabled for this directory.
 enable_language(C)
 
+# In a shared build every test executable imports crpc.dll, which CMake writes
+# to the build root. Windows resolves an import by searching the *executable's
+# own directory* and then the current directory; it does not search the parent
+# of the executable's directory. A test that lives in <build>/tests/ therefore
+# cannot see <build>/crpc.dll, and the process dies before main() with
+# STATUS_DLL_NOT_FOUND (0xC0000135). ctest reports that as a bare exit code
+# with no output, so it looks like a hang or a broken test rather than a
+# missing runtime image.
+#
+# Copying the DLL beside each executable fixes the lookup at the only place
+# that matters -- the image's own directory -- so the test also works when run
+# directly, under a debugger, or from a CI step that bypasses the runner. A
+# PATH entry would only cover the runner's own invocations.
+function(crpc_copy_dll_beside target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:crpc>
+            $<TARGET_FILE_DIR:${target}>
+        VERBATIM)
+endfunction()
+
 file(GLOB CRPC_TEST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*/test_*.cpp")
@@ -42,6 +63,9 @@ foreach(source ${CRPC_TEST_SOURCES})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME ${target} COMMAND ${target})
     set_tests_properties(${target} PROPERTIES TIMEOUT 30)
+    if(CRPC_BUILD_SHARED)
+        crpc_copy_dll_beside(${target})
+    endif()
 endforeach()
 
 set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 120)
@@ -57,6 +81,9 @@ set_target_properties(crpc_test_c_api PROPERTIES
 target_link_libraries(crpc_test_c_api PRIVATE crpc_core)
 add_test(NAME crpc_test_c_api COMMAND crpc_test_c_api)
 set_tests_properties(crpc_test_c_api PROPERTIES TIMEOUT 30)
+if(CRPC_BUILD_SHARED)
+    crpc_copy_dll_beside(crpc_test_c_api)
+endif()
 
 # --- Shared-build link gate --------------------------------------------------
 #
@@ -77,10 +104,8 @@ if(CRPC_BUILD_SHARED)
     target_include_directories(crpc_test_shared_link
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME crpc_test_shared_link COMMAND crpc_test_shared_link)
-    # crpc.dll is written to the build root, so the test's working directory
-    # must be there for the loader to resolve it (Windows searches the
-    # executable's directory first, then the current directory).
-    set_tests_properties(crpc_test_shared_link PROPERTIES
-        TIMEOUT 60
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+    # Same DLL lookup as every other test: the import is resolved from the
+    # executable's own directory, so the probe must sit next to crpc.dll.
+    crpc_copy_dll_beside(crpc_test_shared_link)
+    set_tests_properties(crpc_test_shared_link PROPERTIES TIMEOUT 60)
 endif()
