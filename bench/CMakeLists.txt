@@ -16,4 +16,9 @@ foreach(source ${CRPC_BENCH_SOURCES})
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench")
+    # A shared build stages these into <build>/bench/, one level below
+    # crpc.dll, and the Windows loader does not search the parent directory.
+    if(CRPC_BUILD_SHARED)
+        crpc_copy_dll_beside(${target})
+    endif()
 endforeach()

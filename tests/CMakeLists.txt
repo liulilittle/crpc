@@ -10,25 +10,12 @@
 enable_language(C)
 
 # In a shared build every test executable imports crpc.dll, which CMake writes
-# to the build root. Windows resolves an import by searching the *executable's
-# own directory* and then the current directory; it does not search the parent
-# of the executable's directory. A test that lives in <build>/tests/ therefore
-# cannot see <build>/crpc.dll, and the process dies before main() with
-# STATUS_DLL_NOT_FOUND (0xC0000135). ctest reports that as a bare exit code
-# with no output, so it looks like a hang or a broken test rather than a
-# missing runtime image.
-#
-# Copying the DLL beside each executable fixes the lookup at the only place
-# that matters -- the image's own directory -- so the test also works when run
-# directly, under a debugger, or from a CI step that bypasses the runner. A
-# PATH entry would only cover the runner's own invocations.
-function(crpc_copy_dll_beside target)
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:crpc>
-            $<TARGET_FILE_DIR:${target}>
-        VERBATIM)
-endfunction()
+# to the build root. Windows resolves an import from the executable's own
+# directory and then the current directory; it does not search the parent of
+# the executable's directory, so a test staged into <build>/tests/ dies before
+# main() with STATUS_DLL_NOT_FOUND (0xC0000135). `crpc_copy_dll_beside` is
+# defined by the top-level CMakeLists.txt (inside its CRPC_BUILD_SHARED block)
+# and is shared by every directory that creates executables.
 
 file(GLOB CRPC_TEST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cpp"
