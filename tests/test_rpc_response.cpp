@@ -7,9 +7,12 @@
 // an invalid handle, a completed success, a completed failure, and a cancel.
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <crpc/client_facade.hpp>
@@ -106,6 +109,28 @@ struct stalled_backend final : crpc::backend_factory {
         return nullptr;
     }
 };
+
+// A handler that blocks until the test releases it. It makes "the call is still
+// in flight when `then` is armed" deterministic instead of racing a fast reply.
+struct gate_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+};
+
+crpc::status gate_body(void* self, const crpc::call_envelope&, crpc::span<const std::byte>,
+                       crpc::buffer& out, crpc::rpc::call_context&) {
+    auto* gate = static_cast<gate_state*>(self);
+    {
+        std::unique_lock<std::mutex> lock(gate->mutex);
+        gate->entered = true;
+        gate->cv.notify_all();
+        gate->cv.wait(lock, [gate] { return gate->release; });
+    }
+    (void)crpc::rpc::call_codec<int>::encode(7, out);
+    return crpc::status{};
+}
 
 } // namespace
 
@@ -1114,6 +1139,189 @@ CRPC_TEST(response_wrapper_value_or) {
     srv->stop();
     shard.stop();
     shard.join();
+}
+
+// --- response<Resp> then ----------------------------------------------------
+//
+// Task 4 adds `then(F)`: it forwards to the wrapped `client::call<Resp>::then`,
+// so the callback receives the underlying call handle, runs on the thread that
+// terminates the call, exactly once, and runs immediately on this thread when
+// the call already terminated. `then` returns the response for chaining. A start
+// failure has no call to arm, so it registers nothing.
+
+// A completed call arms the callback after the fact: it runs synchronously on
+// the calling thread, exactly once, with the underlying handle already ready.
+CRPC_TEST(response_wrapper_then_completed_invokes_immediately) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-then-done"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-then-done"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(41);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::client::call<int> handle = std::move(started).value();
+        const crpc::rpc::rpc_result<int> got = handle.get();
+        CRPC_CHECK(got.ok());
+        if (got.ok()) {
+            CRPC_CHECK_EQ(42, got.value());
+        }
+
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(std::move(handle));
+        crpc::response<int> r(std::move(wrapped));
+
+        int calls = 0;
+        bool ready_in_callback = false;
+        const std::thread::id caller = std::this_thread::get_id();
+        std::thread::id callback_thread;
+        crpc::response<int>& chained = r.then(
+            [&calls, &ready_in_callback, &callback_thread](crpc::client::call<int>& c) {
+                ++calls;
+                callback_thread = std::this_thread::get_id();
+                ready_in_callback = c.ready();
+            });
+
+        CRPC_CHECK(&chained == &r);
+        CRPC_CHECK_EQ(1, calls);
+        CRPC_CHECK(callback_thread == caller);
+        CRPC_CHECK(ready_in_callback);
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A call that is still in flight when `then` is armed runs the callback on the
+// completion thread, exactly once, after the handle became ready.
+CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
+    crpc::inproc_backend backend;
+    gate_state gate;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-then-async"), backend);
+    sb.add_service(1, "svc");
+    sb.add_raw_method(1, 1, "gated", &gate_body, &gate);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-then-async"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(10s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(std::move(started).value());
+        crpc::response<int> r(std::move(wrapped));
+
+        bool entered = false;
+        {
+            std::unique_lock<std::mutex> lock(gate.mutex);
+            entered = gate.cv.wait_for(lock, 3s, [&gate] { return gate.entered; });
+        }
+        CRPC_CHECK(entered);
+
+        std::atomic<int> calls{0};
+        const std::thread::id caller = std::this_thread::get_id();
+        std::thread::id callback_thread;
+        bool ready_in_callback = false;
+        crpc::response<int>& chained = r.then(
+            [&calls, &ready_in_callback, &callback_thread](crpc::client::call<int>& c) {
+                ++calls;
+                callback_thread = std::this_thread::get_id();
+                ready_in_callback = c.ready();
+            });
+        CRPC_CHECK(&chained == &r);
+        CRPC_CHECK_EQ(0, calls.load());
+
+        {
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            gate.release = true;
+        }
+        gate.cv.notify_all();
+
+        CRPC_CHECK(crpc_test::wait_for(
+            [&calls] { return calls.load(std::memory_order_acquire) > 0; }, 3000));
+        const crpc::rpc::rpc_result<int> got = r.get();
+        CRPC_CHECK(got.ok());
+        if (got.ok()) {
+            CRPC_CHECK_EQ(7, got.value());
+        }
+        // A second, late invocation would land in this window.
+        std::this_thread::sleep_for(50ms);
+        CRPC_CHECK_EQ(1, calls.load());
+        CRPC_CHECK(callback_thread != caller);
+        CRPC_CHECK(ready_in_callback);
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A start failure has no underlying call: `then` arms nothing, never invokes the
+// callback, and still returns the response for chaining.
+CRPC_TEST(response_wrapper_then_start_error_not_armed) {
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+
+    int calls = 0;
+    crpc::response<int>& chained =
+        r.then([&calls](crpc::client::call<int>&) { ++calls; });
+
+    CRPC_CHECK(&chained == &r);
+    CRPC_CHECK_EQ(0, calls);
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
 }
 
 CRPC_TEST_MAIN()

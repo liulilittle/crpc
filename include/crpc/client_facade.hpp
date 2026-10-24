@@ -50,6 +50,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <crpc/buffer.hpp>
@@ -1944,6 +1945,20 @@ public:
         if (result_.ok()) {
             result_.value().cancel();
         }
+    }
+
+    // Registers a completion callback on the wrapped call handle. It forwards
+    // to `client::call<Resp>::then`, so the callback receives that handle, runs
+    // on the thread that terminates the call (or immediately on this thread
+    // when it already terminated), exactly once. A start failure has no call to
+    // arm: the callback is never registered. Returns `*this` so callers can
+    // chain.
+    template <typename F>
+    [[nodiscard]] response& then(F&& fn) {
+        if (result_.ok()) {
+            result_.value().then(std::forward<F>(fn));
+        }
+        return *this;
     }
 
     // Suspends (or blocks) until a terminal result is available and returns the
