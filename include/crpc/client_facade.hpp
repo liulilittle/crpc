@@ -1929,9 +1929,15 @@ public:
 
     // An invalid response carrying a start failure. `rpc::rpc_result` has no
     // default constructor, so this is the way to build the "nothing started"
-    // value.
+    // value. A composition value type cannot back a started call, so for those
+    // the failure is already terminal and is stored directly (computed mode),
+    // which makes `ready()` agree with `code()`.
     [[nodiscard]] static response error(rpc_error err) {
-        return response(rpc::rpc_result<client::call<Resp>>(std::move(err)));
+        if constexpr (client_detail::is_composition_value_v<Resp>) {
+            return response(rpc::rpc_result<Resp>(std::move(err)));
+        } else {
+            return response(rpc::rpc_result<client::call<Resp>>(std::move(err)));
+        }
     }
 
     [[nodiscard]] bool valid() const noexcept override {
@@ -2082,6 +2088,15 @@ private:
 // Composition helpers over a set of `response<Resp>`. Both return a
 // `response` that holds an already-terminal value rather than a call handle,
 // so the caller can `get()` the composition result directly.
+//
+// `when_all` is a sequential wait: it calls `get()` on every response, so it
+// blocks until the last one terminates and reports the first failure.
+//
+// `when_any` is non-blocking: it polls each response with `try_get()` and
+// returns the first terminal one. When none is terminal it returns a computed
+// error response (`failed_precondition`, "no response ready") without waiting;
+// that result is terminal, so `ready()` is true. This is the brief's reference
+// behaviour and is deliberately not a blocking wait.
 template <typename Resp>
 [[nodiscard]] response<std::vector<rpc::rpc_result<Resp>>> when_all(
     std::vector<response<Resp>>& responses) {

@@ -218,7 +218,10 @@ CRPC_TEST(response_when_all_one_failure) {
     CRPC_CHECK_FALSE(result.ok());
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, result.error().code);
     CRPC_CHECK(result.error().message.find("boom") != std::string::npos);
-    // The computed response exposes the same terminal code through `code()`.
+    // The computed response exposes the same terminal code through `code()`,
+    // and a composition failure is a terminal (computed) result, so `ready()`
+    // is true just like the all-success case.
+    CRPC_CHECK(all.ready());
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, all.code());
 
     cli->close();
@@ -419,6 +422,10 @@ CRPC_TEST(response_when_any_none_ready) {
     const crpc::rpc::rpc_result<crpc::rpc::rpc_result<int>> result = any.get();
     CRPC_CHECK_FALSE(result.ok());
     CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition, result.error().code);
+    // The "none ready" result is terminal by contract, so `ready()` is true and
+    // its code is observable without a wait.
+    CRPC_CHECK(any.ready());
+    CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition, any.code());
 
     cli->close();
     shard.stop();
