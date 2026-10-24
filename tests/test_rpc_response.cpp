@@ -320,8 +320,9 @@ CRPC_TEST(response_call_peek_accessors_canceled) {
 }
 
 // ready-without-get: the low-level call completed (signal fired the callback)
-// but no consumer processed the attempt, so ready() is false and code() is still
-// the default ok (not a failure). get() then records the terminal outcome.
+// but no consumer processed the attempt, so terminal_ready() is false and
+// code() is still the default ok (not a failure). ready() is true (done).
+// get() then records the terminal outcome.
 CRPC_TEST(response_call_peek_accessors_ready_without_get) {
     crpc::inproc_backend backend;
     echo_service service;

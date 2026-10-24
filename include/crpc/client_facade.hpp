@@ -515,10 +515,11 @@ struct CRPC_API call_core {
     std::atomic<bool> completed{false};
     std::atomic<rpc_code> terminal{rpc_code::ok};
     // Set by `record_terminal` once the terminal outcome is published. `ready()`
-    // reports this rather than `done`: `signal()` sets `done` when the low-level
-    // call completes, but the terminal code/origin/error are only recorded when a
-    // consumer (`get()`/`try_get()`) processes the attempt. Reporting `done`
-    // would make `ready()` true while the accessors still hold defaults.
+    // reports `done` (the low-level call completed); `terminal_ready()` reports
+    // this, which becomes true only when a consumer (`get()`/`try_get()`)
+    // processes the attempt. `signal()` sets `done` before the terminal
+    // snapshot exists, so `ready()` alone does not imply the accessors are
+    // readable — use `terminal_ready()` for that.
     std::atomic<bool> terminal_recorded{false};
     // Set by `call::cancel()`, with or without an in-flight low-level call.
     // The retry wait polls it so a backoff can be interrupted.
@@ -574,6 +575,7 @@ struct CRPC_API call_core {
         finalized.store(false, std::memory_order_release);
         terminal.store(rpc_code::ok, std::memory_order_release);
         degraded_.store(false, std::memory_order_release);
+        terminal_recorded.store(false, std::memory_order_release);
     }
     // Publishes the terminal outcome for the non-blocking `code()`/`origin()`/
     // `error()` accessors. `terminal` is atomic; `error`/`origin` are guarded by
