@@ -828,4 +828,292 @@ CRPC_TEST(response_wrapper_ready_follows_terminal) {
     shard.join();
 }
 
+// --- response<Resp> waiting/consuming ---------------------------------------
+//
+// Task 3 adds the blocking and value accessors: `get()`/`wait()`/`park()`
+// (all equivalent), the non-blocking `try_get(out)`, `value()` (throws on
+// failure) and `value_or(fallback)`. A start failure answers from the wrapped
+// error; a started call answers from the handle.
+
+// get()/wait()/park() are equivalent: each returns the same decoded value for a
+// completed success.
+CRPC_TEST(response_wrapper_get_wait_park_success) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-wait-park"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-wait-park"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    {
+        auto stub = cli->service<int, int>(1, 1);
+        auto started = stub.call(41);
+        CRPC_CHECK(started.ok());
+        if (started.ok()) {
+            crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+                std::move(started).value());
+            crpc::response<int> r(std::move(wrapped));
+            const crpc::rpc::rpc_result<int> got = r.get();
+            CRPC_CHECK(got.ok());
+            if (got.ok()) {
+                CRPC_CHECK_EQ(42, got.value());
+            }
+        }
+    }
+    {
+        auto stub = cli->service<int, int>(1, 1);
+        auto started = stub.call(41);
+        CRPC_CHECK(started.ok());
+        if (started.ok()) {
+            crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+                std::move(started).value());
+            crpc::response<int> r(std::move(wrapped));
+            const crpc::rpc::rpc_result<int> got = r.wait();
+            CRPC_CHECK(got.ok());
+            if (got.ok()) {
+                CRPC_CHECK_EQ(42, got.value());
+            }
+        }
+    }
+    {
+        auto stub = cli->service<int, int>(1, 1);
+        auto started = stub.call(41);
+        CRPC_CHECK(started.ok());
+        if (started.ok()) {
+            crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+                std::move(started).value());
+            crpc::response<int> r(std::move(wrapped));
+            const crpc::rpc::rpc_result<int> got = r.park();
+            CRPC_CHECK(got.ok());
+            if (got.ok()) {
+                CRPC_CHECK_EQ(42, got.value());
+            }
+        }
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// get()/wait()/park() on a start failure answer the wrapped error.
+CRPC_TEST(response_wrapper_get_wait_park_start_error) {
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, got.error().code);
+    CRPC_CHECK(got.error().message == "no endpoint");
+
+    const crpc::rpc::rpc_result<int> waited = r.wait();
+    CRPC_CHECK_FALSE(waited.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, waited.error().code);
+
+    const crpc::rpc::rpc_result<int> parked = r.park();
+    CRPC_CHECK_FALSE(parked.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, parked.error().code);
+}
+
+// try_get(out) is non-blocking: an in-flight call that has not completed
+// answers false and leaves `out` untouched.
+CRPC_TEST(response_wrapper_try_get_pending) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-try-pending"), backend);
+    cb.pool_size(1);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+            std::move(started).value());
+        crpc::response<int> r(std::move(wrapped));
+
+        crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+        CRPC_CHECK_FALSE(r.try_get(out));
+        CRPC_CHECK_EQ(crpc::rpc_code::internal, out.error().code);
+
+        r.cancel();
+        const crpc::rpc::rpc_result<int> got = r.get();
+        CRPC_CHECK_FALSE(got.ok());
+        CRPC_CHECK_EQ(crpc::rpc_code::canceled, got.error().code);
+    }
+
+    cli->close();
+    shard.stop();
+    shard.join();
+}
+
+// try_get(out) on a start failure writes the wrapped error and returns true.
+CRPC_TEST(response_wrapper_try_get_error) {
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+
+    crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+    CRPC_CHECK(r.try_get(out));
+    CRPC_CHECK_FALSE(out.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, out.error().code);
+    CRPC_CHECK(out.error().message == "no endpoint");
+}
+
+// value() returns the decoded value on success.
+CRPC_TEST(response_wrapper_value_success) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-value"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-value"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(41);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+            std::move(started).value());
+        crpc::response<int> r(std::move(wrapped));
+        CRPC_CHECK_EQ(42, r.value());
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// value() throws the terminal rpc_error on failure.
+CRPC_TEST(response_wrapper_value_throws) {
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+
+    bool threw = false;
+    try {
+        (void)r.value();
+    } catch (const crpc::rpc_error& e) {
+        threw = true;
+        CRPC_CHECK_EQ(crpc::rpc_code::unavailable, e.code);
+        CRPC_CHECK(e.message == "no endpoint");
+    }
+    CRPC_CHECK(threw);
+}
+
+// value_or(fallback) returns the value on success and the fallback on failure.
+CRPC_TEST(response_wrapper_value_or) {
+    crpc::response<int> failed = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+    CRPC_CHECK_EQ(7, failed.value_or(7));
+
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-value-or"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-value-or"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(41);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+            std::move(started).value());
+        crpc::response<int> r(std::move(wrapped));
+        CRPC_CHECK_EQ(42, r.value_or(7));
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
 CRPC_TEST_MAIN()

@@ -1946,6 +1946,45 @@ public:
         }
     }
 
+    // Suspends (or blocks) until a terminal result is available and returns the
+    // decoded value, or the terminal error. A start failure answers directly
+    // from the wrapped error. `wait()` and `park()` are aliases.
+    [[nodiscard]] rpc::rpc_result<Resp> get() {
+        if (!result_.ok()) {
+            return rpc::rpc_result<Resp>(result_.error());
+        }
+        return result_.value().get();
+    }
+
+    [[nodiscard]] rpc::rpc_result<Resp> wait() { return get(); }
+    [[nodiscard]] rpc::rpc_result<Resp> park() { return get(); }
+
+    // Non-blocking read. A start failure is already terminal, so it writes the
+    // wrapped error and returns true; an in-flight or completed call delegates
+    // to the handle's `try_get`.
+    [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
+        if (!result_.ok()) {
+            out = rpc::rpc_result<Resp>(result_.error());
+            return true;
+        }
+        return result_.value().try_get(out);
+    }
+
+    // Returns the decoded value, or throws the terminal `rpc_error`.
+    [[nodiscard]] Resp value() {
+        auto r = get();
+        if (!r.ok()) {
+            throw r.error();
+        }
+        return std::move(r).value();
+    }
+
+    // Returns the decoded value, or `fallback` when the call failed.
+    [[nodiscard]] Resp value_or(Resp fallback) {
+        auto r = get();
+        return r.ok() ? std::move(r).value() : std::move(fallback);
+    }
+
 private:
     rpc::rpc_result<client::call<Resp>> result_;
 };
