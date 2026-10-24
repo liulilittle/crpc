@@ -1877,6 +1877,24 @@ rpc::rpc_result<Resp> client::fallback_for(
     return rpc::rpc_result<Resp>(std::move(error));
 }
 
+namespace client_detail {
+// True for the value types the composition helpers produce: a single
+// `rpc_result` (`when_any`) or a vector of them (`when_all`). Such a type is
+// never a wire-decodable call value, so a `response` holding one is always a
+// computed result; the call-handle path (`client::call<Resp>::get`, which
+// requires a default-constructible, codec-decodable `Resp`) must not be
+// instantiated for it.
+template <typename T>
+struct is_composition_value : std::false_type {};
+template <typename T>
+struct is_composition_value<rpc::rpc_result<T>> : std::true_type {};
+template <typename T>
+struct is_composition_value<std::vector<rpc::rpc_result<T>>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_composition_value_v = is_composition_value<T>::value;
+} // namespace client_detail
+
 // Type-erased view of a `response<Resp>`, for code that must observe a response
 // without naming its value type. Task 2 defines only the diagnostic skeleton;
 // the waiting/consuming half (`get`/`wait`/`then`) arrives with the later tasks.
@@ -1902,6 +1920,13 @@ public:
     explicit response(rpc::rpc_result<client::call<Resp>> result)
         : result_(std::move(result)) {}
 
+    // A response that already holds a terminal value rather than a call handle.
+    // The composition helpers (`when_all`/`when_any`) build their result from
+    // other responses, so there is no handle left to wait on. `get()` then
+    // returns the stored result instead of delegating to a call.
+    explicit response(rpc::rpc_result<Resp> result)
+        : computed_(std::move(result)) {}
+
     // An invalid response carrying a start failure. `rpc::rpc_result` has no
     // default constructor, so this is the way to build the "nothing started"
     // value.
@@ -1910,40 +1935,66 @@ public:
     }
 
     [[nodiscard]] bool valid() const noexcept override {
-        return result_.ok() && result_.value().valid();
+        if (computed_) {
+            return computed_->ok();
+        }
+        return result_->ok() && result_->value().valid();
     }
     // Follows the terminal snapshot, so `ready()` agrees with `code()`: the
-    // accessors are meaningful only once a consumer recorded the outcome.
+    // accessors are meaningful only once a consumer recorded the outcome. A
+    // computed response is terminal by construction.
     [[nodiscard]] bool ready() const noexcept override {
-        return result_.ok() && result_.value().terminal_ready();
+        if (computed_) {
+            return true;
+        }
+        return result_->ok() && result_->value().terminal_ready();
     }
     [[nodiscard]] std::uint32_t attempts() const noexcept override {
-        return result_.ok() ? result_.value().attempts() : 0;
+        if (computed_) {
+            return 0;
+        }
+        return result_->ok() ? result_->value().attempts() : 0;
     }
     [[nodiscard]] bool degraded() const noexcept override {
-        return result_.ok() && result_.value().degraded();
+        if (computed_) {
+            return false;
+        }
+        return result_->ok() && result_->value().degraded();
     }
     [[nodiscard]] rpc_code code() const noexcept override {
-        return result_.ok() ? result_.value().code() : result_.error().code;
+        if (computed_) {
+            return computed_->code();
+        }
+        return result_->ok() ? result_->value().code() : result_->error().code;
     }
     [[nodiscard]] client_detail::failure_origin origin() const noexcept override {
-        return result_.ok() ? result_.value().origin()
-                            : client_detail::result_origin(result_.error());
+        if (computed_) {
+            return computed_->ok() ? client_detail::failure_origin::remote
+                                   : client_detail::result_origin(computed_->error());
+        }
+        return result_->ok() ? result_->value().origin()
+                             : client_detail::result_origin(result_->error());
     }
     [[nodiscard]] rpc_error error() const noexcept override {
-        if (!result_.ok()) {
-            return result_.error();
+        if (computed_) {
+            return computed_->ok() ? rpc_error(rpc_code::ok) : computed_->error();
+        }
+        if (!result_->ok()) {
+            return result_->error();
         }
         // A fallback-answered call is a success: report the same `ok` that
         // `code()` reports instead of the refusal that triggered the fallback.
-        if (result_.value().degraded()) {
+        if (result_->value().degraded()) {
             return rpc_error(rpc_code::ok);
         }
-        return result_.value().error();
+        return result_->value().error();
     }
     void cancel() noexcept override {
-        if (result_.ok()) {
-            result_.value().cancel();
+        if (computed_) {
+            return;
+        }
+        if (result_->ok()) {
+            result_->value().cancel();
         }
     }
 
@@ -1952,11 +2003,13 @@ public:
     // on the thread that terminates the call (or immediately on this thread
     // when it already terminated), exactly once. A start failure has no call to
     // arm: the callback is never registered. Returns `*this` so callers can
-    // chain.
+    // chain. A computed response has no handle, so it arms nothing.
     template <typename F>
     [[nodiscard]] response& then(F&& fn) {
-        if (result_.ok()) {
-            result_.value().then(std::forward<F>(fn));
+        if constexpr (!client_detail::is_composition_value_v<Resp>) {
+            if (result_ && result_->ok()) {
+                result_->value().then(std::forward<F>(fn));
+            }
         }
         return *this;
     }
@@ -1965,10 +2018,20 @@ public:
     // decoded value, or the terminal error. A start failure answers directly
     // from the wrapped error. `wait()` and `park()` are aliases.
     [[nodiscard]] rpc::rpc_result<Resp> get() {
-        if (!result_.ok()) {
-            return rpc::rpc_result<Resp>(result_.error());
+        if (computed_) {
+            return *computed_;
         }
-        return result_.value().get();
+        if constexpr (client_detail::is_composition_value_v<Resp>) {
+            // A composition value cannot back a started call handle, so an
+            // engaged handle here is the start-failure shape built by
+            // `error()`: report the wrapped error.
+            return rpc::rpc_result<Resp>(result_->error());
+        } else {
+            if (!result_->ok()) {
+                return rpc::rpc_result<Resp>(result_->error());
+            }
+            return result_->value().get();
+        }
     }
 
     [[nodiscard]] rpc::rpc_result<Resp> wait() { return get(); }
@@ -1976,13 +2039,22 @@ public:
 
     // Non-blocking read. A start failure is already terminal, so it writes the
     // wrapped error and returns true; an in-flight or completed call delegates
-    // to the handle's `try_get`.
+    // to the handle's `try_get`. A computed response is always ready.
     [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
-        if (!result_.ok()) {
-            out = rpc::rpc_result<Resp>(result_.error());
+        if (computed_) {
+            out = *computed_;
             return true;
         }
-        return result_.value().try_get(out);
+        if constexpr (client_detail::is_composition_value_v<Resp>) {
+            out = rpc::rpc_result<Resp>(result_->error());
+            return true;
+        } else {
+            if (!result_->ok()) {
+                out = rpc::rpc_result<Resp>(result_->error());
+                return true;
+            }
+            return result_->value().try_get(out);
+        }
     }
 
     // Returns the decoded value, or throws the terminal `rpc_error`.
@@ -2001,8 +2073,50 @@ public:
     }
 
 private:
-    rpc::rpc_result<client::call<Resp>> result_;
+    // Exactly one of `result_` (a started call handle) and `computed_` (an
+    // already-terminal value) is engaged.
+    std::optional<rpc::rpc_result<client::call<Resp>>> result_;
+    std::optional<rpc::rpc_result<Resp>> computed_;
 };
+
+// Composition helpers over a set of `response<Resp>`. Both return a
+// `response` that holds an already-terminal value rather than a call handle,
+// so the caller can `get()` the composition result directly.
+template <typename Resp>
+[[nodiscard]] response<std::vector<rpc::rpc_result<Resp>>> when_all(
+    std::vector<response<Resp>>& responses) {
+    std::vector<rpc::rpc_result<Resp>> results;
+    results.reserve(responses.size());
+    rpc_error first_error;
+    bool has_error = false;
+    for (auto& r : responses) {
+        auto res = r.get();
+        if (!res.ok() && !has_error) {
+            first_error = res.error();
+            has_error = true;
+        }
+        results.push_back(std::move(res));
+    }
+    if (has_error) {
+        return response<std::vector<rpc::rpc_result<Resp>>>::error(first_error);
+    }
+    return response<std::vector<rpc::rpc_result<Resp>>>(
+        rpc::rpc_result<std::vector<rpc::rpc_result<Resp>>>(std::move(results)));
+}
+
+template <typename Resp>
+[[nodiscard]] response<rpc::rpc_result<Resp>> when_any(
+    std::vector<response<Resp>>& responses) {
+    for (auto& r : responses) {
+        rpc::rpc_result<Resp> out(rpc_code::ok);
+        if (r.try_get(out)) {
+            return response<rpc::rpc_result<Resp>>(
+                rpc::rpc_result<rpc::rpc_result<Resp>>(std::move(out)));
+        }
+    }
+    return response<rpc::rpc_result<Resp>>::error(
+        rpc_error(rpc_code::failed_precondition, "no response ready"));
+}
 
 } // namespace crpc
 
