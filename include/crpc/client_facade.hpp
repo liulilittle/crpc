@@ -969,9 +969,18 @@ public:
         // terminal code; `origin()`/`error()` read the snapshot the terminal
         // transition recorded under `core.mutex`. An invalid handle answers the
         // `invalid_argument` sentinel pair rather than dereferencing null.
+        //
+        // A fallback that answered the call is a success from the caller's point
+        // of view: `get()` returns the fallback value, so `code()` must report
+        // `ok` rather than the underlying failure that triggered the fallback
+        // (`degraded()` distinguishes it). Otherwise `code()` and
+        // `get().code()` disagree for a degraded call.
         [[nodiscard]] rpc_code code() const noexcept {
             if (state_ == nullptr) {
                 return rpc_code::invalid_argument;
+            }
+            if (state_->core.degraded()) {
+                return rpc_code::ok;
             }
             return state_->core.terminal.load(std::memory_order_acquire);
         }

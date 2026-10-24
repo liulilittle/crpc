@@ -38,6 +38,35 @@ crpc::status fail_body(void*, const crpc::call_envelope&, crpc::span<const std::
     return crpc::status{crpc::rpc_error(crpc::rpc_code::unavailable, "boom")};
 }
 
+// Fallback state for the degraded case. `refs` is intrusive: the caller owns one
+// reference and the installed policy owns another; whoever drops the last frees.
+struct cache_state {
+    int value = 0;
+    int calls = 0;
+    std::atomic<int> refs{1};
+};
+
+crpc::status cached_fallback(void* self,
+                             const crpc::resilience::fallback_context&,
+                             crpc::buffer& out) noexcept {
+    auto* cache = static_cast<cache_state*>(self);
+    ++cache->calls;
+    (void)crpc::rpc::call_codec<int>::encode(cache->value, out);
+    return crpc::status{};
+}
+
+void* retain_cache(void* self) noexcept {
+    ++static_cast<cache_state*>(self)->refs;
+    return self;
+}
+
+void release_cache(void* self) noexcept {
+    auto* cache = static_cast<cache_state*>(self);
+    if (cache->refs.fetch_sub(1) == 1) {
+        delete cache;
+    }
+}
+
 // A backend whose connection accepts and never completes a write: the call
 // stays in flight so it can be cancelled before get().
 struct stalled_connection final : crpc::connection {
@@ -168,6 +197,89 @@ CRPC_TEST(response_call_peek_accessors_completed) {
     srv->stop();
     shard.stop();
     shard.join();
+}
+
+// A fallback that answered the call is a degraded success: `get()` returns the
+// fallback value, so `code()` must report `ok` and agree with `get().code()`,
+// not the underlying breaker refusal that triggered the fallback.
+CRPC_TEST(response_call_peek_accessors_degraded) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    // The server breaker opens after one dependency failure and refuses later
+    // calls before the handler runs, marking the refusal `crpc-degradable`.
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("peek-degraded"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    sb.add_raw_method(1, 2, "fail", &fail_body, nullptr);
+    crpc::resilience::breaker_config server_breaker;
+    server_breaker.min_requests = 1;
+    server_breaker.failure_ratio_threshold = 0.0;
+    server_breaker.slow_call_threshold = std::chrono::seconds(10);
+    server_breaker.open_duration = std::chrono::seconds(5);
+    sb.breaker(server_breaker);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("peek-degraded"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(std::chrono::seconds(2));
+    cb.plain_thread_timeout(std::chrono::seconds(2));
+    // A remote refusal (sent == true) may only be degraded for an idempotent
+    // call.
+    cb.default_idempotent(true);
+    crpc::resilience::retry_policy retry;
+    retry.max_attempts = 1;
+    cb.retry(retry);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        return;
+    }
+
+    auto* cache = new cache_state{41, 0};
+    CRPC_CHECK(cli->set_fallback(&cached_fallback, cache,
+                                 std::chrono::nanoseconds{0}, &retain_cache,
+                                 &release_cache));
+
+    // Open the server breaker with a plain handler failure.
+    {
+        auto fail = cli->service<int, int>(1, 2);
+        auto started = fail.call(1);
+        if (started.ok()) {
+            auto handle = std::move(started).value();
+            (void)handle.get();
+        }
+    }
+
+    // An idempotent echo now meets the open breaker and is answered by the
+    // fallback value.
+    {
+        auto echo = cli->service<int, int>(1, 1);
+        auto started = echo.call(2);
+        CRPC_CHECK(started.ok());
+        if (started.ok()) {
+            crpc::client::call<int> handle = std::move(started).value();
+            const crpc::rpc::rpc_result<int> result = handle.get();
+            CRPC_CHECK(result.ok());
+            if (result.ok()) {
+                CRPC_CHECK_EQ(41, result.value());
+            }
+            CRPC_CHECK(handle.degraded());
+            CRPC_CHECK_EQ(crpc::rpc_code::ok, handle.code());
+            CRPC_CHECK_EQ(crpc::rpc_code::ok, result.code());
+        }
+    }
+
+    release_cache(cache);
+    cli->close();
+    srv->stop();
 }
 
 // A cancelled call reports `canceled` from the accessors without a wait.
