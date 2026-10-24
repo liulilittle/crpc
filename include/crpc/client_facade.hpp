@@ -507,7 +507,19 @@ struct CRPC_API call_core {
     // terminal transition. Guards exactly-once release of the deadline timer,
     // the connection slot and the breaker permit.
     std::atomic<bool> finalized{false};
+    // Set only by the paths that hand a terminal result to the caller
+    // (`get()`/`try_get()`, close, cancel). Unlike `done`, which `signal()` sets
+    // on every attempt completion, this stays false while a retry backoff is in
+    // progress, so `cancel()` can still interrupt it. `cancel()` treats it as
+    // "already terminal" and leaves the recorded outcome untouched.
+    std::atomic<bool> completed{false};
     std::atomic<rpc_code> terminal{rpc_code::ok};
+    // Set by `record_terminal` once the terminal outcome is published. `ready()`
+    // reports this rather than `done`: `signal()` sets `done` when the low-level
+    // call completes, but the terminal code/origin/error are only recorded when a
+    // consumer (`get()`/`try_get()`) processes the attempt. Reporting `done`
+    // would make `ready()` true while the accessors still hold defaults.
+    std::atomic<bool> terminal_recorded{false};
     // Set by `call::cancel()`, with or without an in-flight low-level call.
     // The retry wait polls it so a backoff can be interrupted.
     std::atomic<bool> canceled{false};
@@ -575,6 +587,7 @@ struct CRPC_API call_core {
         std::lock_guard<std::mutex> lk(mutex);
         this->error = std::move(err);
         this->origin = org;
+        terminal_recorded.store(true, std::memory_order_release);
     }
 
     // --- `then` callback (inline, heap-free) ---
@@ -958,8 +971,16 @@ public:
         ~call() { release(); }
 
         [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
+        // True once the low-level call has completed (`signal()` sets `done`).
+        // The non-blocking accessors (`code()`/`origin()`/`error()`) become
+        // meaningful only after a consumer processes the attempt (`get()`/
+        // `try_get()` records the terminal snapshot); before that they hold
+        // defaults. `terminal_ready()` reports the stricter condition.
         [[nodiscard]] bool ready() const noexcept {
             return state_ != nullptr && state_->core.done.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] bool terminal_ready() const noexcept {
+            return state_ != nullptr && state_->core.terminal_recorded.load(std::memory_order_acquire);
         }
         [[nodiscard]] std::uint32_t attempts() const noexcept {
             return state_ != nullptr ? state_->core.attempts : 0;
@@ -1047,8 +1068,11 @@ public:
                 ~terminal_guard() {
                     if (st) {
                         // Mark the call terminal for `ready()`/`try_get()` and
-                        // run the `then` callback exactly once.
+                        // run the `then` callback exactly once. `completed`
+                        // distinguishes this terminal hand-off from the
+                        // per-attempt `done` so a later cancel() is a no-op.
                         st->core.done.store(true, std::memory_order_release);
+                        st->core.completed.store(true, std::memory_order_release);
                         st->core.invoke_callback();
                     }
                 }
@@ -1281,6 +1305,14 @@ public:
             if (state_ == nullptr) {
                 return;
             }
+            // A terminal call must not be touched: `get()`'s terminal guard (or
+            // close/cancel) set `completed` when the result was handed over, so
+            // a cancel after a successful get() is a no-op and cannot turn
+            // `code()` from ok into canceled. `done` alone is not enough: it is
+            // set on every attempt, including one that is about to be retried.
+            if (state_->core.completed.load(std::memory_order_acquire)) {
+                return;
+            }
             // Set the flag even when there is no low-level inner call: during a
             // retry backoff there is nothing to cancel at the transport, but
             // the waiter must stop.
@@ -1292,6 +1324,7 @@ public:
                 rpc_code::canceled,
                 rpc_error(rpc_code::canceled, "call canceled"),
                 client_detail::failure_origin::cancel);
+            state_->core.completed.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(state_->inner_mutex);
                 if (state_->inner.has_value()) {

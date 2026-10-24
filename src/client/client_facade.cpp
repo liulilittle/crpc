@@ -621,6 +621,7 @@ void client::finalize_active(
         core->record_terminal(rpc_code::shutting_down,
                               rpc_error(rpc_code::shutting_down, "client is closed"),
                               client_detail::failure_origin::local_lifecycle);
+        core->completed.store(true, std::memory_order_release);
         core->cv.notify_all();
         // A `then` callback registered before close() still fires, reporting
         // the shutdown through the handle the callback received.

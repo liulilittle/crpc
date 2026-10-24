@@ -319,4 +319,131 @@ CRPC_TEST(response_call_peek_accessors_canceled) {
     shard.join();
 }
 
+// ready-without-get: the low-level call completed (signal fired the callback)
+// but no consumer processed the attempt, so ready() is false and code() is still
+// the default ok (not a failure). get() then records the terminal outcome.
+CRPC_TEST(response_call_peek_accessors_ready_without_get) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("peek-ready"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    sb.add_raw_method(1, 2, "fail", &fail_body, nullptr);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("peek-ready"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 2);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::client::call<int> handle = std::move(started).value();
+        std::atomic<bool> fired{false};
+        handle.then([&fired](crpc::client::call<int>&) {
+            fired.store(true, std::memory_order_release);
+        });
+        // The low-level call completed and the callback ran, but no consumer
+        // called get() yet. `ready()` is true (done), but the terminal
+        // snapshot is published only when a consumer processes the attempt,
+        // so the accessors still hold defaults.
+        CRPC_CHECK(crpc_test::wait_for(
+            [&fired] { return fired.load(std::memory_order_acquire); }, 3000));
+        CRPC_CHECK(handle.ready());
+        CRPC_CHECK_FALSE(handle.terminal_ready());
+        CRPC_CHECK_EQ(crpc::rpc_code::ok, handle.code());
+        // get() publishes the terminal outcome.
+        const crpc::rpc::rpc_result<int> result = handle.get();
+        CRPC_CHECK_FALSE(result.ok());
+        CRPC_CHECK(handle.ready());
+        CRPC_CHECK(handle.terminal_ready());
+        CRPC_CHECK_EQ(crpc::rpc_code::unavailable, handle.code());
+        CRPC_CHECK(handle.origin() == crpc::client_detail::failure_origin::remote);
+        const crpc::rpc_error peek_err = handle.error();
+        CRPC_CHECK_EQ(crpc::rpc_code::unavailable, peek_err.code);
+        CRPC_CHECK(peek_err.message.find("boom") != std::string::npos);
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A cancel after a successful get() must not change the terminal code.
+CRPC_TEST(response_call_peek_accessors_cancel_after_get) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("peek-cancel-after"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("peek-cancel-after"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(41);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::client::call<int> handle = std::move(started).value();
+        const crpc::rpc::rpc_result<int> result = handle.get();
+        CRPC_CHECK(result.ok());
+        CRPC_CHECK_EQ(42, result.value());
+        CRPC_CHECK_EQ(crpc::rpc_code::ok, handle.code());
+        handle.cancel();
+        CRPC_CHECK_EQ(crpc::rpc_code::ok, handle.code());
+        CRPC_CHECK(handle.origin() == crpc::client_detail::failure_origin::remote);
+    }
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
 CRPC_TEST_MAIN()
