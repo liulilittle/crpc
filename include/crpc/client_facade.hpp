@@ -852,6 +852,9 @@ struct wake_functor {
 
 } // namespace client_detail
 
+template <typename Resp>
+class response;
+
 class CRPC_API client {
 public:
     struct endpoint_config {
@@ -1872,6 +1875,66 @@ rpc::rpc_result<Resp> client::fallback_for(
     // failure unless a value was applied.
     return rpc::rpc_result<Resp>(std::move(error));
 }
+
+// Type-erased view of a `response<Resp>`, for code that must observe a response
+// without naming its value type. Task 2 defines only the diagnostic skeleton;
+// the waiting/consuming half (`get`/`wait`/`then`) arrives with the later tasks.
+class response_base {
+public:
+    virtual ~response_base() = default;
+    [[nodiscard]] virtual bool valid() const noexcept = 0;
+    [[nodiscard]] virtual bool ready() const noexcept = 0;
+    [[nodiscard]] virtual std::uint32_t attempts() const noexcept = 0;
+    [[nodiscard]] virtual bool degraded() const noexcept = 0;
+    [[nodiscard]] virtual rpc_code code() const noexcept = 0;
+    [[nodiscard]] virtual client_detail::failure_origin origin() const noexcept = 0;
+    [[nodiscard]] virtual rpc_error error() const noexcept = 0;
+    virtual void cancel() noexcept = 0;
+};
+
+// Unified result wrapper over the `rpc::rpc_result<client::call<Resp>>` that a
+// call start returns. A start failure (the result holds an `rpc_error`) answers
+// from the error; a started call answers from the handle.
+template <typename Resp>
+class [[nodiscard]] response final : public response_base {
+public:
+    response() = default;
+    explicit response(rpc::rpc_result<client::call<Resp>> result)
+        : result_(std::move(result)) {}
+
+    [[nodiscard]] bool valid() const noexcept override {
+        return result_.ok() && result_.value().valid();
+    }
+    // Follows the terminal snapshot, so `ready()` agrees with `code()`: the
+    // accessors are meaningful only once a consumer recorded the outcome.
+    [[nodiscard]] bool ready() const noexcept override {
+        return result_.ok() && result_.value().terminal_ready();
+    }
+    [[nodiscard]] std::uint32_t attempts() const noexcept override {
+        return result_.ok() ? result_.value().attempts() : 0;
+    }
+    [[nodiscard]] bool degraded() const noexcept override {
+        return result_.ok() && result_.value().degraded();
+    }
+    [[nodiscard]] rpc_code code() const noexcept override {
+        return result_.ok() ? result_.value().code() : result_.error().code;
+    }
+    [[nodiscard]] client_detail::failure_origin origin() const noexcept override {
+        return result_.ok() ? result_.value().origin()
+                            : client_detail::result_origin(result_.error());
+    }
+    [[nodiscard]] rpc_error error() const noexcept override {
+        return result_.ok() ? result_.value().error() : result_.error();
+    }
+    void cancel() noexcept override {
+        if (result_.ok()) {
+            result_.value().cancel();
+        }
+    }
+
+private:
+    rpc::rpc_result<client::call<Resp>> result_;
+};
 
 } // namespace crpc
 
