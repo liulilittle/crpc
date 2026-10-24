@@ -47,6 +47,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <vector>
@@ -72,6 +73,194 @@ namespace crpc {
 class client;
 
 namespace client_detail {
+
+// Fixed-capacity open-addressing hash map with linear probing, used for the
+// client's active-call registry. The registry is written on every attempt, so a
+// `std::unordered_map` there put one system allocation on the call path; this
+// container allocates its table once and grows only while the in-flight set is
+// growing, so a steady-state call reaches the allocator nowhere.
+template <typename Key, typename Value>
+class flat_pool_map {
+private:
+    struct entry {
+        Key first{};
+        Value second{};
+        bool used = false;
+    };
+
+public:
+    flat_pool_map() { init(16); }
+    ~flat_pool_map() = default;
+    flat_pool_map(const flat_pool_map&) = delete;
+    flat_pool_map& operator=(const flat_pool_map&) = delete;
+
+    void init(std::size_t capacity) {
+        std::size_t size = 2;
+        while (size < capacity * 2) {
+            size <<= 1;
+        }
+        capacity_ = size;
+        entries_.reset(new entry[capacity_]());
+        size_ = 0;
+    }
+
+    class iterator {
+    public:
+        iterator() = default;
+        iterator(flat_pool_map* owner, std::size_t index) : owner_(owner), index_(index) {}
+        entry& operator*() const { return owner_->entries_[index_]; }
+        entry* operator->() const { return &owner_->entries_[index_]; }
+        iterator& operator++() {
+            index_ = owner_->next_used(index_ + 1);
+            return *this;
+        }
+        bool operator==(const iterator& other) const {
+            return owner_ == other.owner_ && index_ == other.index_;
+        }
+        bool operator!=(const iterator& other) const { return !(*this == other); }
+
+    private:
+        friend class flat_pool_map;
+        flat_pool_map* owner_ = nullptr;
+        std::size_t index_ = 0;
+    };
+
+    [[nodiscard]] Value* find(const Key& key) {
+        if (capacity_ == 0) {
+            return nullptr;
+        }
+        std::size_t index = hash_key(key) & (capacity_ - 1);
+        for (std::size_t probe = 0; probe < capacity_; ++probe) {
+            if (!entries_[index].used) {
+                return nullptr;
+            }
+            if (entries_[index].first == key) {
+                return &entries_[index].second;
+            }
+            index = (index + 1) & (capacity_ - 1);
+        }
+        return nullptr;
+    }
+
+    void emplace(const Key& key, Value value) {
+        if (size_ + 1 > capacity_ * 3 / 4) {
+            grow();
+        }
+        std::size_t index = hash_key(key) & (capacity_ - 1);
+        for (;;) {
+            if (!entries_[index].used) {
+                entries_[index].used = true;
+                entries_[index].first = key;
+                entries_[index].second = std::move(value);
+                ++size_;
+                return;
+            }
+            if (entries_[index].first == key) {
+                entries_[index].second = std::move(value);
+                return;
+            }
+            index = (index + 1) & (capacity_ - 1);
+        }
+    }
+
+    void erase(const Key& key) {
+        if (capacity_ == 0) {
+            return;
+        }
+        std::size_t index = hash_key(key) & (capacity_ - 1);
+        for (std::size_t probe = 0; probe < capacity_; ++probe) {
+            if (!entries_[index].used) {
+                return;
+            }
+            if (entries_[index].first == key) {
+                entries_[index].second = Value{};
+                entries_[index].used = false;
+                --size_;
+                // Backward-shift deletion, as in `rpc::stream_map`: scan
+                // forward and pull forward every entry whose ideal slot is at
+                // or before the hole.
+                std::size_t i = index;
+                std::size_t j = index;
+                for (;;) {
+                    j = (j + 1) & (capacity_ - 1);
+                    if (!entries_[j].used) {
+                        break;
+                    }
+                    const std::size_t ideal = hash_key(entries_[j].first) & (capacity_ - 1);
+                    if (cyclically_between(ideal, i, j)) {
+                        entries_[i] = entries_[j];
+                        entries_[j].second = Value{};
+                        entries_[j].used = false;
+                        i = j;
+                    }
+                }
+                entries_[i].second = Value{};
+                entries_[i].used = false;
+                return;
+            }
+            index = (index + 1) & (capacity_ - 1);
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    void clear() noexcept {
+        if (capacity_ == 0) {
+            return;
+        }
+        for (std::size_t i = 0; i < capacity_; ++i) {
+            entries_[i].second = Value{};
+            entries_[i].used = false;
+        }
+        size_ = 0;
+    }
+
+    [[nodiscard]] iterator begin() { return iterator(this, next_used(0)); }
+    [[nodiscard]] iterator end() { return iterator(this, capacity_); }
+
+private:
+    static std::size_t hash_key(const Key& key) {
+        return std::hash<Key>{}(key);
+    }
+
+    // True when the hole `i` lies in the entry's probe chain, i.e. in the
+    // cyclic half-open range `[ideal, j)` for the entry at `j`.
+    static bool cyclically_between(std::size_t ideal, std::size_t i, std::size_t j) {
+        if (ideal <= j) {
+            return ideal <= i && i < j;
+        }
+        return i >= ideal || i < j;
+    }
+
+    void grow() {
+        const std::size_t new_capacity = capacity_ == 0 ? 16 : capacity_ * 2;
+        std::unique_ptr<entry[]> fresh(new entry[new_capacity]());
+        for (std::size_t i = 0; i < capacity_; ++i) {
+            if (!entries_[i].used) {
+                continue;
+            }
+            std::size_t index = hash_key(entries_[i].first) & (new_capacity - 1);
+            while (fresh[index].used) {
+                index = (index + 1) & (new_capacity - 1);
+            }
+            fresh[index] = entries_[i];
+        }
+        entries_ = std::move(fresh);
+        capacity_ = new_capacity;
+    }
+
+    [[nodiscard]] std::size_t next_used(std::size_t from) const {
+        for (std::size_t i = from; i < capacity_; ++i) {
+            if (entries_[i].used) {
+                return i;
+            }
+        }
+        return capacity_;
+    }
+
+    std::unique_ptr<entry[]> entries_;
+    std::size_t capacity_ = 0;
+    std::size_t size_ = 0;
+};
 
 // One pooled connection plus its serialization lock.
 struct connection_slot {
@@ -291,6 +480,13 @@ private:
     std::size_t count_ = 0;
 };
 
+// Invokes a `then` callback armed on a `call_core`. `owner` is the
+// `client::call<Resp>*` on which `then` was called. Mirrors the low-level
+// `call_callback_invoker` but for the facade call state.
+struct call_core;
+using call_core_callback_invoker = void (*)(void* storage, void* owner,
+                                            call_core& core) noexcept;
+
 // Type-independent per-call state.
 struct CRPC_API call_core {
     // Atomic: the completion callback may read it on a backend thread while
@@ -334,9 +530,28 @@ struct CRPC_API call_core {
     std::mutex attempt_mutex;
     resilience::breaker_permit permit;
     std::optional<resilience::bulkhead_permit> bulkhead;
-    std::unique_ptr<resilience::retry_sequence> retry;
+    // Per-call retry state machine. Non-owning: the `retry_sequence` lives
+    // inline in `call_state<Resp>::retry_value`, so a call no longer needs a
+    // second per-call `make_unique`. Null until `start_encoded` emplaces the
+    // sequence from the client's policy and shared budget. A raw pointer keeps
+    // `call_core`'s layout identical to the `unique_ptr` it replaces.
+    resilience::retry_sequence* retry = nullptr;
 
     void signal() noexcept;
+    // Invokes the armed `then` callback exactly once, on the thread that
+    // terminates the call. Safe to call more than once; the callback runs at
+    // most once. Public so the terminal paths (close/cancel) can reach it.
+    void invoke_callback() noexcept {
+        if (callback_armed.exchange(false, std::memory_order_acq_rel)) {
+            call_core_callback_invoker invoke = callback_invoke;
+            void* owner_ptr = callback_owner;
+            callback_invoke = nullptr;
+            callback_owner = nullptr;
+            if (invoke != nullptr) {
+                invoke(callback_storage.bytes, owner_ptr, *this);
+            }
+        }
+    }
     // True when the last completed attempt was answered by a fallback value.
     // The flag is cleared when the next attempt is armed.
     [[nodiscard]] bool degraded() const noexcept {
@@ -348,6 +563,28 @@ struct CRPC_API call_core {
         terminal.store(rpc_code::ok, std::memory_order_release);
         degraded_.store(false, std::memory_order_release);
     }
+    // Publishes the terminal outcome for the non-blocking `code()`/`origin()`/
+    // `error()` accessors. `terminal` is atomic; `error`/`origin` are guarded by
+    // `mutex` (the accessors take the same lock). The terminal transition that
+    // wins the attempt's `finalized` exchange is the only writer, so the
+    // snapshot a reader observes is the terminal one, not an intermediate
+    // attempt's.
+    void record_terminal(rpc_code code, rpc_error err,
+                         failure_origin org) noexcept {
+        terminal.store(code, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(mutex);
+        this->error = std::move(err);
+        this->origin = org;
+    }
+
+    // --- `then` callback (inline, heap-free) ---
+    rpc::call_callback_storage callback_storage{};
+    call_core_callback_invoker callback_invoke = nullptr;
+    void* callback_owner = nullptr;
+    // Claimed exactly once by the completion path or by `then()` when the call
+    // already terminated. Atomic so a handle destructor can disarm it without a
+    // race against a backend-thread invocation.
+    std::atomic<bool> callback_armed{false};
 
 private:
     friend class crpc::client;
@@ -378,16 +615,202 @@ struct call_state_base {
     [[nodiscard]] virtual call_core& core_ref() noexcept = 0;
 };
 
+// The pool is forward-declared here because `call_state` needs to hand its
+// request buffer back to it (see the constructor/destructor below).
+class call_state_pool;
+
 template <typename Resp>
 struct call_state final : call_state_base {
     call_core core;
-    // Guards the `inner` pointer between the call owner and a concurrent
-    // cancel() from another thread. The pointed-to low-level handle has its
-    // own synchronization; this mutex only protects the pointer lifetime.
+    // Inline per-call retry state machine. `core.retry` points here once
+    // `start_encoded` emplaces it, so no per-call `make_unique<retry_sequence>`
+    // remains. `core`'s destructor does not touch the pointer, so the member
+    // order only has to keep the sequence inside this object.
+    std::optional<resilience::retry_sequence> retry_value;
+    // Guards the `inner` handle between the call owner and a concurrent
+    // cancel() from another thread. The handle has its own synchronization;
+    // this mutex only protects its lifetime.
     std::mutex inner_mutex;
-    std::unique_ptr<rpc::call<Resp>> inner;
+    // The low-level handle lives inline in the pooled block, so a call no
+    // longer allocates it with `make_unique` (P3b). An empty optional means
+    // no low-level call is in flight (between attempts, or after the terminal
+    // result was taken).
+    std::optional<rpc::call<Resp>> inner;
+
+    // `pool` is the call-state pool this block belongs to. When set, the
+    // constructor takes the request buffer's storage from the pool and the
+    // destructor hands it back, so a call's request buffer is reused across
+    // calls instead of being freed and reallocated on every append. The default
+    // argument keeps the pool-free construction used by the pool's own test.
+    explicit call_state(call_state_pool* pool = nullptr);
+    ~call_state();
 
     [[nodiscard]] call_core& core_ref() noexcept override { return core; }
+
+private:
+    call_state_pool* pool_ = nullptr;
+};
+
+// --- per-call storage pool ---------------------------------------------------
+
+// Process-wide counters for the facade call-state pool. The pool itself is
+// private to each client, but the regression test and the benchmark need to
+// observe whether a call reached the system allocator; these counters are that
+// observation point. They are never read on the call path.
+struct call_state_pool_counters {
+    std::atomic<std::size_t> acquire{0};
+    std::atomic<std::size_t> reuse{0};
+    std::atomic<std::size_t> system_alloc{0};
+};
+inline call_state_pool_counters g_call_state_pool_counters{};
+
+// Type-erased pool of storage blocks for `call_state` objects. Every block is
+// the same size, because `call_state<Resp>` is the same width for every `Resp`
+// (`inner` is an inline `std::optional<rpc::call<Resp>>`, not a `Resp`). Blocks
+// are handed to `std::allocate_shared` through `call_state_allocator`, so the
+// object and its control block share one pooled block and no per-call heap
+// allocation remains for the call state or the low-level handle it carries.
+//
+// The pool is owned by the client's `impl`, but the allocator stored in each
+// control block holds a `shared_ptr` to it, so a block that outlives the client
+// (a handle held after close()) still has a live pool to return to.
+class call_state_pool {
+public:
+    call_state_pool() { free_buffers_.reserve(kMaxFreeBuffers); }
+    call_state_pool(const call_state_pool&) = delete;
+    call_state_pool& operator=(const call_state_pool&) = delete;
+
+    ~call_state_pool() {
+        // Every block is returned before the pool dies (each control block
+        // holds a `shared_ptr`), so the free list holds them all.
+        for (void* block : free_) {
+            ::operator delete(block);
+        }
+    }
+
+    void* acquire(std::size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        g_call_state_pool_counters.acquire.fetch_add(1, std::memory_order_relaxed);
+        if (bytes == block_bytes_ && !free_.empty()) {
+            void* block = free_.back();
+            free_.pop_back();
+            ++live_;
+            g_call_state_pool_counters.reuse.fetch_add(1, std::memory_order_relaxed);
+            return block;
+        }
+        if (block_bytes_ == 0) {
+            block_bytes_ = bytes;
+        }
+        ++live_;
+        g_call_state_pool_counters.system_alloc.fetch_add(1, std::memory_order_relaxed);
+        return ::operator new(bytes);
+    }
+
+    void release(void* block, std::size_t bytes) noexcept {
+        if (block == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        --live_;
+        if (bytes == block_bytes_) {
+            free_.push_back(block);
+        } else {
+            ::operator delete(block);
+        }
+    }
+
+    // Request-buffer storage. A `call_state` block is reconstructed on every
+    // use, so its `buffer` member would otherwise start empty and grow (allocate)
+    // on the first append of each call. Taking the storage from the pool on
+    // construction and returning it on destruction keeps the capacity across
+    // calls, so the append never reaches the allocator after warm-up.
+    [[nodiscard]] buffer acquire_request_buffer() {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        if (!free_buffers_.empty()) {
+            buffer result = std::move(free_buffers_.back());
+            free_buffers_.pop_back();
+            // The pooled buffer keeps its capacity but must not keep its
+            // contents: the next call starts from an empty request.
+            result.clear();
+            return result;
+        }
+        return buffer{};
+    }
+
+    void release_request_buffer(buffer&& value) noexcept {
+        if (value.capacity() == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        if (free_buffers_.size() >= kMaxFreeBuffers) {
+            return;
+        }
+        try {
+            free_buffers_.push_back(std::move(value));
+        } catch (...) {
+            // The buffer is dropped; its storage is freed by its destructor.
+        }
+    }
+
+private:
+    static constexpr std::size_t kMaxFreeBuffers = 64;
+    mutable std::mutex mutex_;
+    std::vector<void*> free_;
+    std::size_t block_bytes_ = 0;
+    std::size_t live_ = 0;
+    std::mutex buffer_mutex_;
+    std::vector<buffer> free_buffers_;
+};
+
+// Defined here, after `call_state_pool` is complete, because the bodies call its
+// request-buffer methods.
+template <typename Resp>
+call_state<Resp>::call_state(call_state_pool* pool) : pool_(pool) {
+    if (pool_ != nullptr) {
+        core.request = pool_->acquire_request_buffer();
+    }
+}
+
+template <typename Resp>
+call_state<Resp>::~call_state() {
+    if (pool_ != nullptr) {
+        pool_->release_request_buffer(std::move(core.request));
+    }
+}
+
+// Allocator adapter that draws `std::allocate_shared`'s combined object and
+// control block from a `call_state_pool`. `allocate_shared` rebinds this to its
+// control-block type, so `sizeof(value_type)` is exactly the block size the
+// pool hands out, and the deleter returns the block to the same pool.
+template <typename T>
+struct call_state_allocator {
+    using value_type = T;
+
+    call_state_allocator() = default;
+    explicit call_state_allocator(std::shared_ptr<call_state_pool> pool)
+        : pool_(std::move(pool)) {}
+
+    template <typename U>
+    call_state_allocator(const call_state_allocator<U>& other) : pool_(other.pool_) {}
+
+    T* allocate(std::size_t count) {
+        return static_cast<T*>(pool_->acquire(count * sizeof(T)));
+    }
+
+    void deallocate(T* block, std::size_t count) {
+        pool_->release(block, count * sizeof(T));
+    }
+
+    template <typename U>
+    bool operator==(const call_state_allocator<U>& other) const noexcept {
+        return pool_ == other.pool_;
+    }
+    template <typename U>
+    bool operator!=(const call_state_allocator<U>& other) const noexcept {
+        return !(*this == other);
+    }
+
+    std::shared_ptr<call_state_pool> pool_;
 };
 
 // Returns the owner only while the client is alive. `core.owner` alone is not
@@ -497,6 +920,15 @@ public:
         builder& plain_thread_timeout(std::chrono::nanoseconds value);
         builder& idle_eviction(std::chrono::milliseconds value);
         builder& on_shard(runtime& shard);
+
+        // Deprecated aliases for the canonical names above. They exist so a
+        // caller that used the earlier spelling keeps compiling; prefer
+        // `default_deadline` and `max_inflight_per_connection`.
+        [[deprecated("use builder::default_deadline")]]
+        builder& default_timeout(std::chrono::nanoseconds value);
+        [[deprecated("use builder::max_inflight_per_connection")]]
+        builder& per_connection_inflight(std::size_t value);
+
         [[nodiscard]] std::unique_ptr<client> build();
 
     private:
@@ -508,13 +940,16 @@ public:
     class [[nodiscard]] call {
     public:
         call() noexcept = default;
-        call(call&& other) noexcept : state_(std::move(other.state_)) {}
+        call(call&& other) noexcept : state_(std::move(other.state_)) {
+            rebind_owner(&other);
+        }
         call& operator=(call&& other) noexcept {
             if (this != &other) {
                 // Releasing a still-active old state_ must abandon its attempt
                 // (cancel timer, release slot) before taking over the new one.
                 release();
                 state_ = std::move(other.state_);
+                rebind_owner(&other);
             }
             return *this;
         }
@@ -530,10 +965,38 @@ public:
             return state_ != nullptr ? state_->core.attempts : 0;
         }
 
+        // Non-blocking read of the terminal outcome. `code()` reads the atomic
+        // terminal code; `origin()`/`error()` read the snapshot the terminal
+        // transition recorded under `core.mutex`. An invalid handle answers the
+        // `invalid_argument` sentinel pair rather than dereferencing null.
+        [[nodiscard]] rpc_code code() const noexcept {
+            if (state_ == nullptr) {
+                return rpc_code::invalid_argument;
+            }
+            return state_->core.terminal.load(std::memory_order_acquire);
+        }
+
+        [[nodiscard]] client_detail::failure_origin origin() const noexcept {
+            if (state_ == nullptr) {
+                return client_detail::failure_origin::local_lifecycle;
+            }
+            std::lock_guard<std::mutex> lk(state_->core.mutex);
+            return state_->core.origin;
+        }
+
+        [[nodiscard]] rpc_error error() const noexcept {
+            if (state_ == nullptr) {
+                return rpc_error(rpc_code::invalid_argument, "invalid call handle");
+            }
+            std::lock_guard<std::mutex> lk(state_->core.mutex);
+            return state_->core.error;
+        }
+
         // True when the terminal result was produced by a fallback function.
-        // Always false in this slice: nothing calls mark_degraded() yet. It is
-        // only meaningful after get() returned; try_get() moves the state out,
-        // so a later call reads false.
+        // Only a successful decode of the fallback value sets it, so `applied`
+        // with a body that does not decode leaves it false. It is meaningful
+        // only after get() returned; try_get() moves the state out and does not
+        // run a fallback at all, so a later call reads false.
         [[nodiscard]] bool degraded() const noexcept {
             return state_ != nullptr && state_->core.degraded();
         }
@@ -541,12 +1004,53 @@ public:
         // Suspends (or blocks) until a terminal result is available. Returns
         // the decoded value, or the last error when retries are exhausted.
         [[nodiscard]] rpc::rpc_result<Resp> get() {
-            if (state_ == nullptr ||
-                client_detail::live_owner(state_->core) == nullptr) {
+            if (state_ == nullptr) {
+                // An invalid handle is a programming error (`invalid_argument`),
+                // deliberately distinct from a wait that failed because the
+                // caller is on a shard thread outside a coroutine, which is
+                // reported as `failed_precondition` below. Both used to answer
+                // `failed_precondition`.
+                return rpc::rpc_result<Resp>(
+                    rpc_error(rpc_code::invalid_argument, "invalid call handle"));
+            }
+            if (client_detail::live_owner(state_->core) == nullptr) {
+                state_->core.record_terminal(
+                    rpc_code::failed_precondition,
+                    rpc_error(rpc_code::failed_precondition, "invalid call handle"),
+                    client_detail::failure_origin::local_lifecycle);
                 return rpc::rpc_result<Resp>(
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
             }
             std::shared_ptr<client_detail::call_state<Resp>> st = state_;
+            // Every return below is terminal. The guard runs the `then` callback
+            // exactly once on the thread that observes the terminal result, so a
+            // callback fires even for a terminal reached locally (a pre-send
+            // refusal or a local timeout) where no backend thread rang the
+            // completion path. `invoke_callback` is idempotent, so a callback
+            // already run by `signal()` is not run twice.
+            //
+            // The guard holds the `shared_ptr`, not a raw pointer into the state:
+            // a terminal path may call `release()`, which moves `state_` out and
+            // can drop the last reference to the call state. A raw `&core` would
+            // then dangle when the guard runs.
+            struct terminal_guard {
+                std::shared_ptr<client_detail::call_state<Resp>> st;
+                ~terminal_guard() {
+                    if (st) {
+                        // Mark the call terminal for `ready()`/`try_get()` and
+                        // run the `then` callback exactly once.
+                        st->core.done.store(true, std::memory_order_release);
+                        st->core.invoke_callback();
+                    }
+                }
+            } guard{st};
+            // Records the terminal outcome for the non-blocking accessors on the
+            // exits that do not pass through `finish_attempt` (a dead owner, a
+            // shutdown during the wait, and the cancel returns).
+            auto record = [&st](rpc_code code, rpc_error error,
+                                client_detail::failure_origin origin) noexcept {
+                st->core.record_terminal(code, std::move(error), origin);
+            };
             for (;;) {
                 // Re-read the owner every turn: close()/``~client`` detaches it
                 // in finalize_active(), so a cached pointer would be stale (R1
@@ -554,6 +1058,9 @@ public:
                 // delivered by close() rather than touching the freed client.
                 client* const owner = client_detail::live_owner(st->core);
                 if (owner == nullptr) {
+                    record(rpc_code::shutting_down,
+                           rpc_error(rpc_code::shutting_down, "client is closed"),
+                           client_detail::failure_origin::local_lifecycle);
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::shutting_down, "client is closed"));
                 }
@@ -565,7 +1072,7 @@ public:
                 bool has_inner = false;
                 {
                     std::lock_guard<std::mutex> lk(st->inner_mutex);
-                    has_inner = st->inner != nullptr;
+                    has_inner = st->inner.has_value();
                 }
                 if (has_inner) {
                     const status waited = owner->wait_ready(st->core);
@@ -576,6 +1083,9 @@ public:
                         // connection slot is dropped) so the low-level handle
                         // never outlives its call-slot pool.
                         release();
+                        record(rpc_code::shutting_down,
+                               rpc_error(rpc_code::shutting_down, "client is closed"),
+                               client_detail::failure_origin::local_lifecycle);
                         return rpc::rpc_result<Resp>(
                             rpc_error(rpc_code::shutting_down, "client is closed"));
                     }
@@ -594,18 +1104,27 @@ public:
                             std::lock_guard<std::mutex> lk(st->inner_mutex);
                             st->inner.reset();
                         }
-                        current->finish_attempt(st->core, failure.code, origin,
+                        current->finish_attempt(st->core, failure.code, failure,
+                                                origin,
                                                 client_detail::breaker_record::failure);
-                        return rpc::rpc_result<Resp>(std::move(failure));
+                        // A locally observed timeout has no admission stage, so
+                        // this counts as `ineligible` and the original error is
+                        // returned unchanged. Calling it keeps every terminal
+                        // failure on one counting path.
+                        return current->fallback_for<Resp>(
+                            st->core, std::move(failure), origin);
                     }
                     rpc::rpc_result<Resp> result(
                         rpc_error(rpc_code::internal, "call produced no result"));
                     rpc::call<Resp>* inner = nullptr;
                     {
                         std::lock_guard<std::mutex> lk(st->inner_mutex);
-                        inner = st->inner.get();
+                        inner = &*st->inner;
                     }
                     if (inner == nullptr) {
+                        record(rpc_code::shutting_down,
+                               rpc_error(rpc_code::shutting_down, "client is closed"),
+                               client_detail::failure_origin::local_lifecycle);
                         return rpc::rpc_result<Resp>(
                             rpc_error(rpc_code::shutting_down, "client is closed"));
                     }
@@ -628,14 +1147,18 @@ public:
                     // One logical call feeds the breaker once: a retried
                     // attempt is ignored and only the terminal result counts.
                     current->finish_attempt(
-                        st->core, code, origin,
+                        st->core, code, terminal_error, origin,
                         retry ? client_detail::breaker_record::ignore
                               : client_detail::breaker_record_for(origin, code));
                     if (decoded && code == rpc_code::ok) {
                         return result;
                     }
                     if (!retry) {
-                        return result;
+                        // Last attempt failed: this is the one place a fallback
+                        // may answer, and it runs after finish_attempt() so the
+                        // breaker already saw the real outcome.
+                        return current->fallback_for<Resp>(
+                            st->core, std::move(terminal_error), origin);
                     }
                     current->sleep_for(st->core, delay);
                     if (st->core.canceled.load(std::memory_order_acquire)) {
@@ -644,6 +1167,9 @@ public:
                         // previous attempt must not survive into a `canceled`
                         // result (same rule as begin_attempt).
                         st->core.clear_degraded();
+                        record(rpc_code::canceled,
+                               rpc_error(rpc_code::canceled, "call canceled"),
+                               client_detail::failure_origin::cancel);
                         return rpc::rpc_result<Resp>(
                             rpc_error(rpc_code::canceled, "call canceled"));
                     }
@@ -653,6 +1179,9 @@ public:
 
                 if (st->core.canceled.load(std::memory_order_acquire)) {
                     st->core.clear_degraded();
+                    record(rpc_code::canceled,
+                           rpc_error(rpc_code::canceled, "call canceled"),
+                           client_detail::failure_origin::cancel);
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::canceled, "call canceled"));
                 }
@@ -667,15 +1196,21 @@ public:
                 const bool retry =
                     owner->should_retry(st->core, failure, origin, delay);
                 owner->finish_attempt(
-                    st->core, failure.code, origin,
+                    st->core, failure.code, failure, origin,
                     retry ? client_detail::breaker_record::ignore
                           : client_detail::breaker_record_for(origin, failure.code));
                 if (!retry) {
-                    return rpc::rpc_result<Resp>(std::move(failure));
+                    // Last attempt failed before the peer answered; a fallback
+                    // may still answer for a pre-send refusal.
+                    return owner->fallback_for<Resp>(st->core, std::move(failure),
+                                                     origin);
                 }
                 owner->sleep_for(st->core, delay);
                 if (st->core.canceled.load(std::memory_order_acquire)) {
                     st->core.clear_degraded();
+                    record(rpc_code::canceled,
+                           rpc_error(rpc_code::canceled, "call canceled"),
+                           client_detail::failure_origin::cancel);
                     return rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::canceled, "call canceled"));
                 }
@@ -699,7 +1234,7 @@ public:
             rpc::call<Resp>* inner = nullptr;
             {
                 std::lock_guard<std::mutex> lk(state_->inner_mutex);
-                inner = state_->inner.get();
+                inner = &*state_->inner;
             }
             if (inner == nullptr) {
                 return false;
@@ -723,9 +1258,11 @@ public:
                 client* const owner = client_detail::live_owner(st->core);
                 if (owner != nullptr) {
                     owner->finish_attempt(
-                        st->core, code, origin,
+                        st->core, code, terminal_error, origin,
                         client_detail::breaker_record_for(origin, code));
                 }
+                // The call is terminal: run the `then` callback exactly once.
+                st->core.invoke_callback();
             }
             return decoded;
         }
@@ -739,9 +1276,16 @@ public:
             // retry backoff there is nothing to cancel at the transport, but
             // the waiter must stop.
             state_->core.canceled.store(true, std::memory_order_release);
+            // Publish the terminal outcome: `cancel()` is a terminal transition
+            // that does not go through `finish_attempt`, so the accessors would
+            // otherwise read a stale or reset code.
+            state_->core.record_terminal(
+                rpc_code::canceled,
+                rpc_error(rpc_code::canceled, "call canceled"),
+                client_detail::failure_origin::cancel);
             {
                 std::lock_guard<std::mutex> lk(state_->inner_mutex);
-                if (state_->inner) {
+                if (state_->inner.has_value()) {
                     state_->inner->cancel();
                 }
             }
@@ -756,10 +1300,70 @@ public:
                 std::lock_guard<std::mutex> lk(state_->core.mutex);
             }
             state_->core.cv.notify_all();
+            // A `then` callback registered before cancel() still fires: the
+            // cancel is a terminal transition and the handle it receives will
+            // answer `canceled` from get().
+            state_->core.invoke_callback();
+        }
+
+        // Registers a completion callback. `fn` is invoked as `fn(call&)` once
+        // the call terminates, or immediately on this thread when it has already
+        // terminated. The callback must be trivially copyable and fit in
+        // `rpc::call_callback_inline_size`; it must not destroy the handle it
+        // belongs to.
+        //
+        // This is the facade-level counterpart of `rpc::call::then`: the
+        // callback runs on the thread that terminates the call (the reader, the
+        // deadline timer or close/cancel), exactly once.
+        template <typename F>
+        void then(F&& fn) {
+            if (state_ == nullptr) {
+                return;
+            }
+            using fn_type = std::decay_t<F>;
+            static_assert(std::is_trivially_copyable_v<fn_type>,
+                          "call<Resp>::then callback must be trivially copyable");
+            static_assert(sizeof(fn_type) <= rpc::call_callback_inline_size,
+                          "call<Resp>::then callback exceeds the inline storage budget");
+            static_assert(alignof(fn_type) <= alignof(std::max_align_t),
+                          "call<Resp>::then callback has an unsupported alignment");
+            client_detail::call_core& core = state_->core;
+            std::memcpy(core.callback_storage.bytes,
+                        static_cast<const void*>(std::addressof(fn)), sizeof(fn_type));
+            core.callback_invoke = &then_thunk<fn_type>;
+            core.callback_owner = this;
+            // Publish the callback before arming it; the completion path claims
+            // it with an acquire exchange. If completion already happened, claim
+            // it here instead so the callback runs exactly once.
+            core.callback_armed.store(true, std::memory_order_release);
+            if (core.done.load(std::memory_order_acquire) &&
+                core.callback_armed.exchange(false, std::memory_order_acq_rel)) {
+                core.callback_invoke = nullptr;
+                core.callback_owner = nullptr;
+                fn(*this);
+            }
         }
 
     private:
         friend class crpc::client;
+
+        template <typename F>
+        static void then_thunk(void* storage, void* owner,
+                               client_detail::call_core&) noexcept {
+            F& fn = *static_cast<F*>(storage);
+            call& self = *static_cast<call*>(owner);
+            fn(self);
+        }
+
+        // After a move, a callback armed on the source handle must target the
+        // destination, or it would run against a moved-from object.
+        void rebind_owner(call* old) noexcept {
+            if (state_ != nullptr &&
+                state_->core.callback_armed.load(std::memory_order_acquire) &&
+                state_->core.callback_owner == old) {
+                state_->core.callback_owner = this;
+            }
+        }
 
         // Ends the attempt if one is active: drops the inner low-level call
         // (which cancels it when still pending) and abandons the facade-level
@@ -771,7 +1375,7 @@ public:
             std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
             {
                 std::lock_guard<std::mutex> lk(st->inner_mutex);
-                if (st->inner) {
+                if (st->inner.has_value()) {
                     // Resetting `inner` runs the low-level handle destructor,
                     // which detaches (and synchronizes with) any in-flight
                     // callback under the connection lock before the call_state
@@ -795,6 +1399,10 @@ public:
         stub(client& owner, u64 service_id, u64 method_id) noexcept
             : owner_(&owner), service_id_(service_id), method_id_(method_id) {}
 
+        // Strongly typed overload: the ids cannot be swapped.
+        stub(client& owner, service_id service, method_id method) noexcept
+            : owner_(&owner), service_id_(service.value), method_id_(method.value) {}
+
         [[nodiscard]] rpc::rpc_result<client::call<Resp>> call(
             const Req& request, rpc::call_context ctx = {}) {
             buffer encoded;
@@ -817,6 +1425,12 @@ public:
         return stub<Resp, Req>(*this, service_id, method_id);
     }
 
+    // Strongly typed overload: the ids cannot be swapped.
+    template <typename Resp, typename Req>
+    [[nodiscard]] stub<Resp, Req> service(service_id service, method_id method) {
+        return stub<Resp, Req>(*this, service, method);
+    }
+
     ~client();
     client(const client&) = delete;
     client& operator=(const client&) = delete;
@@ -829,9 +1443,61 @@ public:
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
     [[nodiscard]] resilience_statistics resilience_stats() const noexcept;
-    // Additive fallback counters. The primitives are not wired in this slice,
-    // so every field is zero; the accessor is the MINOR ABI addition.
+    // Additive fallback counters. They are fed by `run_fallback` once per
+    // fallback attempt, from a stack tally, so a concurrent reader never sees a
+    // half-applied batch. The accessor is a MINOR ABI addition.
     [[nodiscard]] resilience::fallback_statistics fallback_stats() const noexcept;
+
+    // Installs a fallback. `retain`/`release` keep `self` alive for as long as
+    // this client owns the policy, so a non-null `self` is rejected without
+    // them: an unowned `self` would dangle and terminate inside the noexcept
+    // fallback path. Both callbacks must be non-null together or both null, and
+    // both are `noexcept` so no exception can escape the destructor path; the
+    // type system enforces that (a function that may throw does not convert).
+    // Never `reinterpret_cast` a throwing function into these types.
+    //
+    // `retain` runs once per installed policy, outside every library lock, and
+    // `release` runs once when that policy is replaced or the client is
+    // destroyed. A `retain` that returns null means "the reference could not be
+    // taken": the call is rejected and nothing is installed.
+    //
+    // `min_remaining` is the G1 floor ("is the degraded value still
+    // deliverable"). Pass `std::chrono::nanoseconds(resilience::min_remaining_ns)`
+    // to match the server's admission floor; do not introduce a second literal.
+    //
+    // A rejected call installs nothing, so fallback_stats() stays all-zero and a
+    // later call reports its original error, not a degraded value. Passing a
+    // null `function` uninstalls the current policy.
+    [[nodiscard]] bool set_fallback(resilience::fallback_fn function, void* self,
+                                    std::chrono::nanoseconds min_remaining,
+                                    void* (*retain)(void*) noexcept,
+                                    void (*release)(void*) noexcept) noexcept;
+
+    // High-level RAII form of `set_fallback`. `self` is owned by a `shared_ptr`,
+    // so the caller no longer supplies a matching `retain`/`release` pair: the
+    // shared_ptr is released when the policy is replaced or the client is
+    // destroyed. Passing a null `function` uninstalls the current policy.
+    //
+    // This is the form the `fallback_install` guard uses. The low-level
+    // five-argument `set_fallback` stays for a caller that already owns `self`
+    // and wants to keep the explicit retain/release contract.
+    [[nodiscard]] bool set_fallback_owned(resilience::fallback_fn function,
+                                          std::shared_ptr<void> self,
+                                          std::chrono::nanoseconds min_remaining) noexcept;
+
+    // Adds one fallback tally to the client counters. `run_fallback` calls it
+    // once per attempt; it is public so a future header-side consumer can flush
+    // its own tally without a second counting path.
+    void record_fallbacks(const resilience::fallback_statistics& tally) noexcept;
+
+    // Runs the installed fallback for one terminal failure. Returns
+    // `not_configured` when no policy is installed (the fast path, no lock).
+    // `error` may be rewritten by G3; `out` receives the encoded value on
+    // `applied`. The caller decodes `out` and only then marks the call
+    // degraded: `applied` does not promise that the body decodes.
+    [[nodiscard]] resilience::fallback_outcome run_fallback(
+        client_detail::call_core& core, buffer& out, rpc_error& error,
+        resilience::fallback_counter_sink* sink) noexcept;
 
     // Low-level path used by `stub`. Encodes are the caller's responsibility.
     template <typename Resp>
@@ -842,7 +1508,13 @@ public:
             return rpc::rpc_result<client::call<Resp>>(
                 rpc_error(rpc_code::shutting_down, "client is closed"));
         }
-        auto st = std::make_shared<client_detail::call_state<Resp>>();
+        // The object and its shared_ptr control block come from the client's
+        // pool, so a call does not reach the system allocator (the pool grows
+        // only until it has seen the first call).
+        client_detail::call_state_allocator<client_detail::call_state<Resp>> alloc(
+            call_state_pool());
+        auto st = std::allocate_shared<client_detail::call_state<Resp>>(alloc,
+                                                                       call_state_pool().get());
         client_detail::call_core& core = st->core;
         core.owner.store(this, std::memory_order_release);
         core.owner_liveness = liveness_token();
@@ -852,7 +1524,7 @@ public:
             return rpc::rpc_result<client::call<Resp>>(rpc_error(rpc_code::resource_exhausted));
         }
         normalize_context(core, ctx);
-        core.retry = std::make_unique<resilience::retry_sequence>(options_.retry, &budget_);
+        core.retry = &st->retry_value.emplace(options_.retry, &budget_);
         budget_.on_request();
 
         // The first attempt may fail before anything was sent (all candidates
@@ -881,7 +1553,7 @@ public:
             const client_detail::failure_origin origin = core.origin;
             std::chrono::nanoseconds delay{0};
             const bool retry = should_retry(core, failure, origin, delay);
-            finish_attempt(core, failure.code, origin,
+            finish_attempt(core, failure.code, failure, origin,
                            retry ? client_detail::breaker_record::ignore
                                  : client_detail::breaker_record_for(origin,
                                                                      failure.code));
@@ -901,6 +1573,15 @@ public:
         return rpc::rpc_result<client::call<Resp>>(std::move(handle));
     }
 
+    // Strongly typed overload of the low-level path used by `stub`.
+    template <typename Resp>
+    [[nodiscard]] rpc::rpc_result<client::call<Resp>> start_encoded(
+        service_id service, method_id method, span<const std::byte> request_body,
+        rpc::call_context ctx = {}) {
+        return start_encoded<Resp>(service.value, method.value, request_body,
+                                   std::move(ctx));
+    }
+
     struct impl;
 
 private:
@@ -912,6 +1593,11 @@ private:
     status issue(const std::shared_ptr<client_detail::call_state<Resp>>& st,
                  rpc_error& failure);
 
+    // The pool `start_encoded` draws `call_state` storage from. Defined out of
+    // line because `impl` is incomplete here.
+    [[nodiscard]] std::shared_ptr<client_detail::call_state_pool> call_state_pool()
+        const noexcept;
+
     void normalize_context(client_detail::call_core& core, const rpc::call_context& ctx);
     bool begin_attempt(client_detail::call_core& core,
                       const std::shared_ptr<client_detail::call_state_base>& keep,
@@ -921,7 +1607,7 @@ private:
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
                       rpc_code code) noexcept;
     void finish_attempt(client_detail::call_core& core, rpc_code code,
-                        client_detail::failure_origin origin,
+                        rpc_error error, client_detail::failure_origin origin,
                         client_detail::breaker_record record) noexcept;
     // Idempotent counterpart to finish_attempt for paths that end an attempt
     // without a result (handle destruction, try_get, cancel, close).
@@ -937,6 +1623,13 @@ private:
                                     const rpc_error& error,
                                     client_detail::failure_origin origin,
                                     std::chrono::nanoseconds& delay) noexcept;
+    // Runs the installed fallback for a terminal failure and, when the value
+    // decodes, reports it as the call's result. Used by the two terminal
+    // failure exits of get(); it is never used before the last attempt.
+    template <typename Resp>
+    rpc::rpc_result<Resp> fallback_for(
+        client_detail::call_core& core, rpc_error error,
+        client_detail::failure_origin origin);
     [[nodiscard]] std::shared_ptr<client_detail::client_liveness>
     liveness_token() const noexcept;
     [[nodiscard]] status wait_ready(client_detail::call_core& core) const;
@@ -976,6 +1669,68 @@ private:
     std::atomic<std::size_t> pre_send_retries_{0};
     std::atomic<std::size_t> probe_admitted_{0};
     std::atomic<std::size_t> retries_delayed_by_hint_{0};
+};
+
+// RAII scoped fallback installer.
+//
+// The low-level `client::set_fallback` takes five arguments and a matching
+// `retain`/`release` pair: the caller must promise that `self` outlives the
+// policy, and a forgotten `release` leaks the reference while a forgotten
+// `retain` leaves a dangling pointer that the noexcept fallback path would
+// dereference. This guard removes that contract: `self` is owned by a
+// `shared_ptr`, and destroying the guard uninstalls the policy.
+//
+//   crpc::client::fallback_install fb(cli, &my_fallback,
+//                                     std::shared_ptr<void>(&state, [](void*){}),
+//                                     50ms);
+//   // the fallback applies here; at the end of the scope it is gone
+//
+// The guard must be destroyed before the client it was installed on. It is
+// move-only and non-copyable, like the call handle.
+class CRPC_API fallback_install {
+public:
+    fallback_install() noexcept = default;
+
+    fallback_install(crpc::client& owner, resilience::fallback_fn function,
+                     std::shared_ptr<void> self,
+                     std::chrono::nanoseconds min_remaining) noexcept
+        : owner_(&owner) {
+        static_cast<void>(
+            owner_->set_fallback_owned(function, std::move(self), min_remaining));
+    }
+
+    ~fallback_install() { reset(); }
+
+    fallback_install(fallback_install&& other) noexcept : owner_(other.owner_) {
+        other.owner_ = nullptr;
+    }
+
+    fallback_install& operator=(fallback_install&& other) noexcept {
+        if (this != &other) {
+            reset();
+            owner_ = other.owner_;
+            other.owner_ = nullptr;
+        }
+        return *this;
+    }
+
+    fallback_install(const fallback_install&) = delete;
+    fallback_install& operator=(const fallback_install&) = delete;
+
+    // Uninstalls the policy this guard installed. Idempotent and safe to call
+    // more than once.
+    void reset() noexcept {
+        if (owner_ != nullptr) {
+            static_cast<void>(owner_->set_fallback(
+                nullptr, nullptr, std::chrono::nanoseconds{0}, nullptr, nullptr));
+            owner_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] bool active() const noexcept { return owner_ != nullptr; }
+
+private:
+    crpc::client* owner_ = nullptr;
 };
 
 // --- Template implementations ------------------------------------------------
@@ -1042,10 +1797,36 @@ status client::issue(
         // already terminated; the wake functor only touches the call core and
         // never re-enters `inner_mutex`, so holding the lock here is safe.
         std::lock_guard<std::mutex> inner_lk(st->inner_mutex);
-        st->inner = std::make_unique<rpc::call<Resp>>(std::move(started).value());
+        st->inner.emplace(std::move(started).value());
         st->inner->then(client_detail::wake_functor<Resp>{&core});
     }
     return status{};
+}
+
+template <typename Resp>
+rpc::rpc_result<Resp> client::fallback_for(
+    client_detail::call_core& core, rpc_error error,
+    client_detail::failure_origin origin) {
+    // The stage inference reads the origin, so publish the terminal origin
+    // first. `run_fallback` is a library member: the policy and the counters
+    // never leave the library.
+    core.origin = origin;
+    buffer body;
+    const resilience::fallback_outcome outcome =
+        run_fallback(core, body, error, nullptr);
+    if (outcome == resilience::fallback_outcome::applied) {
+        Resp value{};
+        // `applied` only promises "not late", not "decodable": mark the call
+        // degraded only after the value decoded (fallback.hpp contract).
+        if (rpc::call_codec<Resp>::decode(body.readable(), value).ok()) {
+            core.mark_degraded();
+            return rpc::rpc_result<Resp>(std::move(value));
+        }
+    }
+    // `overrun` rewrote `error` to deadline_exceeded; every other outcome
+    // leaves it untouched. Either way the caller answers with the original
+    // failure unless a value was applied.
+    return rpc::rpc_result<Resp>(std::move(error));
 }
 
 } // namespace crpc

@@ -119,13 +119,165 @@ namespace {
 // callback context, not a client pointer: a callback may destroy the client.
 thread_local const void* timer_thread_local = nullptr;
 
+// One sink per fallback attempt: it accumulates the seven counters on the
+// stack and forwards to an optional caller sink, so the client counters are
+// updated once per attempt instead of once per counter (no cache-line
+// contention between concurrent get() callers, no partially applied batch).
+struct fallback_tally {
+    resilience::fallback_statistics values{};
+    resilience::fallback_counter_sink* extra = nullptr;
+};
+
+void fallback_tally_add(void* self, resilience::fallback_counter counter) noexcept {
+    auto* tally = static_cast<fallback_tally*>(self);
+    switch (counter) {
+    case resilience::fallback_counter::ineligible:
+        ++tally->values.ineligible;
+        break;
+    case resilience::fallback_counter::skipped_deadline:
+        ++tally->values.skipped_deadline;
+        break;
+    case resilience::fallback_counter::attempted:
+        ++tally->values.attempted;
+        break;
+    case resilience::fallback_counter::failed:
+        ++tally->values.failed;
+        break;
+    case resilience::fallback_counter::canceled:
+        ++tally->values.canceled;
+        break;
+    case resilience::fallback_counter::overrun:
+        ++tally->values.overrun;
+        break;
+    case resilience::fallback_counter::applied:
+        ++tally->values.applied;
+        break;
+    }
+    if (tally->extra != nullptr) {
+        resilience::fallback_record(tally->extra, counter);
+    }
+}
+
+} // namespace
+
+// Derives the admission stage of a terminal failure from its origin and code.
+//
+// `call_core` has no `stage` field, and adding one would be a layout change.
+// The mapping is therefore an inverse of the single `reject_code()` table, and
+// it validates itself against that table: a candidate is only returned when
+// `reject_code(candidate)` reproduces the observed code. A pair the table
+// cannot reproduce returns `nullopt`, which makes the fallback ineligible
+// (fail closed) rather than guessing.
+//
+// The remote side is the only place where the stage is inferred rather than
+// recorded: the client sees just the code and the `crpc-degradable` marker, so
+// the marker is the real gate (see `degradable()` below) and the inference only
+// satisfies `fallback_admissible`'s signature.
+namespace {
+
+[[nodiscard]] std::optional<resilience::stage_kind> stage_for(
+    client_detail::failure_origin origin, rpc_code code,
+    const rpc_error& error) noexcept {
+    using client_detail::failure_origin;
+    using resilience::stage_kind;
+
+    stage_kind candidate = stage_kind::dispatch;
+    bool known = false;
+    switch (origin) {
+    case failure_origin::endpoint_open:
+        // The only producer of this origin answers `unavailable`.
+        candidate = stage_kind::breaker;
+        known = code == rpc_code::unavailable;
+        break;
+    case failure_origin::local_gate:
+        // Two producers with disjoint codes: the rate bucket answers
+        // `resource_exhausted` / `deadline_exceeded`, the bulkhead `overload`.
+        if (code == rpc_code::overload) {
+            candidate = stage_kind::endpoint_bulkhead;
+            known = true;
+        } else {
+            candidate = stage_kind::endpoint_rate;
+            known = code == rpc_code::resource_exhausted ||
+                    code == rpc_code::deadline_exceeded;
+        }
+        break;
+    case failure_origin::local_capacity:
+        candidate = stage_kind::pool_capacity;
+        known = code == rpc_code::resource_exhausted;
+        break;
+    case failure_origin::local_lifecycle:
+        // `dispatch` is the only pre-send lifecycle refusal with a stage; every
+        // other code on this origin (shutting_down, the bitmap allocation
+        // failure, an expired deadline) stays undecidable.
+        candidate = stage_kind::dispatch;
+        known = code == rpc_code::unavailable;
+        break;
+    case failure_origin::remote:
+        // The marker is mandatory: a handler that returns the same code must
+        // not be degradable. Only three codes can carry it.
+        if (!resilience::degradable(error)) {
+            return std::nullopt;
+        }
+        if (code == rpc_code::unavailable) {
+            candidate = stage_kind::breaker;
+        } else if (code == rpc_code::overload) {
+            // P3 and P5 share this code and both are eligible; either stage is
+            // a valid witness for `fallback_eligible`.
+            candidate = stage_kind::service_bulkhead;
+        } else if (code == rpc_code::resource_exhausted) {
+            candidate = stage_kind::service_rate;
+        } else {
+            return std::nullopt;
+        }
+        known = true;
+        break;
+    case failure_origin::timeout:
+    case failure_origin::cancel:
+    case failure_origin::endpoint_pre_send:
+    case failure_origin::endpoint_sent:
+        // The stage table covers admission refusals only; a transport or
+        // timeout failure has no stage and must never be degraded.
+        return std::nullopt;
+    }
+    if (!known) {
+        return std::nullopt;
+    }
+    // Self-check against the single authority: the candidate must reproduce the
+    // observed code under at least one `deadline_met` value.
+    if (resilience::reject_code(candidate, true) != code &&
+        resilience::reject_code(candidate, false) != code) {
+        return std::nullopt;
+    }
+    return candidate;
+}
+
+// True when the request may already have reached the peer, which is the
+// `sent` gate of `fallback_admissible`.
+[[nodiscard]] bool request_was_sent(client_detail::failure_origin origin) noexcept {
+    return origin == client_detail::failure_origin::endpoint_sent ||
+           origin == client_detail::failure_origin::remote;
+}
+
+[[nodiscard]] resilience::fallback_context build_fallback_context(
+    const client_detail::call_core& core, const rpc_error& error) noexcept {
+    resilience::fallback_context ctx;
+    ctx.code = error.code;
+    ctx.stage = stage_for(core.origin, error.code, error);
+    ctx.retry_after = error.retry_after;
+    ctx.one_way = core.ctx.mode != rpc::delivery_mode::reliable;
+    ctx.sent = request_was_sent(core.origin);
+    ctx.idempotent = core.idempotent;
+    ctx.has_deadline = core.has_deadline;
+    ctx.deadline = core.deadline;
+    return ctx;
+}
+
 } // namespace
 
 struct client::impl {
     // Fallback primitive counters. They live in the implementation, not in
-    // `client`, so the public `client` layout does not change. Nothing in this
-    // slice increments them: the entries stay zero until S4 wires the
-    // primitives into the call path.
+    // `client`, so the public `client` layout does not change. `run_fallback`
+    // flushes one attempt's stack tally here.
     std::atomic<std::size_t> fallback_ineligible{0};
     std::atomic<std::size_t> fallback_skipped_deadline{0};
     std::atomic<std::size_t> fallback_attempted{0};
@@ -133,6 +285,42 @@ struct client::impl {
     std::atomic<std::size_t> fallback_canceled{0};
     std::atomic<std::size_t> fallback_overrun{0};
     std::atomic<std::size_t> fallback_applied{0};
+
+    // One installed fallback. Immutable once published, and it owns exactly one
+    // reference: `token` is what `retain` returned at install time and
+    // `~fallback_slot` is the only place `release` runs. Copying the owning
+    // shared_ptr does not call `retain` again.
+    struct fallback_slot {
+        resilience::fallback_fn function = nullptr;
+        void* self = nullptr;                     // the caller's pointer
+        std::chrono::nanoseconds min_remaining{0};
+        void* token = nullptr;                    // what retain returned
+        void (*release)(void*) noexcept = nullptr;
+        // Owned self for the RAII installer (`set_fallback_owned`). Released with
+        // the slot, so a non-null `self` does not need a matching retain/release
+        // pair. Empty for the low-level five-argument contract.
+        std::shared_ptr<void> owned_self;
+
+        fallback_slot() = default;
+        fallback_slot(const fallback_slot&) = delete;
+        fallback_slot& operator=(const fallback_slot&) = delete;
+
+        ~fallback_slot() noexcept {
+            if (release != nullptr && token != nullptr) {
+                // Outside every library lock: the last owner may drop this slot
+                // on the reader thread, in set_fallback, or in ~client.
+                release(token);
+            }
+        }
+    };
+
+    // Guards only the shared_ptr below. No consumer callback ever runs under it.
+    std::mutex fallback_mutex;
+    std::shared_ptr<fallback_slot> fallback;
+    // Fast path for the unconfigured client: get() must not take a lock when no
+    // fallback was ever installed, so an unwired client keeps the exact
+    // pre-S4 call path.
+    std::atomic<bool> fallback_configured{false};
 
     struct endpoint_pool {
         endpoint_pool(endpoint ep, backend_factory* backend,
@@ -202,14 +390,22 @@ struct client::impl {
     // without ownership a handle destroyed on another thread could free the
     // core while close() is still writing to it (a real race, found by TSan).
     std::mutex calls_mutex;
-    std::unordered_map<client_detail::call_core*,
-                       std::shared_ptr<client_detail::call_state_base>>
+    client_detail::flat_pool_map<client_detail::call_core*,
+                                 std::shared_ptr<client_detail::call_state_base>>
         active_calls;
 
     // Shared with every call this client issues; expires when the client is
     // destroyed so a handle that outlives it never calls into freed memory.
     std::shared_ptr<client_detail::client_liveness> liveness =
         std::make_shared<client_detail::client_liveness>();
+
+    // Pool of `call_state` storage. Every call draws its object and control
+    // block from here, so a call reaches the system allocator only while the
+    // pool is still growing. The pool outlives the client: the allocator stored
+    // in each control block holds a `shared_ptr`, so a handle held after
+    // close() still has a live pool to return its block to.
+    std::shared_ptr<client_detail::call_state_pool> call_pool =
+        std::make_shared<client_detail::call_state_pool>();
 };
 
 // Timer bookkeeping that outlives the client on a callback's stack. The
@@ -231,6 +427,10 @@ namespace client_detail {
 
 void call_core::signal() noexcept {
     done.store(true, std::memory_order_release);
+    // The completion callback runs before the waiters are released, so a
+    // `get()` that returns after the callback has observed it. A `then` body
+    // may call get() on the same handle; it sees the terminal state at once.
+    invoke_callback();
     {
         std::lock_guard<std::mutex> lk(mutex);
     }
@@ -345,6 +545,11 @@ client::liveness_token() const noexcept {
     return impl_->liveness;
 }
 
+std::shared_ptr<client_detail::call_state_pool> client::call_state_pool()
+    const noexcept {
+    return impl_->call_pool;
+}
+
 bool client::register_core_if_open(
     client_detail::call_core& core,
     const std::shared_ptr<client_detail::call_state_base>& keep) noexcept {
@@ -410,13 +615,16 @@ void client::finalize_active(
         }
         // R2: wake a blocked get() promptly with `shutting_down` instead of
         // letting it sit until the plain-thread timeout or a cancelled timer.
-        core->error = rpc_error(rpc_code::shutting_down, "client is closed");
-        core->terminal.store(rpc_code::shutting_down, std::memory_order_release);
         core->done.store(true, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lk(core->mutex);
-        }
+        // Publish the shutdown under the lock the non-blocking accessors take,
+        // so `error()`/`origin()` do not race this write.
+        core->record_terminal(rpc_code::shutting_down,
+                              rpc_error(rpc_code::shutting_down, "client is closed"),
+                              client_detail::failure_origin::local_lifecycle);
         core->cv.notify_all();
+        // A `then` callback registered before close() still fires, reporting
+        // the shutdown through the handle the callback received.
+        core->invoke_callback();
         client* const who = core->owner.load(std::memory_order_acquire);
         if (who != nullptr) {
             who->notify_waiter();
@@ -478,6 +686,161 @@ resilience::fallback_statistics client::fallback_stats() const noexcept {
     out.overrun = impl_->fallback_overrun.load(std::memory_order_relaxed);
     out.applied = impl_->fallback_applied.load(std::memory_order_relaxed);
     return out;
+}
+
+void client::record_fallbacks(
+    const resilience::fallback_statistics& tally) noexcept {
+    impl_->fallback_ineligible.fetch_add(tally.ineligible,
+                                         std::memory_order_relaxed);
+    impl_->fallback_skipped_deadline.fetch_add(tally.skipped_deadline,
+                                               std::memory_order_relaxed);
+    impl_->fallback_attempted.fetch_add(tally.attempted,
+                                        std::memory_order_relaxed);
+    impl_->fallback_failed.fetch_add(tally.failed, std::memory_order_relaxed);
+    impl_->fallback_canceled.fetch_add(tally.canceled,
+                                       std::memory_order_relaxed);
+    impl_->fallback_overrun.fetch_add(tally.overrun, std::memory_order_relaxed);
+    impl_->fallback_applied.fetch_add(tally.applied, std::memory_order_relaxed);
+}
+
+bool client::set_fallback(resilience::fallback_fn function, void* self,
+                          std::chrono::nanoseconds min_remaining,
+                          void* (*retain)(void*) noexcept,
+                          void (*release)(void*) noexcept) noexcept {
+    // The pair is a contract: one without the other cannot keep `self` alive and
+    // cannot release it, so a half-configured pair is rejected rather than
+    // silently ignored. A non-null `self` without the pair would dangle inside
+    // the noexcept fallback path.
+    if ((retain == nullptr) != (release == nullptr)) {
+        return false;
+    }
+    if (self != nullptr && retain == nullptr) {
+        return false;
+    }
+
+    std::shared_ptr<impl::fallback_slot> fresh;
+    if (function != nullptr) {
+        try {
+            fresh = std::make_shared<impl::fallback_slot>();
+        } catch (...) {
+            // A policy that cannot be allocated is not installed. The caller
+            // sees `false` and keeps the previous policy (or none).
+            return false;
+        }
+        fresh->function = function;
+        fresh->self = self;
+        fresh->min_remaining = min_remaining;
+        if (retain != nullptr && self != nullptr) {
+            // Outside the lock: a slow or lock-taking `retain` must never
+            // serialise the library mutex.
+            fresh->token = retain(self);
+            if (fresh->token == nullptr) {
+                // The reference could not be taken, so `fn` must not run with
+                // this `self`. Nothing is installed; the slot destructor is a
+                // no-op because `token` is null.
+                return false;
+            }
+            fresh->release = release;
+        }
+    }
+
+    std::shared_ptr<impl::fallback_slot> old;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lk(impl_->fallback_mutex);
+        old.swap(impl_->fallback);
+        impl_->fallback = std::move(fresh);
+        installed = impl_->fallback != nullptr;
+    }
+    // `old` dies here, outside the lock. If it was the last reference, its
+    // destructor calls the consumer's `release`; if a concurrent reader still
+    // holds the slot, that reader releases it instead, also outside the lock.
+    impl_->fallback_configured.store(installed, std::memory_order_release);
+    return true;
+}
+
+bool client::set_fallback_owned(resilience::fallback_fn function,
+                                std::shared_ptr<void> self,
+                                std::chrono::nanoseconds min_remaining) noexcept {
+    // The RAII form: `self` is owned by the shared_ptr, so there is no
+    // retain/release pair to keep in sync. A null `function` uninstalls.
+    if (function == nullptr) {
+        return set_fallback(nullptr, nullptr, std::chrono::nanoseconds{0}, nullptr,
+                            nullptr);
+    }
+    if (self == nullptr) {
+        return false;
+    }
+
+    std::shared_ptr<impl::fallback_slot> fresh;
+    try {
+        fresh = std::make_shared<impl::fallback_slot>();
+    } catch (...) {
+        // A policy that cannot be allocated is not installed. The caller sees
+        // `false` and keeps the previous policy (or none).
+        return false;
+    }
+    fresh->function = function;
+    fresh->self = self.get();
+    fresh->min_remaining = min_remaining;
+    fresh->owned_self = std::move(self);
+
+    std::shared_ptr<impl::fallback_slot> old;
+    {
+        std::lock_guard<std::mutex> lk(impl_->fallback_mutex);
+        old.swap(impl_->fallback);
+        impl_->fallback = std::move(fresh);
+    }
+    // `old` dies here, outside the lock, releasing the previous policy's owned
+    // self and/or retain token.
+    impl_->fallback_configured.store(true, std::memory_order_release);
+    return true;
+}
+
+resilience::fallback_outcome client::run_fallback(
+    client_detail::call_core& core, buffer& out, rpc_error& error,
+    resilience::fallback_counter_sink* sink) noexcept {
+    // The unconfigured client never takes a lock: `get()` keeps the exact
+    // pre-S4 path when no fallback was installed.
+    if (!impl_->fallback_configured.load(std::memory_order_acquire)) {
+        return resilience::fallback_outcome::not_configured;
+    }
+
+    // One strong reference covers the whole `fallback_execute` call, including
+    // a blocking `fn`: a concurrent set_fallback can only swap the pointer, and
+    // the slot stays alive until this function returns.
+    std::shared_ptr<impl::fallback_slot> snap;
+    {
+        std::lock_guard<std::mutex> lk(impl_->fallback_mutex);
+        snap = impl_->fallback;
+    }
+    if (!snap || snap->function == nullptr) {
+        return resilience::fallback_outcome::not_configured;
+    }
+
+    // A local copy, because `fallback_execute` takes `const fallback_policy&`
+    // and must not read the published slot while set_fallback swaps it.
+    // `self` is the caller's pointer; `token` never reaches `fn`.
+    resilience::fallback_policy policy;
+    policy.function = snap->function;
+    policy.self = snap->self;
+    policy.min_remaining = snap->min_remaining;
+
+    const resilience::fallback_context ctx = build_fallback_context(core, error);
+
+    fallback_tally tally;
+    tally.extra = sink;
+    resilience::fallback_counter_sink local_sink;
+    local_sink.self = &tally;
+    local_sink.add = &fallback_tally_add;
+
+    // Unlocked: `fn` may block and may call into user code.
+    const resilience::fallback_outcome outcome = resilience::fallback_execute(
+        policy, ctx, core.canceled, out, error,
+        &resilience::steady_clock_now, &local_sink);
+
+    record_fallbacks(tally.values);
+    return outcome;
 }
 
 // --- admission and pools -----------------------------------------------------
@@ -890,11 +1253,13 @@ void client::release_slot(
 }
 
 void client::finish_attempt(client_detail::call_core& core, rpc_code code,
-                            client_detail::failure_origin,
+                            rpc_error error,
+                            client_detail::failure_origin origin,
                             client_detail::breaker_record record) noexcept {
     if (core.finalized.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    core.record_terminal(code, std::move(error), origin);
     if (options_.shard != nullptr) {
         (void)options_.shard->cancel_timer(&core);
     }
@@ -1378,6 +1743,14 @@ client::builder& client::builder::idle_eviction(std::chrono::milliseconds value)
 client::builder& client::builder::on_shard(runtime& shard) {
     options_.shard = &shard;
     return *this;
+}
+
+client::builder& client::builder::default_timeout(std::chrono::nanoseconds value) {
+    return default_deadline(value);
+}
+
+client::builder& client::builder::per_connection_inflight(std::size_t value) {
+    return max_inflight_per_connection(value);
 }
 
 std::unique_ptr<client> client::builder::build() {
