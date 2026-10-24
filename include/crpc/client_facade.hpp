@@ -1898,9 +1898,15 @@ public:
 template <typename Resp>
 class [[nodiscard]] response final : public response_base {
 public:
-    response() = default;
     explicit response(rpc::rpc_result<client::call<Resp>> result)
         : result_(std::move(result)) {}
+
+    // An invalid response carrying a start failure. `rpc::rpc_result` has no
+    // default constructor, so this is the way to build the "nothing started"
+    // value.
+    [[nodiscard]] static response error(rpc_error err) {
+        return response(rpc::rpc_result<client::call<Resp>>(std::move(err)));
+    }
 
     [[nodiscard]] bool valid() const noexcept override {
         return result_.ok() && result_.value().valid();
@@ -1924,7 +1930,15 @@ public:
                             : client_detail::result_origin(result_.error());
     }
     [[nodiscard]] rpc_error error() const noexcept override {
-        return result_.ok() ? result_.value().error() : result_.error();
+        if (!result_.ok()) {
+            return result_.error();
+        }
+        // A fallback-answered call is a success: report the same `ok` that
+        // `code()` reports instead of the refusal that triggered the fallback.
+        if (result_.value().degraded()) {
+            return rpc_error(rpc_code::ok);
+        }
+        return result_.value().error();
     }
     void cancel() noexcept override {
         if (result_.ok()) {

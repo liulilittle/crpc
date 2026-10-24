@@ -456,12 +456,11 @@ CRPC_TEST(response_call_peek_accessors_cancel_after_get) {
 // `ready()` follows the terminal snapshot (`terminal_ready()`), not the
 // low-level completion (`call::ready()`).
 
-// A start failure (the result holds an error, not a handle) is invalid but
-// still exposes the error it was created with; cancel() is a no-op.
+// A start failure built with the static error() factory is invalid but still
+// exposes the error it was created with; cancel() is a no-op.
 CRPC_TEST(response_wrapper_start_error) {
-    crpc::rpc::rpc_result<crpc::client::call<int>> failed(
+    crpc::response<int> r = crpc::response<int>::error(
         crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
-    crpc::response<int> r(std::move(failed));
 
     CRPC_CHECK_FALSE(r.valid());
     CRPC_CHECK_FALSE(r.ready());
@@ -749,11 +748,11 @@ CRPC_TEST(response_wrapper_degraded) {
             CRPC_CHECK(r.ready());
             CRPC_CHECK_EQ(1u, r.attempts());
             CRPC_CHECK(r.degraded());
-            // `code()` reports the caller-visible success; `error()` forwards
-            // the call's terminal snapshot unchanged, which still carries the
-            // refusal that triggered the fallback.
+            // A fallback-answered call is a success: both `code()` and
+            // `error()` must agree on `ok`, not expose the refusal that
+            // triggered the fallback.
             CRPC_CHECK_EQ(crpc::rpc_code::ok, r.code());
-            CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.error().code);
+            CRPC_CHECK_EQ(crpc::rpc_code::ok, r.error().code);
         }
     }
 
