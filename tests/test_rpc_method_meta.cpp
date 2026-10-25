@@ -105,14 +105,18 @@ struct declaring_controller {
 
 // A controller that declares its methods with the macro. The controller type is
 // incomplete inside its own body, so the macro must be able to derive the service
-// id from an incomplete type exactly where it is expanded.
+// id from an incomplete type exactly where it is expanded. The method is declared
+// before the macro: the registrar names `&Ctl::Method`.
 struct macro_controller {
+    int ping(const int& value) { return value; }
     CRPC_RPC_METHOD(macro_controller, ping, "macro.ping")
 };
 
 // Two methods in one controller: the macro must generate a distinct static member
 // per method, all sharing the controller's service id.
 struct macro_controller_two {
+    int ping(const int& value) { return value; }
+    int pong(const int& value) { return value; }
     CRPC_RPC_METHOD(macro_controller_two, ping, "macro.ping")
     CRPC_RPC_METHOD(macro_controller_two, pong, "macro.pong")
 };

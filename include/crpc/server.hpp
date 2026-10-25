@@ -56,6 +56,7 @@
 #include <crpc/resilience/circuit_breaker.hpp>
 #include <crpc/resilience/rate_limiter.hpp>
 #include <crpc/rpc/dispatcher.hpp>
+#include <crpc/rpc/method_macro.hpp>
 #include <crpc/runtime.hpp>
 #include <crpc/span.hpp>
 
@@ -283,6 +284,22 @@ public:
                             Ctl& instance, rpc::method_options options = {}) {
             return add_method<Ctl, Method>(service.value, method.value,
                                            std::move(name), instance, options);
+        }
+
+        // Declarative registration. Walks the methods `Ctl` declared with
+        // `CRPC_RPC_METHOD` and registers each one, deriving the service id and
+        // method id from the type and the wire name. The service itself is
+        // registered separately with `add_service`. The controller instance must
+        // outlive `build()`.
+        template <typename Ctl>
+        builder& add_controller(Ctl& instance) {
+            for (const auto& descriptor : rpc::service_registrar<Ctl>::methods()) {
+                registrations_.push_back(
+                    [&instance, descriptor](rpc::service_registry& registry) -> status {
+                        return descriptor.register_fn(registry, &instance);
+                    });
+            }
+            return *this;
         }
         [[deprecated("use builder::max_inflight_per_connection")]]
         builder& per_connection_inflight(std::size_t count);
