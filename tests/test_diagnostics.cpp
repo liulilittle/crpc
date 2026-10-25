@@ -74,11 +74,15 @@ CRPC_TEST(diagnostics_classification_predicate_matrix) {
         bool fallback;
         bool server;
     };
+    // Ruling 16 mapping: `local_gate` is rate limiting + bulkhead,
+    // `local_capacity` is connection-pool capacity, `endpoint_open` is a refused
+    // connect (breaker open), and `endpoint_pre_send`/`endpoint_sent` are
+    // network failures after a connection was established.
     const expectation cases[] = {
         {crpc::failure_origin::local_lifecycle, true,  false, false, false, false, true,  false},
-        {crpc::failure_origin::local_gate,       true,  false, false, true,  false, false, false},
-        {crpc::failure_origin::local_capacity,   true,  false, false, false, true,  false, false},
-        {crpc::failure_origin::endpoint_open,    false, true,  false, false, false, false, false},
+        {crpc::failure_origin::local_gate,       false, false, false, false, true,  false, false},
+        {crpc::failure_origin::local_capacity,   true,  false, false, false, false, false, false},
+        {crpc::failure_origin::endpoint_open,    false, false, false, true,  false, false, false},
         {crpc::failure_origin::endpoint_pre_send,false, true,  false, false, false, false, false},
         {crpc::failure_origin::endpoint_sent,    false, true,  false, false, false, false, false},
         {crpc::failure_origin::remote,           false, false, false, false, false, false, true},
@@ -97,6 +101,20 @@ CRPC_TEST(diagnostics_classification_predicate_matrix) {
         CRPC_CHECK_EQ(c.fallback, crpc::is_fallback(error));
         CRPC_CHECK_EQ(c.server, crpc::is_server(error));
     }
+}
+
+CRPC_TEST(diagnostics_is_fallback_matches_lifecycle_only) {
+    // A successful fallback produces no error, and there is no dedicated
+    // fallback origin, so `is_fallback` can only key on `local_lifecycle`. It is
+    // a lifecycle marker, not a true fallback detector.
+    crpc::rpc_error error;
+    error.origin = crpc::failure_origin::local_lifecycle;
+    CRPC_CHECK(crpc::is_fallback(error));
+
+    error.origin = crpc::failure_origin::local_gate;
+    CRPC_CHECK_FALSE(crpc::is_fallback(error));
+    error.origin = crpc::failure_origin::local_capacity;
+    CRPC_CHECK_FALSE(crpc::is_fallback(error));
 }
 
 CRPC_TEST(diagnostics_predicates_are_origin_based_not_code_based) {

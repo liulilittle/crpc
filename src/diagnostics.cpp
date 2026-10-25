@@ -40,7 +40,6 @@ std::string to_string(const rpc_error& err) {
 bool is_local(const rpc_error& err) noexcept {
     switch (err.origin) {
     case failure_origin::local_lifecycle:
-    case failure_origin::local_gate:
     case failure_origin::local_capacity:
         return true;
     default:
@@ -50,7 +49,6 @@ bool is_local(const rpc_error& err) noexcept {
 
 bool is_network(const rpc_error& err) noexcept {
     switch (err.origin) {
-    case failure_origin::endpoint_open:
     case failure_origin::endpoint_pre_send:
     case failure_origin::endpoint_sent:
         return true;
@@ -64,14 +62,19 @@ bool is_timeout(const rpc_error& err) noexcept {
 }
 
 bool is_circuit_breaker(const rpc_error& err) noexcept {
-    return err.origin == failure_origin::local_gate;
+    return err.origin == failure_origin::endpoint_open;
 }
 
 bool is_rate_limiter(const rpc_error& err) noexcept {
-    return err.origin == failure_origin::local_capacity;
+    return err.origin == failure_origin::local_gate;
 }
 
 bool is_fallback(const rpc_error& err) noexcept {
+    // Ruling 16: a fallback that answers the call is a success and carries no
+    // error, and there is no dedicated fallback origin, so this can only key on
+    // `local_lifecycle`. It marks lifecycle-short-circuited errors, it is not a
+    // true fallback detector (callers must read the fallback statistics for
+    // that).
     return err.origin == failure_origin::local_lifecycle;
 }
 

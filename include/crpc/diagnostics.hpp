@@ -29,10 +29,18 @@ CRPC_API std::string to_string(const rpc_error& err);
 
 // --- Classification predicates ----------------------------------------------
 //
-// Every predicate is noexcept and reads only `err.origin`. `is_local` covers
-// the three local origins, `is_network` the three endpoint origins, and the
-// remaining predicates name the specific subsystem. `cancel` matches no
-// predicate: a caller-initiated cancel is not a subsystem failure.
+// Every predicate is noexcept and reads only `err.origin`. The mapping follows
+// the library's own semantics (Ruling 16):
+//   is_local           = local_lifecycle | local_capacity
+//   is_network         = endpoint_pre_send | endpoint_sent
+//   is_timeout         = timeout
+//   is_circuit_breaker = endpoint_open
+//   is_rate_limiter    = local_gate
+//   is_fallback        = local_lifecycle (lifecycle marker, not a fallback detector)
+//   is_server          = remote
+// `local_gate` is rate limiting + bulkhead, `local_capacity` is connection-pool
+// capacity, and `endpoint_open` is a refused connect (breaker open). `cancel`
+// matches no predicate: a caller-initiated cancel is not a subsystem failure.
 
 CRPC_API bool is_local(const rpc_error& err) noexcept;
 CRPC_API bool is_network(const rpc_error& err) noexcept;
