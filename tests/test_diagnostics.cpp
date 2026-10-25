@@ -402,6 +402,10 @@ CRPC_TEST(diagnostics_response_get_notifies_started_success_once) {
     CRPC_CHECK_EQ(42, got.value());
     CRPC_CHECK_EQ(1, probe.calls);
     CRPC_CHECK(probe.last_code == crpc::rpc_code::ok);
+    // A success has no error result, but the hook's `ok` record still carries
+    // the call's terminal origin/attempts for diagnostics.
+    CRPC_CHECK(probe.last_origin == crpc::failure_origin::remote);
+    CRPC_CHECK_EQ(r.attempts(), probe.last_attempts);
 
     (void)r.get();
     CRPC_CHECK_EQ(1, probe.calls);
@@ -451,15 +455,29 @@ CRPC_TEST(diagnostics_response_get_notifies_started_failure_once) {
     crpc::response<int> r =
         cli->request<int, int>(crpc::service_id{1}, crpc::method_id{2}, 0);
 
+    // The non-blocking read carries the call's terminal diagnostics too, so a
+    // later `get()` served from the cache is enriched as well. `try_get` is
+    // non-blocking by contract, so poll it until the call completes.
+    crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+    CRPC_CHECK(crpc_test::wait_for([&r, &out] { return r.try_get(out); }, 2000));
+    CRPC_CHECK_FALSE(out.ok());
+    CRPC_CHECK(out.error().origin == crpc::failure_origin::remote);
+    CRPC_CHECK(out.error().attempts >= 1u);
+    CRPC_CHECK_EQ(0, probe.calls);
+
     const crpc::rpc::rpc_result<int> got = r.get();
     CRPC_CHECK_FALSE(got.ok());
     CRPC_CHECK(got.error().code == crpc::rpc_code::unavailable);
+    // `get()` returns the error with the call's terminal origin/attempts, not
+    // the `rpc_error` defaults.
+    CRPC_CHECK(got.error().origin == crpc::failure_origin::remote);
+    CRPC_CHECK(got.error().attempts >= 1u);
+    CRPC_CHECK_EQ(r.attempts(), got.error().attempts);
     CRPC_CHECK_EQ(1, probe.calls);
     CRPC_CHECK(probe.last_code == crpc::rpc_code::unavailable);
-    // The terminal `rpc_error` produced by the call path does not carry
-    // `origin`/`attempts` (the handle keeps those on its own snapshot); the hook
-    // receives the error as `get()` returns it, so only the code is pinned here.
-    // Wiring those fields into the error is a separate concern from this hook.
+    // The hook observes the same diagnostics as the returned error.
+    CRPC_CHECK(probe.last_origin == got.error().origin);
+    CRPC_CHECK_EQ(got.error().attempts, probe.last_attempts);
 
     (void)r.get();
     CRPC_CHECK_EQ(1, probe.calls);
@@ -504,8 +522,11 @@ CRPC_TEST(diagnostics_response_get_notifies_cancel_once) {
         const crpc::rpc::rpc_result<int> got = r.get();
         CRPC_CHECK_FALSE(got.ok());
         CRPC_CHECK(got.error().code == crpc::rpc_code::canceled);
+        CRPC_CHECK(got.error().origin == crpc::failure_origin::cancel);
         CRPC_CHECK_EQ(1, probe.calls);
         CRPC_CHECK(probe.last_code == crpc::rpc_code::canceled);
+        CRPC_CHECK(probe.last_origin == crpc::failure_origin::cancel);
+        CRPC_CHECK_EQ(got.error().attempts, probe.last_attempts);
 
         (void)r.get();
         CRPC_CHECK_EQ(1, probe.calls);

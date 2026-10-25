@@ -2213,6 +2213,10 @@ public:
                 return true;
             }
             if (result_->value().try_get(out)) {
+                if (!out.ok()) {
+                    out = rpc::rpc_result<Resp>(
+                        with_call_diagnostics(out.error()));
+                }
                 cache(out);
                 return true;
             }
@@ -2248,8 +2252,27 @@ private:
             if (!result_->ok()) {
                 return rpc::rpc_result<Resp>(result_->error());
             }
-            return result_->value().get();
+            rpc::rpc_result<Resp> result = result_->value().get();
+            if (!result.ok()) {
+                return rpc::rpc_result<Resp>(
+                    with_call_diagnostics(result.error()));
+            }
+            return result;
         }
+    }
+
+    // Attaches the call handle's terminal origin/attempts to an error from a
+    // started call. The handle keeps those in a separate snapshot from the
+    // `rpc_error`, so without this copy the returned error (and the completion
+    // hook's record) would carry the `rpc_error` defaults and the classification
+    // predicates would be wrong. Start failures and computed results have no
+    // live handle and keep the diagnostics they already carry.
+    [[nodiscard]] rpc_error with_call_diagnostics(rpc_error error) const {
+        if (!computed_ && result_->ok()) {
+            error.origin = result_->value().origin();
+            error.attempts = result_->value().attempts();
+        }
+        return error;
     }
 
     // Records a terminal result for a repeat `get()`/`try_get()`. Skipped for a
@@ -2269,8 +2292,8 @@ private:
             return;
         }
         completion_notified_ = true;
-        diagnostics::on_completion(value.ok() ? rpc_error(rpc_code::ok)
-                                              : value.error());
+        diagnostics::on_completion(with_call_diagnostics(
+            value.ok() ? rpc_error(rpc_code::ok) : value.error()));
     }
 
     // Type-erased consuming hooks (`response_base`). `get_erased` returns the
