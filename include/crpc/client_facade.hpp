@@ -1004,6 +1004,16 @@ public:
             return state_ != nullptr ? state_->core.attempts : 0;
         }
 
+        // The per-call context captured at start. `normalize_context` fixes it
+        // before the first attempt and never mutates the trace afterwards, so the
+        // trace id a caller supplied is the one the terminal diagnostics report.
+        [[nodiscard]] rpc::call_context context() const noexcept {
+            if (state_ == nullptr) {
+                return rpc::call_context{};
+            }
+            return state_->core.ctx;
+        }
+
         // Non-blocking read of the terminal outcome. `code()` reads the atomic
         // terminal code; `origin()`/`error()` read the snapshot the terminal
         // transition recorded under `core.mutex`. An invalid handle answers the
@@ -2261,18 +2271,42 @@ private:
         }
     }
 
-    // Attaches the call handle's terminal origin/attempts to an error from a
-    // started call. The handle keeps those in a separate snapshot from the
-    // `rpc_error`, so without this copy the returned error (and the completion
-    // hook's record) would carry the `rpc_error` defaults and the classification
-    // predicates would be wrong. Start failures and computed results have no
-    // live handle and keep the diagnostics they already carry.
+    // Attaches the call handle's terminal origin/attempts/trace id to an error
+    // from a started call. The handle keeps those in a separate snapshot from
+    // the `rpc_error`, so without this copy the returned error (and the
+    // completion hook's record) would carry the `rpc_error` defaults and the
+    // classification predicates would be wrong. Start failures and computed
+    // results have no live handle and keep the diagnostics they already carry.
     [[nodiscard]] rpc_error with_call_diagnostics(rpc_error error) const {
         if (!computed_ && result_->ok()) {
+            const rpc::call_context ctx = result_->value().context();
             error.origin = result_->value().origin();
             error.attempts = result_->value().attempts();
+            if (ctx.trace.trace.valid()) {
+                error.metadata.set(k_trace_id_metadata,
+                                   format_trace_id(ctx.trace.trace));
+            }
         }
         return error;
+    }
+
+    // Metadata key carrying the call's W3C trace id. Stable but not part of the
+    // wire protocol; the value is the lowercase hexadecimal traceparent form.
+    static constexpr const char* k_trace_id_metadata = "trace_id";
+
+    // Lowercase hexadecimal form of a 16-byte W3C trace id. Kept as a private
+    // static member because only this template uses it; a non-template helper
+    // would have to be exported or duplicated in every translation unit.
+    [[nodiscard]] static std::string format_trace_id(const obs::trace_id& id) {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(id.bytes.size() * 2);
+        for (const std::byte b : id.bytes) {
+            const auto value = static_cast<std::uint8_t>(b);
+            out.push_back(digits[value >> 4]);
+            out.push_back(digits[value & 0x0F]);
+        }
+        return out;
     }
 
     // Records a terminal result for a repeat `get()`/`try_get()`. Skipped for a

@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -533,6 +534,86 @@ CRPC_TEST(diagnostics_response_get_notifies_cancel_once) {
     }
 
     cli->close();
+    shard.stop();
+    shard.join();
+}
+
+// --- Task 4: trace metadata --------------------------------------------------
+//
+// A started call carries the caller's W3C trace context. When the call fails,
+// `response<Resp>::get()` attaches the trace id to the terminal `rpc_error`
+// metadata under the `trace_id` key, so a caller can correlate the failure with
+// the trace that produced it without re-deriving the context. A call with no
+// trace id (the all-zero default) must not invent one: the key stays absent.
+
+namespace {
+
+// The 16 bytes 0x01..0x10, and their lowercase hexadecimal form.
+constexpr std::byte k_trace_bytes[16] = {
+    std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04},
+    std::byte{0x05}, std::byte{0x06}, std::byte{0x07}, std::byte{0x08},
+    std::byte{0x09}, std::byte{0x0a}, std::byte{0x0b}, std::byte{0x0c},
+    std::byte{0x0d}, std::byte{0x0e}, std::byte{0x0f}, std::byte{0x10},
+};
+constexpr const char* k_trace_hex = "0102030405060708090a0b0c0d0e0f10";
+
+} // namespace
+
+CRPC_TEST(diagnostics_response_error_metadata_carries_trace_id) {
+    crpc::inproc_backend backend;
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("diagnostics-trace-id"), backend);
+    sb.add_service(1, "svc");
+    sb.add_raw_method(1, 2, "fail", &fail_body, nullptr);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("diagnostics-trace-id"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::rpc::call_context ctx;
+    for (std::size_t i = 0; i < ctx.trace.trace.bytes.size(); ++i) {
+        ctx.trace.trace.bytes[i] = k_trace_bytes[i];
+    }
+
+    crpc::response<int> traced =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{2}, 0, ctx);
+    const crpc::rpc::rpc_result<int> failed = traced.get();
+    CRPC_CHECK_FALSE(failed.ok());
+    const std::string* trace = failed.error().metadata.find("trace_id");
+    CRPC_CHECK(trace != nullptr);
+    if (trace != nullptr) {
+        CRPC_CHECK_EQ(std::string(k_trace_hex), *trace);
+    }
+
+    // A call with the default (invalid) trace id must not fabricate metadata.
+    crpc::response<int> untraced =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{2}, 0);
+    const crpc::rpc::rpc_result<int> plain = untraced.get();
+    CRPC_CHECK_FALSE(plain.ok());
+    CRPC_CHECK(plain.error().metadata.find("trace_id") == nullptr);
+
+    cli->close();
+    srv->stop();
     shard.stop();
     shard.join();
 }
