@@ -53,6 +53,17 @@
 #include <utility>
 #include <vector>
 
+// `operator co_await` below needs `std::coroutine_handle`; only include the
+// header (and declare the operator) when the compiler is in C++20 mode and
+// `<coroutine>` is available. `__cpp_coroutines` is deliberately not used as
+// the test: MSVC (19.x) does not define it even under `/std:c++20` (it defines
+// `__cpp_impl_coroutine` instead), which would silently disable the operator on
+// the project's primary compiler. `__has_include(<coroutine>)` is the portable
+// form of the "and `<coroutine>` is available" condition.
+#if __cplusplus >= 202002L && __has_include(<coroutine>)
+#include <coroutine>
+#endif
+
 #include <crpc/buffer.hpp>
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
@@ -2052,6 +2063,28 @@ public:
 
     [[nodiscard]] rpc::rpc_result<Resp> wait() { return get(); }
     [[nodiscard]] rpc::rpc_result<Resp> park() { return get(); }
+
+    // C++20 coroutine integration. `await_ready()` reports `ready()` so an
+    // already-terminal response (a composition value, or a call that finished
+    // before the await) resumes immediately; an in-flight call suspends the
+    // awaiting coroutine and is resumed by the call's `then` callback on the
+    // thread that terminates it. `await_resume()` returns `get()`. Absent from
+    // a C++17 build, where `co_await` is not a language feature.
+#if __cplusplus >= 202002L && __has_include(<coroutine>)
+    auto operator co_await() {
+        struct awaiter {
+            response& r;
+            bool await_ready() const noexcept { return r.ready(); }
+            void await_suspend(std::coroutine_handle<> h) {
+                // `(void)`: `response::then` is [[nodiscard]], and a discarded
+                // return would be a warning promoted to an error under /WX.
+                (void)r.then([h](client::call<Resp>&) mutable { h.resume(); });
+            }
+            rpc::rpc_result<Resp> await_resume() { return r.get(); }
+        };
+        return awaiter{*this};
+    }
+#endif
 
     // Non-blocking read. A start failure is already terminal, so it writes the
     // wrapped error and returns true; an in-flight or completed call delegates
