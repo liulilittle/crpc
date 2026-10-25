@@ -29,13 +29,39 @@
 // `__FUNCSIG__`/`__PRETTY_FUNCTION__`, so completeness is not required. It only
 // has to be complete by the time `add_controller<Ctl>` runs. `Method` must be
 // declared before the macro: the registrar names `&Ctl::Method`.
+//
+// `CRPC_RPC_SERVICE(Ctl, name)` is optional and declares the service name the
+// controller registers under. `add_controller<Ctl>` registers the service itself
+// (id `method_id_from<Ctl>()`, name `Ctl::crpc_service_name`), so the caller does
+// not call `add_service`. Without `CRPC_RPC_SERVICE` the name falls back to
+// `typeid(Ctl).name()`, or to an empty string when the translation unit cannot
+// write `typeid` (the registry does not use the name for dispatch, only for
+// diagnostics).
 #ifndef CRPC_RPC_METHOD_MACRO_HPP
 #define CRPC_RPC_METHOD_MACRO_HPP
 
+#include <string>
+#include <type_traits>
+#include <typeinfo>
 #include <vector>
 
 #include <crpc/rpc/dispatcher.hpp>
 #include <crpc/rpc/method_meta.hpp>
+
+// Mirrors `CRPC_CAN_USE_TYPEID` in crpc/codec.hpp: whether this translation unit
+// can write the static `typeid(T)` form. Kept local so this header does not pull
+// in the codec registry just for the service-name fallback. The two must agree
+// for one binary; a build that mixes RTTI flags across translation units is not
+// supported (see the comment in crpc/codec.hpp).
+#if !defined(CRPC_RPC_TYPEID_AVAILABLE)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define CRPC_RPC_TYPEID_AVAILABLE 1
+#elif defined(__cpp_rtti)
+#define CRPC_RPC_TYPEID_AVAILABLE 1
+#else
+#define CRPC_RPC_TYPEID_AVAILABLE 0
+#endif
+#endif
 
 namespace crpc::rpc {
 
@@ -72,6 +98,36 @@ public:
     }
 };
 
+namespace service_name_detail {
+
+// True when `Ctl` declared `crpc_service_name` with `CRPC_RPC_SERVICE`.
+template <typename Ctl, typename = void>
+struct has_service_name : std::false_type {};
+
+template <typename Ctl>
+struct has_service_name<Ctl, std::void_t<decltype(Ctl::crpc_service_name)>>
+    : std::true_type {};
+
+} // namespace service_name_detail
+
+// The service name a declarative controller registers under: the name declared
+// with `CRPC_RPC_SERVICE`, else the compiler's type-name spelling, else an empty
+// string when `typeid` is unavailable.
+template <typename Ctl>
+[[nodiscard]] std::string service_name_of() {
+    if constexpr (service_name_detail::has_service_name<Ctl>::value) {
+        const char* declared = Ctl::crpc_service_name;
+        return declared != nullptr ? std::string(declared) : std::string();
+    } else {
+#if CRPC_RPC_TYPEID_AVAILABLE
+        const char* spelling = typeid(Ctl).name();
+        return spelling != nullptr ? std::string(spelling) : std::string();
+#else
+        return std::string();
+#endif
+    }
+}
+
 } // namespace crpc::rpc
 
 // Declares `Method` as an RPC method of `Ctl` under the wire name
@@ -98,5 +154,11 @@ public:
                 }});                                                             \
         return true;                                                             \
     }();
+
+// Declares the service name `Ctl` registers under. Place it inside the
+// controller body. `add_controller<Ctl>` uses it; without it the name falls back
+// to `typeid(Ctl).name()` (or empty when `typeid` is unavailable).
+#define CRPC_RPC_SERVICE(Ctl, name_literal)                                     \
+    inline static constexpr const char* crpc_service_name = name_literal;
 
 #endif // CRPC_RPC_METHOD_MACRO_HPP

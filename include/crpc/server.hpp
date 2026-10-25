@@ -286,13 +286,19 @@ public:
                                            std::move(name), instance, options);
         }
 
-        // Declarative registration. Walks the methods `Ctl` declared with
-        // `CRPC_RPC_METHOD` and registers each one, deriving the service id and
-        // method id from the type and the wire name. The service itself is
-        // registered separately with `add_service`. The controller instance must
-        // outlive `build()`.
+        // Declarative registration. Registers the service `Ctl` belongs to (id
+        // `method_id_from<Ctl>()`, name from `CRPC_RPC_SERVICE` or the type name)
+        // and then every method `Ctl` declared with `CRPC_RPC_METHOD`, deriving
+        // the method id from the type and the wire name. The caller does not call
+        // `add_service`; the controller instance must outlive `build()`.
         template <typename Ctl>
         builder& add_controller(Ctl& instance) {
+            registrations_.push_back(
+                [service_id = rpc::method_id_from<Ctl>(),
+                 name = rpc::service_name_of<Ctl>()](
+                    rpc::service_registry& registry) -> status {
+                    return registry.register_service(service_id, name);
+                });
             for (const auto& descriptor : rpc::service_registrar<Ctl>::methods()) {
                 registrations_.push_back(
                     [&instance, descriptor](rpc::service_registry& registry) -> status {

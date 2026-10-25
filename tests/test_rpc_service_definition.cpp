@@ -11,8 +11,9 @@
 //     controller's service id, the deterministic method id and the wire name;
 //   * two methods in one controller produce two descriptors;
 //   * distinct controllers produce distinct service ids;
-//   * `add_controller` registers every declared method end to end -- a real
-//     server built from the builder answers a real client call.
+//   * `add_controller` registers the service itself (id + name) and every
+//     declared method end to end -- a real server built from the builder answers
+//     a real client call, with no separate `add_service` call.
 #include <atomic>
 #include <cstddef>
 #include <string>
@@ -41,6 +42,7 @@ struct echo_controller {
         return value + 1;
     }
 
+    CRPC_RPC_SERVICE(echo_controller, "echo")
     CRPC_RPC_METHOD(echo_controller, echo, "echo.inc")
 };
 
@@ -59,8 +61,22 @@ struct pair_controller {
         return value * 2;
     }
 
+    CRPC_RPC_SERVICE(pair_controller, "pair")
     CRPC_RPC_METHOD(pair_controller, ping, "pair.ping")
     CRPC_RPC_METHOD(pair_controller, pong, "pair.pong")
+};
+
+// No `CRPC_RPC_SERVICE`: `add_controller` must still register the service, using
+// the type-name fallback.
+struct fallback_controller {
+    std::atomic<int> calls{0};
+
+    int twice(const int& value) {
+        ++calls;
+        return value * 2;
+    }
+
+    CRPC_RPC_METHOD(fallback_controller, twice, "fallback.twice")
 };
 
 } // namespace
@@ -122,7 +138,6 @@ CRPC_TEST(add_controller_registers_declared_methods_end_to_end) {
 
     server::builder sb;
     sb.add_listener(endpoint::inproc("service-definition-echo"), backend);
-    sb.add_service(method_id_from<echo_controller>(), "echo");
     sb.add_controller(controller);
     auto srv = sb.build();
     CRPC_CHECK(srv != nullptr);
@@ -178,7 +193,6 @@ CRPC_TEST(add_controller_registers_all_declared_methods) {
 
     server::builder sb;
     sb.add_listener(endpoint::inproc("service-definition-pair"), backend);
-    sb.add_service(method_id_from<pair_controller>(), "pair");
     sb.add_controller(controller);
     auto srv = sb.build();
     CRPC_CHECK(srv != nullptr);
@@ -238,6 +252,74 @@ CRPC_TEST(add_controller_registers_all_declared_methods) {
 
     CRPC_CHECK_EQ(1, controller.ping_calls.load());
     CRPC_CHECK_EQ(1, controller.pong_calls.load());
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// The declared service name is what `add_controller` registers.
+CRPC_TEST(service_name_comes_from_the_declared_macro) {
+    CRPC_CHECK_EQ(std::string(service_name_of<echo_controller>()), std::string("echo"));
+    CRPC_CHECK_EQ(std::string(service_name_of<pair_controller>()), std::string("pair"));
+}
+
+// Without `CRPC_RPC_SERVICE` the name falls back to the compiler's type-name
+// spelling (non-empty in this RTTI-enabled build).
+CRPC_TEST(service_name_falls_back_to_the_type_name) {
+    const std::string fallback = service_name_of<fallback_controller>();
+    CRPC_CHECK_FALSE(fallback.empty());
+}
+
+// A controller with no `CRPC_RPC_SERVICE` still registers its service and is
+// callable.
+CRPC_TEST(add_controller_registers_service_without_declared_name) {
+    inproc_backend backend;
+    fallback_controller controller;
+
+    server::builder sb;
+    sb.add_listener(endpoint::inproc("service-definition-fallback"), backend);
+    sb.add_controller(controller);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    runtime_options ro;
+    ro.start_handler_pool = false;
+    runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(endpoint::inproc("service-definition-fallback"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(
+        method_id_from<fallback_controller>(),
+        method_id_from_name<fallback_controller>("fallback.twice"));
+    auto started = stub.call(21);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::client::call<int> handle = std::move(started).value();
+        const rpc::rpc_result<int> result = handle.get();
+        CRPC_CHECK(result.ok());
+        if (result.ok()) {
+            CRPC_CHECK_EQ(42, result.value());
+        }
+        CRPC_CHECK_EQ(1, controller.calls.load());
+    }
 
     cli->close();
     srv->stop();
