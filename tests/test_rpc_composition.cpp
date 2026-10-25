@@ -302,7 +302,7 @@ CRPC_TEST(response_when_any_first_completion) {
         if (started.ok()) {
             crpc::response<int> echo_response(std::move(started));
             [[maybe_unused]] crpc::response<int>& chained = echo_response.then(
-                [&echo_done](crpc::client::call<int>&) {
+                [&echo_done](crpc::rpc::rpc_result<int>) {
                     echo_done.store(true, std::memory_order_release);
                 });
             CRPC_CHECK(&chained == &echo_response);

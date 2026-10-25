@@ -663,6 +663,12 @@ struct call_state final : call_state_base {
     // no low-level call is in flight (between attempts, or after the terminal
     // result was taken).
     std::optional<rpc::call<Resp>> inner;
+    // The terminal outcome once `get()` has produced it. `get()` is idempotent:
+    // a repeat call returns this cached result instead of re-entering `issue()`,
+    // which would refuse with `shutting_down` because the winning attempt left
+    // `finalized == true` and the retry path never ran `reset_for_attempt()`.
+    // Written only on a terminal hand-off, read on every later `get()`.
+    std::optional<rpc::rpc_result<Resp>> terminal_result;
 
     // `pool` is the call-state pool this block belongs to. When set, the
     // constructor takes the request buffer's storage from the pool and the
@@ -1060,13 +1066,22 @@ public:
                 return rpc::rpc_result<Resp>(
                     rpc_error(rpc_code::invalid_argument, "invalid call handle"));
             }
+            // Idempotent: once a terminal outcome has been produced, return the
+            // cached copy. Without this a second `get()` re-enters `issue()`,
+            // whose `finalized` guard refuses with `shutting_down` (the winning
+            // attempt never ran `reset_for_attempt()`), so the caller sees a
+            // different result than the first call.
+            if (state_->terminal_result.has_value()) {
+                return *state_->terminal_result;
+            }
             if (client_detail::live_owner(state_->core) == nullptr) {
                 state_->core.record_terminal(
                     rpc_code::failed_precondition,
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"),
                     client_detail::failure_origin::local_lifecycle);
-                return rpc::rpc_result<Resp>(
+                state_->terminal_result = rpc::rpc_result<Resp>(
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
+                return *state_->terminal_result;
             }
             std::shared_ptr<client_detail::call_state<Resp>> st = state_;
             // Every return below is terminal. The guard runs the `then` callback
@@ -1080,10 +1095,19 @@ public:
             // a terminal path may call `release()`, which moves `state_` out and
             // can drop the last reference to the call state. A raw `&core` would
             // then dangle when the guard runs.
+            //
+            // `result` carries the terminal outcome so the guard can publish it
+            // into `terminal_result` *before* the `then` callback runs: the
+            // callback may call `get()` again, and it must observe the cached
+            // result rather than re-entering `issue()`.
             struct terminal_guard {
                 std::shared_ptr<client_detail::call_state<Resp>> st;
+                std::optional<rpc::rpc_result<Resp>> result;
                 ~terminal_guard() {
                     if (st) {
+                        if (result.has_value()) {
+                            st->terminal_result = *result;
+                        }
                         // Mark the call terminal for `ready()`/`try_get()` and
                         // run the `then` callback exactly once. `completed`
                         // distinguishes this terminal hand-off from the
@@ -1094,6 +1118,15 @@ public:
                     }
                 }
             } guard{st};
+            // Publishes a terminal outcome into the guard (and, through it, the
+            // call state) and returns it. `Resp` is copied into the cache only
+            // when it is copyable; a move-only `Resp` still returns by value.
+            auto finish = [&guard](rpc::rpc_result<Resp> r) -> rpc::rpc_result<Resp> {
+                if constexpr (std::is_copy_constructible_v<Resp>) {
+                    guard.result = r;
+                }
+                return r;
+            };
             // Records the terminal outcome for the non-blocking accessors on the
             // exits that do not pass through `finish_attempt` (a dead owner, a
             // shutdown during the wait, and the cancel returns).
@@ -1111,8 +1144,8 @@ public:
                     record(rpc_code::shutting_down,
                            rpc_error(rpc_code::shutting_down, "client is closed"),
                            client_detail::failure_origin::local_lifecycle);
-                    return rpc::rpc_result<Resp>(
-                        rpc_error(rpc_code::shutting_down, "client is closed"));
+                    return finish(rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::shutting_down, "client is closed")));
                 }
                 // Presence is read under `inner_mutex` so a concurrent cancel()
                 // (which takes the same lock to reach the low-level handle) has
@@ -1136,8 +1169,8 @@ public:
                         record(rpc_code::shutting_down,
                                rpc_error(rpc_code::shutting_down, "client is closed"),
                                client_detail::failure_origin::local_lifecycle);
-                        return rpc::rpc_result<Resp>(
-                            rpc_error(rpc_code::shutting_down, "client is closed"));
+                        return finish(rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::shutting_down, "client is closed")));
                     }
                     if (!waited.ok()) {
                         rpc_error failure(rpc_code::deadline_exceeded,
@@ -1161,8 +1194,8 @@ public:
                         // this counts as `ineligible` and the original error is
                         // returned unchanged. Calling it keeps every terminal
                         // failure on one counting path.
-                        return current->fallback_for<Resp>(
-                            st->core, std::move(failure), origin);
+                        return finish(current->fallback_for<Resp>(
+                            st->core, std::move(failure), origin));
                     }
                     rpc::rpc_result<Resp> result(
                         rpc_error(rpc_code::internal, "call produced no result"));
@@ -1175,8 +1208,8 @@ public:
                         record(rpc_code::shutting_down,
                                rpc_error(rpc_code::shutting_down, "client is closed"),
                                client_detail::failure_origin::local_lifecycle);
-                        return rpc::rpc_result<Resp>(
-                            rpc_error(rpc_code::shutting_down, "client is closed"));
+                        return finish(rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::shutting_down, "client is closed")));
                     }
                     const bool decoded = inner->try_get(result);
                     const rpc_code code = inner->code();
@@ -1201,14 +1234,14 @@ public:
                         retry ? client_detail::breaker_record::ignore
                               : client_detail::breaker_record_for(origin, code));
                     if (decoded && code == rpc_code::ok) {
-                        return result;
+                        return finish(result);
                     }
                     if (!retry) {
                         // Last attempt failed: this is the one place a fallback
                         // may answer, and it runs after finish_attempt() so the
                         // breaker already saw the real outcome.
-                        return current->fallback_for<Resp>(
-                            st->core, std::move(terminal_error), origin);
+                        return finish(current->fallback_for<Resp>(
+                            st->core, std::move(terminal_error), origin));
                     }
                     current->sleep_for(st->core, delay);
                     if (st->core.canceled.load(std::memory_order_acquire)) {
@@ -1220,8 +1253,8 @@ public:
                         record(rpc_code::canceled,
                                rpc_error(rpc_code::canceled, "call canceled"),
                                client_detail::failure_origin::cancel);
-                        return rpc::rpc_result<Resp>(
-                            rpc_error(rpc_code::canceled, "call canceled"));
+                        return finish(rpc::rpc_result<Resp>(
+                            rpc_error(rpc_code::canceled, "call canceled")));
                     }
                     st->core.reset_for_attempt();
                     continue;
@@ -1232,8 +1265,8 @@ public:
                     record(rpc_code::canceled,
                            rpc_error(rpc_code::canceled, "call canceled"),
                            client_detail::failure_origin::cancel);
-                    return rpc::rpc_result<Resp>(
-                        rpc_error(rpc_code::canceled, "call canceled"));
+                    return finish(rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::canceled, "call canceled")));
                 }
 
                 rpc_error failure;
@@ -1252,8 +1285,8 @@ public:
                 if (!retry) {
                     // Last attempt failed before the peer answered; a fallback
                     // may still answer for a pre-send refusal.
-                    return owner->fallback_for<Resp>(st->core, std::move(failure),
-                                                     origin);
+                    return finish(owner->fallback_for<Resp>(st->core, std::move(failure),
+                                                            origin));
                 }
                 owner->sleep_for(st->core, delay);
                 if (st->core.canceled.load(std::memory_order_acquire)) {
@@ -1261,8 +1294,8 @@ public:
                     record(rpc_code::canceled,
                            rpc_error(rpc_code::canceled, "call canceled"),
                            client_detail::failure_origin::cancel);
-                    return rpc::rpc_result<Resp>(
-                        rpc_error(rpc_code::canceled, "call canceled"));
+                    return finish(rpc::rpc_result<Resp>(
+                        rpc_error(rpc_code::canceled, "call canceled")));
                 }
                 // The failed issue finalized this attempt (and dropped its
                 // permit); re-arm it for the next one, as the decoded path
@@ -1273,8 +1306,17 @@ public:
         }
 
         [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
-            if (state_ == nullptr ||
-                !state_->core.done.load(std::memory_order_acquire)) {
+            if (state_ == nullptr) {
+                return false;
+            }
+            // Idempotent: a repeat read returns the cached terminal outcome.
+            // `try_get` moves `state_` out when it delivers a result, so a
+            // second read would otherwise see a null handle and answer false.
+            if (state_->terminal_result.has_value()) {
+                out = *state_->terminal_result;
+                return true;
+            }
+            if (!state_->core.done.load(std::memory_order_acquire)) {
                 return false;
             }
             // Snapshot the handle under `inner_mutex`: a concurrent cancel() may
@@ -1291,6 +1333,10 @@ public:
             }
             const bool decoded = inner->try_get(out);
             if (decoded) {
+                // Publish the terminal outcome before `state_` is moved out.
+                if constexpr (std::is_copy_constructible_v<Resp>) {
+                    state_->terminal_result = out;
+                }
                 // The handle has delivered its terminal result: record it once
                 // and release the timer and slot.
                 const rpc_code code = inner->code();
@@ -1300,7 +1346,11 @@ public:
                 }
                 const client_detail::failure_origin origin =
                     client_detail::result_origin(terminal_error);
-                std::shared_ptr<client_detail::call_state<Resp>> st = std::move(state_);
+                // Keep `state_` engaged: `try_get` finalizes the attempt but
+                // must leave the handle valid so a `then` body that calls
+                // `get()` observes the recorded result instead of the
+                // `invalid_argument` sentinel of a null handle.
+                std::shared_ptr<client_detail::call_state<Resp>> st = state_;
                 {
                     std::lock_guard<std::mutex> lk(st->inner_mutex);
                     st->inner.reset();
@@ -1916,9 +1966,22 @@ template <typename T>
 inline constexpr bool is_composition_value_v = is_composition_value<T>::value;
 } // namespace client_detail
 
+// Type-erased terminal callback. `ctx` is the caller-supplied cookie; `error`
+// is the terminal outcome (empty on success). The typed value is not part of
+// the erased interface, so a callback registered through `response_base`
+// receives only the terminal error; a caller that needs the value names
+// `response<Resp>`.
+using response_callback = void (*)(void* ctx, rpc_error error) noexcept;
+
 // Type-erased view of a `response<Resp>`, for code that must observe a response
-// without naming its value type. Task 2 defines only the diagnostic skeleton;
-// the waiting/consuming half (`get`/`wait`/`then`) arrives with the later tasks.
+// without naming its value type. It exposes the diagnostics plus a
+// type-erased consuming half: `get()`/`try_get()`/`then()`.
+//
+// The type-erased consuming methods are named `get`/`try_get`/`then` to match
+// the typed API, but they cannot be virtual with the typed `get()`'s return
+// type (`rpc_result<Resp>`), which the base does not know. They are therefore
+// non-virtual forwarders over the private virtual `*_erased` hooks; the hooks
+// carry the erased signature and are implemented by `response<Resp>`.
 class response_base {
 public:
     virtual ~response_base() = default;
@@ -1930,6 +1993,21 @@ public:
     [[nodiscard]] virtual client_detail::failure_origin origin() const noexcept = 0;
     [[nodiscard]] virtual rpc_error error() const noexcept = 0;
     virtual void cancel() noexcept = 0;
+
+    // Type-erased consumption. A `response_base&` can consume a response
+    // without naming `Resp`: `get()` waits and returns the terminal error
+    // (empty on success), `try_get()` is the non-blocking form, and `then()`
+    // registers a callback that fires once with the terminal error. The typed
+    // value is not part of the erased interface; a caller that needs it names
+    // `response<Resp>`.
+    [[nodiscard]] rpc_error get() { return get_erased(); }
+    [[nodiscard]] bool try_get(rpc_error& out) { return try_get_erased(out); }
+    void then(response_callback cb, void* ctx) { then_erased(cb, ctx); }
+
+private:
+    [[nodiscard]] virtual rpc_error get_erased() = 0;
+    [[nodiscard]] virtual bool try_get_erased(rpc_error& out) = 0;
+    virtual void then_erased(response_callback cb, void* ctx) = 0;
 };
 
 // Unified result wrapper over the `rpc::rpc_result<client::call<Resp>>` that a
@@ -1938,7 +2016,10 @@ public:
 template <typename Resp>
 class [[nodiscard]] response final : public response_base {
 public:
-    explicit response(rpc::rpc_result<client::call<Resp>> result)
+    // Non-explicit so a `rpc_result<client::call<Resp>>` (what `stub::call` and
+    // `start_encoded` still return) converts implicitly to a `response<Resp>`:
+    // `response<Resp> r = stub.call(...);` compiles without a cast (spec:96).
+    response(rpc::rpc_result<client::call<Resp>> result)
         : result_(std::move(result)) {}
 
     // A response that already holds a terminal value rather than a call handle.
@@ -1969,12 +2050,18 @@ public:
     }
     // Follows the terminal snapshot, so `ready()` agrees with `code()`: the
     // accessors are meaningful only once a consumer recorded the outcome. A
-    // computed response is terminal by construction.
+    // computed response is terminal by construction. A start failure has no
+    // handle but is terminal, so it is ready too: otherwise `ready()` would
+    // disagree with `try_get()`/`get()`, and a caller that gates on `ready()`
+    // would never observe the error.
     [[nodiscard]] bool ready() const noexcept override {
         if (computed_) {
             return true;
         }
-        return result_->ok() && result_->value().terminal_ready();
+        if (!result_->ok()) {
+            return true;
+        }
+        return result_->value().terminal_ready();
     }
     [[nodiscard]] std::uint32_t attempts() const noexcept override {
         if (computed_) {
@@ -2025,40 +2112,52 @@ public:
         }
     }
 
-    // Registers a completion callback on the wrapped call handle. It forwards
-    // to `client::call<Resp>::then`, so the callback receives that handle, runs
-    // on the thread that terminates the call (or immediately on this thread
-    // when it already terminated), exactly once. A start failure has no call to
-    // arm: the callback is never registered. Returns `*this` so callers can
-    // chain. A computed response has no handle, so it arms nothing.
+    // Registers a completion callback that receives the terminal result. The
+    // callback is `void(rpc_result<Resp>)` (spec:73), runs on the thread that
+    // terminates the call (or immediately on this thread when it already
+    // terminated), exactly once, and is delivered for a start failure and for a
+    // computed response too (both are terminal, so both invoke immediately).
+    // Returns `*this` so callers can chain.
     template <typename F>
     [[nodiscard]] response& then(F&& fn) {
+        static_assert(
+            std::is_invocable_v<std::decay_t<F>, rpc::rpc_result<Resp>>,
+            "response<Resp>::then callback must be callable as void(rpc_result<Resp>)");
+        if (computed_) {
+            fn(*computed_);
+            return *this;
+        }
+        if (!result_->ok()) {
+            fn(rpc::rpc_result<Resp>(result_->error()));
+            return *this;
+        }
         if constexpr (!client_detail::is_composition_value_v<Resp>) {
-            if (result_ && result_->ok()) {
-                result_->value().then(std::forward<F>(fn));
-            }
+            result_->value().then(
+                [fn = std::forward<F>(fn)](client::call<Resp>& c) mutable {
+                    // The callback runs once the call is terminal, so `get()`
+                    // returns immediately with the recorded result instead of
+                    // re-entering `issue()`.
+                    fn(c.get());
+                });
         }
         return *this;
     }
 
     // Suspends (or blocks) until a terminal result is available and returns the
     // decoded value, or the terminal error. A start failure answers directly
-    // from the wrapped error. `wait()` and `park()` are aliases.
+    // from the wrapped error. `wait()` and `park()` are aliases. Idempotent: the
+    // first terminal result is cached and a repeat call returns it without
+    // touching the underlying handle (spec:69).
     [[nodiscard]] rpc::rpc_result<Resp> get() {
         if (computed_) {
             return *computed_;
         }
-        if constexpr (client_detail::is_composition_value_v<Resp>) {
-            // A composition value cannot back a started call handle, so an
-            // engaged handle here is the start-failure shape built by
-            // `error()`: report the wrapped error.
-            return rpc::rpc_result<Resp>(result_->error());
-        } else {
-            if (!result_->ok()) {
-                return rpc::rpc_result<Resp>(result_->error());
-            }
-            return result_->value().get();
+        if (cached_) {
+            return *cached_;
         }
+        rpc::rpc_result<Resp> result_value = read_result();
+        cache(result_value);
+        return result_value;
     }
 
     [[nodiscard]] rpc::rpc_result<Resp> wait() { return get(); }
@@ -2078,7 +2177,7 @@ public:
             void await_suspend(std::coroutine_handle<> h) {
                 // `(void)`: `response::then` is [[nodiscard]], and a discarded
                 // return would be a warning promoted to an error under /WX.
-                (void)r.then([h](client::call<Resp>&) mutable { h.resume(); });
+                (void)r.then([h](rpc::rpc_result<Resp>) mutable { h.resume(); });
             }
             rpc::rpc_result<Resp> await_resume() { return r.get(); }
         };
@@ -2087,22 +2186,34 @@ public:
 #endif
 
     // Non-blocking read. A start failure is already terminal, so it writes the
-    // wrapped error and returns true; an in-flight or completed call delegates
-    // to the handle's `try_get`. A computed response is always ready.
+    // wrapped error and returns true; an in-flight call that has not terminated
+    // returns false and leaves `out` untouched; a completed call delegates to
+    // the handle's `try_get`. A computed response is always ready. Idempotent:
+    // a terminal result is cached and returned on later calls.
     [[nodiscard]] bool try_get(rpc::rpc_result<Resp>& out) {
         if (computed_) {
             out = *computed_;
             return true;
         }
+        if (cached_) {
+            out = *cached_;
+            return true;
+        }
         if constexpr (client_detail::is_composition_value_v<Resp>) {
             out = rpc::rpc_result<Resp>(result_->error());
+            cache(out);
             return true;
         } else {
             if (!result_->ok()) {
                 out = rpc::rpc_result<Resp>(result_->error());
+                cache(out);
                 return true;
             }
-            return result_->value().try_get(out);
+            if (result_->value().try_get(out)) {
+                cache(out);
+                return true;
+            }
+            return false;
         }
     }
 
@@ -2122,10 +2233,60 @@ public:
     }
 
 private:
+    // Computes the terminal result without default-constructing `rpc_result<Resp>`
+    // (which has no default constructor). `get()` caches the value this returns.
+    [[nodiscard]] rpc::rpc_result<Resp> read_result() {
+        if constexpr (client_detail::is_composition_value_v<Resp>) {
+            // A composition value cannot back a started call handle, so an
+            // engaged handle here is the start-failure shape built by
+            // `error()`: report the wrapped error.
+            return rpc::rpc_result<Resp>(result_->error());
+        } else {
+            if (!result_->ok()) {
+                return rpc::rpc_result<Resp>(result_->error());
+            }
+            return result_->value().get();
+        }
+    }
+
+    // Records a terminal result for a repeat `get()`/`try_get()`. Skipped for a
+    // move-only `Resp`, which cannot be copied into the cache.
+    void cache(const rpc::rpc_result<Resp>& value) {
+        if constexpr (std::is_copy_constructible_v<Resp>) {
+            cached_ = value;
+        }
+    }
+
+    // Type-erased consuming hooks (`response_base`). `get_erased` returns the
+    // terminal error (empty on success); the typed value is not part of the
+    // erased interface.
+    [[nodiscard]] rpc_error get_erased() override {
+        const rpc::rpc_result<Resp> r = get();
+        return r.ok() ? rpc_error(rpc_code::ok) : r.error();
+    }
+    [[nodiscard]] bool try_get_erased(rpc_error& out) override {
+        // `rpc_result<Resp>` has no default constructor, so start from a
+        // success placeholder; `try_get` overwrites it or leaves it untouched.
+        rpc::rpc_result<Resp> value{rpc_error(rpc_code::ok)};
+        if (!try_get(value)) {
+            return false;
+        }
+        out = value.ok() ? rpc_error(rpc_code::ok) : value.error();
+        return true;
+    }
+    void then_erased(response_callback cb, void* ctx) override {
+        // `(void)`: the return value is unused here, and `then` is [[nodiscard]].
+        (void)then([cb, ctx](rpc::rpc_result<Resp> value) {
+            cb(ctx, value.ok() ? rpc_error(rpc_code::ok) : value.error());
+        });
+    }
+
     // Exactly one of `result_` (a started call handle) and `computed_` (an
     // already-terminal value) is engaged.
     std::optional<rpc::rpc_result<client::call<Resp>>> result_;
     std::optional<rpc::rpc_result<Resp>> computed_;
+    // Cached terminal result for idempotent `get()`/`try_get()`.
+    std::optional<rpc::rpc_result<Resp>> cached_;
 };
 
 // `client::request` encodes `request` with the same `rpc::call_codec<Req>` path
@@ -2154,11 +2315,14 @@ template <typename Resp, typename Req>
 // `when_all` is a sequential wait: it calls `get()` on every response, so it
 // blocks until the last one terminates and reports the first failure.
 //
-// `when_any` is non-blocking: it polls each response with `try_get()` and
-// returns the first terminal one. When none is terminal it returns a computed
-// error response (`failed_precondition`, "no response ready") without waiting;
-// that result is terminal, so `ready()` is true. This is the brief's reference
-// behaviour and is deliberately not a blocking wait.
+// `when_any` is deliberately NON-BLOCKING. It polls each response with
+// `try_get()` and returns the first one that is already terminal. If none is
+// terminal it returns immediately with a computed error response
+// (`failed_precondition`, "no response ready") -- it does NOT wait for a
+// completion and does not block the caller. That result is terminal, so
+// `ready()` is true. A caller that wants "first completion" semantics must
+// drive the poll (or use `when_all`/`get` on the individual responses). This is
+// the brief's reference behaviour and is intentionally not a blocking wait.
 template <typename Resp>
 [[nodiscard]] response<std::vector<rpc::rpc_result<Resp>>> when_all(
     std::vector<response<Resp>>& responses) {

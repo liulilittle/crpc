@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -482,19 +483,26 @@ CRPC_TEST(response_call_peek_accessors_cancel_after_get) {
 // low-level completion (`call::ready()`).
 
 // A start failure built with the static error() factory is invalid but still
-// exposes the error it was created with; cancel() is a no-op.
+// exposes the error it was created with. A start failure is terminal, so
+// `ready()` is true, `try_get()` writes the error and returns true, and
+// `get()` returns the error; `cancel()` is a no-op.
 CRPC_TEST(response_wrapper_start_error) {
     crpc::response<int> r = crpc::response<int>::error(
         crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
 
     CRPC_CHECK_FALSE(r.valid());
-    CRPC_CHECK_FALSE(r.ready());
+    CRPC_CHECK(r.ready());
     CRPC_CHECK_EQ(0u, r.attempts());
     CRPC_CHECK_FALSE(r.degraded());
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
     CRPC_CHECK(r.origin() == crpc::client_detail::failure_origin::remote);
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.error().code);
     CRPC_CHECK(r.error().message == "no endpoint");
+
+    crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+    CRPC_CHECK(r.try_get(out));
+    CRPC_CHECK_FALSE(out.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, out.error().code);
 
     r.cancel();
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
@@ -1199,20 +1207,26 @@ CRPC_TEST(response_wrapper_then_completed_invokes_immediately) {
         crpc::response<int> r(std::move(wrapped));
 
         int calls = 0;
-        bool ready_in_callback = false;
+        bool ok_in_callback = false;
+        int value_in_callback = -1;
         const std::thread::id caller = std::this_thread::get_id();
         std::thread::id callback_thread;
         crpc::response<int>& chained = r.then(
-            [&calls, &ready_in_callback, &callback_thread](crpc::client::call<int>& c) {
+            [&calls, &ok_in_callback, &value_in_callback, &callback_thread](
+                crpc::rpc::rpc_result<int> result) {
                 ++calls;
                 callback_thread = std::this_thread::get_id();
-                ready_in_callback = c.ready();
+                ok_in_callback = result.ok();
+                if (result.ok()) {
+                    value_in_callback = result.value();
+                }
             });
 
         CRPC_CHECK(&chained == &r);
         CRPC_CHECK_EQ(1, calls);
         CRPC_CHECK(callback_thread == caller);
-        CRPC_CHECK(ready_in_callback);
+        CRPC_CHECK(ok_in_callback);
+        CRPC_CHECK_EQ(42, value_in_callback);
     }
 
     cli->close();
@@ -1273,12 +1287,17 @@ CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
         std::atomic<int> calls{0};
         const std::thread::id caller = std::this_thread::get_id();
         std::thread::id callback_thread;
-        bool ready_in_callback = false;
+        bool ok_in_callback = false;
+        int value_in_callback = -1;
         crpc::response<int>& chained = r.then(
-            [&calls, &ready_in_callback, &callback_thread](crpc::client::call<int>& c) {
+            [&calls, &ok_in_callback, &value_in_callback, &callback_thread](
+                crpc::rpc::rpc_result<int> result) {
                 ++calls;
                 callback_thread = std::this_thread::get_id();
-                ready_in_callback = c.ready();
+                ok_in_callback = result.ok();
+                if (result.ok()) {
+                    value_in_callback = result.value();
+                }
             });
         CRPC_CHECK(&chained == &r);
         CRPC_CHECK_EQ(0, calls.load());
@@ -1300,7 +1319,8 @@ CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
         std::this_thread::sleep_for(50ms);
         CRPC_CHECK_EQ(1, calls.load());
         CRPC_CHECK(callback_thread != caller);
-        CRPC_CHECK(ready_in_callback);
+        CRPC_CHECK(ok_in_callback);
+        CRPC_CHECK_EQ(7, value_in_callback);
     }
 
     cli->close();
@@ -1309,18 +1329,27 @@ CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
     shard.join();
 }
 
-// A start failure has no underlying call: `then` arms nothing, never invokes the
-// callback, and still returns the response for chaining.
-CRPC_TEST(response_wrapper_then_start_error_not_armed) {
+// A start failure is terminal even though no call handle exists: `then` invokes
+// the callback immediately with the wrapped error and still returns the response
+// for chaining.
+CRPC_TEST(response_wrapper_then_start_error_invokes_immediately) {
     crpc::response<int> r = crpc::response<int>::error(
         crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
 
     int calls = 0;
-    crpc::response<int>& chained =
-        r.then([&calls](crpc::client::call<int>&) { ++calls; });
+    bool ok_in_callback = true;
+    crpc::rpc_code code_in_callback = crpc::rpc_code::ok;
+    crpc::response<int>& chained = r.then(
+        [&calls, &ok_in_callback, &code_in_callback](crpc::rpc::rpc_result<int> result) {
+            ++calls;
+            ok_in_callback = result.ok();
+            code_in_callback = result.code();
+        });
 
     CRPC_CHECK(&chained == &r);
-    CRPC_CHECK_EQ(0, calls);
+    CRPC_CHECK_EQ(1, calls);
+    CRPC_CHECK_FALSE(ok_in_callback);
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, code_in_callback);
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
 }
 
@@ -1484,7 +1513,7 @@ CRPC_TEST(response_request_entry_encode_error) {
     CRPC_CHECK_FALSE(got.ok());
     CRPC_CHECK_EQ(crpc::rpc_code::encode_error, got.error().code);
     CRPC_CHECK_FALSE(r.valid());
-    CRPC_CHECK_FALSE(r.ready());
+    CRPC_CHECK(r.ready());
     CRPC_CHECK_EQ(0u, r.attempts());
     CRPC_CHECK_FALSE(r.degraded());
     CRPC_CHECK_EQ(crpc::rpc_code::encode_error, r.code());
@@ -1493,6 +1522,276 @@ CRPC_TEST(response_request_entry_encode_error) {
     CRPC_CHECK(err.message == "bad request");
 
     cli->close();
+    shard.stop();
+    shard.join();
+}
+
+// --- response<Resp> idempotency / type erasure / lifecycle / conversion ------
+//
+// These pin the final-review fixes: `get()`/`try_get()` are idempotent, the
+// `response_base&` view can consume a response without naming `Resp`, a response
+// outlives its client, and `rpc_result<client::call<Resp>>` converts implicitly
+// to `response<Resp>`.
+
+// State handed to a type-erased `then` callback.
+struct erased_cb_state {
+    std::atomic<bool> fired{false};
+    std::atomic<bool> ok{false};
+};
+
+void erased_then_cb(void* ctx, crpc::rpc_error error) noexcept {
+    auto* state = static_cast<erased_cb_state*>(ctx);
+    state->ok.store(error.ok(), std::memory_order_release);
+    state->fired.store(true, std::memory_order_release);
+}
+
+// get()/value() are idempotent: a second call returns the same result and does
+// not re-enter issue(), so `attempts()` does not grow and the code is not
+// `shutting_down`. try_get() after get() also returns the cached result.
+CRPC_TEST(response_wrapper_get_idempotent) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-idempotent"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-idempotent"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{1}, 41);
+
+    const crpc::rpc::rpc_result<int> first = r.get();
+    CRPC_CHECK(first.ok());
+    CRPC_CHECK_EQ(42, first.value());
+    const std::uint32_t attempts = r.attempts();
+
+    const crpc::rpc::rpc_result<int> second = r.get();
+    CRPC_CHECK(second.ok());
+    CRPC_CHECK_EQ(42, second.value());
+    CRPC_CHECK_EQ(attempts, r.attempts());
+    CRPC_CHECK_EQ(42, r.value());
+
+    crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+    CRPC_CHECK(r.try_get(out));
+    CRPC_CHECK(out.ok());
+    CRPC_CHECK_EQ(42, out.value());
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A `response_base&` can consume a response without naming `Resp`: the erased
+// `get()`/`try_get()` return the terminal error (empty on success) and the
+// erased `then()` fires once with it.
+CRPC_TEST(response_base_type_erased_consumption) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-base-erased"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-base-erased"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{1}, 41);
+    crpc::response_base& base = r;
+
+    const crpc::rpc_error waited = base.get();
+    CRPC_CHECK(waited.ok());
+
+    crpc::rpc_error out(crpc::rpc_code::internal);
+    CRPC_CHECK(base.try_get(out));
+    CRPC_CHECK(out.ok());
+
+    erased_cb_state cb_state;
+    base.then(&erased_then_cb, &cb_state);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&cb_state] { return cb_state.fired.load(std::memory_order_acquire); }, 3000));
+    CRPC_CHECK(cb_state.ok.load(std::memory_order_acquire));
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// The type-erased view of a start-failure response: `ready()` is true and the
+// erased `get()`/`then()` deliver the wrapped error.
+CRPC_TEST(response_base_type_erased_start_error) {
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+    crpc::response_base& base = r;
+
+    CRPC_CHECK(base.ready());
+    const crpc::rpc_error waited = base.get();
+    CRPC_CHECK_FALSE(waited.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, waited.code);
+
+    crpc::rpc_error out(crpc::rpc_code::internal);
+    CRPC_CHECK(base.try_get(out));
+    CRPC_CHECK_FALSE(out.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, out.code);
+
+    erased_cb_state cb_state;
+    base.then(&erased_then_cb, &cb_state);
+    CRPC_CHECK(cb_state.fired.load(std::memory_order_acquire));
+    CRPC_CHECK_FALSE(cb_state.ok.load(std::memory_order_acquire));
+}
+
+// A response outlives the client that started it: destroying the client does
+// not invalidate the response's shared state, and consuming it answers a
+// defined terminal error instead of crashing.
+CRPC_TEST(response_wrapper_lifecycle_client_destroyed) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-lifecycle"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-lifecycle"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+
+    std::optional<crpc::response<int>> r;
+    {
+        auto cli = cb.build();
+        CRPC_CHECK(cli != nullptr);
+        if (!cli) {
+            srv->stop();
+            shard.stop();
+            shard.join();
+            return;
+        }
+        r.emplace(cli->request<int, int>(crpc::service_id{1}, crpc::method_id{1}, 41));
+        cli->close();
+        cli.reset();
+    }
+
+    const crpc::rpc::rpc_result<int> result = r->get();
+    CRPC_CHECK_FALSE(result.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition, result.error().code);
+
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// `stub::call` still returns `rpc_result<client::call<Resp>>`; it converts
+// implicitly to `response<Resp>` (spec:96).
+CRPC_TEST(response_wrapper_implicit_conversion_from_call_result) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("response-conversion"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("response-conversion"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    crpc::response<int> r = stub.call(41);
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK(got.ok());
+    CRPC_CHECK_EQ(42, got.value());
+
+    // `start_encoded` has the same conversion path.
+    crpc::buffer encoded;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(41, encoded).ok());
+    crpc::response<int> r2 = cli->start_encoded<int>(1, 1, encoded.readable());
+    const crpc::rpc::rpc_result<int> got2 = r2.get();
+    CRPC_CHECK(got2.ok());
+    CRPC_CHECK_EQ(42, got2.value());
+
+    cli->close();
+    srv->stop();
     shard.stop();
     shard.join();
 }
