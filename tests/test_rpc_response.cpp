@@ -1324,4 +1324,177 @@ CRPC_TEST(response_wrapper_then_start_error_not_armed) {
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
 }
 
+// A request type whose codec always fails to encode. The `client.request`
+// entry must report that local encode error instead of starting a call.
+struct unencodable_request {
+    int value = 0;
+};
+
+namespace crpc::rpc {
+template <>
+struct call_codec<unencodable_request> {
+    static status encode(const unencodable_request&, buffer&) {
+        return status{rpc_error{rpc_code::encode_error, "bad request"}};
+    }
+    static status decode(span<const std::byte>, unencodable_request&) {
+        return status{rpc_code::decode_error};
+    }
+};
+} // namespace crpc::rpc
+
+// --- client.request<Resp>(service, method, request) entry point --------------
+//
+// Task 6 adds the convenience entry that encodes the request and wraps the
+// started call in a `response<Resp>`. These tests pin the success path, the
+// server-produced failure path, and the local serialization failure path.
+
+CRPC_TEST(response_request_entry_success) {
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("request-entry-ok"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("request-entry-ok"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    // Three arguments: the default `ctx` must be applied.
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{1}, 41);
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK(got.ok());
+    if (got.ok()) {
+        CRPC_CHECK_EQ(42, got.value());
+    }
+    CRPC_CHECK(r.valid());
+    CRPC_CHECK(r.ready());
+    CRPC_CHECK_EQ(1u, r.attempts());
+    CRPC_CHECK_FALSE(r.degraded());
+    CRPC_CHECK_EQ(crpc::rpc_code::ok, r.code());
+    CRPC_CHECK(r.origin() == crpc::client_detail::failure_origin::remote);
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A server-produced failure is forwarded through the entry: `get()` fails and
+// the accessors expose the terminal code, origin and message.
+CRPC_TEST(response_request_entry_failure) {
+    crpc::inproc_backend backend;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("request-entry-fail"), backend);
+    sb.add_service(1, "svc");
+    sb.add_raw_method(1, 2, "fail", &fail_body, nullptr);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("request-entry-fail"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{2}, 1);
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK(r.valid());
+    CRPC_CHECK(r.ready());
+    CRPC_CHECK_EQ(1u, r.attempts());
+    CRPC_CHECK_FALSE(r.degraded());
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, r.code());
+    CRPC_CHECK(r.origin() == crpc::client_detail::failure_origin::remote);
+    const crpc::rpc_error err = r.error();
+    CRPC_CHECK_EQ(crpc::rpc_code::unavailable, err.code);
+    CRPC_CHECK(err.message.find("boom") != std::string::npos);
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+// A local serialization failure is reported as an invalid response carrying the
+// encode error, before any call is started.
+CRPC_TEST(response_request_entry_encode_error) {
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("request-entry-encode"), backend);
+    cb.pool_size(1);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    const unencodable_request req{5};
+    crpc::response<int> r =
+        cli->request<int, unencodable_request>(crpc::service_id{1},
+                                               crpc::method_id{1}, req);
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::encode_error, got.error().code);
+    CRPC_CHECK_FALSE(r.valid());
+    CRPC_CHECK_FALSE(r.ready());
+    CRPC_CHECK_EQ(0u, r.attempts());
+    CRPC_CHECK_FALSE(r.degraded());
+    CRPC_CHECK_EQ(crpc::rpc_code::encode_error, r.code());
+    const crpc::rpc_error err = r.error();
+    CRPC_CHECK_EQ(crpc::rpc_code::encode_error, err.code);
+    CRPC_CHECK(err.message == "bad request");
+
+    cli->close();
+    shard.stop();
+    shard.join();
+}
+
 CRPC_TEST_MAIN()

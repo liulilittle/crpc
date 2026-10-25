@@ -1479,6 +1479,16 @@ public:
         return stub<Resp, Req>(*this, service, method);
     }
 
+    // Convenience entry: encodes `request`, starts the call and wraps the result
+    // in a `response<Resp>`. The encoding path is the same `rpc::call_codec<Req>`
+    // that `stub::call` uses. A serialization failure is reported as an invalid
+    // response carrying the encode error. Defined after `response<Resp>` at the
+    // end of the header because it names the complete wrapper type.
+    template <typename Resp, typename Req>
+    [[nodiscard]] response<Resp> request(service_id service, method_id method,
+                                         const Req& request,
+                                         rpc::call_context ctx = {});
+
     ~client();
     client(const client&) = delete;
     client& operator=(const client&) = delete;
@@ -2084,6 +2094,25 @@ private:
     std::optional<rpc::rpc_result<client::call<Resp>>> result_;
     std::optional<rpc::rpc_result<Resp>> computed_;
 };
+
+// `client::request` encodes `request` with the same `rpc::call_codec<Req>` path
+// as `stub::call`, then starts the call and wraps the `rpc_result` in a
+// `response<Resp>`. A serialization failure answers with an invalid response
+// carrying the encode error. Defined here, after `response<Resp>`, because the
+// body names the complete wrapper type.
+template <typename Resp, typename Req>
+[[nodiscard]] response<Resp> client::request(service_id service, method_id method,
+                                             const Req& request,
+                                             rpc::call_context ctx) {
+    buffer encoded;
+    const status encoded_status = rpc::call_codec<Req>::encode(request, encoded);
+    if (!encoded_status.ok()) {
+        return response<Resp>::error(encoded_status.error());
+    }
+    auto result = start_encoded<Resp>(service.value, method.value,
+                                      encoded.readable(), std::move(ctx));
+    return response<Resp>(std::move(result));
+}
 
 // Composition helpers over a set of `response<Resp>`. Both return a
 // `response` that holds an already-terminal value rather than a call handle,
