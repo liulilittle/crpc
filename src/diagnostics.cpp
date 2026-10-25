@@ -1,6 +1,8 @@
-// CRPC -- readable error strings and classification predicates.
+// CRPC -- readable error strings, classification predicates and the completion
+// hook.
 #include <crpc/diagnostics.hpp>
 
+#include <mutex>
 #include <string>
 
 namespace crpc {
@@ -81,5 +83,38 @@ bool is_fallback(const rpc_error& err) noexcept {
 bool is_server(const rpc_error& err) noexcept {
     return err.origin == failure_origin::remote;
 }
+
+namespace diagnostics {
+namespace {
+
+// One process-wide hook. The mutex publishes the hook/cookie pair as a unit and
+// is only ever held for the copy: `on_completion` releases it before invoking
+// the hook so a hook may re-enter `set_completion_hook` or `on_completion`.
+std::mutex g_hook_mutex;
+completion_hook g_hook = nullptr;
+void* g_hook_self = nullptr;
+
+} // namespace
+
+void set_completion_hook(completion_hook hook, void* self) noexcept {
+    std::lock_guard<std::mutex> lock(g_hook_mutex);
+    g_hook = hook;
+    g_hook_self = self;
+}
+
+void on_completion(const rpc_error& err) noexcept {
+    completion_hook hook = nullptr;
+    void* self = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hook_mutex);
+        hook = g_hook;
+        self = g_hook_self;
+    }
+    if (hook != nullptr) {
+        hook(err, self);
+    }
+}
+
+} // namespace diagnostics
 
 } // namespace crpc

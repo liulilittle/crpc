@@ -66,6 +66,7 @@
 
 #include <crpc/buffer.hpp>
 #include <crpc/config.hpp>
+#include <crpc/diagnostics.hpp>
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/io.hpp>
@@ -2142,15 +2143,23 @@ public:
     // from the wrapped error. `wait()` and `park()` are aliases. Idempotent: the
     // first terminal result is cached and a repeat call returns it without
     // touching the underlying handle (spec:69).
+    //
+    // The first call that observes a terminal outcome also notifies the
+    // process-wide `diagnostics::on_completion` hook, on every path (computed
+    // value, start failure, completed call). A repeat read of the same response
+    // is not a new completion and does not notify again.
     [[nodiscard]] rpc::rpc_result<Resp> get() {
         if (computed_) {
+            notify_completion(*computed_);
             return *computed_;
         }
         if (cached_) {
+            notify_completion(*cached_);
             return *cached_;
         }
         rpc::rpc_result<Resp> result_value = read_result();
         cache(result_value);
+        notify_completion(result_value);
         return result_value;
     }
 
@@ -2251,6 +2260,19 @@ private:
         }
     }
 
+    // Notifies the process-wide completion hook the first time this response
+    // observes a terminal outcome. The hook receives `ok` for a success and the
+    // terminal error (including a cancel) otherwise. `on_completion` does not
+    // hold the hook lock while the callback runs.
+    void notify_completion(const rpc::rpc_result<Resp>& value) {
+        if (completion_notified_) {
+            return;
+        }
+        completion_notified_ = true;
+        diagnostics::on_completion(value.ok() ? rpc_error(rpc_code::ok)
+                                              : value.error());
+    }
+
     // Type-erased consuming hooks (`response_base`). `get_erased` returns the
     // terminal error (empty on success); the typed value is not part of the
     // erased interface.
@@ -2281,6 +2303,8 @@ private:
     std::optional<rpc::rpc_result<Resp>> computed_;
     // Cached terminal result for idempotent `get()`/`try_get()`.
     std::optional<rpc::rpc_result<Resp>> cached_;
+    // Set once the completion hook has been notified for this response.
+    bool completion_notified_ = false;
 };
 
 // `client::request` encodes `request` with the same `rpc::call_codec<Req>` path

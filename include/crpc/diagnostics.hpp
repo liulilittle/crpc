@@ -50,6 +50,29 @@ CRPC_API bool is_rate_limiter(const rpc_error& err) noexcept;
 CRPC_API bool is_fallback(const rpc_error& err) noexcept;
 CRPC_API bool is_server(const rpc_error& err) noexcept;
 
+// --- Completion hook ---------------------------------------------------------
+//
+// A process-wide notification for callers that need one place to observe every
+// terminal call outcome (metrics, debug logging, tracing) without wrapping each
+// call site. `response<Resp>::get()` invokes `on_completion` the first time it
+// observes a terminal outcome; the error is `ok` for a success and the terminal
+// failure (including a cancel) otherwise.
+//
+// `set_completion_hook` installs a hook plus an opaque `self` cookie; passing a
+// null hook clears it. Both functions are safe to call from any thread.
+// `on_completion` invokes the registered hook exactly once per call and does not
+// hold a library lock while the hook runs, so the hook may call
+// `set_completion_hook`/`on_completion` again. The hook must not throw; it is
+// declared `noexcept` for that reason.
+namespace diagnostics {
+
+using completion_hook = void (*)(const rpc_error&, void* self) noexcept;
+
+CRPC_API void set_completion_hook(completion_hook hook, void* self) noexcept;
+CRPC_API void on_completion(const rpc_error& err) noexcept;
+
+} // namespace diagnostics
+
 } // namespace crpc
 
 #endif // CRPC_DIAGNOSTICS_HPP

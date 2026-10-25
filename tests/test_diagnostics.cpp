@@ -7,9 +7,19 @@
 #include <crpc/diagnostics.hpp>
 #include <crpc/error.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <string>
+#include <utility>
+
+#include <crpc/client_facade.hpp>
+#include <crpc/runtime.hpp>
+#include <crpc/server.hpp>
 
 #include "test_framework.hpp"
+
+using namespace std::chrono_literals;
 
 CRPC_TEST(rpc_error_origin_and_attempts_default) {
     const crpc::rpc_error error;
@@ -124,6 +134,386 @@ CRPC_TEST(diagnostics_predicates_are_origin_based_not_code_based) {
     error.origin = crpc::failure_origin::remote;
     CRPC_CHECK(crpc::is_server(error));
     CRPC_CHECK_FALSE(crpc::is_local(error));
+}
+
+// --- Task 3: completion hook -------------------------------------------------
+//
+// `diagnostics::set_completion_hook` installs a process-wide notification and
+// `diagnostics::on_completion` invokes it exactly once per call, outside any
+// library lock. `response<Resp>::get()` notifies the hook the first time it
+// observes a terminal outcome (success, failure or cancel); repeat reads of the
+// same response do not notify again.
+
+namespace {
+
+struct completion_probe {
+    int calls = 0;
+    crpc::rpc_code last_code = crpc::rpc_code::internal;
+    crpc::failure_origin last_origin = crpc::failure_origin::remote;
+    std::uint32_t last_attempts = 0;
+};
+
+void record_completion(const crpc::rpc_error& err, void* self) noexcept {
+    auto* probe = static_cast<completion_probe*>(self);
+    ++probe->calls;
+    probe->last_code = err.code;
+    probe->last_origin = err.origin;
+    probe->last_attempts = err.attempts;
+}
+
+// Installs no hook at construction and clears the process-wide hook at
+// destruction, so a failing test cannot leak a dangling probe into the next
+// case.
+struct completion_hook_scope {
+    completion_hook_scope() noexcept {
+        crpc::diagnostics::set_completion_hook(nullptr, nullptr);
+    }
+    ~completion_hook_scope() {
+        crpc::diagnostics::set_completion_hook(nullptr, nullptr);
+    }
+    completion_hook_scope(const completion_hook_scope&) = delete;
+    completion_hook_scope& operator=(const completion_hook_scope&) = delete;
+};
+
+// A hook that re-enters `set_completion_hook`. It deadlocks if `on_completion`
+// calls the hook while holding the hook lock.
+void clear_hook_on_completion(const crpc::rpc_error&, void* self) noexcept {
+    auto* probe = static_cast<completion_probe*>(self);
+    ++probe->calls;
+    crpc::diagnostics::set_completion_hook(nullptr, nullptr);
+}
+
+// A backend whose connection accepts and never completes a write: the call
+// stays in flight so it can be cancelled before `get()`.
+struct stalled_connection final : crpc::connection {
+    crpc::io::source& source() noexcept override { return source_; }
+    crpc::io::sink& sink() noexcept override { return sink_; }
+    void bind_source(crpc::io::source*) noexcept override {}
+    void resume_read() noexcept override {}
+    void close() noexcept override { open.store(false, std::memory_order_release); }
+    [[nodiscard]] bool is_open() const noexcept override {
+        return open.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] crpc::endpoint remote() const noexcept override {
+        return crpc::endpoint::inproc("stalled");
+    }
+
+private:
+    struct noop_source final : crpc::io::source {
+        std::size_t on_data(crpc::span<const std::byte>) noexcept override { return 0; }
+        void on_eof() noexcept override {}
+        void on_error(std::error_code) noexcept override {}
+    };
+    struct never_sink final : crpc::io::sink {
+        void push(crpc::span<const std::byte>, crpc::io::completion*) noexcept override {}
+    };
+    noop_source source_;
+    never_sink sink_;
+    std::atomic<bool> open{true};
+};
+
+struct stalled_backend final : crpc::backend_factory {
+    std::unique_ptr<crpc::connection> connect(const crpc::endpoint&,
+                                              const crpc::connect_options&) override {
+        return std::make_unique<stalled_connection>();
+    }
+    std::unique_ptr<crpc::listener> listen(const crpc::endpoint&,
+                                           const crpc::listen_options&) override {
+        return nullptr;
+    }
+};
+
+struct echo_service {
+    int echo(const int& value) { return value + 1; }
+};
+
+crpc::status fail_body(void*, const crpc::call_envelope&, crpc::span<const std::byte>,
+                       crpc::buffer&, crpc::rpc::call_context&) {
+    return crpc::status{crpc::rpc_error(crpc::rpc_code::unavailable, "boom")};
+}
+
+} // namespace
+
+CRPC_TEST(diagnostics_completion_hook_fires_exactly_once_per_notification) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::rpc_error error(crpc::rpc_code::deadline_exceeded, "slow");
+    error.origin = crpc::failure_origin::timeout;
+    error.attempts = 2;
+
+    crpc::diagnostics::on_completion(error);
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::deadline_exceeded);
+    CRPC_CHECK(probe.last_origin == crpc::failure_origin::timeout);
+    CRPC_CHECK_EQ(2u, probe.last_attempts);
+
+    // A second notification is a second event, and it still fires exactly once.
+    crpc::diagnostics::on_completion(error);
+    CRPC_CHECK_EQ(2, probe.calls);
+}
+
+CRPC_TEST(diagnostics_completion_hook_can_be_replaced_and_cleared) {
+    completion_hook_scope scope;
+    completion_probe first;
+    completion_probe second;
+
+    crpc::diagnostics::set_completion_hook(&record_completion, &first);
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::unavailable));
+    CRPC_CHECK_EQ(1, first.calls);
+    CRPC_CHECK_EQ(0, second.calls);
+
+    crpc::diagnostics::set_completion_hook(&record_completion, &second);
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::overload));
+    CRPC_CHECK_EQ(1, first.calls);
+    CRPC_CHECK_EQ(1, second.calls);
+    CRPC_CHECK(second.last_code == crpc::rpc_code::overload);
+
+    crpc::diagnostics::set_completion_hook(nullptr, nullptr);
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::internal));
+    CRPC_CHECK_EQ(1, first.calls);
+    CRPC_CHECK_EQ(1, second.calls);
+}
+
+CRPC_TEST(diagnostics_completion_hook_runs_without_holding_a_lock) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&clear_hook_on_completion, &probe);
+
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::ok));
+    CRPC_CHECK_EQ(1, probe.calls);
+
+    // The hook cleared itself; the next notification is a no-op.
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::ok));
+    CRPC_CHECK_EQ(1, probe.calls);
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_computed_success_once) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::response<int> r(crpc::rpc::rpc_result<int>(42));
+
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK(got.ok());
+    CRPC_CHECK_EQ(42, got.value());
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::ok);
+
+    // Reading the same terminal response again is not a new completion.
+    const crpc::rpc::rpc_result<int> again = r.get();
+    CRPC_CHECK(again.ok());
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK_EQ(42, r.value());
+    CRPC_CHECK_EQ(1, probe.calls);
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_start_failure_once) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::rpc_error error(crpc::rpc_code::unavailable, "no endpoint");
+    error.origin = crpc::failure_origin::local_capacity;
+    error.attempts = 4;
+    crpc::response<int> r = crpc::response<int>::error(error);
+
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK(got.error().code == crpc::rpc_code::unavailable);
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::unavailable);
+    CRPC_CHECK(probe.last_origin == crpc::failure_origin::local_capacity);
+    CRPC_CHECK_EQ(4u, probe.last_attempts);
+
+    (void)r.get();
+    CRPC_CHECK_EQ(1, probe.calls);
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_after_try_get) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::response<int> r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+
+    crpc::rpc::rpc_result<int> out(crpc::rpc_code::internal);
+    CRPC_CHECK(r.try_get(out));
+    CRPC_CHECK(out.error().code == crpc::rpc_code::unavailable);
+    // `try_get` is the non-blocking read; the hook is bound to `get()`.
+    CRPC_CHECK_EQ(0, probe.calls);
+
+    // `try_get` cached the terminal result; the first `get()` still reports the
+    // completion exactly once.
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::unavailable);
+
+    (void)r.get();
+    CRPC_CHECK_EQ(1, probe.calls);
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_started_success_once) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::inproc_backend backend;
+    echo_service service;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("diagnostics-completion-ok"), backend);
+    sb.add_service(1, "svc");
+    sb.add_method<echo_service, &echo_service::echo>(1, 1, "echo", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("diagnostics-completion-ok"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{1}, 41);
+
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK(got.ok());
+    CRPC_CHECK_EQ(42, got.value());
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::ok);
+
+    (void)r.get();
+    CRPC_CHECK_EQ(1, probe.calls);
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_started_failure_once) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    crpc::inproc_backend backend;
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc("diagnostics-completion-fail"), backend);
+    sb.add_service(1, "svc");
+    sb.add_raw_method(1, 2, "fail", &fail_body, nullptr);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("diagnostics-completion-fail"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        srv->stop();
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    crpc::response<int> r =
+        cli->request<int, int>(crpc::service_id{1}, crpc::method_id{2}, 0);
+
+    const crpc::rpc::rpc_result<int> got = r.get();
+    CRPC_CHECK_FALSE(got.ok());
+    CRPC_CHECK(got.error().code == crpc::rpc_code::unavailable);
+    CRPC_CHECK_EQ(1, probe.calls);
+    CRPC_CHECK(probe.last_code == crpc::rpc_code::unavailable);
+    // The terminal `rpc_error` produced by the call path does not carry
+    // `origin`/`attempts` (the handle keeps those on its own snapshot); the hook
+    // receives the error as `get()` returns it, so only the code is pinned here.
+    // Wiring those fields into the error is a separate concern from this hook.
+
+    (void)r.get();
+    CRPC_CHECK_EQ(1, probe.calls);
+
+    cli->close();
+    srv->stop();
+    shard.stop();
+    shard.join();
+}
+
+CRPC_TEST(diagnostics_response_get_notifies_cancel_once) {
+    completion_hook_scope scope;
+    completion_probe probe;
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+
+    stalled_backend backend;
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime shard(ro);
+    shard.start_thread();
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("diagnostics-completion-cancel"), backend);
+    cb.pool_size(1);
+    cb.on_shard(shard);
+    auto cli = cb.build();
+    if (!cli) {
+        shard.stop();
+        shard.join();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (started.ok()) {
+        crpc::rpc::rpc_result<crpc::client::call<int>> wrapped(
+            std::move(started).value());
+        crpc::response<int> r(std::move(wrapped));
+
+        r.cancel();
+        const crpc::rpc::rpc_result<int> got = r.get();
+        CRPC_CHECK_FALSE(got.ok());
+        CRPC_CHECK(got.error().code == crpc::rpc_code::canceled);
+        CRPC_CHECK_EQ(1, probe.calls);
+        CRPC_CHECK(probe.last_code == crpc::rpc_code::canceled);
+
+        (void)r.get();
+        CRPC_CHECK_EQ(1, probe.calls);
+    }
+
+    cli->close();
+    shard.stop();
+    shard.join();
 }
 
 CRPC_TEST_MAIN()
