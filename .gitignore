@@ -71,3 +71,6 @@ crash-*.txt
 # Python bytecode from scripts/export_gate.py
 __pycache__/
 *.pyc
+
+.worktrees/
+
