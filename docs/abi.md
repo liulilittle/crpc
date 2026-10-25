@@ -303,7 +303,9 @@ is guarded.
 - `::crpc::push::push_envelope`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`
+- `::crpc::resilience::call_traits`
 - `::crpc::resilience::instance`
+- `::crpc::resilience::smart_policy`
 
 These records are governed only by the policy in section 7 (any change to a
 public struct layout is a MAJOR change), not by a build-time check. Most of them
