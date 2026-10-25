@@ -1,9 +1,9 @@
 // CRPC -- fallback vocabulary and the single value entry point.
 //
 // This header is deliberately header-only: no exported symbols, no layout
-// change, no behaviour. Slice 2 of 4c adds the primitives only; nothing in
-// `src/` calls them yet. The slice that consumes them (S4) runs the fallback
-// after the last attempt has been finalized and its breaker outcome recorded.
+// change, no behaviour. The client facade consumes it: after the last attempt
+// of a call has been finalized and its breaker outcome recorded, `get()` runs
+// the installed policy through `fallback_execute`.
 //
 // Flow
 // ----
@@ -72,8 +72,9 @@ namespace crpc::resilience {
 // `crpc-degradable` is written by the server on four pre-execution admission
 // refusals (breaker, rate, bulkhead, per-service cap) and by nothing else; it
 // advertises that the refusal COULD be answered by a fallback, it does not mean
-// one was. `crpc-degraded` is written by the client when a fallback value was
-// actually used, so the server still sets it nowhere. See
+// one was. `crpc-degraded` has no writer on the wire: a successful call has no
+// `rpc_error` to carry metadata, so a degraded result is reported in-process by
+// `call<Resp>::degraded()` and counted by `fallback_stats().applied`. See
 // crpc/resilience/admission.hpp (6).
 inline constexpr char degraded_metadata_key[] = "crpc-degraded";
 inline constexpr char degradable_metadata_key[] = "crpc-degradable";

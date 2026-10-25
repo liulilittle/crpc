@@ -2,7 +2,7 @@
 
 [简体中文](performance.zh-CN.md) | **English**
 
-Version 1.1 / 2026-10-19
+Version 2.0 / 2026-10-24
 
 This document states what has actually been measured in the repository, on what
 hardware and toolchain, what is only a budget, and how the library will be
@@ -48,7 +48,7 @@ microbenchmarks in `bench/bench_core.cpp` cover the wire/codec layers. The raw
 loopback probe and the object-layout probe below predate the benchmark target
 and are kept as history.
 
-1. **Raw loopback probe** in `.opencode/audit-arch-a.md` §12.2. Hardware: AMD
+1. **Raw loopback probe**, recorded in this section. Hardware: AMD
    Ryzen 9 7945HX, 16 cores / 32 threads. Toolchain: MSVC 2022, `/O2`, Windows
    loopback. Workload: 16-byte frame, blocking socket echo, 1,000,000 RPCs, one
    connection, one thread pair, no coroutine, codec or multiplexing.
@@ -81,8 +81,8 @@ and are kept as history.
 ### 2.3 Measured end-to-end RPC (2026-10-19)
 
 Source: `bench/bench_rpc.cpp`; command:
-`crpc_bench_rpc` (Windows MSVC Release) and
-`.opencode/tmp/verify/release/bench/crpc_bench_rpc` (WSL GCC Release).
+`crpc_bench_rpc` (Windows MSVC Release) and the same target built under WSL
+(GCC Release).
 Workload: 64-byte `std::string` echo through a registered `bench.echo` method,
 encoded/decoded with `call_codec<std::string>` (crpc-binary path), one client
 thread over the in-process backend (and IOCP TCP loopback on Windows). Machine:
@@ -136,6 +136,67 @@ No p99, p999, cross-shard handoff, codec or resilience-pipeline measurement
 existed before this document; the p99/p999 figures above are now measured, the
 cross-shard handoff and resilience-pipeline budgets remain unmeasured.
 
+### 2.4 CRC32C and push-hub statistics (2026-10-24) <a id="s2-4"></a>
+
+Source: `bench/bench_core.cpp` (`crpc_bench_core crc32c`). Toolchain: MSVC 19.51
+x64 Release, `NDEBUG`, sanitizer off. Machine: AMD Ryzen 9 7945HX, 16 cores /
+32 threads. Median of seven runs after one discarded warm-up pass.
+
+`frame.cpp` computed CRC32C one byte at a time through a 256-entry table. It now
+uses slicing-by-8 (eight interleaved tables) as the portable path and, on x64
+MSVC when CPUID reports SSE4.2, the hardware `crc32` instructions; the choice is
+made once at run time, so a CPU without SSE4.2 still takes the portable path.
+
+| Case | byte loop (before) | slicing-by-8 | `crc32c()` (hardware) |
+|---|---:|---:|---:|
+| 256 B | 504.2 ns | 125.6 ns | **58.5 ns** |
+| 16 KiB | 32 490.3 ns | 8 264.7 ns | **3 683.6 ns** |
+
+The measured speedup over the byte loop is 8.6x (256 B) and 8.8x (16 KiB). The
+`crc32c()` column is faster than the local slicing-by-8 reference measured on the
+same input, which confirms the hardware path is selected on this CPU. Correctness
+is covered by `tests/test_frame.cpp`: the known CRC32C vectors plus a cross-check
+against an independent per-byte reference over every length 0..2048 and several
+sizes up to 70 000 bytes.
+
+The push hub's `stats()` no longer scans every subscriber and subscription. The
+server reads it on every PUSH_ACK (`refresh_push_stats_locked`), so the old
+O(subscribers x subscriptions) scan ran per acknowledgement. Four counters are
+maintained incrementally at each queue/subscription mutation and `stats()` is
+O(1); `tests/test_push.cpp` walks every mutation path (subscribe, publish,
+overflow, retransmit, front replay, ack, take, detach, release, unsubscribe,
+disconnect) and compares the aggregates against the values a full scan would
+produce.
+
+Those two hot-path copies are now gone. The frame decoder gained
+`feed_external()`/`drain_external()`: `feed_external()` borrows the caller's
+recv chunk and decodes complete frames straight out of it, so in borrowing mode
+a returned payload points into that chunk with no per-chunk copy, and
+`drain_external()` copies back only the trailing bytes that do not complete a
+frame. The TLS writer's `push()` now borrows the caller's span and materialises
+the unwritten remainder into `write_buffer_` only when the write parks, so the
+common synchronous write performs no copy and the caller may reuse the span as
+soon as `push()` returns. `feed()` keeps its copy-in contract (the caller's span
+need not outlive the call) and `push()` keeps its reuse-after-return contract;
+`feed_external()` is the zero-copy form for a caller that consumes every decoded
+frame before the chunk goes away. The `feed_external()` contract is specified in
+[protocol §15](protocol.md#s15); the paths are exercised by `tests/test_frame.cpp`
+(`frame_decoder_external_*`) and `tests/test_tls_write_borrow.cpp`.
+
+| Case | `feed()` | `feed_external()` | speedup |
+|---|---:|---:|---:|
+| 1 KiB frame | 56.0 ns/frame | **16.4 ns/frame** | 3.4x |
+| 64-frame batch | 44.9 ns/frame | **10.5 ns/frame** | 4.3x |
+| payload copies | 1.00 | **0.00** | — |
+
+The cases are the bench records `frame/feed_copy_1KiB_per_frame` vs
+`frame/feed_external_1KiB_per_frame`, the `*_batch64_per_frame` pair, and
+`frame/feed_*_payload_copies`. The copies row is a deterministic pointer check,
+not a timing: a `feed()` payload points into the decoder while a
+`feed_external()` payload is the chunk's own bytes.
+`frame_decoder_external_matches_feed` checks that the same frame stream is
+produced at every split point, including a split inside a frame.
+
 ## 3. Budgets and targets <a id="s3"></a>
 
 Memory budgets are from design §17.1; status is assessed against the code.
@@ -156,7 +217,7 @@ Performance targets:
 
 | Metric | Target | Status |
 |---|---|---|
-| aggregate throughput | 5M RPC/s | **not met**: 0.275M RPC/s best measured (inproc, MSVC, depth 64); 0.024M over IOCP loopback |
+| aggregate throughput | 5M RPC/s | **not met**: 0.275M RPC/s best single-client measured (inproc, MSVC, depth 64); 0.773M RPC/s with eight client threads over four shards (§2.3); 0.024M over IOCP loopback |
 | per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.275M RPC/s inproc measured (§2.3) |
 | p99 latency | < 100 µs | **partly met**: 22.6 µs inproc (MSVC); 170.2 µs IOCP loopback; 151.8 µs WSL inproc |
 | cross-shard handoff | 15–30 ns per batched message | budget; not measured |
@@ -225,7 +286,9 @@ with a projection.
 Current status: the library has functional test coverage, an HTTP server facade,
 an in-process and IOCP end-to-end RPC benchmark (§2.3) and a wire/codec
 microbenchmark. The 5M RPC/s and IOCP p99 targets are **not met** (measured
-0.275M RPC/s inproc and 170 µs p99 over IOCP); the in-process p99 target is met
+0.275M RPC/s inproc single-client, 0.773M RPC/s multi-thread, and 170 µs p99
+over IOCP); the in-process p99 target is met
 at 22.6 µs on MSVC. The 128-byte call-slot budget remains **unmet** at 440 bytes
-on the measured toolchain. The verification matrix, defect list and raw logs are
-in `.opencode/verify-round.md`.
+on the measured toolchain. The measured figures, the rejected experiments and
+the remaining gaps are recorded in §2 and §3; the shipped microbenchmark log is
+`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`.

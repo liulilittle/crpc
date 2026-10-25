@@ -28,7 +28,9 @@
 // standard-layout, and `offsetof` on it would be ill-formed.
 
 #include <cstddef>
+#include <functional>
 #include <type_traits>
+#include <vector>
 
 #include <crpc/buffer.hpp>
 #include <crpc/client_facade.hpp>
@@ -188,6 +190,28 @@ CRPC_MEMBER_COUNT(stream_snapshot, http2::stream_snapshot, id, state,
 CRPC_MEMBER_COUNT(window_credit, http2::window_credit, connection, stream)
 CRPC_MEMBER_COUNT(frame_compression_info, frame_compression_info, algorithm,
                   wire_size, logical_size, dropped, drop_reason)
+// `fallback_context` crosses the callback boundary: the library builds it and
+// the consumer's `fallback_fn` reads it, so both sides must agree on the
+// layout. No signature spells the type name (`set_fallback` takes the
+// `fallback_fn` typedef and `fallback_execute` is header-inline), so the
+// documentation scan cannot discover it: this anchor is hand-written on
+// purpose, like `frame_header`.
+CRPC_MEMBER_COUNT(fallback_context, resilience::fallback_context, code, stage,
+                  retry_after, one_way, sent, idempotent, has_deadline,
+                  deadline)
+
+// `server::options` is the 2.0.0 MAJOR break point: it is passed by value into
+// the exported `server` constructor, so the caller and the library must agree on
+// its size. It is guarded here rather than only by policy: the member count
+// catches an append on every target (including x86, where a trailing `std::size_t`
+// can be absorbed by tail padding), and the per-architecture absolute anchors
+// below pin the width and the position of the appended `clock_source` field.
+CRPC_MEMBER_COUNT(server_options, server::options, shards, runtime,
+                  per_connection_inflight, per_service_inflight, drain_timeout,
+                  overload_retry_after, breaker, per_connection_rate,
+                  per_service_rate, per_service_bulkhead, resilience_enabled,
+                  send_goaway_on_stop, push_egress_max_bytes, push_subscribe,
+                  clock_source)
 
 // --- Per-architecture absolute layout anchors -------------------------------
 //
@@ -313,6 +337,29 @@ CRPC_ABS_OFF(frame_compression_info, logical_size, 8);
 CRPC_ABS_OFF(frame_compression_info, dropped, 12);
 CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 
+// `fallback_context` has the same width and offsets on both targets: its only
+// sub-word member is the 2-byte `std::optional<stage_kind>` and every other
+// field is 8 bytes, so no 4-byte member can reorder it. The numbers are
+// repeated here anyway because `CRPC_ABS_*` is defined inside this block.
+CRPC_ABS_SIZE(resilience::fallback_context, 32);
+CRPC_ABS_OFF(resilience::fallback_context, code, 0);
+CRPC_ABS_OFF(resilience::fallback_context, stage, 2);
+CRPC_ABS_OFF(resilience::fallback_context, retry_after, 8);
+CRPC_ABS_OFF(resilience::fallback_context, one_way, 16);
+CRPC_ABS_OFF(resilience::fallback_context, sent, 17);
+CRPC_ABS_OFF(resilience::fallback_context, idempotent, 18);
+CRPC_ABS_OFF(resilience::fallback_context, has_deadline, 19);
+CRPC_ABS_OFF(resilience::fallback_context, deadline, 24);
+
+// `server::options` is 264 bytes on x86: the pre-2.0.0 layout was 256 and the
+// appended `clock_source` (a function pointer plus a context pointer) adds 8.
+// The last pre-existing field `push_subscribe` stays at 232 and `clock_source`
+// lands at 252, so every existing member keeps its offset.
+CRPC_ABS_SIZE(server::options, 264);
+CRPC_ABS_OFF(server::options, send_goaway_on_stop, 225);
+CRPC_ABS_OFF(server::options, push_subscribe, 232);
+CRPC_ABS_OFF(server::options, clock_source, 252);
+
 #elif defined(CRPC_ABI_ARCH_X64)
 
 // 64-bit: measured with MSVC 19.44, x64, Release and Debug identical.
@@ -408,6 +455,28 @@ CRPC_ABS_OFF(frame_compression_info, logical_size, 8);
 CRPC_ABS_OFF(frame_compression_info, dropped, 12);
 CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 
+// Same numbers as the x86 block above: `fallback_context` has no 4-byte
+// member, so the two targets agree. The anchor is repeated because
+// `CRPC_ABS_*` is defined inside each architecture block.
+CRPC_ABS_SIZE(resilience::fallback_context, 32);
+CRPC_ABS_OFF(resilience::fallback_context, code, 0);
+CRPC_ABS_OFF(resilience::fallback_context, stage, 2);
+CRPC_ABS_OFF(resilience::fallback_context, retry_after, 8);
+CRPC_ABS_OFF(resilience::fallback_context, one_way, 16);
+CRPC_ABS_OFF(resilience::fallback_context, sent, 17);
+CRPC_ABS_OFF(resilience::fallback_context, idempotent, 18);
+CRPC_ABS_OFF(resilience::fallback_context, has_deadline, 19);
+CRPC_ABS_OFF(resilience::fallback_context, deadline, 24);
+
+// `server::options` is 320 bytes on x64: the pre-2.0.0 layout was 304 and the
+// appended `clock_source` (a function pointer plus a context pointer) adds 16.
+// The last pre-existing field `push_subscribe` stays at 264 and `clock_source`
+// lands at 304, so every existing member keeps its offset.
+CRPC_ABS_SIZE(server::options, 320);
+CRPC_ABS_OFF(server::options, send_goaway_on_stop, 249);
+CRPC_ABS_OFF(server::options, push_subscribe, 264);
+CRPC_ABS_OFF(server::options, clock_source, 304);
+
 #else
 
 // Any other target (ARM64, RISC-V, ...) keeps the architecture-independent
@@ -425,6 +494,33 @@ CRPC_ABS_OFF(frame_compression_info, drop_reason, 14);
 // width, which in practice means a change to the standard library's own types.
 
 #endif
+
+// `server::builder` is exported (`class CRPC_API builder`) and its out-of-line
+// member functions read the private `options_` member of a consumer-allocated
+// object, so its layout is ABI-relevant even though it is not a plain aggregate
+// record. `CRPC_MEMBER_COUNT` and `offsetof` cannot be applied to it because
+// its data members are private. Its width is also not a fixed number: it is
+// `sizeof(server::options)` plus its three `std::vector` members, rounded to
+// the builder's alignment, and `std::vector` widens with the standard
+// library's debug configuration (MSVC x64: 392 bytes in Release, 416 in Debug;
+// x86: 304 / 312). The structural relation below catches an added, removed or
+// re-typed builder member on every target and configuration without pinning a
+// standard-library width, and the alignment assertion catches a member that
+// would shift the vector offsets without changing the total width. A reorder
+// of the three same-width vectors is still covered only by policy, like the
+// other unguarded cases in docs/abi.md.
+static_assert(
+    sizeof(server::builder) ==
+        (sizeof(server::options) +
+         sizeof(std::vector<server::listener_config>) +
+         sizeof(std::vector<std::function<status(rpc::service_registry&)>>) +
+         sizeof(std::vector<server_interceptor*>) +
+         alignof(server::builder) - 1) /
+            alignof(server::builder) *
+            alignof(server::builder),
+    "server::builder must be options plus its three vector members");
+static_assert(alignof(server::builder) == alignof(server::options),
+              "server::builder must keep the options alignment");
 
 #undef CRPC_ABS_SIZE
 #undef CRPC_ABS_OFF
@@ -503,6 +599,10 @@ static_assert(std::is_standard_layout<http2::window_credit>::value,
               "http2::window_credit must be standard-layout");
 static_assert(std::is_standard_layout<frame_compression_info>::value,
               "frame_compression_info must be standard-layout");
+// The library builds a `fallback_context` and the consumer's callback reads it,
+// so it is a cross-boundary record even though no signature spells its name.
+static_assert(std::is_standard_layout<resilience::fallback_context>::value,
+              "resilience::fallback_context must be standard-layout");
 // `buffer` is intentionally *not* asserted standard-layout. It owns a
 // `std::unique_ptr`, and in C++17 a class is only standard-layout when every
 // non-static data member is standard-layout too. MSVC and GCC happen to accept
@@ -583,6 +683,19 @@ CRPC_AFTER(frame_compression_info, algorithm, wire_size);
 CRPC_AFTER(frame_compression_info, wire_size, logical_size);
 CRPC_AFTER(frame_compression_info, logical_size, dropped);
 CRPC_AFTER(frame_compression_info, dropped, drop_reason);
+
+// `fallback_context` mixes a 2-byte optional, a duration and three adjacent
+// bools, so the absolute anchors above pin the layout on x86/x64 while this
+// relative chain catches a reorder on every target (including the ones with no
+// absolute anchor). Without it, a swap of `sent`/`idempotent` would be invisible
+// outside x86/x64.
+CRPC_AFTER(resilience::fallback_context, code, stage);
+CRPC_AFTER(resilience::fallback_context, stage, retry_after);
+CRPC_AFTER(resilience::fallback_context, retry_after, one_way);
+CRPC_AFTER(resilience::fallback_context, one_way, sent);
+CRPC_AFTER(resilience::fallback_context, sent, idempotent);
+CRPC_AFTER(resilience::fallback_context, idempotent, has_deadline);
+CRPC_AFTER(resilience::fallback_context, has_deadline, deadline);
 
 // --- http_statistics: the 28-counter STEP chain -----------------------------
 //

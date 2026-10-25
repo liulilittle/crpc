@@ -343,6 +343,36 @@ status finish_call(const codec& response_codec, Callable&& call,
     }
 }
 
+// Invokes a lambda handler registered by `CRPC_HTTP_GET("/path", lambda)`.
+// The lambda is stored in the `lambda_route_registrar` object and addressed
+// through `self`. Three call shapes are accepted, in order: `fn(request,
+// params)`, `fn(request)` and `fn()`. The return value is handled by
+// `finish_call`, so a lambda may return a plain value, `status`, `result<T>`,
+// `status_body<T>` or `no_content`.
+template <typename Fn>
+status invoke_lambda(void* self, const http::request& request,
+                     const route_params& params, const codec& response_codec,
+                     const codec_registry& registry, http::response& response) {
+    (void)registry;
+    Fn& fn = *static_cast<Fn*>(self);
+    auto call = [&]() -> decltype(auto) {
+        if constexpr (std::is_invocable_v<Fn&, const http::request&,
+                                          const route_params&>) {
+            return fn(request, params);
+        } else if constexpr (std::is_invocable_v<Fn&, const http::request&>) {
+            return fn(request);
+        } else {
+            static_assert(std::is_invocable_v<Fn&>,
+                          "CRPC_HTTP_GET lambda must be callable as "
+                          "fn(const http::request&, const route_params&), "
+                          "fn(const http::request&) or fn()");
+            return fn();
+        }
+    };
+    using response_type = std::decay_t<decltype(call())>;
+    return finish_call<response_type>(response_codec, call, response, request.path);
+}
+
 } // namespace detail
 
 // Type-checked handler adapter. `Method` is `&Controller::method`, so the
@@ -439,6 +469,33 @@ public:
         entry.ordinal = ordinal;
         pending_routes().push_back(std::move(entry));
     }
+};
+
+// One registration object per `CRPC_HTTP_GET("/path", lambda)` macro. It owns
+// the lambda (so a capturing lambda is allowed) and passes its own address as
+// the type-erased controller. Unlike `route_registrar`, it has no controller
+// type or route prefix: the lambda is a free handler. The object must be
+// namespace-scope and must outlive the router, which an `inline` variable does.
+template <typename Fn>
+class lambda_route_registrar {
+public:
+    lambda_route_registrar(http::method verb, const char* path, const char* name,
+                           std::uint32_t ordinal, Fn fn) noexcept
+        : fn_(std::move(fn)) {
+        route_entry entry;
+        entry.method = verb;
+        entry.path = path;
+        entry.name = name != nullptr ? name : "";
+        // The controller is the stored lambda itself, not the registrar object:
+        // `invoke_lambda` casts `controller` back to `Fn*`.
+        entry.controller = &fn_;
+        entry.invoke = &detail::invoke_lambda<Fn>;
+        entry.ordinal = ordinal;
+        pending_routes().push_back(std::move(entry));
+    }
+
+private:
+    Fn fn_;
 };
 
 } // namespace crpc::mvc

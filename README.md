@@ -5,8 +5,8 @@
 A modern C++17 framework for building large server systems: remote calls and
 server push over one connection, one frame format and one coroutine model.
 
-> Status: **v0.1 under construction.** The core primitives (wire, frame, codec,
-> transport contract) are being built module by module. See
+> Status: **v2.0.0.** The core primitives (wire, frame, codec, transport
+> contract) and the call/server facade are in place. See
 > [docs/README.md](docs/README.md) for the document index and the current
 > implementation status.
 
@@ -14,9 +14,18 @@ server push over one connection, one frame format and one coroutine model.
 
 | Document | English | 中文 |
 |---|---|---|
-| Documentation home | [docs/README.md](docs/README.md) | [docs/README.zh-CN.md](docs/README.zh-CN.md) |
 | Design specification | [docs/superpowers/specs/2026-10-19-crpc-design.md](docs/superpowers/specs/2026-10-19-crpc-design.md) | [中文](docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md) |
 | ABI policy | [docs/abi.md](docs/abi.md) | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) |
+| Architecture overview | [docs/architecture.md](docs/architecture.md) | [架构概览](docs/architecture.zh-CN.md) |
+| Wire protocol | [docs/protocol.md](docs/protocol.md) | [线上协议](docs/protocol.zh-CN.md) |
+| Build and test | [docs/building.md](docs/building.md) | [构建与测试](docs/building.zh-CN.md) |
+| Engineering principles | [docs/principles.md](docs/principles.md) | [工程原则](docs/principles.zh-CN.md) |
+| Performance report | [docs/performance.md](docs/performance.md) | [性能报告](docs/performance.zh-CN.md) |
+| Migration guide | [docs/migration.md](docs/migration.md) | [迁移指南](docs/migration.zh-CN.md) |
+| API reference | [docs/api/README.md](docs/api/README.md) | [API 参考](docs/api/README.zh-CN.md) |
+| Tutorial | [docs/tutorial.md](docs/tutorial.md) | [教程](docs/tutorial.zh-CN.md) |
+| Examples | [examples/README.md](examples/README.md) | [示例](examples/README.zh-CN.md) |
+| Release notes | [docs/CHANGELOG.md](docs/CHANGELOG.md) | [发布说明](docs/CHANGELOG.zh-CN.md) |
 
 ## What this is
 

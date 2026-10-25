@@ -166,6 +166,15 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
     return nullptr;
 }
 
+// The outcome of resolving an SSE request against the push hub. `detail`
+// carries the human-readable reason for a failure; it is empty on success.
+enum class sse_open_error : u8 {
+    ok,
+    bad_request,
+    conflict,
+    unavailable,
+};
+
 // Long-poll route lookup. The list is immutable once the server is built.
 [[nodiscard]] const longpoll_route* find_longpoll_route(
     const std::vector<longpoll_route>& routes, std::string_view path) noexcept {
@@ -535,6 +544,13 @@ private:
     void build_h2_request(u32 stream_id, const header_list& fields);
     void dispatch_h2(u32 stream_id);
     void send_h2_response(u32 stream_id, http::response& response, bool head_only);
+    // Encodes and enqueues one HPACK header block as HEADERS + CONTINUATION,
+    // with optional END_STREAM. Shared by `send_h2_response` and the SSE head.
+    void h2_send_header_block(u32 stream_id, const std::string& block,
+                              bool end_stream);
+    // Sends the SSE response head (`:status 200`, `text/event-stream`, no
+    // Content-Length, no END_STREAM). Returns false when HPACK encoding failed.
+    [[nodiscard]] bool h2_send_sse_head(u32 stream_id);
     void h2_flush(u32 stream_id);
     void h2_resume_parked();
     void h2_send_initial_settings();
@@ -586,11 +602,24 @@ private:
 
     // Server-Sent Events. `sse_open` runs on the shard after the request has
     // been parsed and takes ownership of the response (the connection is
-    // dedicated to the event stream).
+    // dedicated to the event stream). `sse_open_h2` is the HTTP/2 variant: the
+    // stream stays open and its events are DATA frames. Both share
+    // `sse_resolve`, which validates the request and attaches the hub token.
     void sse_open(http::request request, const sse_route& route);
+    void sse_open_h2(u32 stream_id, http::request request,
+                     const sse_route& route);
+    sse_open_error sse_resolve(const http::request& request,
+                               const sse_route& route, std::string& detail);
     // The single event pump. Idempotent/re-entrancy safe; honors the per-session
     // staged-byte bound and parks one taken message instead of dropping it.
     void sse_pump();
+    // The HTTP/2 pump: the same hub accounting, but each frame is a DATA frame
+    // on `sse_stream_id_` and the flow-control window gates the loop.
+    void sse_pump_h2();
+    // Sends one event frame as a DATA frame without END_STREAM; parks the
+    // remainder in the connection's send queue when the window is short.
+    void sse_h2_send_frame(const std::string& frame);
+    [[nodiscard]] bool sse_h2_window_exhausted() const noexcept;
     void sse_send_heartbeat();
     void sse_mark_output();
     void sse_clear_stall_if_drained();
@@ -599,8 +628,12 @@ private:
     // Detaches from the hub. Must run before the connection/token is destroyed;
     // idempotent.
     void sse_detach() noexcept;
-    // Graceful close: detach, then emit the chunked terminator and let the
-    // write queue drain. `finish_now()` is the hard close.
+    // Detaches and clears the SSE state without closing the connection. Used
+    // when the peer resets an HTTP/2 SSE stream but the connection stays usable.
+    void sse_reset() noexcept;
+    // Graceful close: detach, then end the stream (HTTP/1.1 terminating chunk,
+    // HTTP/2 empty DATA frame with END_STREAM) and let the write queue drain.
+    // `finish_now()` is the hard close.
     void sse_close(bool graceful) noexcept;
     // Hard close after detach; used for stall detection and write failures.
     void sse_abort() noexcept;
@@ -684,6 +717,9 @@ private:
 
     // SSE state. All of this is shard-only except `sse_token_`, which is only
     // touched on the shard and always under `server_state::hub_mutex`.
+    // `sse_stream_id_` is the HTTP/2 stream carrying the event stream (0 when
+    // the transport is HTTP/1.1). The rest is shared by both transports.
+    u32 sse_stream_id_ = 0;
     http::chunked_encoder sse_encoder_{};
     std::atomic<bool> sse_active_{false};
     bool sse_pumping_ = false;
@@ -734,14 +770,17 @@ struct server_state {
     http_server_options options;
     const mvc::router* router = nullptr;
 
-    // HTTP SSE (single-shard subset). The hub is owned by the facade but every
-    // access is serialized by `hub_mutex`: publishes arrive from arbitrary
-    // threads while sessions pump on their shard. No hub method blocks.
+    // HTTP push. One hub per shard. A topic is owned by exactly one hub
+    // (`push::topic_shard`), so only that hub holds its subscriptions and queue
+    // and every topic keeps a single writer. `hub_mutex` serializes every
+    // access: a session on any shard pumps the hub of its topic (a request is
+    // routed to the owning shard, not to the shard that accepted it) and a
+    // publish is posted to the owning shard. No hub method blocks.
     std::vector<sse_route> sse_routes;
     // File download routes. Immutable once the server is built.
     std::vector<download_route> download_routes;
     std::recursive_mutex hub_mutex;
-    std::unique_ptr<push::hub> hub;
+    std::vector<std::unique_ptr<push::hub>> hubs;
     // Per (subscriber, topic) high water: the largest seq ever handed to that
     // subscriber. Reconnect cursors are clamped to this value before acking.
     std::map<std::pair<u64, std::string>, u64> sse_delivered;
@@ -831,8 +870,7 @@ struct server_state {
     }
 
     void arm_longpoll_timer() noexcept {
-        const std::size_t shard_count = options.shards == 0 ? 1 : options.shards;
-        if (shard_count != 1 || shards.empty() || longpoll_routes.empty()) {
+        if (shards.empty() || longpoll_routes.empty()) {
             return;
         }
         const u64 period = longpoll_timer_period_ns(options);
@@ -946,8 +984,10 @@ struct server_state {
             if (!expired) {
                 continue;
             }
-            if (hub) {
-                (void)hub->unsubscribe_all(id);
+            for (auto& h : hubs) {
+                if (h) {
+                    (void)h->unsubscribe_all(id);
+                }
             }
             longpoll_owners.erase(id);
             for (auto dit = longpoll_delivered.begin();
@@ -1028,6 +1068,19 @@ struct server_state {
 
     explicit server_state(http_server_options opt) : options(std::move(opt)) {}
 
+    // The hub that owns `topic`. Must be called under `hub_mutex`. The HTTP
+    // server never declares a shard key, so the owner is the plain topic hash;
+    // every shard computes the same owner from the same topic name, which is
+    // what lets a request, a publish and a reconnect agree on one hub.
+    [[nodiscard]] push::hub* hub_for(std::string_view topic) noexcept {
+        if (hubs.empty()) {
+            return nullptr;
+        }
+        const u32 owner =
+            push::topic_shard(topic, 0, static_cast<u32>(hubs.size()));
+        return hubs[owner].get();
+    }
+
     void on_accept(std::unique_ptr<connection> transport, bool use_tls) noexcept {
         if (transport == nullptr) {
             return;
@@ -1089,6 +1142,82 @@ struct server_state {
         return sessions.size();
     }
 };
+
+// --- Cross-shard publish -----------------------------------------------------
+
+// A publish is routed to the hub of the shard that owns the topic. The
+// application thread never touches a hub directly: it copies the payload and
+// posts a task to the owning shard, which takes `hub_mutex`, publishes, then
+// wakes every SSE / long-poll session. The task owns its copy, so the caller's
+// buffers may go away immediately.
+//
+// `publish()` waits for the task to finish queueing the message. A poll that
+// is sent after `publish()` returns must observe the message, and the shard's
+// write-completion task may pick the poll's bytes out of the session ingress
+// buffer before the publish task runs; waiting closes that window. The wait is
+// on the shard's task queue, never on a subscriber: the hub's `publish` does
+// not block.
+struct publish_context {
+    server_state* state = nullptr;
+    std::string topic;
+    std::vector<std::byte> body;
+    push::delivery_mode mode = push::delivery_mode::reliable;
+    // Shared so the caller can wait even if the shard stops and the drop hook
+    // releases the task first.
+    std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
+    std::shared_ptr<std::condition_variable> cv =
+        std::make_shared<std::condition_variable>();
+    std::shared_ptr<bool> done = std::make_shared<bool>(false);
+};
+
+void publish_run(server_state& state, const std::string& topic,
+                 const std::vector<std::byte>& body,
+                 push::delivery_mode mode) noexcept {
+    try {
+        std::vector<std::shared_ptr<session>> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(state.sessions_mutex);
+            snapshot = state.sessions;
+        }
+        {
+            std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
+            push::hub* hub = state.hub_for(topic);
+            if (hub != nullptr) {
+                hub->publish(topic,
+                             span<const std::byte>(body.data(), body.size()),
+                             mode);
+            }
+        }
+        // The publish completes before any wake, so a session that pumps on the
+        // wake always sees the queued message. A wake only posts shard work.
+        for (const std::shared_ptr<session>& value : snapshot) {
+            value->wake_sse();
+            value->wake_longpoll();
+        }
+    } catch (...) {
+    }
+}
+
+void publish_trampoline(void* ctx) noexcept {
+    auto* task = static_cast<publish_context*>(ctx);
+    publish_run(*task->state, task->topic, task->body, task->mode);
+    {
+        std::lock_guard<std::mutex> lk(*task->mu);
+        *task->done = true;
+    }
+    task->cv->notify_all();
+    delete task;
+}
+
+void publish_drop(void* ctx) noexcept {
+    auto* task = static_cast<publish_context*>(ctx);
+    {
+        std::lock_guard<std::mutex> lk(*task->mu);
+        *task->done = true;
+    }
+    task->cv->notify_all();
+    delete task;
+}
 
 // --- reader_source / write_completion ---------------------------------------
 
@@ -1347,14 +1476,19 @@ void session::process() {
             sse_abort();
             return;
         }
-        if (!input.empty() && !sse_active_.load(std::memory_order_acquire) &&
+        // Once the response is an event stream the connection is dedicated to
+        // it: later bytes are not a pipelined request (HTTP/1.1 cannot answer
+        // them in order) and must not be parsed. A streamed download likewise
+        // holds the connection until its body is written, and a poll in flight
+        // keeps the response order intact. HTTP/2 is different: its streams
+        // multiplex on one connection, so inbound frames (WINDOW_UPDATE,
+        // RST_STREAM, PING) must keep being processed while an SSE stream is
+        // open.
+        const bool http1_dedicated =
+            sse_active_.load(std::memory_order_acquire) && sse_stream_id_ == 0;
+        if (!input.empty() && !http1_dedicated &&
             !download_active_.load(std::memory_order_acquire) &&
             !longpoll_active_.load(std::memory_order_acquire)) {
-            // Once the response is an event stream the connection is dedicated
-            // to it: later bytes are not a pipelined request (HTTP/1.1 cannot
-            // answer them in order) and must not be parsed. A streamed download
-            // likewise holds the connection until its body is written, and a
-            // poll in flight keeps the response order intact.
             note_activity();
             consume(std::move(input));
             arm_probe();
@@ -2146,7 +2280,13 @@ std::size_t session::sse_egress_cap() const noexcept {
 }
 
 std::size_t session::sse_staged_bytes() const noexcept {
-    return out_bytes_ + (write_in_flight_ ? in_flight_.size() : 0);
+    std::size_t staged = out_bytes_ + (write_in_flight_ ? in_flight_.size() : 0);
+    if (sse_stream_id_ != 0) {
+        // HTTP/2 bytes parked behind a zero window are staged output too: they
+        // must count toward the bound so a slow peer cannot grow memory.
+        staged += h2_.parked_bytes(sse_stream_id_);
+    }
+    return staged;
 }
 
 void session::wake_sse() noexcept {
@@ -2207,8 +2347,9 @@ void session::sse_detach() noexcept {
             }
         }
     }
-    if (state_.hub) {
-        (void)state_.hub->detach(token);
+    push::hub* hub = state_.hub_for(sse_topic_);
+    if (hub != nullptr) {
+        (void)hub->detach(token);
     }
     state_.sse_connections.fetch_sub(1, std::memory_order_relaxed);
 }
@@ -2222,10 +2363,23 @@ void session::sse_abort() noexcept {
     sse_detach();
     sse_pending_ = push::push_message{};
     sse_has_pending_ = false;
+    sse_stream_id_ = 0;
     close_when_drained_ = true;
     stop_reading_ = true;
     // The peer is gone or wedged: do not wait for a queued write to complete.
     finish_now();
+}
+
+void session::sse_reset() noexcept {
+    if (!sse_active_.exchange(false)) {
+        sse_stream_id_ = 0;
+        return;
+    }
+    sse_detach();
+    sse_pending_ = push::push_message{};
+    sse_has_pending_ = false;
+    sse_stream_id_ = 0;
+    // The connection stays usable: other HTTP/2 streams may still be active.
 }
 
 void session::sse_close(bool graceful) noexcept {
@@ -2234,6 +2388,33 @@ void session::sse_close(bool graceful) noexcept {
         return;
     }
     sse_detach();
+    if (sse_stream_id_ != 0) {
+        const u32 stream_id = sse_stream_id_;
+        sse_stream_id_ = 0;
+        if (graceful && !write_failed_ &&
+            h2_.state_of(stream_id) != h2::stream_state::closed) {
+            // End the stream with an empty DATA frame carrying END_STREAM. A
+            // non-graceful close (peer reset/EOF) has already ended it.
+            if (h2_.local_end_stream(stream_id).ok()) {
+                h2::frame_header header;
+                header.type = h2::frame_type::data;
+                header.flags = h2::flags::end_stream;
+                header.stream_id = stream_id;
+                header.length = 0;
+                std::string frame(h2::frame_header_size, '\0');
+                std::size_t count = 0;
+                (void)h2::encode_frame(
+                    span<std::byte>(reinterpret_cast<std::byte*>(frame.data()),
+                                    frame.size()),
+                    header, span<const std::byte>(), count);
+                enqueue(std::move(frame));
+            }
+        }
+        close_when_drained_ = true;
+        stop_reading_ = true;
+        flush_writes();
+        return;
+    }
     if (graceful && !write_failed_) {
         // The terminating chunk is bound to the response close, never emitted
         // between events (mirrors maybe_finish's drain rule).
@@ -2247,14 +2428,15 @@ void session::sse_close(bool graceful) noexcept {
     flush_writes();
 }
 
-void session::sse_open(http::request request, const sse_route& route) {
+sse_open_error session::sse_resolve(const http::request& request,
+                                     const sse_route& route,
+                                     std::string& detail) {
     std::string topic = route.topic;
     std::string value;
     switch (query_param(request.query, "topic", value)) {
     case query_result::invalid:
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(400, "invalid topic parameter", request, false);
-        return;
+        detail = "invalid topic parameter";
+        return sse_open_error::bad_request;
     case query_result::ok:
         topic = std::move(value);
         break;
@@ -2262,27 +2444,23 @@ void session::sse_open(http::request request, const sse_route& route) {
         break;
     }
     if (topic.empty()) {
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(400, "SSE route requires a topic", request, false);
-        return;
+        detail = "SSE route requires a topic";
+        return sse_open_error::bad_request;
     }
 
     push::delivery_mode mode = route.mode;
     switch (query_param(request.query, "mode", value)) {
     case query_result::invalid:
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(400, "invalid mode parameter", request, false);
-        return;
+        detail = "invalid mode parameter";
+        return sse_open_error::bad_request;
     case query_result::ok:
         if (value == "reliable") {
             mode = push::delivery_mode::reliable;
         } else if (value == "unreliable") {
             mode = push::delivery_mode::unreliable;
         } else {
-            state_.bad.fetch_add(1, std::memory_order_relaxed);
-            send_http1_error(400, "mode must be reliable or unreliable", request,
-                             false);
-            return;
+            detail = "mode must be reliable or unreliable";
+            return sse_open_error::bad_request;
         }
         break;
     case query_result::missing:
@@ -2292,15 +2470,12 @@ void session::sse_open(http::request request, const sse_route& route) {
     bool ordered = route.ordered;
     switch (query_param(request.query, "ordered", value)) {
     case query_result::invalid:
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(400, "invalid ordered parameter", request, false);
-        return;
+        detail = "invalid ordered parameter";
+        return sse_open_error::bad_request;
     case query_result::ok:
         if (!parse_bool_text(value, ordered)) {
-            state_.bad.fetch_add(1, std::memory_order_relaxed);
-            send_http1_error(400, "ordered must be 0/1 or false/true", request,
-                             false);
-            return;
+            detail = "ordered must be 0/1 or false/true";
+            return sse_open_error::bad_request;
         }
         break;
     case query_result::missing:
@@ -2310,15 +2485,12 @@ void session::sse_open(http::request request, const sse_route& route) {
     u64 subscriber = 0;
     switch (query_param(request.query, "subscriber", value)) {
     case query_result::invalid:
-        state_.bad.fetch_add(1, std::memory_order_relaxed);
-        send_http1_error(400, "invalid subscriber parameter", request, false);
-        return;
+        detail = "invalid subscriber parameter";
+        return sse_open_error::bad_request;
     case query_result::ok:
         if (!parse_u64_text(value, subscriber) || subscriber == 0) {
-            state_.bad.fetch_add(1, std::memory_order_relaxed);
-            send_http1_error(400, "subscriber must be a non-zero u64", request,
-                             false);
-            return;
+            detail = "subscriber must be a non-zero u64";
+            return sse_open_error::bad_request;
         }
         break;
     case query_result::missing:
@@ -2331,86 +2503,76 @@ void session::sse_open(http::request request, const sse_route& route) {
     sse::event_id cursor{};
     if (const std::string* field = request.headers.find("last-event-id")) {
         if (!sse::parse_last_event_id(*field, cursor).ok()) {
-            state_.bad.fetch_add(1, std::memory_order_relaxed);
-            send_http1_error(400, "invalid Last-Event-ID", request, false);
-            return;
+            detail = "invalid Last-Event-ID";
+            return sse_open_error::bad_request;
         }
         have_cursor = true;
     }
 
-    if (state_.options.shards != 1) {
-        send_http1_error(503, "SSE requires a single shard", request, false);
-        return;
-    }
-
-    bool longpoll_conflict = false;
     {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
-        longpoll_conflict =
-            state_.longpoll_owners.find(subscriber) !=
-            state_.longpoll_owners.end();
-    }
-    if (longpoll_conflict) {
-        state_.longpoll_conflicts.fetch_add(1, std::memory_order_relaxed);
-        const bool keep = keep_alive(request);
-        send_longpoll_error(409, "subscriber is used by long polling", request,
-                            keep, false);
-        return;
-    }
-
-    status failure;
-    {
-        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
-        push::hub* hub = state_.hub.get();
-        if (hub == nullptr) {
-            failure = status{rpc_error(rpc_code::unavailable,
-                                       "push hub is not running")};
-        } else {
-            const status subscribed =
-                hub->subscribe(topic, subscriber, mode, ordered,
-                               state_.options.sse.subscribe);
-            if (!subscribed.ok() &&
-                subscribed.code() != rpc_code::failed_precondition) {
-                failure = subscribed;
-            } else {
-                // Reconnect order: clamp the client cursor to the highest seq
-                // this server ever delivered for (subscriber, topic), then
-                // ack, then attach. Ack-only: a re-subscribe would fail with
-                // failed_precondition and must never create a new subscriber.
-                u64 accepted = 0;
-                if (have_cursor && mode == push::delivery_mode::reliable &&
-                    cursor.epoch == state_.options.sse.epoch) {
-                    const auto high =
-                        state_.sse_delivered.find({subscriber, topic});
-                    const u64 delivered =
-                        high == state_.sse_delivered.end() ? 0 : high->second;
-                    accepted = std::min(cursor.seq, delivered);
-                }
-                if (accepted != 0) {
-                    (void)hub->ack(subscriber, topic, accepted);
-                }
-                const push::hub::connection_id token = hub->attach(subscriber);
-                if (token == push::hub::invalid_connection) {
-                    failure = status{rpc_error(rpc_code::unavailable,
-                                               "SSE attach failed")};
-                } else {
-                    sse_subscriber_ = subscriber;
-                    sse_token_ = token;
-                    sse_topic_ = topic;
-                    const auto high =
-                        state_.sse_delivered.find({subscriber, topic});
-                    sse_delivered_high_water_ =
-                        high == state_.sse_delivered.end() ? 0 : high->second;
-                    ++state_.sse_subscribers[subscriber];
-                    sse_active_.store(true, std::memory_order_release);
-                    state_.sse_connections.fetch_add(1,
-                                                     std::memory_order_relaxed);
-                }
-            }
+        if (state_.longpoll_owners.find(subscriber) !=
+            state_.longpoll_owners.end()) {
+            detail = "subscriber is used by long polling";
+            return sse_open_error::conflict;
         }
     }
-    if (!failure.ok()) {
-        send_http1_error(503, failure.error().message, request, false);
+
+    std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+    push::hub* hub = state_.hub_for(topic);
+    if (hub == nullptr) {
+        detail = "push hub is not running";
+        return sse_open_error::unavailable;
+    }
+    const status subscribed = hub->subscribe(topic, subscriber, mode, ordered,
+                                            state_.options.sse.subscribe);
+    if (!subscribed.ok() && subscribed.code() != rpc_code::failed_precondition) {
+        detail = subscribed.error().message;
+        return sse_open_error::unavailable;
+    }
+    // Reconnect order: clamp the client cursor to the highest seq this server
+    // ever delivered for (subscriber, topic), then ack, then attach. Ack-only:
+    // a re-subscribe would fail with failed_precondition and must never create
+    // a new subscriber.
+    u64 accepted = 0;
+    if (have_cursor && mode == push::delivery_mode::reliable &&
+        cursor.epoch == state_.options.sse.epoch) {
+        const auto high = state_.sse_delivered.find({subscriber, topic});
+        const u64 delivered = high == state_.sse_delivered.end() ? 0 : high->second;
+        accepted = std::min(cursor.seq, delivered);
+    }
+    if (accepted != 0) {
+        (void)hub->ack(subscriber, topic, accepted);
+    }
+    const push::hub::connection_id token = hub->attach(subscriber);
+    if (token == push::hub::invalid_connection) {
+        detail = "SSE attach failed";
+        return sse_open_error::unavailable;
+    }
+    sse_subscriber_ = subscriber;
+    sse_token_ = token;
+    sse_topic_ = topic;
+    const auto high = state_.sse_delivered.find({subscriber, topic});
+    sse_delivered_high_water_ = high == state_.sse_delivered.end() ? 0 : high->second;
+    ++state_.sse_subscribers[subscriber];
+    sse_active_.store(true, std::memory_order_release);
+    state_.sse_connections.fetch_add(1, std::memory_order_relaxed);
+    return sse_open_error::ok;
+}
+
+void session::sse_open(http::request request, const sse_route& route) {
+    std::string detail;
+    const sse_open_error err = sse_resolve(request, route, detail);
+    if (err != sse_open_error::ok) {
+        if (err == sse_open_error::bad_request) {
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+            send_http1_error(400, detail, request, false);
+        } else if (err == sse_open_error::conflict) {
+            state_.longpoll_conflicts.fetch_add(1, std::memory_order_relaxed);
+            send_longpoll_error(409, detail, request, keep_alive(request), false);
+        } else {
+            send_http1_error(503, detail, request, false);
+        }
         return;
     }
 
@@ -2460,15 +2622,98 @@ void session::sse_open(http::request request, const sse_route& route) {
     arm_probe();
 }
 
+void session::sse_open_h2(u32 stream_id, http::request request,
+                          const sse_route& route) {
+    if (h2_.state_of(stream_id) == h2::stream_state::closed) {
+        return;
+    }
+    // A session owns one SSE subscription. A second SSE request on the same
+    // connection replaces the first: detach it before re-attaching so the hub
+    // token cannot be leaked.
+    if (sse_active_.load(std::memory_order_acquire)) {
+        const u32 replaced = sse_stream_id_;
+        sse_reset();
+        // The replaced stream must actually end: leaving it open would keep its
+        // record (and any parked bytes) alive until the connection closes.
+        if (replaced != 0 && h2_.stream_exists(replaced) &&
+            h2_.state_of(replaced) != h2::stream_state::closed) {
+            h2_send_rst(replaced, h2::error_code::cancel);
+        }
+    }
+
+    std::string detail;
+    const sse_open_error err = sse_resolve(request, route, detail);
+    if (err != sse_open_error::ok) {
+        int code = 503;
+        if (err == sse_open_error::bad_request) {
+            code = 400;
+            state_.bad.fetch_add(1, std::memory_order_relaxed);
+        } else if (err == sse_open_error::conflict) {
+            code = 409;
+            state_.longpoll_conflicts.fetch_add(1, std::memory_order_relaxed);
+        }
+        http::response response;
+        response.status_code = code;
+        response.reason = local_reason(code);
+        response.headers.add("Content-Type", "text/plain; charset=utf-8");
+        response.body = detail + "\n";
+        state_.handled.fetch_add(1, std::memory_order_relaxed);
+        send_h2_response(stream_id, response, false);
+        return;
+    }
+
+    sse_stream_id_ = stream_id;
+    if (!h2_send_sse_head(stream_id)) {
+        sse_reset();
+        return;
+    }
+
+    if (state_.options.sse.retry.count() > 0) {
+        const std::string hint =
+            sse::retry_hint(state_.options.sse.retry);
+        if (!hint.empty()) {
+            sse_h2_send_frame(hint);
+        }
+    }
+    // The head and retry hint are already output: arm the slow-read stall
+    // deadline so a peer that never drains them is closed instead of waiting
+    // for the first event (D4).
+    sse_mark_output();
+
+    state_.handled.fetch_add(1, std::memory_order_relaxed);
+    state_.responded.fetch_add(1, std::memory_order_relaxed);
+
+    // The SSE response is long-lived: no idle or request deadline. HTTP/2 keeps
+    // reading because flow-control frames (WINDOW_UPDATE/RST_STREAM/PING) must
+    // still be processed while the stream is open.
+    idle_deadline_ns_ = 0;
+    request_deadline_ns_ = 0;
+    if (state_.options.sse.heartbeat.count() > 0 && shard_ != nullptr) {
+        sse_heartbeat_ns_ =
+            shard_->now_ns() +
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 state_.options.sse.heartbeat)
+                                 .count());
+    }
+
+    sse_pump();
+    flush_writes();
+    arm_probe();
+}
+
 void session::sse_pump() {
     if (!sse_active_.load(std::memory_order_acquire) || finished_ ||
         sse_pumping_) {
         return;
     }
+    if (sse_stream_id_ != 0) {
+        sse_pump_h2();
+        return;
+    }
     sse_pumping_ = true;
     {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
-        push::hub* hub = state_.hub.get();
+        push::hub* hub = state_.hub_for(sse_topic_);
         if (hub == nullptr || sse_token_ == 0) {
             sse_pumping_ = false;
             return;
@@ -2553,6 +2798,145 @@ void session::sse_pump() {
     sse_pumping_ = false;
 }
 
+bool session::sse_h2_window_exhausted() const noexcept {
+    return sse_stream_id_ != 0 &&
+           h2_.available_send_window(sse_stream_id_) == 0;
+}
+
+void session::sse_pump_h2() {
+    if (sse_pumping_) {
+        return;
+    }
+    sse_pumping_ = true;
+    {
+        std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
+        push::hub* hub = state_.hub_for(sse_topic_);
+        if (hub == nullptr || sse_token_ == 0) {
+            sse_pumping_ = false;
+            return;
+        }
+        const std::size_t cap = sse_egress_cap();
+        for (;;) {
+            if (finished_ || write_failed_ || !sse_active_.load()) {
+                break;
+            }
+            // A zero send window means every further frame would park: stop and
+            // let WINDOW_UPDATE (or the probe PING) reopen the stream instead of
+            // growing the send queue toward its cap.
+            if (sse_h2_window_exhausted()) {
+                break;
+            }
+            const std::size_t staged = sse_staged_bytes();
+            if (sse_has_pending_) {
+                if (cap != 0 && staged != 0 &&
+                    staged + sse_pending_bytes_ > cap) {
+                    break;
+                }
+                std::string frame;
+                const bool reliable =
+                    sse_pending_.mode == push::delivery_mode::reliable;
+                const sse::event_id id{
+                    sse_pending_.epoch, reliable ? sse_pending_.seq
+                                                 : sse_pending_.topic_seq};
+                if (!sse::encode_event(id, sse_pending_.data(), frame).ok()) {
+                    sse_has_pending_ = false;
+                    sse_pending_bytes_ = 0;
+                    sse_pending_ = push::push_message{};
+                    break;
+                }
+                sse_pending_ = push::push_message{};
+                sse_has_pending_ = false;
+                sse_pending_bytes_ = 0;
+                sse_h2_send_frame(frame);
+                if (write_failed_ || finished_ || sse_stream_id_ == 0) {
+                    break;
+                }
+                if (reliable && id.seq > sse_delivered_high_water_) {
+                    sse_delivered_high_water_ = id.seq;
+                    state_.sse_delivered[{sse_subscriber_, sse_topic_}] = id.seq;
+                }
+                state_.sse_events_delivered.fetch_add(1,
+                                                      std::memory_order_relaxed);
+                continue;
+            }
+            if (cap != 0 && staged >= cap) {
+                break;
+            }
+            push::push_message message;
+            if (!hub->try_take(sse_token_, sse_topic_, message)) {
+                break;
+            }
+            const sse::event_id id{
+                message.epoch,
+                message.mode == push::delivery_mode::reliable ? message.seq
+                                                              : message.topic_seq};
+            std::string frame;
+            if (!sse::encode_event(id, message.data(), frame).ok()) {
+                continue;
+            }
+            if (cap != 0 && staged != 0 && staged + frame.size() > cap) {
+                sse_pending_ = std::move(message);
+                sse_pending_bytes_ = frame.size();
+                sse_has_pending_ = true;
+                break;
+            }
+            sse_h2_send_frame(frame);
+            if (write_failed_ || finished_ || sse_stream_id_ == 0) {
+                break;
+            }
+            if (message.mode == push::delivery_mode::reliable &&
+                id.seq > sse_delivered_high_water_) {
+                sse_delivered_high_water_ = id.seq;
+                state_.sse_delivered[{sse_subscriber_, sse_topic_}] = id.seq;
+            }
+            state_.sse_events_delivered.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    sse_pumping_ = false;
+}
+
+void session::sse_h2_send_frame(const std::string& frame) {
+    const u32 stream_id = sse_stream_id_;
+    if (stream_id == 0 || finished_ || write_failed_ || frame.empty()) {
+        return;
+    }
+    std::size_t sent = 0;
+    bool parked = false;
+    const h2::h2_error error =
+        h2_.send_data(stream_id, as_bytes(frame), sent, parked);
+    if (!error.ok()) {
+        // A stream-scope error (closed or flow-control overflow) ends this
+        // stream; the connection stays usable for its other streams.
+        if (error.scope == h2::error_scope::stream) {
+            h2_send_rst(stream_id, error.code);
+        }
+        sse_reset();
+        return;
+    }
+    if (sent != 0) {
+        h2::frame_header data_frame;
+        data_frame.type = h2::frame_type::data;
+        data_frame.flags = 0; // END_STREAM is sent only when the stream ends.
+        data_frame.stream_id = stream_id;
+        data_frame.length = static_cast<u32>(sent);
+        std::string out(h2::frame_header_size + sent, '\0');
+        std::size_t count = 0;
+        (void)h2::encode_frame(
+            span<std::byte>(reinterpret_cast<std::byte*>(out.data()), out.size()),
+            data_frame,
+            span<const std::byte>(
+                reinterpret_cast<const std::byte*>(frame.data()), sent),
+            count);
+        enqueue(std::move(out));
+        sse_mark_output();
+    }
+    if (parked) {
+        // Retry the remainder now; the probe PING covers a peer that stays at a
+        // zero window (R18).
+        h2_flush(stream_id);
+    }
+}
+
 void session::sse_send_heartbeat() {
     if (!sse_active_.load(std::memory_order_acquire) || finished_) {
         return;
@@ -2561,6 +2945,10 @@ void session::sse_send_heartbeat() {
         // The peer is still draining an earlier write. Skip this tick instead
         // of growing the queue; the stall deadline closes a peer that never
         // drains.
+        return;
+    }
+    if (sse_stream_id_ != 0) {
+        sse_h2_send_frame(sse::heartbeat());
         return;
     }
     std::string chunk;
@@ -2616,13 +3004,9 @@ void session::longpoll_release() noexcept {
     const push::subscriber_id subscriber = longpoll_subscriber_;
     longpoll_token_ = 0;
     longpoll_subscriber_ = 0;
-    longpoll_topic_.clear();
     longpoll_deadline_ns_ = 0;
     longpoll_response_active_ = false;
     output_stall_deadline_ns_ = 0;
-    if (token == 0 && subscriber == 0) {
-        return;
-    }
     try {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
         if (was_waiting && subscriber != 0 &&
@@ -2641,17 +3025,19 @@ void session::longpoll_release() noexcept {
             state_.longpoll_last_seen[subscriber] =
                 shard_ != nullptr ? shard_->now_ns() : 0;
         }
-        if (token != 0 && state_.hub) {
+        push::hub* hub = state_.hub_for(longpoll_topic_);
+        if (token != 0 && hub != nullptr) {
             // Keep-queue: queued messages stay in_queue, an already-taken
             // message stays in the replay window, and nothing is counted as a
             // retransmission. The subscription is intentionally kept so a
             // reconnect inside `subscriber_ttl` still resumes it; the periodic
             // long-poll housekeeping timer performs `unsubscribe_all` when the
             // TTL expires (no later poll is required).
-            (void)state_.hub->release(token);
+            (void)hub->release(token);
         }
     } catch (...) {
     }
+    longpoll_topic_.clear();
 }
 
 void session::longpoll_send_message(const push::push_message& message,
@@ -2753,7 +3139,7 @@ void session::longpoll_pump() {
     bool taken = false;
     try {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
-        push::hub* hub = state_.hub.get();
+        push::hub* hub = state_.hub_for(longpoll_topic_);
         if (hub != nullptr && longpoll_token_ != 0) {
             taken = hub->try_take(longpoll_token_, longpoll_topic_, message);
             if (taken) {
@@ -2962,13 +3348,6 @@ void session::longpoll_open(http::request request, const longpoll_route& route) 
         break;
     }
 
-    if (state_.options.shards != 1) {
-        state_.longpoll_overloaded.fetch_add(1, std::memory_order_relaxed);
-        send_longpoll_error(503, "long polling requires a single shard",
-                            request, keep, true);
-        return;
-    }
-
     const u64 now = shard_ != nullptr ? shard_->now_ns() : 0;
     const u64 epoch = state_.options.longpoll.epoch;
     push::push_message message;
@@ -2981,7 +3360,7 @@ void session::longpoll_open(http::request request, const longpoll_route& route) 
 
     {
         std::lock_guard<std::recursive_mutex> lk(state_.hub_mutex);
-        push::hub* hub = state_.hub.get();
+        push::hub* hub = state_.hub_for(topic);
         if (hub == nullptr) {
             unavailable = true;
         } else if (!hub->owns_topic(topic)) {
@@ -3339,9 +3718,19 @@ void session::after_h2_receive(const h2::frame_header& frame, std::string data) 
         h2_last_reset_seen_ = stream_id;
         h2_streams_.erase(stream_id);
         h2_end_pending_.erase(stream_id);
+        // The peer reset the SSE stream. Detach the hub subscription; the
+        // connection itself stays usable for its remaining streams.
+        if (sse_active_.load(std::memory_order_acquire) &&
+            stream_id == sse_stream_id_) {
+            sse_reset();
+        }
     }
 
     if (h2_.goaway_received()) {
+        // The peer is shutting the connection down: end every SSE stream.
+        if (sse_active_.load(std::memory_order_acquire)) {
+            sse_close(false);
+        }
         if (!h2_goaway_sent_) {
             h2_send_goaway(h2::error_code::no_error);
         }
@@ -3458,17 +3847,18 @@ void session::dispatch_h2(u32 stream_id) {
         // gzip/deflate offer must NOT fail the request: serve identity and
         // advertise the variance (a normal h2 client sends gzip by default).
     }
-    // SSE is not implemented over HTTP/2 in this slice. A matching route must
-    // fail closed with a complete, non-streaming response rather than pretend
-    // to open a stream.
-    if (find_sse_route(state_.sse_routes, routed.path) != nullptr) {
-        http::response response;
-        response.status_code = 501;
-        response.reason = "Not Implemented";
-        response.headers.add("Content-Type", "text/plain; charset=utf-8");
-        response.body = "SSE is not supported over HTTP/2\n";
-        state_.handled.fetch_add(1, std::memory_order_relaxed);
-        send_h2_response(stream_id, response, head_only);
+    // SSE is served over HTTP/2 when the server is single-shard: the request
+    // opens one stream and the events are DATA frames (see `sse_open_h2`).
+    if (const sse_route* sse = find_sse_route(state_.sse_routes, routed.path)) {
+        if (head_only || routed.method != http::method::get) {
+            http::response response =
+                make_problem(405, "SSE requires GET", routed.path);
+            response.version = routed.version;
+            state_.handled.fetch_add(1, std::memory_order_relaxed);
+            send_h2_response(stream_id, response, head_only);
+            return;
+        }
+        sse_open_h2(stream_id, std::move(routed), *sse);
         return;
     }
     if (find_longpoll_route(state_.longpoll_routes, routed.path) != nullptr) {
@@ -3494,6 +3884,73 @@ void session::dispatch_h2(u32 stream_id) {
     }
     state_.handled.fetch_add(1, std::memory_order_relaxed);
     send_h2_response(stream_id, response, head_only);
+}
+
+void session::h2_send_header_block(u32 stream_id, const std::string& block,
+                                   bool end_stream) {
+    const std::size_t max_frame = h2_.remote_settings().max_frame_size;
+    const std::size_t first = std::min(block.size(), max_frame);
+    // END_HEADERS belongs on the frame that completes the block. When the block
+    // spills into CONTINUATION frames the HEADERS frame must not carry it
+    // (RFC 7540 6.2); END_STREAM is independent and still applies to HEADERS.
+    const bool whole = first == block.size();
+    h2::frame_header header;
+    header.type = h2::frame_type::headers;
+    header.flags = static_cast<u8>(
+        (whole ? h2::flags::end_headers : static_cast<u8>(0)) |
+        (end_stream ? h2::flags::end_stream : static_cast<u8>(0)));
+    header.stream_id = stream_id;
+    header.length = static_cast<u32>(first);
+    std::string header_frame(h2::frame_header_size + first, '\0');
+    std::size_t written = 0;
+    (void)h2::encode_frame(
+        span<std::byte>(reinterpret_cast<std::byte*>(header_frame.data()),
+                        header_frame.size()),
+        header,
+        span<const std::byte>(reinterpret_cast<const std::byte*>(block.data()),
+                             first),
+        written);
+    enqueue(std::move(header_frame));
+    std::size_t offset = first;
+    while (offset < block.size()) {
+        const std::size_t chunk = std::min(block.size() - offset, max_frame);
+        const bool last = offset + chunk == block.size();
+        h2::frame_header continuation;
+        continuation.type = h2::frame_type::continuation;
+        continuation.flags = last ? h2::flags::end_headers : static_cast<u8>(0);
+        continuation.stream_id = stream_id;
+        continuation.length = static_cast<u32>(chunk);
+        std::string frame(h2::frame_header_size + chunk, '\0');
+        std::size_t count = 0;
+        (void)h2::encode_frame(
+            span<std::byte>(reinterpret_cast<std::byte*>(frame.data()),
+                            frame.size()),
+            continuation,
+            span<const std::byte>(
+                reinterpret_cast<const std::byte*>(block.data() + offset), chunk),
+            count);
+        enqueue(std::move(frame));
+        offset += chunk;
+    }
+}
+
+bool session::h2_send_sse_head(u32 stream_id) {
+    std::vector<h2::header_field> fields;
+    fields.push_back({":status", "200"});
+    fields.push_back({"content-type", "text/event-stream; charset=utf-8"});
+    fields.push_back({"cache-control", "no-cache"});
+    fields.push_back({"x-accel-buffering", "no"});
+    std::string block;
+    const status encoded = h2_.encoder().encode(
+        span<const h2::header_field>(fields.data(), fields.size()), block);
+    if (!encoded.ok()) {
+        h2_send_rst(stream_id, h2::error_code::internal_error);
+        return false;
+    }
+    // No Content-Length (a stream has no fixed length) and no END_STREAM (the
+    // events follow on the same stream).
+    h2_send_header_block(stream_id, block, false);
+    return true;
 }
 
 void session::send_h2_response(u32 stream_id, http::response& response,
@@ -3532,46 +3989,8 @@ void session::send_h2_response(u32 stream_id, http::response& response,
         return;
     }
 
-    const std::size_t max_frame = h2_.remote_settings().max_frame_size;
     const bool end_stream = !send_body;
-    std::size_t offset = 0;
-    h2::frame_header header;
-    header.type = h2::frame_type::headers;
-    header.flags = static_cast<u8>(
-        h2::flags::end_headers |
-        (end_stream ? h2::flags::end_stream : static_cast<u8>(0)));
-    header.stream_id = stream_id;
-    const std::size_t first = std::min(block.size(), max_frame);
-    header.length = static_cast<u32>(first);
-    std::string header_frame(h2::frame_header_size + first, '\0');
-    std::size_t written = 0;
-    (void)h2::encode_frame(
-        span<std::byte>(reinterpret_cast<std::byte*>(header_frame.data()),
-                        header_frame.size()),
-        header,
-        span<const std::byte>(reinterpret_cast<const std::byte*>(block.data()), first),
-        written);
-    enqueue(std::move(header_frame));
-    offset = first;
-    while (offset < block.size()) {
-        const std::size_t chunk = std::min(block.size() - offset, max_frame);
-        const bool last = offset + chunk == block.size();
-        h2::frame_header continuation;
-        continuation.type = h2::frame_type::continuation;
-        continuation.flags = last ? h2::flags::end_headers : static_cast<u8>(0);
-        continuation.stream_id = stream_id;
-        continuation.length = static_cast<u32>(chunk);
-        std::string frame(h2::frame_header_size + chunk, '\0');
-        std::size_t count = 0;
-        (void)h2::encode_frame(
-            span<std::byte>(reinterpret_cast<std::byte*>(frame.data()), frame.size()),
-            continuation,
-            span<const std::byte>(
-                reinterpret_cast<const std::byte*>(block.data() + offset), chunk),
-            count);
-        enqueue(std::move(frame));
-        offset += chunk;
-    }
+    h2_send_header_block(stream_id, block, end_stream);
 
     if (!send_body) {
         (void)h2_.local_end_stream(stream_id);
@@ -4089,6 +4508,16 @@ void session::on_probe() {
                         state_.options.sse.heartbeat)
                         .count());
             sse_send_heartbeat();
+        }
+        if (sse_stream_id_ != 0) {
+            // HTTP/2: retry bytes parked behind a zero window and, if the peer
+            // still sends no WINDOW_UPDATE, probe it so a dead peer is detected
+            // instead of waited on forever (R18).
+            h2_resume_parked();
+            if (h2_.has_parked()) {
+                h2_send_ping();
+            }
+        } else {
             flush_writes();
         }
         arm_probe();
@@ -4340,18 +4769,14 @@ status http_server::start() {
                                 "the MVC router must be frozen before start()")};
     }
 
-    // SSE is defined only for the single-shard, in-process subset. Reject the
-    // configuration up front rather than streaming from a hub owned by the
-    // wrong thread.
+    // One hub per shard. A topic is owned by exactly one hub, so a request is
+    // routed to the owning shard's hub instead of being refused when the server
+    // runs more than one shard.
     const std::size_t shard_count =
         state.options.shards == 0 ? 1 : state.options.shards;
     // Published only after every validation below succeeds, so a failed start()
     // keeps reporting zero (the documented "not running" value).
     std::size_t effective_replay_window = 0;
-    if (!state.sse_routes.empty() && shard_count != 1) {
-        return status{rpc_error(rpc_code::failed_precondition,
-                                "SSE requires http_server_options::shards == 1")};
-    }
     for (std::size_t i = 0; i < state.sse_routes.size(); ++i) {
         if (state.sse_routes[i].path.empty()) {
             return status{rpc_error(rpc_code::invalid_argument,
@@ -4479,13 +4904,16 @@ status http_server::start() {
 
     try {
         const std::size_t count = shard_count;
-        if (count == 1) {
+        {
             std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
             push::hub_options hub_options;
-            hub_options.shard_count = 1;
-            hub_options.shard_index = 0;
+            hub_options.shard_count = static_cast<u32>(count);
             hub_options.epoch = state.options.sse.epoch;
-            state.hub = std::make_unique<push::hub>(hub_options);
+            state.hubs.clear();
+            for (std::size_t i = 0; i < count; ++i) {
+                hub_options.shard_index = static_cast<u32>(i);
+                state.hubs.push_back(std::make_unique<push::hub>(hub_options));
+            }
             state.sse_delivered.clear();
             state.longpoll_owners.clear();
             state.longpoll_busy.clear();
@@ -4561,7 +4989,7 @@ void http_server::stop() noexcept {
         }
         {
             std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
-            state.hub.reset();
+            state.hubs.clear();
             state.sse_delivered.clear();
             state.sse_subscribers.clear();
             state.longpoll_owners.clear();
@@ -4612,7 +5040,7 @@ void http_server::stop() noexcept {
     }
     {
         std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
-        state.hub.reset();
+        state.hubs.clear();
         state.sse_delivered.clear();
         state.sse_subscribers.clear();
         state.longpoll_owners.clear();
@@ -4690,15 +5118,25 @@ http_statistics http_server::stats() const noexcept {
         out.longpoll_replay_window =
             impl_->state.longpoll_replay_window.load(
                 std::memory_order_relaxed);
-        if (impl_->state.hub) {
-            const push::hub_stats counters = impl_->state.hub->stats();
-            out.sse_hub_published = static_cast<std::size_t>(counters.published);
-            out.sse_hub_delivered = static_cast<std::size_t>(counters.delivered);
-            out.sse_hub_queued = static_cast<std::size_t>(counters.queued_messages);
-            out.sse_hub_dropped = static_cast<std::size_t>(
-                counters.dropped_overflow + counters.dropped_unreliable +
-                counters.dropped_disconnected + counters.dropped_allocation);
+        push::hub_stats counters{};
+        for (const auto& h : impl_->state.hubs) {
+            if (h) {
+                const push::hub_stats partial = h->stats();
+                counters.published += partial.published;
+                counters.delivered += partial.delivered;
+                counters.queued_messages += partial.queued_messages;
+                counters.dropped_overflow += partial.dropped_overflow;
+                counters.dropped_unreliable += partial.dropped_unreliable;
+                counters.dropped_disconnected += partial.dropped_disconnected;
+                counters.dropped_allocation += partial.dropped_allocation;
+            }
         }
+        out.sse_hub_published = static_cast<std::size_t>(counters.published);
+        out.sse_hub_delivered = static_cast<std::size_t>(counters.delivered);
+        out.sse_hub_queued = static_cast<std::size_t>(counters.queued_messages);
+        out.sse_hub_dropped = static_cast<std::size_t>(
+            counters.dropped_overflow + counters.dropped_unreliable +
+            counters.dropped_disconnected + counters.dropped_allocation);
     }
     return out;
 }
@@ -4706,31 +5144,62 @@ http_statistics http_server::stats() const noexcept {
 bool http_server::publish(std::string_view topic, span<const std::byte> body,
                           push::delivery_mode mode) noexcept {
     server_state& state = impl_->state;
-    if (topic.empty() || state.options.shards != 1 ||
+    if (topic.empty() || state.hubs.empty() ||
         !state.accepting.load(std::memory_order_acquire)) {
         return false;
     }
+    // Route to the hub of the shard that owns the topic.
+    const u32 owner =
+        push::topic_shard(topic, 0, static_cast<u32>(state.hubs.size()));
+    if (owner >= state.shards.size()) {
+        return false;
+    }
+    runtime* shard = state.shards[owner].get();
+    if (shard == nullptr) {
+        return false;
+    }
+    std::string topic_copy;
+    std::vector<std::byte> body_copy;
     try {
-        std::vector<std::shared_ptr<session>> snapshot;
-        {
-            std::lock_guard<std::mutex> lk(state.sessions_mutex);
-            snapshot = state.sessions;
-        }
-        {
-            std::lock_guard<std::recursive_mutex> lk(state.hub_mutex);
-            if (!state.hub) {
-                return false;
-            }
-            state.hub->publish(topic, body, mode);
-        }
-        // Wake every SSE or waiting long-poll session on the shard. Both wakes
-        // only post a task, so this thread never touches shard-only session
-        // state or the write queue, and a slow subscriber cannot block the
-        // publisher.
-        for (const std::shared_ptr<session>& value : snapshot) {
-            value->wake_sse();
-            value->wake_longpoll();
-        }
+        topic_copy.assign(topic.data(), topic.size());
+        body_copy.assign(body.begin(), body.end());
+    } catch (...) {
+        return false;
+    }
+    // Fast path: called on the owning shard's own thread (an RPC handler on the
+    // same shard, for example). Run inline instead of waiting on a task that
+    // cannot be drained without deadlocking the caller.
+    if (shard->is_owner_thread()) {
+        publish_run(state, topic_copy, body_copy, mode);
+        return true;
+    }
+    // Cross-shard: post a task to the owning shard and wait until it has queued
+    // the message. The wait is on the shard's task queue, never on a subscriber.
+    auto* task = new (std::nothrow) publish_context();
+    if (task == nullptr) {
+        return false;
+    }
+    task->state = &state;
+    task->mode = mode;
+    try {
+        task->topic = std::move(topic_copy);
+        task->body = std::move(body_copy);
+    } catch (...) {
+        delete task;
+        return false;
+    }
+    // Capture the wait state before posting: the trampoline (or the shutdown
+    // drop hook) may release the task while the caller is still here.
+    std::shared_ptr<std::mutex> mu = task->mu;
+    std::shared_ptr<std::condition_variable> cv = task->cv;
+    std::shared_ptr<bool> done = task->done;
+    if (!shard->post(&publish_trampoline, task, &publish_drop)) {
+        delete task;
+        return false;
+    }
+    try {
+        std::unique_lock<std::mutex> lk(*mu);
+        cv->wait(lk, [&done] { return *done; });
     } catch (...) {
         return false;
     }

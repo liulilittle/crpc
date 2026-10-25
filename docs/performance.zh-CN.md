@@ -2,7 +2,7 @@
 
 [English](performance.md) | **简体中文**
 
-版本 1.1 / 2026-10-19
+版本 2.0 / 2026-10-24
 
 本文说明仓库中真正测过什么、在什么硬件与工具链上测的、哪些只是预算，以及库将如何基准测试。目标是目标，
 不是结果。不存在的数字会明确标为缺失，而不是估算。
@@ -42,8 +42,7 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 IOCP TCP loopback（§2.3）。`bench/bench_core.cpp` 覆盖线格式/编解码微基准。
 下面的裸 loopback 探针与对象布局探针早于该基准，作为历史保留。
 
-1. **裸 loopback 探针**，位于 `.opencode/audit-arch-a.md`
-   §12.2。硬件：AMD Ryzen 9 7945HX，16 核 / 32 线程。工具链：MSVC
+1. **裸 loopback 探针**，记录于本节。硬件：AMD Ryzen 9 7945HX，16 核 / 32 线程。工具链：MSVC
    2022、`/O2`、Windows loopback。负载：16 字节帧、阻塞 socket 回显、
    1,000,000 次 RPC、一条连接、一个线程对，不含协程、编解码或多路复用。
 
@@ -74,7 +73,7 @@ IOCP TCP loopback（§2.3）。`bench/bench_core.cpp` 覆盖线格式/编解码�
 ### 2.3 端到端 RPC 实测（2026-10-19）
 
 源码：`bench/bench_rpc.cpp`；命令：`crpc_bench_rpc`（Windows MSVC Release）与
-`.opencode/tmp/verify/release/bench/crpc_bench_rpc`（WSL GCC Release）。
+在 WSL 下构建的同一目标（GCC Release）。
 负载：64 字节 `std::string` 回显，经注册的 `bench.echo` 方法，`call_codec<std::string>`
 （crpc-binary 路径）编解码，单客户端线程，进程内后端（Windows 上另有 IOCP TCP loopback）。
 机器：AMD Ryzen 9 7945HX，32 逻辑核。编译器：MSVC 19.44 x64 Release；WSL2 内
@@ -115,7 +114,58 @@ issue 2612 ns + wait 934 ns；仅 0.6% 的调用在发起时已完成，说明�
 两者均已回滚，实测天花板不变。每调用成本是同步往返（深度 64 时 issue 2612 ns + wait 934 ns），
 因此 5 M 目标的差距不在分配与定时器。
 
-在本文之前不存在 p99/p999 实测；上文 p99/p999 现已实测，跨分片交接与韧性流水线预算仍未测量。
+在本文之前不存在 p99/p999、跨分片交接、编解码或韧性流水线实测；上文 p99/p999 现已实测，跨分片交接与韧性流水线预算仍未测量。
+
+### 2.4 CRC32C 与推送 hub 统计（2026-10-24） <a id="s2-4"></a>
+
+源码：`bench/bench_core.cpp`（`crpc_bench_core crc32c`）。工具链：MSVC 19.51
+x64 Release、`NDEBUG`、关闭消毒器。机器：AMD Ryzen 9 7945HX，16 核 /
+32 线程。丢弃一次预热后取七次运行中位数。
+
+`frame.cpp` 原先通过 256 项表逐字节计算 CRC32C。现在以 slicing-by-8（八张
+交错表）作为可移植路径，并在 x64 MSVC 且 CPUID 报告 SSE4.2 时使用硬件
+`crc32` 指令；选择在运行时只做一次，因此没有 SSE4.2 的 CPU 仍走可移植路径。
+
+| 用例 | 字节循环（前） | slicing-by-8 | `crc32c()`（硬件） |
+|---|---:|---:|---:|
+| 256 B | 504.2 ns | 125.6 ns | **58.5 ns** |
+| 16 KiB | 32 490.3 ns | 8 264.7 ns | **3 683.6 ns** |
+
+相对字节循环的实测加速为 8.6×（256 B）与 8.8×（16 KiB）。`crc32c()` 列比
+同一输入上实测的本地 slicing-by-8 参考更快，确认本 CPU 上选择了硬件路径。
+正确性由 `tests/test_frame.cpp` 覆盖：已知 CRC32C 向量，加上对 0..2048 每个
+长度以及若干至 70 000 字节大小、对照独立逐字节参考的交叉校验。
+
+推送 hub 的 `stats()` 不再扫描每个订阅者与订阅。服务端在每次 PUSH_ACK 时
+读取它（`refresh_push_stats_locked`），因此旧的 O(订阅者 × 订阅) 扫描会在每次
+确认时执行。现在在每次队列/订阅变更处增量维护四个计数器，`stats()` 为
+O(1)；`tests/test_push.cpp` 走遍每条变更路径（subscribe、publish、overflow、
+retransmit、front replay、ack、take、detach、release、unsubscribe、
+disconnect），并把聚合值与全量扫描会得到的结果对比。
+
+上述两处热路径拷贝现已移除。帧解码器新增 `feed_external()`/`drain_external()`：
+`feed_external()` 借用调用方的接收块并直接从中解码完整帧，因此在借用模式下返回的
+负载指向该块本身，省去了每块一次的拷贝；`drain_external()` 只把未完成一帧的尾部
+字节拷贝回内部缓冲区。TLS 写侧的 `push()` 现在借用调用方的 span，仅在写入停留
+（park）时把未写完的剩余部分物化到 `write_buffer_`，因此常见的同步写入不产生拷贝，
+调用方在 `push()` 返回后即可复用该 span。`feed()` 的复制契约（调用方 span 不必
+活过本次调用）与 `push()` 的返回后可复用契约保持不变；`feed_external()` 是面向
+「在块失效前消费完每一帧」调用方的零拷贝形式。`feed_external()` 契约见
+[protocol §15](protocol.zh-CN.md#s15)；两条路径分别由 `tests/test_frame.cpp`
+（`frame_decoder_external_*`）与 `tests/test_tls_write_borrow.cpp` 覆盖。
+
+| 用例 | `feed()` | `feed_external()` | 加速 |
+|---|---:|---:|---:|
+| 1 KiB 帧 | 56.0 ns/帧 | **16.4 ns/帧** | 3.4× |
+| 64 帧批 | 44.9 ns/帧 | **10.5 ns/帧** | 4.3× |
+| 负载拷贝 | 1.00 | **0.00** | — |
+
+对应用例为基准记录 `frame/feed_copy_1KiB_per_frame` 与
+`frame/feed_external_1KiB_per_frame`、`*_batch64_per_frame` 一对，以及
+`frame/feed_*_payload_copies`。「负载拷贝」行是确定性的指针校验而非计时：
+`feed()` 的负载指向解码器内部，`feed_external()` 的负载就是块自身字节。
+`frame_decoder_external_matches_feed` 在每一种切分点（包括在一帧中间切分）都
+验证产生相同的帧流。
 
 ## 3. 预算与目标 <a id="s3"></a>
 
@@ -137,12 +187,15 @@ issue 2612 ns + wait 934 ns；仅 0.6% 的调用在发起时已完成，说明�
 
 | 指标 | 目标 | 状态 |
 |---|---|---|
-| 聚合吞吐 | 5M RPC/s | **未达成**：最佳实测 0.275M RPC/s（inproc，MSVC，depth 64）；IOCP loopback 0.024M |
+| 聚合吞吐 | 5M RPC/s | **未达成**：单客户端最佳实测 0.275M RPC/s（inproc，MSVC，depth 64）；八客户端线程四线程分片 0.773M RPC/s（§2.3）；IOCP loopback 0.024M |
 | 单连接对、批处理 | ≥ 1M RPC/s | **未达成**：inproc 实测 0.275M RPC/s（§2.3） |
 | p99 延迟 | < 100 µs | **部分达成**：inproc 22.6 µs（MSVC）；IOCP loopback 170.2 µs；WSL inproc 151.8 µs |
 | 跨分片交接 | 每条批量消息 15–30 ns | 预算；未测量 |
-| 编解码，64 字节消息 | 编码与解码均 < 100 ns | 预算；见 `bench/bench_core.cpp` / `docs/benchmarks/` |
+| 编解码，64 字节消息 | 编码与解码均 < 100 ns | **未证明**：`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt` 记录 `codec/binary_encode_small` 218.8 ns 与 `codec/binary_decode_small` 232.9 ns。基准负载是小型 `bench_request`（string/vector 字段），并非恰好 64 字节，因此这些数字不能与预算直接比较；但它们仍说明目标未达成。 |
 | 韧性流水线 | 每次成功调用 35–65 ns | 预算；未测量 |
+
+编解码预算需要直接警示：上文记录的微基准是真实测量，但它超出 `< 100 ns` 目标
+2.2–2.3×，且使用了与「64 字节消息」不同的负载。不应把它读作通过的结果。
 
 今天唯一可辩护的陈述是：传输层围绕有界队列与批处理设计，Windows loopback
 裸探针显示批处理把吞吐改变约 50 倍。这解释了设计动机，不证明目标。
@@ -188,6 +241,7 @@ issue 2612 ns + wait 934 ns；仅 0.6% 的调用在发起时已完成，说明�
 不得用推算替代缺失的测量。
 
 当前状态：库有功能测试覆盖、HTTP 服务端门面、进程内与 IOCP 端到端 RPC 基准（§2.3）以及
-线格式/编解码微基准。5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 0.275M RPC/s、
-IOCP p99 170.2 µs）；进程内 p99 目标在 MSVC 上以 22.6 µs **达成**。128 字节调用槽预算在
-已测工具链上仍是**未达成的 440 字节**。验证矩阵、缺陷清单与原始日志见 `.opencode/verify-round.md`。
+线格式/编解码微基准。5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 单客户端 0.275M RPC/s、
+多线程 0.773M RPC/s、IOCP p99 170.2 µs）；进程内 p99 目标在 MSVC 上以 22.6 µs **达成**。128 字节调用槽预算在
+已测工具链上仍是**未达成的 440 字节**。实测数值、被否决的实验与剩余差距记录于 §2 与 §3；
+随仓库发布的微基准日志为 `docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`。

@@ -2,7 +2,7 @@
 
 [简体中文](CHANGELOG.zh-CN.md) | **English**
 
-## Unreleased
+## 2.0.0 - 2026-10-24
 
 ### Changed (MINOR, behaviour only)
 
@@ -73,17 +73,112 @@
   seven-counter snapshot (`ineligible`, `skipped_deadline`, `attempted`,
   `failed`, `canceled`, `overrun`, `applied`) for the fallback primitives in
   `crpc/resilience/fallback.hpp`, plus `client::call<Resp>::degraded()`, which
-  reports whether the terminal result came from a fallback function (always
-  false in this slice). The primitives are header-only and are not wired into
-  the call path, so every counter stays zero. `client::fallback_stats()` is the
-  only new exported symbol; the return type and the `degraded()` accessor are
-  header-only. See [abi.md](abi.md) §4.
+  reports whether the terminal result came from a fallback function. The
+  primitives are header-only; `client::fallback_stats()` was the only new
+  exported symbol of that slice; the return type and the `degraded()` accessor
+  are header-only. See [abi.md](abi.md) §4.
+
+### Usability deep improvements (MINOR, symbols only)
+
+Nine gaps from the usability gap analysis are closed. Every change is additive:
+the low-level forms keep their signatures and the new names are canonical.
+
+- `client::set_fallback_owned` and `crpc::fallback_install`: the RAII fallback
+  installer. `fallback_install` owns `self` in a `std::shared_ptr` and uninstalls
+  the policy when it is destroyed or reset, so the five-argument
+  `set_fallback(function, self, min_remaining, retain, release)` retain/release
+  contract is no longer the only way to install a policy.
+- `rpc::call_context::set_deadline` / `set_timeout` / `set_idempotent` and the
+  `with_deadline` / `with_timeout` / `with_idempotent` builders: the deadline
+  setter sets `has_deadline` together with the value, so a `deadline` assigned
+  without the flag no longer silently means "no timeout".
+- `client::call<Resp>::then`: the facade-level completion callback, mirroring
+  `rpc::call<Resp>::then`. It fires exactly once when the call terminates,
+  including a terminal reached locally.
+- `crpc::delivery_mode`: one enum shared by `crpc::rpc` and `crpc::push`; the two
+  namespace aliases are the same type, so an RPC mode and a push mode
+  interoperate without a conversion.
+- Builder naming: `max_inflight_per_connection` is the canonical per-connection
+  in-flight cap on both the client and the server builder; the server's
+  `per_connection_inflight` is a deprecated alias. `default_deadline` is
+  canonical on the client builder and `default_timeout` is a deprecated alias.
+- `crpc::service_id` and `crpc::method_id`: strong newtypes for the two ids. A
+  `service_id` converts implicitly from a `u64` literal but never from a
+  `method_id`, so a swapped argument list is a compile error.
+- `result<T>::error_or` and `value_or` overloads for lvalue and const lvalue
+  results; `call<Resp>::get()` answers `invalid_argument` for an invalid handle,
+  distinct from the `failed_precondition` of a wait outside a coroutine.
+- `CRPC_HTTP_GET("/path", lambda)`: the two-argument MVC form with no
+  controller type; the route ordinal and object name come from `__COUNTER__`, so
+  two registrations on one source line cannot collide on `__LINE__`.
+- `crpc::publish_result` and `server::publish`: `publish` returns a
+  distinguishable result (`ok`, `empty_topic`, `not_running`,
+  `unsupported_configuration`, `no_push_hub`, `internal_error`). The conversion
+  to `bool` is implicit, so an existing `if (server.publish(...))` keeps
+  compiling and keeps meaning "ok".
+- Impact: MINOR, symbols and behaviour only. No exported symbol is removed or
+  resignatured, no public record changes layout or size (the deprecated builder
+  aliases are methods, not fields), and no wire value changes. A consumer that
+  does not use the new names is unaffected.
+
+### Documentation and examples
+
+- `examples/` is now a wired build target. `examples/CMakeLists.txt` builds
+  `crpc_example_quickstart` — one in-process program that starts a server,
+  registers a typed method, makes a call and handles a push subscription —
+  under `CRPC_BUILD_EXAMPLES=ON` and registers it in CTest;
+  `examples/README.md` explains how to build and run it. The directory had no
+  `CMakeLists.txt` before, so `CRPC_BUILD_EXAMPLES` had to stay off.
+- `docs/api/README.md` indexes the public headers and key types;
+  `docs/tutorial.md` is a step-by-step build from a message type to a call and
+  a push subscription. Both exist in English and Chinese, and `README.md`,
+  `README.zh-CN.md`, `docs/README.md` and `docs/README.zh-CN.md` link them.
+- Impact: documentation and examples only. No public header, symbol, layout or
+  behaviour changes; the examples live outside `src/` and the library target.
+
+### Fallback wiring and the injected server clock
+
+- The client now runs the installed fallback after the last attempt of a call
+  has been finalized and its breaker outcome recorded, at the two terminal
+  failure exits of `call<Resp>::get()`. `client::set_fallback(function, self,
+  min_remaining, retain, release)` installs a policy, and
+  `client::run_fallback` / `client::record_fallbacks` are the library-side
+  entry points. The reference that keeps `self` alive is taken once per
+  installed policy and released once when that policy is replaced or the client
+  is destroyed; a non-null `self` without the `noexcept` `retain`/`release` pair
+  is rejected and installs nothing. `crpc-degradable` (written by the server on
+  four pre-execution refusals) is the gate for a remote refusal; a sent,
+  non-idempotent call is never degraded, because replacing its error could hide
+  a side effect that already happened. A fallback value that arrives after the
+  deadline is reported as `deadline_exceeded`, not as a degraded success.
+  `crpc-degraded` is still written by nobody on the wire: the observable
+  carriers are `call<Resp>::degraded()` and `fallback_stats().applied`.
+- Impact: MINOR for the new symbols, **MAJOR for the layout change below**.
+  No existing member offset changes, but a consumer must be rebuilt from the
+  same headers.
+- `server::options` gained a trailing `resilience::clock_source clock_source`
+  (invalid by default; the library replaces it with
+  `resilience::monotonic_clock()`) and `server::builder::clock()` sets it. The
+  same clock now feeds the per-connection rate bucket, the per-service rate
+  bucket, the per-service circuit breaker and the dispatcher's deadline check,
+  so one request can no longer be judged against two different "now" values.
+  `sizeof(server::options)` grows 304 -> **320** (x64) and 256 -> **264**
+  (x86); `sizeof(server::builder)` grows with it. Adding a field to a public
+  struct is MAJOR under [abi.md](abi.md) §1, so this cycle's MAJOR record now
+  covers it as well. The default keeps the previous behaviour exactly: an
+  options struct that leaves the field invalid reads `monotonic_clock()`, which
+  is the same `std::chrono::steady_clock` the server used before.
+- ABI breaking: `server::options` grew from 304 to 320 bytes (x64) and from 256
+  to 264 bytes (x86); `server::builder` grew with it (376 -> 392 / 296 -> 304).
+  No exported symbol changed signature; three were added
+  (`client::set_fallback`, `client::run_fallback`,
+  `client::record_fallbacks`).
 
 ### Compile-time layout guards
 
 - The internal translation unit `src/abi_check.cpp` (in no header, exporting no
   symbol) now asserts the layout of a subset of the public records that cross the
-  ABI boundary: standard-layout for 14 records; an exact member count for 14
+  ABI boundary: standard-layout for 15 records; an exact member count for 15
   records (`CRPC_MEMBER_COUNT`), which catches an append, an insertion or a
   removal; relative member chains (`CRPC_STEP`, `CRPC_STEP_SAME`,
   `CRPC_STEP_MIXED`, `CRPC_AFTER`) that catch a reorder or a rename; the total
@@ -92,13 +187,14 @@
   member count is what sees a tail append that x86 tail padding would hide from an
   absolute `sizeof`.
 - [abi.md](abi.md) §4 now states the scope predicate for "crosses the ABI
-  boundary" and lists the 19 in-scope records that still have no compile-time
-  guard. `crpc_test_abi_docs` rescans `include/crpc/**/*.hpp` and
+  boundary" and lists the 36 in-scope records that still have no compile-time
+  guard (the exact count confirmed by `crpc_test_abi_docs`).
+  `crpc_test_abi_docs` rescans `include/crpc/**/*.hpp` and
   `src/abi_check.cpp`, so a new cross-boundary record must be guarded or added to
   that list, or the test fails.
 - Documented blind spots: the member count does not validate names (a rename is
   caught by a relative chain where one exists; in `rpc_error` it is caught by
-  the member-type assertions in `src/abi_check.cpp`); among the 14
+  the member-type assertions in `src/abi_check.cpp`); among the 15
   member-counted records, `rpc_error` is the only one without a relative chain,
   so a reorder inside it is not caught by this unit. Its constructors name only
   `code`, `message` and `retryable`, so they do not catch a rename of

@@ -239,7 +239,7 @@ struct crpc_server {
 
 extern "C" {
 
-const char* crpc_version_string(void) { return "0.1.0"; }
+const char* crpc_version_string(void) { return "2.0.0"; }
 
 const char* crpc_last_error_message(void) { return g_last_error.c_str(); }
 

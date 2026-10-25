@@ -1,0 +1,14 @@
+# Reviewed exceptions for scripts/export_gate.py.
+#
+# Format: <key>\t<reason>
+#
+# Keys:
+#   class:<name>   a class in a public header with out-of-line members that is
+#                  an implementation detail: it must NOT be exported, so it
+#                  carries no CRPC_API. Adding a key asserts exactly that.
+#
+# Every entry is a decision, not a convenience. The gate fails on a stale entry
+# as well as a missing one, so an entry cannot outlive the symbol it excuses.
+#
+# Regenerate with:
+#   python scripts/export_gate.py --build-dir <dir> --update-baseline

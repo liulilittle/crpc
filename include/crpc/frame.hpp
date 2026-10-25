@@ -378,6 +378,43 @@ public:
     // the error state with rpc_code::resource_exhausted.
     void feed(span<const std::byte> data) noexcept;
 
+    // Zero-copy feed for a caller-owned chunk. `data` must stay valid until
+    // drain_external() returns: the usual shape is one feed_external() followed
+    // by a next() loop followed by drain_external(), all inside the scope that
+    // owns `data`. Complete frames are decoded directly out of `data`, so in
+    // borrowing mode a frame returned by next() has a payload that points into
+    // `data`; in copying mode the payload is still copied into the decoder's
+    // payload buffer. Only the trailing bytes that do not complete a frame are
+    // copied into the internal buffer (by drain_external), so a later
+    // feed()/feed_external() completes them. This is the same stream of frames
+    // feed() would produce, with the per-chunk copy removed.
+    //
+    // Drop-in replacement for feed() in a caller that consumes every decoded
+    // frame before the chunk goes away:
+    //
+    //   decoder.feed_external(chunk);
+    //   for (;;) {
+    //       frame value;
+    //       const auto r = decoder.next(value);
+    //       if (r == frame_decoder::result::need_more) break;
+    //       if (r == frame_decoder::result::error) { ...; break; }
+    //       handle(value);           // value.payload borrows `chunk`
+    //   }
+    //   decoder.drain_external();
+    //
+    // If bytes are already buffered from an earlier partial frame, or if a
+    // previous chunk was not drained, feed_external() falls back to the copying
+    // path of feed() and the frames borrow the internal buffer instead. Calling
+    // feed() while an external chunk is active first drains it. After an error
+    // both calls are no-ops that only release the external state.
+    void feed_external(span<const std::byte> data) noexcept;
+
+    // Ends a feed_external() window: copies any unconsumed tail into the
+    // internal buffer and clears the external view. A no-op when no external
+    // chunk is active. Must be called before the chunk passed to
+    // feed_external() goes out of scope.
+    void drain_external() noexcept;
+
     // Attempts to decode one frame from the buffered bytes.
     //   * need_more   -- the header or payload is incomplete; `out` unchanged;
     //   * frame_ready -- `out` is filled and the consumed bytes are released;
@@ -416,6 +453,14 @@ private:
     span<std::byte> payload_buffer_;
     u32 max_frame_ = max_frame_default;
     std::size_t read_offset_ = 0;
+    // Active external (borrowed) chunk set by feed_external(); when
+    // external_active_ is true the decoder reads from external_ +
+    // external_offset_ instead of from buffer_. buffer_ stays empty for the
+    // duration of the window, and drain_external() copies the unconsumed tail
+    // back into it.
+    span<const std::byte> external_;
+    std::size_t external_offset_ = 0;
+    bool external_active_ = false;
     rpc_code error_ = rpc_code::ok;
 };
 

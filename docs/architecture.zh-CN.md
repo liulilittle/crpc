@@ -2,7 +2,7 @@
 
 [English](architecture.md) | **简体中文**
 
-版本 1.0 / 2026-10-19
+版本 2.0 / 2026-10-24
 
 本文描述分层、传输契约、执行模型、调用状态机，以及每项需求在代码树中的位置。它区分“仓库今天已经实现的内容”和“设计已冻结、但代码尚未提供的内容”。**已设计，未实现** 表示设计承诺，不是当前行为。
 
@@ -50,7 +50,7 @@ CRPC 在同一条连接、同一套帧格式、同一个执行模型上承载两
 
 两者共用 `source`/`sink`、帧、错误值、截止时间、追踪上下文与背压。它们不共用调用槽：推送拥有的是订阅，而不是在途调用。这也是 `include/crpc/rpc/**` 与 `include/crpc/push/**` 各自拥有独立状态机的原因。
 
-调用路径由 `rpc::client` 与 `rpc::dispatcher` 实现；推送路径由 `push::hub` 与 `push::stream` 实现。两者尚未在帧层接到同一条连接：客户端处理 `RESPONSE`、`PING`、`GOAWAY`，不处理 `PUSH`/`PUSH_ACK`。这部分接线属于**已设计，未实现**。
+调用路径由 `rpc::client` 与 `rpc::dispatcher` 实现；推送路径由 `push::hub` 与 `push::stream` 实现。两者在帧层接到同一条连接：`rpc::client::handle_frame` 解码 `RESPONSE`、`PING`、`GOAWAY`、`PUSH` 与 `PUSH_ACK`（`src/rpc/client.cpp:129-149`），把解码后的 `PUSH` 消息投递给已安装的 `push_sink_`，并对可靠消息回 `PUSH_ACK`；服务端的 push pump 编码 `PUSH` 帧并处理对端的 `PUSH_ACK`（`src/server/server.cpp:591-609,741-747,1389`）。
 
 ## 3. 分层图 <a id="s3"></a>
 
@@ -99,7 +99,7 @@ CRPC 在同一条连接、同一套帧格式、同一个执行模型上承载两
 - `io` 只依赖 `base`；RPC 层只接受 `backend_factory&`，从不判断传输是 TCP 还是进程内。
 - `rpc/client.hpp` 包含 `frame.hpp`、`io.hpp`、`rpc/call.hpp`、`rpc/dispatcher.hpp`；`rpc/dispatcher.hpp` 包含 `frame.hpp` 与 `rpc/call.hpp`。
 - `mvc/router.hpp` 包含 `http/message.hpp`、`codec.hpp`、`mvc/binding.hpp`；`http2/connection.hpp` 包含 `http2/frame.hpp`、`http2/hpack.hpp`、`http/message.hpp`。
-- `cluster`、`observability`、`push`、`flow` 今天独立于 `rpc`。`resilience` 已部分接入：`client_facade` 接入了负载均衡、每端点 rate/bulkhead/breaker、重试和 deadline；`rpc::server` 接入了准入半边流水线（连接级 rate、服务级 rate、bulkhead、breaker、并发上限）。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`。
+- `cluster`、`observability`、`push`、`flow` 今天独立于 `rpc`。`resilience` 已部分接入：`client_facade` 接入了负载均衡、每端点 rate/bulkhead/breaker、重试和 deadline；`rpc::server` 接入了准入半边流水线（连接级 rate、服务级 rate、bulkhead、breaker、并发上限）。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `call<Resp>::get()` 中、最后一次尝试被终结之后调用它，因此被服务端标记为可降级的拒绝可以由已安装的 fallback 值应答。
 - 没有脚本强制这些方向。设计中的上下文依赖规则是评审规则；构建期依赖检查属于**已设计，未实现**。
 
 ## 5. 基础层 <a id="s5"></a>
@@ -187,7 +187,7 @@ per shard:
 
 `rpc::method_traits` 从成员指针推导请求/响应类型；类型化 trampoline 用 `call_codec<T>` 解码并编码响应。`call_codec` 对不支持的类型没有主定义，因此缺少特化是编译错误，而不是静默的空负载。设计中的 RTTI 驱动服务宏在这一层属于**已设计，未实现**；RTTI 编解码器独立存在于 `codec.hpp`。
 
-服务端连接循环在 `src/server/server.cpp` 中实现。`server::start()` 在 `registry.freeze()` 后构建冻结的每服务 guard 表，再创建分片运行时并启动监听；accept sink 把每条连接包装成 `reader_source`，`on_data` 解码 REQUEST/ONE_WAY 并提交到分片的 handler 池。`server::impl::handle_request` 先校验服务 id，再执行 §14 的服务端准入流水线，调用 `rpc::dispatcher::dispatch`，最后把 RESPONSE 或错误帧放入该连接的有界发送路径。客户端流水线已按端点接线；fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`。证据：`src/server/server.cpp:295-380,882-1145,1339-1385`；`include/crpc/server.hpp:78-180`。
+服务端连接循环在 `src/server/server.cpp` 中实现。`server::start()` 在 `registry.freeze()` 后构建冻结的每服务 guard 表，再创建分片运行时并启动监听；accept sink 把每条连接包装成 `reader_source`，`on_data` 解码 REQUEST/ONE_WAY 并提交到分片的 handler 池。`server::impl::handle_request` 先校验服务 id，再执行 §14 的服务端准入流水线，调用 `rpc::dispatcher::dispatch`，最后把 RESPONSE 或错误帧放入该连接的有界发送路径。客户端流水线已按端点接线；fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `call<Resp>::get()` 中、最后一次尝试被终结之后调用它，因此被服务端标记为可降级的拒绝可以由已安装的 fallback 值应答。证据：`src/server/server.cpp:317-403,905-1168,1362-1408`；`include/crpc/server.hpp:78-217`。
 
 ## 10. 调用状态机 <a id="s10"></a>
 
@@ -226,7 +226,7 @@ HTTP/2 在协议层实现：9 字节大端帧编解码、包含静态表/动态�
 
 MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时注册条目；`router::freeze` 编译模式、拒绝畸形模式与冲突，并构建精确匹配表加按优先级排序的参数列表。绑定按固定顺序从 route/query/header/form/file/body 填充反射 DTO，并显式映射 400。`router::handle` 执行匹配、Accept 协商、绑定、调用与响应写出。
 
-仍缺失：服务端路径中的 HTTP 压缩接线、SSE/长轮询，以及 CRPC 调用到 HTTP 的适配器，均属于**已设计，未实现**。
+已实现：`http/content_coding.hpp` 的 gzip/deflate 原语已接入 `http_server` 响应路径（内容协商、`Content-Encoding`、请求体解码；`src/http/server.cpp`、`test_http_coding.cpp`），SSE 与 HTTP 长轮询也已接入（`http/sse.hpp`、`longpoll_sweep.hpp`、`src/http/server.cpp`、`test_http_sse.cpp`）。仍缺失：CRPC 调用到 HTTP 的适配器，属于**已设计，未实现**（`src/http/server.cpp` 经 MVC 路由分派 HTTP 请求，不经过 `rpc::dispatcher`）。
 
 `http/server.hpp` 实现把上述各层接通的服务端门面。`http_server` 绑定一个或多个 `io::backend_factory` 监听器，把每条被接受的连接分配到某个 shard 的 `runtime`，并只在该线程上触碰全部协议状态：传输 source 只把字节拷入有界 ingress 缓冲并投递任务，因此不存在每连接线程，缓冲满时暂停读取（R1 credit）而不是丢弃。明文连接做嗅探——HTTP/2 连接前导选择 h2c，其余为 HTTP/1.1。请求经 MVC 路由分派（HEAD 执行 GET 处理器并丢弃正文），序列化后的响应入队；每连接写队列保证同一时刻至多一个后端 push 在途，队列增长则对读取方背压。HTTP/1.1 处理 keep-alive、流水线、`100-continue`、chunked 正文与 400/404/405/411/413/431/500 路径，并通过消息层拒绝请求走私。HTTP/2 原样复用帧/HPACK/连接层：遵守连接与流窗口，对超出对端窗口的响应停车并在 `WINDOW_UPDATE` 后恢复（对端窗口长期为零时周期性 PING 探测，R18），应答 PING/SETTINGS/GOAWAY，并把流错误映射为 RST_STREAM、连接错误映射为 GOAWAY。`listen_tls` 用 `io::tls_stream` 包装监听器，并按 ALPN 结果路由（`h2` 走 HTTP/2，`http/1.1` 走 HTTP/1.1）；公共头不出现 OpenSSL 类型，未定义 `CRPC_HAVE_OPENSSL` 时 `listen_tls` 返回明确错误。`stop()` 停止接受、在 HTTP/2 上发送 GOAWAY、在 `drain_timeout` 内排空在途请求后关闭，且幂等。它同时保留 builder 的监听配置，使之后的 `start()` 能重新绑定同样的端点；保存的 `backend_factory` 指针是借用的，因此 backend 必须活过整个 server 生命周期，包括每次 `stop()` -> `start()` 循环（与 MVC router 同一契约）。资源上限按服务器实例显式给出：`max_connections`（超出的 accept 直接关闭并计数，绝不排队）、`idle_timeout`（静默连接被关闭）与 `request_timeout`（未完成的请求回 408），因此连接洪泛与 slowloris 都无法长期占用内存或连接。出站队列同样有界：HTTP/1.1 一旦越过 cap 就停止解析并把未解析字节退回有界入站缓冲，HTTP/2 响应则停在每流队列中、其上限被强制。DTO 绑定依赖反射：无 RTTI 构建服务的是请求类型不含反射 DTO 的路由；文档编解码在 JSON 缺失时回退到其他已注册格式，而不是对所有请求回 406。
 
@@ -248,7 +248,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 - `load_balancer`：在不可变 `instance_set` 上实现轮询、随机、最少在途、一致性哈希和平滑加权轮询。
 - `retry_sequence` / `retry_budget`：带指数退避与抖动的逐调用尝试，以及共享令牌桶预算；`unknown_side_effect` 仅在幂等时可重试。
 
-设计命名六个**逻辑阶段**：`rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`。服务端准入半边已经接线；客户端按端点接线同样的阶段，但不按字面顺序执行：必须先选出端点（负载均衡）并通过其 breaker 准入，才能应用该端点的 rate 与 bulkhead，因此实际执行序为 `select + allow -> probe 判定 -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；全局 rate 阶段属于 slice 2c。
+设计命名六个**逻辑阶段**：`rate_limit -> bulkhead -> load_balance -> breaker -> retry -> deadline`。服务端准入半边已经接线；客户端按端点接线同样的阶段，但不按字面顺序执行：必须先选出端点（负载均衡）并通过其 breaker 准入，才能应用该端点的 rate 与 bulkhead，因此实际执行序为 `select + allow -> probe 判定 -> rate -> bulkhead -> register -> pool/slot -> retry -> deadline`。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `get()` 的终态失败出口调用它（在 `finish_attempt` 记录熔断结果之后）。全局 rate 阶段属于 slice 2c。
 
 客户端的一次逻辑调用依次经过：
 
@@ -271,13 +271,13 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 两个服务级阶段默认都是 `nullopt`（一次可预测分支；不构造对象、不加锁、不分配）。bulkhead 需要显式配置 `per_service_bulkhead`；capacity 为 0 时由 `per_service_inflight` 派生。`resilience_enabled=false` 跳过新的 rate/bulkhead 阶段并保留 breaker 与并发上限，行为与接线前一致；此模式没有探针特判，cap 同样作用于探针。`stop()` 先停止 accept、drain、关闭连接，并在 join 全部分片之后才释放 guard 表；Debug 构建断言每个计数与 bulkhead 都回到零。64 位统计包括 `rate_limited_connection`、`rate_limited_service`、`bulkhead_rejected`、`breaker_open`、`deadline_rejected`、`probe_admitted`；`rejected_overload` 统计 per-connection cap、per-service cap 与 per-method 上限（rate/bulkhead/breaker 仍在各自计数器）。
 
-客户端路径按端点经过同样的阶段：负载均衡 + breaker 感知的重新选择、每端点 rate/bulkhead（探针跳过）、带共享预算且遵守 `retry_after` 的重试、每端点 breaker（`src/client/client_facade.cpp`）。服务端流水线证据：`src/server/server.cpp:295-380,882-1145,1339-1385`；`include/crpc/server.hpp:78-180`。
+客户端路径按端点经过同样的阶段：负载均衡 + breaker 感知的重新选择、每端点 rate/bulkhead（探针跳过）、带共享预算且遵守 `retry_after` 的重试、每端点 breaker（`src/client/client_facade.cpp`）。服务端流水线证据：`src/server/server.cpp:317-403,905-1168,1362-1408`；`include/crpc/server.hpp:78-217`。
 
 ## 15. 可观测性 <a id="s15"></a>
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:937-941`，`on_response` 在 `:973-977` 与 `:1197-1201`），它不是可观测性链。
+`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1127-1131`，`on_response` 在 `:1164-1168` 与 `:1387-1391`），它不是可观测性链。
 
 **异常契约。** HTTP 与 RPC 路径跨越两种不同的边界，它们的行为并不相同。头内联边界编译进消费方，跟随**消费方**的异常选项；库翻译单元是预编译的，保留**库**的选项。
 
@@ -298,7 +298,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `push::stream_state`、`stream_reader`、`stream_writer` 实现客户端流、服务端流和双向流。写操作最多接受传输当前的信用并返回接受字节数；零表示背压，不是错误。Reset 幂等。
 
-缺失：`rpc::client` 中的 `PUSH`/`PUSH_ACK` 帧路径、HTTP SSE 与长轮询、CRPC 与 HTTP 共享的发布路径。这些属于**已设计，未实现**。
+缺失：CRPC 与 HTTP 共享的发布路径。`rpc::client` 中的 `PUSH`/`PUSH_ACK` 帧路径、HTTP SSE 与长轮询均已实现。
 
 ## 17. 流控 <a id="s17"></a>
 
@@ -327,11 +327,11 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | HTTP/2 与 HPACK | `http2/*`、`http/server.hpp` | 已实现：协议层 + h2c/h2 服务端 |
 | HTTPS/TLS | `http/server.hpp`、`io/tls.hpp` | `CRPC_WITH_OPENSSL` 下已实现；未启用时返回明确错误 |
 | MVC/REST | `mvc/*` | 已实现，经 `http_server` 接线 |
-| multipart 与文件 | `http/multipart.hpp`、`http/file_transfer.hpp` | 已实现，无专用测试套件 |
+| multipart 与文件 | `http/multipart.hpp`、`http/file_transfer.hpp` | 已实现，有测试（`test_multipart.cpp`、`test_file_transfer.cpp`）；multipart 解析、上传/下载与 Range/206 |
 | Registry | `cluster/registry.hpp`、`src/cluster/registry.cpp` | 已实现，有测试 |
 | 租约/选举/健康/watch | `cluster/*` | 已实现的原语 |
-| 韧性策略 | `resilience/*` | 已实现的原语；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
-| 推送 hub/流 | `push/*` | 已实现，未接入帧/HTTP |
+| 韧性策略 | `resilience/*` | 已实现的原语；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现并接入客户端门面；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
+| 推送 hub/流 | `push/*` | 已实现；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump，SSE 与长轮询已接入 `http_server` |
 | 追踪/日志/AOP | `observability/*` | 已实现，AOP 未接入调用路径 |
 | 流控 | `flow/estimator.hpp` | 已实现原语，未接入调用路径 |
 | 分片/协程/MPSC | 设计规格 §4 | 已设计，未实现 |
@@ -342,19 +342,19 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 |---|---|---|
 | 基础、wire、frame | 已实现 | `test_endian.cpp`、`test_wire.cpp`、`test_frame.cpp` |
 | inproc / epoll / IOCP | 已实现 | `test_io_inproc.cpp`、`test_io_epoll.cpp`、`test_io_iocp.cpp` |
-| RPC 核心 | 已实现 | `test_rpc_core.cpp`、`test_server_client.cpp`；低层客户端为回调/轮询式，PUSH/流帧集成仍缺失 |
+| RPC 核心 | 已实现 | `test_rpc_core.cpp`、`test_server_client.cpp`、`test_push_e2e.cpp`；低层客户端为回调/轮询式；PUSH/PUSH_ACK 帧集成已接线 |
 | 编解码 | 已实现 | `test_codec.cpp`；文本格式依赖 RTTI |
-| HTTP/1.1、multipart、文件 | 部分 | `test_http_message.cpp`、`test_http_server.cpp`；无 multipart/文件套件 |
+| HTTP/1.1、multipart、文件 | 已实现 | `test_http_message.cpp`、`test_http_server.cpp`、`test_multipart.cpp`、`test_file_transfer.cpp`；multipart 解析、上传/下载与 Range/206 |
 | HTTP/2 + HPACK | 已实现 | `test_http2.cpp`；`test_http_server.cpp` 覆盖 inproc 上的 h2c |
 | MVC | 已实现 | `test_mvc.cpp`；`test_http_server.cpp` 经 inproc 走路由器分派 |
 | 集群原语 | 已实现 | `test_cluster.cpp`；无网络 registry 服务 |
-| 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
+| 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现并接入客户端门面；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
 | 可观测性 | 部分 | `test_observability.cpp`；AOP 未接入调用路径，无指标 |
-| 推送 | 部分 | `test_push.cpp`；无 PUSH 帧/HTTP 集成 |
+| 推送 | 已实现 | `test_push.cpp`、`test_push_e2e.cpp`、`test_http_sse.cpp`；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump；SSE 与长轮询已接入 `http_server` |
 | 流控 | 部分 | `test_flow.cpp`；未接入传输 |
 | 分片/协程 | 已设计 | 无 `shard` 类型或 `coro_rt_*` 调用 |
-| 压缩 | 部分 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），尚未接入 `http_server`；CRPC 帧压缩：lz4 block 已实现并测试（`test_frame_compression.cpp`），zstd 保留且 fail-closed，gzip 留待下一阶段；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
-| SSE / 长轮询 | 已设计 | 无 SSE writer 或 HTTP 推送适配器 |
+| 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：lz4 block 已实现并测试（`test_frame_compression.cpp`），zstd 保留且 fail-closed，gzip 留待下一阶段；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
+| SSE / 长轮询 | 已实现 | `test_http_sse.cpp`；SSE writer 与长轮询路由已接入 `src/http/server.cpp` |
 
 ## 20. 验证映射 <a id="s20"></a>
 

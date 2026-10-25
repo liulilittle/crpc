@@ -52,6 +52,7 @@
 #include <string_view>
 
 #include <crpc/config.hpp>
+#include <crpc/delivery_mode.hpp>
 #include <crpc/error.hpp>
 #include <crpc/span.hpp>
 
@@ -62,11 +63,9 @@ using subscriber_id = u64;
 
 // Best-effort or acknowledged delivery. Reliability is a property of the
 // (subscription, message) pair: a message is reliable only when both the
-// subscription and the publish are reliable.
-enum class delivery_mode : u8 {
-    reliable = 0,
-    unreliable = 1
-};
+// subscription and the publish are reliable. The enum is the shared
+// `crpc::delivery_mode` from `crpc/delivery_mode.hpp`, aliased into this
+// namespace so a push mode and an RPC mode are the same type.
 
 // Replay policy used when a connection token is (re)attached.
 //   * `tail` -- replay unacknowledged reliable messages at the queue tail

@@ -236,7 +236,7 @@ bool start_inproc(fixture& f, const fixture_config& cfg) {
     register_services(sb, f.service);
     sb.shards(cfg.server_shards);
     sb.handler_workers(cfg.server_workers);
-    sb.per_connection_inflight(cfg.per_connection);
+    sb.max_inflight_per_connection(cfg.per_connection);
     sb.per_service_inflight(cfg.per_service);
     sb.drain_timeout(cfg.drain);
     sb.overload_retry_after(cfg.overload_retry);
@@ -2651,8 +2651,10 @@ CRPC_TEST(client_initial_open_endpoint_reselects) {
     }
     CRPC_CHECK_EQ(5, service.echo_calls.load());
 
-    // Slice 2 adds the fallback primitives but wires nothing: no handle is
-    // marked degraded and every fallback counter stays zero.
+    // No fallback was installed on this client, so the unconfigured fast path
+    // must not count anything: every fallback counter stays zero even though
+    // the call failed. A `not_configured` result that incremented a counter
+    // would break this assertion.
     CRPC_CHECK_FALSE(any_degraded);
     const crpc::resilience::fallback_statistics fallback = cli->fallback_stats();
     CRPC_CHECK_EQ(static_cast<std::size_t>(0), fallback.ineligible);
@@ -4642,7 +4644,7 @@ CRPC_TEST(server_queues_a_response_while_one_push_is_in_flight) {
         sb.add_listener(crpc::endpoint::inproc(f.name), holding);
         register_services(sb, f.service);
         sb.handler_workers(cfg.server_workers);
-        sb.per_connection_inflight(cfg.per_connection);
+        sb.max_inflight_per_connection(cfg.per_connection);
         sb.per_service_inflight(cfg.per_service);
         sb.drain_timeout(cfg.drain);
         sb.overload_retry_after(cfg.overload_retry);
@@ -4712,6 +4714,467 @@ CRPC_TEST(server_queues_a_response_while_one_push_is_in_flight) {
         CRPC_CHECK_EQ(3, r2.value());
     }
     CRPC_CHECK_EQ(0, hc->holding().rejected());
+}
+
+// --- Fallback wiring ---------------------------------------------------------
+//
+// These cases exercise the S4 wiring, not the primitives (test_fallback.cpp
+// covers those). They pin what the wiring alone is responsible for:
+//   * a remote refusal (sent == true) may only be degraded for an idempotent
+//     call, and only because the server wrote `crpc-degradable`;
+//   * a failure that never produced a call handle does not degrade at all (the
+//     fallback runs at get()'s terminal exits, never inside `start_encoded`);
+//   * `set_fallback` refuses a `self` it cannot keep alive, and keeps one alive
+//     exactly once per installed policy;
+//   * a value that arrives after the deadline is an overrun, not a success.
+
+// Intrusive reference count, because the retain/release pair is exactly the
+// A'' contract: the caller owns one reference, the installed policy owns one
+// more, and whoever drops the last one frees the object.
+struct cache_state {
+    int value = 0;
+    int calls = 0;
+    std::chrono::milliseconds delay{0};
+    std::atomic<int> refs{1};
+};
+
+struct cache_counters {
+    std::atomic<int> retains{0};
+    std::atomic<int> releases{0};
+};
+
+cache_counters g_cache_counters;
+
+crpc::status cached_fallback(void* self,
+                             const crpc::resilience::fallback_context&,
+                             crpc::buffer& out) noexcept {
+    auto* cache = static_cast<cache_state*>(self);
+    ++cache->calls;
+    if (cache->delay.count() > 0) {
+        std::this_thread::sleep_for(cache->delay);
+    }
+    (void)crpc::rpc::call_codec<int>::encode(cache->value, out);
+    return crpc::status{};
+}
+
+// Ignores `self`, so it can be installed with a null `self`.
+crpc::status constant_fallback(void*,
+                               const crpc::resilience::fallback_context&,
+                               crpc::buffer& out) noexcept {
+    (void)crpc::rpc::call_codec<int>::encode(7, out);
+    return crpc::status{};
+}
+
+void* retain_cache(void* self) noexcept {
+    ++g_cache_counters.retains;
+    ++static_cast<cache_state*>(self)->refs;
+    return self;
+}
+
+void release_cache(void* self) noexcept {
+    ++g_cache_counters.releases;
+    auto* cache = static_cast<cache_state*>(self);
+    if (cache->refs.fetch_sub(1) == 1) {
+        delete cache;
+    }
+}
+
+constexpr std::chrono::nanoseconds kFallbackFloor{0};
+
+// A server whose breaker opens after one dependency failure, plus a client that
+// reaches it. The server breaker refuses every later call before the handler
+// runs and marks the refusal `crpc-degradable`, which is the remote path the
+// fallback consumes.
+struct remote_breaker_fixture {
+    crpc::inproc_backend backend;
+    service_state service;
+    std::unique_ptr<crpc::server> srv;
+    std::unique_ptr<crpc::client> cli;
+    std::string name;
+
+    explicit remote_breaker_fixture(const std::string& fixture_name, bool idempotent)
+        : name(fixture_name) {
+        crpc::server::builder sb;
+        sb.add_listener(crpc::endpoint::inproc(name), backend);
+        register_services(sb, service);
+        sb.handler_workers(8);
+        sb.drain_timeout(2000ms);
+        crpc::resilience::breaker_config server_breaker;
+        server_breaker.min_requests = 1;
+        server_breaker.failure_ratio_threshold = 0.0;
+        server_breaker.slow_call_threshold = 10s;
+        server_breaker.open_duration = 5s;
+        sb.breaker(server_breaker);
+        srv = sb.build();
+        if (!srv || !srv->start().ok()) {
+            srv.reset();
+            return;
+        }
+        crpc::client::builder cb;
+        cb.add_endpoint(crpc::endpoint::inproc(name), backend);
+        cb.pool_size(1);
+        cb.default_deadline(2s);
+        cb.plain_thread_timeout(2s);
+        cb.default_idempotent(idempotent);
+        crpc::resilience::retry_policy retry;
+        retry.max_attempts = 1;
+        cb.retry(retry);
+        cli = cb.build();
+    }
+
+    ~remote_breaker_fixture() {
+        if (cli) {
+            cli->close();
+        }
+        if (srv) {
+            srv->stop();
+        }
+    }
+
+    // Opens the server breaker with a plain handler failure.
+    void open_breaker() {
+        auto fail = cli->service<int, int>(kService, kFail);
+        auto started = fail.call(1);
+        if (started.ok()) {
+            auto handle = std::move(started).value();
+            (void)handle.get();
+        }
+    }
+};
+
+// Runs one call to completion and returns its code. Opening a breaker needs the
+// terminal result to be recorded, so the handle must be consumed, not dropped.
+int run_one(crpc::client::stub<int, int>& stub, int argument) {
+    auto started = stub.call(argument);
+    if (!started.ok()) {
+        return static_cast<int>(started.code());
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+    return result.ok() ? 0 : static_cast<int>(result.code());
+}
+
+CRPC_TEST(fallback_rejects_a_remote_refusal_for_a_non_idempotent_call) {
+    // Given: an open server breaker and a non-idempotent client call.
+    remote_breaker_fixture f("crpc-fallback-remote-nonidem", false);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    auto* cache = new cache_state();
+    cache->value = 41;
+    CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                   &retain_cache, &release_cache));
+    f.open_breaker();
+
+    // When: the call meets the open breaker (sent == true).
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+
+    // Then: it is NOT degraded. A sent, non-idempotent call may already have
+    // produced a side effect, so replacing its error would be a lie.
+    CRPC_CHECK_FALSE(result.ok());
+    if (!result.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                      static_cast<int>(result.code()));
+    }
+    CRPC_CHECK_FALSE(handle.degraded());
+    const crpc::resilience::fallback_statistics stats = f.cli->fallback_stats();
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.applied);
+    CRPC_CHECK(stats.ineligible >= 1);
+    CRPC_CHECK_EQ(0, cache->calls);
+}
+
+CRPC_TEST(fallback_applies_a_cached_value_on_a_remote_breaker_refusal) {
+    // Given: the same open server breaker, but an idempotent client call.
+    remote_breaker_fixture f("crpc-fallback-remote-idem", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    auto* cache = new cache_state();
+    cache->value = 41;
+    CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                   &retain_cache, &release_cache));
+    f.open_breaker();
+
+    // When: the idempotent call meets the open breaker.
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+
+    // Then: the value is applied and the handler never ran. This is the only
+    // end-to-end proof that the server's `crpc-degradable` marker plus the
+    // client's idempotency flag together allow a degraded success.
+    CRPC_CHECK(result.ok());
+    if (result.ok()) {
+        CRPC_CHECK_EQ(41, result.value());
+    }
+    CRPC_CHECK(handle.degraded());
+    CRPC_CHECK_EQ(0, f.service.echo_calls.load());
+    const crpc::resilience::fallback_statistics stats = f.cli->fallback_stats();
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.applied);
+}
+
+CRPC_TEST(fallback_does_not_run_when_the_call_never_starts) {
+    // Given: a client whose only endpoint has no listener, so every attempt
+    // fails before a call handle exists.
+    crpc::inproc_backend backend;
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("crpc-fallback-dead"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(2s);
+    cb.plain_thread_timeout(2s);
+    crpc::resilience::retry_policy retry;
+    retry.max_attempts = 1;
+    cb.retry(retry);
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.0;
+    breaker.slow_call_threshold = 10s;
+    breaker.open_duration = 5s;
+    cb.breaker(breaker);
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        return;
+    }
+    auto* cache = new cache_state();
+    cache->value = 41;
+    CRPC_CHECK(cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                 &retain_cache, &release_cache));
+
+    // When: the call is refused before a handle exists.
+    auto stub = cli->service<int, int>(kService, kEcho);
+    auto started = stub.call(1);
+    CRPC_CHECK_FALSE(started.ok());
+    if (!started.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                      static_cast<int>(started.code()));
+    }
+
+    // Then: no fallback ran and no counter moved. The wiring deliberately lives
+    // at get()'s terminal exits, not in `start_encoded`: a call that never
+    // produced a handle has no result to replace.
+    CRPC_CHECK_EQ(0, cache->calls);
+    const crpc::resilience::fallback_statistics stats = cli->fallback_stats();
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.applied);
+    cli->close();
+}
+
+CRPC_TEST(set_fallback_rejects_an_unowned_self) {
+    // Given: a live client and a policy whose `self` cannot be kept alive.
+    remote_breaker_fixture f("crpc-fallback-unowned", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    cache_state cache;
+    cache.value = 41;
+
+    // When: the policy is installed without retain/release.
+    // Then: it is refused and nothing is installed.
+    CRPC_CHECK_FALSE(f.cli->set_fallback(&cached_fallback, &cache, kFallbackFloor,
+                                         nullptr, nullptr));
+    // A half-configured pair is refused too: one callback without the other can
+    // neither keep the reference nor release it.
+    CRPC_CHECK_FALSE(f.cli->set_fallback(&cached_fallback, &cache, kFallbackFloor,
+                                         &retain_cache, nullptr));
+    CRPC_CHECK_FALSE(f.cli->set_fallback(&cached_fallback, &cache, kFallbackFloor,
+                                         nullptr, &release_cache));
+
+    // A rejected call installs nothing: the original error comes back and no
+    // fallback function runs.
+    f.open_breaker();
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+    CRPC_CHECK_FALSE(result.ok());
+    if (!result.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                      static_cast<int>(result.code()));
+    }
+    CRPC_CHECK_FALSE(handle.degraded());
+    CRPC_CHECK_EQ(0, cache.calls);
+}
+
+CRPC_TEST(fallback_keeps_self_alive_after_the_caller_drops_it) {
+    // Given: a heap-allocated cache with one caller reference, and a policy
+    // that owns a second reference.
+    remote_breaker_fixture f("crpc-fallback-alive", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    g_cache_counters.retains.store(0);
+    g_cache_counters.releases.store(0);
+    auto* cache = new cache_state();
+    cache->value = 41;
+    CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                   &retain_cache, &release_cache));
+    CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
+    CRPC_CHECK_EQ(2, cache->refs.load());
+    f.open_breaker();
+
+    // The caller drops its own reference: only the installed policy holds one.
+    release_cache(cache);
+    CRPC_CHECK_EQ(1, cache->refs.load());
+
+    // When: the next call degrades after the caller released its handle.
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+
+    // Then: the value is still there (no use-after-free) and the policy still
+    // holds its reference.
+    CRPC_CHECK(result.ok());
+    if (result.ok()) {
+        CRPC_CHECK_EQ(41, result.value());
+    }
+    CRPC_CHECK(handle.degraded());
+    CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
+
+    // Replacing the policy releases exactly the one reference it owned, which
+    // frees the object (the caller already dropped its own reference).
+    CRPC_CHECK(f.cli->set_fallback(nullptr, nullptr, kFallbackFloor, nullptr,
+                                   nullptr));
+    CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
+}
+
+CRPC_TEST(retain_and_release_run_exactly_once_regardless_of_call_count) {
+    // Given: an installed policy with counted retain/release callbacks.
+    remote_breaker_fixture f("crpc-fallback-once", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    g_cache_counters.retains.store(0);
+    g_cache_counters.releases.store(0);
+    auto* cache = new cache_state();
+    cache->value = 41;
+    CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                   &retain_cache, &release_cache));
+    CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
+    CRPC_CHECK_EQ(0, g_cache_counters.releases.load());
+    f.open_breaker();
+
+    // When: five calls are answered by the same policy.
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    for (int i = 0; i < 5; ++i) {
+        auto started = echo.call(10 + i);
+        CRPC_CHECK(started.ok());
+        if (!started.ok()) {
+            return;
+        }
+        auto handle = std::move(started).value();
+        const auto result = handle.get();
+        CRPC_CHECK(result.ok());
+        CRPC_CHECK(handle.degraded());
+    }
+
+    // Then: one retain for the policy, none per call, and one release when it
+    // is replaced. A per-call retain would leak a reference forever.
+    CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
+    CRPC_CHECK_EQ(0, g_cache_counters.releases.load());
+    CRPC_CHECK_EQ(5, cache->calls);
+
+    CRPC_CHECK(f.cli->set_fallback(nullptr, nullptr, kFallbackFloor, nullptr,
+                                   nullptr));
+    CRPC_CHECK_EQ(1, g_cache_counters.releases.load());
+}
+
+CRPC_TEST(fallback_with_a_null_self_needs_no_holder) {
+    // Given: a fallback that reads no state, so `self` is null.
+    remote_breaker_fixture f("crpc-fallback-nullself", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+
+    // When: it is installed without retain/release.
+    CRPC_CHECK(f.cli->set_fallback(&constant_fallback, nullptr, kFallbackFloor,
+                                   nullptr, nullptr));
+    f.open_breaker();
+
+    // Then: it applies, which proves a null `self` is not a rejection.
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+    CRPC_CHECK(result.ok());
+    if (result.ok()) {
+        CRPC_CHECK_EQ(7, result.value());
+    }
+    CRPC_CHECK(handle.degraded());
+}
+
+CRPC_TEST(fallback_overrun_reports_deadline_exceeded) {
+    // Given: an open server breaker, 60 ms of deadline left and a fallback that
+    // takes 120 ms.
+    remote_breaker_fixture f("crpc-fallback-overrun", true);
+    CRPC_CHECK(f.cli != nullptr);
+    if (!f.cli) {
+        return;
+    }
+    auto* cache = new cache_state();
+    cache->value = 41;
+    cache->delay = 120ms;
+    CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
+                                   &retain_cache, &release_cache));
+    f.open_breaker();
+
+    // When: the degraded attempt runs past the deadline.
+    crpc::rpc::call_context ctx;
+    ctx.has_deadline = true;
+    ctx.deadline = std::chrono::steady_clock::now() + 60ms;
+    auto echo = f.cli->service<int, int>(kService, kEcho);
+    auto started = echo.call(2, ctx);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        return;
+    }
+    auto handle = std::move(started).value();
+    const auto result = handle.get();
+
+    // Then: it is a timeout, not a degraded success, and the value is dropped.
+    CRPC_CHECK_FALSE(result.ok());
+    if (!result.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded),
+                      static_cast<int>(result.code()));
+    }
+    CRPC_CHECK_FALSE(handle.degraded());
+    const crpc::resilience::fallback_statistics stats = f.cli->fallback_stats();
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.attempted);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.overrun);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.applied);
 }
 
 } // namespace

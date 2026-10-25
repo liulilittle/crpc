@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -53,6 +54,51 @@ constexpr crpc::u64 kSlow = 2;
 constexpr crpc::u64 kFail = 4;
 constexpr crpc::u64 kReturnCode = 5;
 constexpr crpc::u64 kBlocking = 7;
+
+// The frozen clock origin. It is far from zero on purpose: a test that
+// accidentally reads the real steady clock instead of the injected one produces
+// a huge value, not a value near zero, so the mistake is visible in the
+// assertion instead of silently passing.
+constexpr crpc::u64 kT0 = 1'000'000'000ull;
+
+// The low-level client's clock type returns a `time_point`, not nanoseconds.
+std::chrono::steady_clock::time_point manual_now(void* context) noexcept {
+    return std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(
+            static_cast<crpc::resilience::manual_clock*>(context)->now_ns()));
+}
+
+// A deadline expressed on the frozen client clock. The client encodes
+// `deadline - now`, so with both frozen the wire value is exactly `left`.
+std::chrono::steady_clock::time_point frozen_deadline(
+    const crpc::resilience::manual_clock& clock, std::chrono::nanoseconds left) {
+    return std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(clock.now_ns()) + left);
+}
+
+// Diagnostic override for the server clock advance between two admissions. It
+// exists only to prove the timing tests still discriminate: with
+// `e >= h` (the gap between the two admissions larger than the rate hint) the
+// rate branch flips to the deadline exit and the assertions must fail. It is
+// never set in a normal run.
+crpc::u64 server_advance_override() {
+    long parsed = 0;
+#if defined(_MSC_VER)
+    char* value = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&value, &size, "CRPC_S4_SERVER_ADVANCE_NS") == 0 &&
+        value != nullptr) {
+        parsed = std::strtol(value, nullptr, 10);
+        std::free(value);
+    }
+#else
+    const char* value = std::getenv("CRPC_S4_SERVER_ADVANCE_NS");
+    if (value != nullptr) {
+        parsed = std::strtol(value, nullptr, 10);
+    }
+#endif
+    return parsed > 0 ? static_cast<crpc::u64>(parsed) : 0;
+}
 
 // The reserved metadata entry, byte for byte: key length 15, key
 // "crpc-degradable", value length 4, value "true".
@@ -131,6 +177,11 @@ struct setup {
     std::size_t per_connection = 1024;
     std::chrono::milliseconds overload_retry{10};
     bool resilience_enabled = true;
+    // Frozen clock: the server reads only `server_clock`, so the interval
+    // between two admissions is exactly the amount this test advances it by
+    // (zero unless it deliberately advances). Tests that leave this false keep
+    // the real monotonic clock.
+    bool frozen_clock = false;
     std::optional<crpc::resilience::rate_limit_config> connection_rate;
     std::optional<crpc::resilience::rate_limit_config> service_rate;
     std::optional<crpc::resilience::bulkhead_config> service_bulkhead;
@@ -141,6 +192,11 @@ struct server_under_test {
     crpc::inproc_backend backend;
     service_state service;
     std::unique_ptr<crpc::server> srv;
+    // The injected clock. Two separate clocks are deliberate: a real deployment
+    // has one clock per process, and the timing experiments advance exactly one
+    // side.
+    crpc::resilience::manual_clock server_clock{kT0};
+    crpc::resilience::manual_clock client_clock{kT0};
     std::string name = "crpc-degradable";
 
     ~server_under_test() {
@@ -166,7 +222,7 @@ bool start(server_under_test& f, const setup& cfg) {
         kService, kBlocking, "blocking", f.service);
     sb.shards(cfg.shards);
     sb.handler_workers(8);
-    sb.per_connection_inflight(cfg.per_connection);
+    sb.max_inflight_per_connection(cfg.per_connection);
     sb.per_service_inflight(cfg.per_service);
     sb.overload_retry_after(cfg.overload_retry);
     sb.drain_timeout(2000ms);
@@ -182,6 +238,9 @@ bool start(server_under_test& f, const setup& cfg) {
     }
     if (cfg.breaker) {
         sb.breaker(*cfg.breaker);
+    }
+    if (cfg.frozen_clock) {
+        sb.clock(f.server_clock.source());
     }
     f.srv = sb.build();
     return f.srv != nullptr && f.srv->start().ok();
@@ -289,6 +348,9 @@ private:
 struct tee_client {
     std::unique_ptr<crpc::rpc::client> client;
     tee_connection* tee = nullptr;
+    // Set when the client clock is frozen; `call_int` then derives its deadline
+    // from the same clock, so the encoded wire deadline is deterministic.
+    crpc::resilience::manual_clock* clock = nullptr;
 };
 
 tee_client make_client(server_under_test& f) {
@@ -306,6 +368,29 @@ tee_client make_client(server_under_test& f) {
     // one, which keeps the golden payloads free of that field.
     options.default_timeout = std::chrono::nanoseconds{0};
     out.client = std::make_unique<crpc::rpc::client>(std::move(wrapped), options);
+    return out;
+}
+
+// Same connection, but the low-level client reads the frozen clock. The
+// deadline has to be expressed on that same clock (see `call_int`): the client
+// encodes `deadline - now`, so a real-clock deadline against a frozen clock
+// would put a huge relative value on the wire.
+tee_client make_client(server_under_test& f, crpc::resilience::manual_clock& clock) {
+    tee_client out;
+    auto inner =
+        f.backend.connect(crpc::endpoint::inproc(f.name), crpc::connect_options{});
+    if (!inner) {
+        return out;
+    }
+    auto wrapped = std::make_unique<tee_connection>(std::move(inner));
+    out.tee = wrapped.get();
+    crpc::rpc::client_options options;
+    options.slot_capacity = 8;
+    options.default_timeout = std::chrono::nanoseconds{0};
+    options.clock = &manual_now;
+    options.clock_ctx = &clock;
+    out.client = std::make_unique<crpc::rpc::client>(std::move(wrapped), options);
+    out.clock = &clock;
     return out;
 }
 
@@ -351,7 +436,11 @@ call_outcome call_int(tee_client& c, crpc::u64 method, int argument,
     crpc::rpc::call_context ctx;
     if (deadline) {
         ctx.has_deadline = true;
-        ctx.deadline = std::chrono::steady_clock::now() + *deadline;
+        // The deadline must be expressed on the same clock the client encodes
+        // with, or the wire value becomes meaningless (see make_client).
+        ctx.deadline = c.clock != nullptr
+                           ? frozen_deadline(*c.clock, *deadline)
+                           : std::chrono::steady_clock::now() + *deadline;
     }
     if (one_way) {
         ctx.mode = crpc::rpc::delivery_mode::unreliable;
@@ -684,15 +773,18 @@ CRPC_TEST(degradable_service_capacity_refusal_is_marked) {
 
 CRPC_TEST(degradable_service_capacity_refusal_with_expired_wire_deadline_is_not_marked) {
     // Given: a per-service cap of one and nothing else configured, so the cap
-    // is the first refusal the second request meets.
+    // is the first refusal the second request meets. Both clocks are frozen, so
+    // the encoded wire deadline is the constant 990 us: the marker decision no
+    // longer depends on how long the two admissions took.
     server_under_test f;
     setup cfg;
     cfg.shards = 2;
     cfg.per_service = 1;
     cfg.overload_retry = 10ms;
+    cfg.frozen_clock = true;
     CRPC_CHECK(start(f, cfg));
-    tee_client first = make_client(f);
-    tee_client second = make_client(f);
+    tee_client first = make_client(f, f.client_clock);
+    tee_client second = make_client(f, f.client_clock);
     CRPC_CHECK(first.client != nullptr);
     CRPC_CHECK(second.client != nullptr);
     if (!first.client || !second.client) {
@@ -715,10 +807,11 @@ CRPC_TEST(degradable_service_capacity_refusal_with_expired_wire_deadline_is_not_
         [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
 
     // When: the second request arrives with 990 us of wire deadline left, below
-    // the 1 ms floor.
+    // the 1 ms floor. `frozen_deadline` uses the clock the client encodes with,
+    // so the wire carries exactly 990000 ns.
     crpc::rpc::call_context ctx;
     ctx.has_deadline = true;
-    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+    ctx.deadline = frozen_deadline(f.client_clock, std::chrono::microseconds(990));
     auto second_started =
         second.client->start_call<int>(kService, kBlocking, second_body.readable(), ctx);
     CRPC_CHECK(second_started.ok());
@@ -796,19 +889,17 @@ CRPC_TEST(degradable_rate_deadline_exit_is_not_marked) {
 // call. `initial_tokens = 0` is not stable, because the bucket refills from the
 // wall clock and may already hold a token by the time the first call arrives.
 //
-// The two calls are pipelined on one connection: both bodies are encoded up
-// front and the timed call is handed to the transport immediately after the
-// burn, without waiting for the burn's reply. This branch only exists while the
-// bucket is empty, and one token takes `1 / rate_per_second` (909 us here) to
-// refill, so the gap between the two admissions must stay below that. A blocking
-// round trip adds a condition-variable wakeup and a scheduler round trip, which
-// under load can exceed 909 us: the bucket then refills, the request is
-// admitted, and it falls through to the dispatcher's 1 ms floor
-// (`deadline already passed`) instead of this branch. Pipelining on one
-// single-shard connection keeps the two admissions adjacent.
+// Both clocks are frozen and the burn is awaited before the timed call, so the
+// interval between the two admissions is exactly zero (no refill) and the wire
+// deadline is exactly 990 us. The recipe no longer depends on how long a round
+// trip takes: the bucket cannot refill because the injected clock does not
+// advance. `CRPC_S4_SERVER_ADVANCE_NS` advances the injected clock between the
+// two admissions; setting it to the hint (909 us) or more must flip the branch
+// to the deadline exit and fail this case (the discrimination check).
 
 CRPC_TEST(degradable_rate_refusal_with_expired_wire_deadline_is_not_marked) {
-    // Given: a bucket that needs ~909 us to refill one token, starting full.
+    // Given: a bucket that needs ~909 us to refill one token, starting full,
+    // and a server whose clock is frozen at kT0.
     server_under_test f;
     setup cfg;
     crpc::resilience::rate_limit_config rate;
@@ -816,8 +907,9 @@ CRPC_TEST(degradable_rate_refusal_with_expired_wire_deadline_is_not_marked) {
     rate.burst = 1.0;
     rate.initial_tokens = 1.0;
     cfg.service_rate = rate;
+    cfg.frozen_clock = true;
     CRPC_CHECK(start(f, cfg));
-    tee_client c = make_client(f);
+    tee_client c = make_client(f, f.client_clock);
     CRPC_CHECK(c.client != nullptr);
     if (!c.client) {
         return;
@@ -840,12 +932,22 @@ CRPC_TEST(degradable_rate_refusal_with_expired_wire_deadline_is_not_marked) {
     }
     crpc::rpc::call<int> burned = std::move(burn_started).value();
 
+    // Wait until the burn was admitted (its handler ran), then optionally
+    // advance the injected server clock. Advancing BEFORE the burn's admission
+    // would let the burn itself absorb the delta, so `e` would stay zero and the
+    // discrimination check below would be a no-op.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.echo_calls.load() >= 1; }, 2000));
+    if (const crpc::u64 advance = server_advance_override(); advance != 0) {
+        f.server_clock.advance(std::chrono::nanoseconds(advance));
+    }
+
     // When: the wire deadline has 990 us left, below the 1 ms floor, while the
     // hint (one token at 1100/s = 909 us) still fits inside it.
     crpc::rpc::call_context timed_ctx;
     timed_ctx.has_deadline = true;
     timed_ctx.deadline =
-        std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+        frozen_deadline(f.client_clock, std::chrono::microseconds(990));
     auto timed_started = c.client->start_call<int>(kService, kEcho,
                                                    timed_body.readable(),
                                                    timed_ctx);
@@ -1216,7 +1318,10 @@ CRPC_TEST(degradable_resilience_disabled_keeps_service_cap_marker) {
 }
 
 CRPC_TEST(degradable_breaker_refusal_with_expired_wire_deadline_is_not_marked) {
-    // Given: a breaker that opens after one dependency failure.
+    // Given: a breaker that opens after one dependency failure, on a frozen
+    // clock. With `now` pinned to kT0 the 5 s open window cannot expire while
+    // the test runs, so the second call deterministically meets an open breaker
+    // instead of racing the open duration.
     server_under_test f;
     setup cfg;
     crpc::resilience::breaker_config breaker;
@@ -1225,8 +1330,9 @@ CRPC_TEST(degradable_breaker_refusal_with_expired_wire_deadline_is_not_marked) {
     breaker.slow_call_threshold = 10s;
     breaker.open_duration = 5s;
     cfg.breaker = breaker;
+    cfg.frozen_clock = true;
     CRPC_CHECK(start(f, cfg));
-    tee_client c = make_client(f);
+    tee_client c = make_client(f, f.client_clock);
     CRPC_CHECK(c.client != nullptr);
     if (!c.client) {
         return;
@@ -1254,7 +1360,8 @@ CRPC_TEST(degradable_breaker_refusal_with_expired_wire_deadline_is_not_marked) {
 
 CRPC_TEST(degradable_bulkhead_refusal_with_expired_wire_deadline_is_not_marked) {
     // Given: a per-service bulkhead of one slot, two shards and two connections
-    // so the two handlers truly overlap.
+    // so the two handlers truly overlap. Both clocks are frozen so the wire
+    // deadline is the constant 990 us.
     server_under_test f;
     setup cfg;
     cfg.shards = 2;
@@ -1262,9 +1369,10 @@ CRPC_TEST(degradable_bulkhead_refusal_with_expired_wire_deadline_is_not_marked) 
     bulkhead.capacity = 1;
     bulkhead.retry_after = 10ms;
     cfg.service_bulkhead = bulkhead;
+    cfg.frozen_clock = true;
     CRPC_CHECK(start(f, cfg));
-    tee_client first = make_client(f);
-    tee_client second = make_client(f);
+    tee_client first = make_client(f, f.client_clock);
+    tee_client second = make_client(f, f.client_clock);
     CRPC_CHECK(first.client != nullptr);
     CRPC_CHECK(second.client != nullptr);
     if (!first.client || !second.client) {
@@ -1287,10 +1395,11 @@ CRPC_TEST(degradable_bulkhead_refusal_with_expired_wire_deadline_is_not_marked) 
         [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
 
     // When: the second request arrives with 990 us of wire deadline left, below
-    // the 1 ms floor.
+    // the 1 ms floor. `frozen_deadline` uses the clock the client encodes with,
+    // so the wire carries exactly 990000 ns.
     crpc::rpc::call_context ctx;
     ctx.has_deadline = true;
-    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(990);
+    ctx.deadline = frozen_deadline(f.client_clock, std::chrono::microseconds(990));
     auto second_started =
         second.client->start_call<int>(kService, kBlocking, second_body.readable(), ctx);
     CRPC_CHECK(second_started.ok());
@@ -1315,6 +1424,91 @@ CRPC_TEST(degradable_bulkhead_refusal_with_expired_wire_deadline_is_not_marked) 
     CRPC_CHECK_EQ(static_cast<std::size_t>(0), second_error.metadata.size());
     CRPC_CHECK_EQ(static_cast<std::uint64_t>(1),
                   f.srv->stats().bulkhead_rejected);
+}
+
+// --- T9/T10: the injected clock reaches every consumer ----------------------
+//
+// "One clock, four consumers" is a contract, not a comment. These two cases can
+// only be written with an injected clock: advancing it is the only way to
+// observe that the breaker and the bucket read the injected source instead of
+// the real one. If either consumer kept `std::chrono::steady_clock`, the
+// advance would do nothing and the case would fail.
+
+CRPC_TEST(degradable_breaker_probe_follows_the_injected_clock) {
+    // Given: a breaker with a 1 ms open duration on a frozen clock.
+    server_under_test f;
+    setup cfg;
+    crpc::resilience::breaker_config breaker;
+    breaker.min_requests = 1;
+    breaker.failure_ratio_threshold = 0.0;
+    breaker.slow_call_threshold = 10s;
+    breaker.open_duration = 1ms;
+    cfg.breaker = breaker;
+    cfg.frozen_clock = true;
+    CRPC_CHECK(start(f, cfg));
+    tee_client c = make_client(f, f.client_clock);
+    CRPC_CHECK(c.client != nullptr);
+    if (!c.client) {
+        return;
+    }
+
+    // Open the breaker: one dependency failure is enough with min_requests=1.
+    const call_outcome opened = call_int(c, kFail, 1);
+    CRPC_CHECK(opened.started);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  static_cast<int>(opened.error.code));
+    const call_outcome refused = call_int(c, kFail, 2);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  static_cast<int>(refused.error.code));
+    CRPC_CHECK_EQ(std::string("service circuit breaker is open"),
+                  refused.error.message);
+
+    // When: the injected clock advances past the open duration.
+    f.server_clock.advance(2ms);
+
+    // Then: the next call is admitted as a half-open probe and reaches the
+    // handler. A real clock would still be inside the 1 ms window only for a
+    // moment, so this assertion also proves the breaker is not reading it.
+    const call_outcome probe = call_int(c, kFail, 3);
+    CRPC_CHECK_EQ(std::string("always"), probe.error.message);
+    CRPC_CHECK_EQ(static_cast<std::uint64_t>(1),
+                  f.srv->stats().probe_admitted);
+}
+
+CRPC_TEST(degradable_rate_bucket_follows_the_injected_clock) {
+    // Given: a bucket that refills one token per second, frozen after one burn.
+    server_under_test f;
+    setup cfg;
+    crpc::resilience::rate_limit_config rate;
+    rate.rate_per_second = 1.0;
+    rate.burst = 1.0;
+    rate.initial_tokens = 1.0;
+    cfg.service_rate = rate;
+    cfg.frozen_clock = true;
+    CRPC_CHECK(start(f, cfg));
+    tee_client c = make_client(f, f.client_clock);
+    CRPC_CHECK(c.client != nullptr);
+    if (!c.client) {
+        return;
+    }
+
+    // Burn the only token; with the clock frozen the bucket cannot refill.
+    const call_outcome burn = call_int(c, kEcho, 1);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
+                  static_cast<int>(burn.error.code));
+    const call_outcome refused = call_int(c, kEcho, 2);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::resource_exhausted),
+                  static_cast<int>(refused.error.code));
+    CRPC_CHECK_EQ(1, f.service.echo_calls.load());
+
+    // When: the injected clock advances by a full refill interval.
+    f.server_clock.advance(1s);
+
+    // Then: the bucket has a token again and the call reaches the handler.
+    const call_outcome admitted = call_int(c, kEcho, 3);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
+                  static_cast<int>(admitted.error.code));
+    CRPC_CHECK_EQ(2, f.service.echo_calls.load());
 }
 
 CRPC_TEST_MAIN()

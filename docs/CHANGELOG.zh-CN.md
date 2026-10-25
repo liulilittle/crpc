@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) | **简体中文**
 
-## 未发布
+## 2.0.0 - 2026-10-24
 
 ### 变更（MINOR，仅行为）
 
@@ -33,13 +33,68 @@
 ### 新增（MINOR，仅新增符号）
 
 - `client::resilience_statistics` 与 `client::resilience_stats()`：客户端韧性流水线的增补可观测性（`rate_limited`、`bulkhead_rejected`、`local_gate_rejected`、`endpoint_open`、`lb_unavailable`、`pre_send_retries`、`probe_admitted`、`retries_delayed_by_hint`、`bulkhead_in_use`）。不改变既有结构：`client::statistics` 的字段顺序、大小与含义保持不变，C ABI 入口不变。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
-- `resilience::fallback_statistics` 与 `client::fallback_stats()`：`crpc/resilience/fallback.hpp` 中 fallback 原语的七计数器快照（`ineligible`、`skipped_deadline`、`attempted`、`failed`、`canceled`、`overrun`、`applied`），以及 `client::call<Resp>::degraded()`——它报告最终结果是否来自 fallback 函数（本切片恒为 false）。本切片只提供原语，未接入调用路径，因此所有计数保持为 0。`client::fallback_stats()` 是该切片唯一新增的导出符号；按值返回的类型与 `degraded()` 访问器都是 header-only。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
+- `resilience::fallback_statistics` 与 `client::fallback_stats()`：`crpc/resilience/fallback.hpp` 中 fallback 原语的七计数器快照（`ineligible`、`skipped_deadline`、`attempted`、`failed`、`canceled`、`overrun`、`applied`），以及 `client::call<Resp>::degraded()`——它报告最终结果是否来自 fallback 函数（本切片恒为 false）。fallback 的实际接线见下文「fallback 接线与服务端时钟注入」，因此计数不再恒为 0。`client::fallback_stats()` 是该切片唯一新增的导出符号；按值返回的类型与 `degraded()` 访问器都是 header-only。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
+
+### 易用性深度改进（MINOR，仅符号）
+
+易用性差距分析中的九个缺口被补齐。每一项都是增补式的：底层形式保留其签名，新名称是规范名称。
+
+- `client::set_fallback_owned` 与 `crpc::fallback_install`：RAII fallback 安装器。`fallback_install` 用 `std::shared_ptr` 持有 `self`，并在销毁或 `reset` 时卸载该策略，因此五参数的 `set_fallback(function, self, min_remaining, retain, release)` retain/release 契约不再是安装策略的唯一方式。
+- `rpc::call_context::set_deadline` / `set_timeout` / `set_idempotent` 与 `with_deadline` / `with_timeout` / `with_idempotent` 构造器：设置 deadline 时同时设置 `has_deadline`，因此只赋值 `deadline` 而不置标志位不再静默地表示「无超时」。
+- `client::call<Resp>::then`：门面层的完成回调，与 `rpc::call<Resp>::then` 对应。调用终止时恰好触发一次，包括本地观测到的终止。
+- `crpc::delivery_mode`：由 `crpc::rpc` 与 `crpc::push` 共享的一个枚举；两个命名空间别名是同一类型，因此 RPC 模式与推送模式无需转换即可互通。
+- 构造器命名：`max_inflight_per_connection` 是客户端与服务端构造器上每连接在途上限的规范名称；服务端的 `per_connection_inflight` 是弃用别名。`default_deadline` 是客户端构造器的规范名称，`default_timeout` 是弃用别名。
+- `crpc::service_id` 与 `crpc::method_id`：两个 id 的强类型 newtype。`service_id` 可从 `u64` 字面量隐式转换，但绝不从 `method_id` 转换，因此参数顺序颠倒会成为编译错误。
+- `result<T>::error_or` 与 `value_or` 针对左值与 const 左值结果的重载；`call<Resp>::get()` 对无效句柄返回 `invalid_argument`，与协程外等待的 `failed_precondition` 区分开。
+- `CRPC_HTTP_GET("/path", lambda)`：无需控制器类型的两参数 MVC 形式；路由序号与对象名来自 `__COUNTER__`，因此同一源行上的两次注册不会在 `__LINE__` 上冲突。
+- `crpc::publish_result` 与 `server::publish`：`publish` 返回可区分的结果（`ok`、`empty_topic`、`not_running`、`unsupported_configuration`、`no_push_hub`、`internal_error`）。到 `bool` 的转换是隐式的，因此既有的 `if (server.publish(...))` 仍可编译且仍表示「ok」。
+- 影响：MINOR，仅符号与行为。没有导出符号被删除或改签名，没有公开记录改变布局或大小（弃用的构造器别名是方法而非字段），没有线路值变化。不使用新名称的消费者不受影响。
+
+### 文档与示例
+
+- `examples/` 现在是已接入的构建目标。`examples/CMakeLists.txt` 在
+  `CRPC_BUILD_EXAMPLES=ON` 下构建 `crpc_example_quickstart`——一个进程内程序，
+  启动服务器、注册一个类型化方法、发起一次调用并处理一个推送订阅——并把
+  它注册到 CTest；`examples/README.md` 说明如何构建与运行。此前该目录没有
+  `CMakeLists.txt`，因此 `CRPC_BUILD_EXAMPLES` 必须保持关闭。
+- `docs/api/README.md` 索引公开头文件与关键类型；`docs/tutorial.md` 从消息类型
+  到一次调用与一个推送订阅逐步构建。两者均有中英版本，且 `README.md`、
+  `README.zh-CN.md`、`docs/README.md`、`docs/README.zh-CN.md` 都链接了它们。
+- 影响：仅文档与示例。没有公开头文件、符号、布局或行为变化；示例位于
+  `src/` 与库目标之外。
+
+### fallback 接线与服务端时钟注入
+
+- 客户端现在在调用的最后一次尝试被终结、且其熔断结果被记录之后运行已安装的 fallback，
+  落点是 `call<Resp>::get()` 的两个终态失败出口。`client::set_fallback(function, self,
+  min_remaining, retain, release)` 安装策略，`client::run_fallback` 与
+  `client::record_fallbacks` 是库内入口。保活 `self` 的引用在每次安装策略时取一次，
+  在策略被替换或客户端销毁时释放一次；`self` 非空却缺少 `noexcept` 的
+  `retain`/`release` 对会被拒绝，且什么都不安装。服务端四处执行前拒绝写下的
+  `crpc-degradable` 是远端拒绝可降级的闸门；**已发送且非幂等**的调用永不降级，因为
+  替换它的错误可能掩盖已经发生的副作用。超过 deadline 才返回的降级值报
+  `deadline_exceeded`，不是降级成功。`crpc-degraded` 仍然没有线上写入者：可观测载体是
+  `call<Resp>::degraded()` 与 `fallback_stats().applied`。
+- 影响：新增符号属 MINOR，**下面的布局变更属 MAJOR**。既有成员偏移不变，但消费方必须
+  用同一份头文件重建。
+- `server::options` 尾部新增 `resilience::clock_source clock_source`（默认无效，库内替换
+  为 `resilience::monotonic_clock()`），并新增 `server::builder::clock()` 设置它。同一个
+  时钟现在同时供给每连接 rate 桶、每服务 rate 桶、每服务熔断器与 dispatcher 的 deadline
+  判定，因此同一个请求不会再被两套「现在」判定。`sizeof(server::options)` 从 304 增长到
+  **320**（x64）、从 256 增长到 **264**（x86）；`sizeof(server::builder)` 随之增长。按
+  [abi.zh-CN.md](abi.zh-CN.md) 第 1 节，给公开结构体加字段属 MAJOR，因此本周期的 MAJOR
+  记录也覆盖它。默认值完全保留旧行为：字段保持无效的 options 读 `monotonic_clock()`，
+  与注入前服务端使用的 `std::chrono::steady_clock` 相同。
+- ABI breaking：`server::options` 从 304 增至 320 字节（x64）、从 256 增至 264 字节
+  （x86）；`server::builder` 随之增长（376 -> 392 / 296 -> 304）。没有导出符号改签名；
+  新增三个（`client::set_fallback`、`client::run_fallback`、
+  `client::record_fallbacks`）。
 
 ### 编译期布局护栏
 
-- 新增内部翻译单元 `src/abi_check.cpp`（不进入任何头文件，也不导出符号），对跨越 ABI 边界的一部分公开记录做编译期断言：14 个记录的标准布局属性；14 个记录的精确成员数量（`CRPC_MEMBER_COUNT`，可捕获追加、中间插入或删除）；可捕获重排或改名的相对成员链（`CRPC_STEP`、`CRPC_STEP_SAME`、`CRPC_STEP_MIXED`、`CRPC_AFTER`）；`http_statistics` 的总宽度与尾字段位置；以及仅在 x86 与 x64 上的绝对 `sizeof`/`offsetof` 锚（`CRPC_ABS_SIZE`、`CRPC_ABS_OFF`）。成员数量正是能看到「尾追加被 x86 尾部填充吸收」这一情况的护栏。
-- [abi.zh-CN.md](abi.zh-CN.md) §4 现在给出「跨越 ABI 边界」的范围谓词，并列出 19 个仍无编译期护栏的范围内记录。`crpc_test_abi_docs` 会重新扫描 `include/crpc/**/*.hpp` 与 `src/abi_check.cpp`：新增跨边界记录若不加入护栏，也不更新该清单，测试即失败。
-- 已写入文档的盲区：成员数量护栏不校验名字（若记录存在相对链，则由相对链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获）；在 14 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排不会被该单元捕获。其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名；该单元的五条 `decltype` 断言点名了全部五个成员，因此其中任何一个改名都会在那里失败。`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
+- 新增内部翻译单元 `src/abi_check.cpp`（不进入任何头文件，也不导出符号），对跨越 ABI 边界的一部分公开记录做编译期断言：15 个记录的标准布局属性；15 个记录的精确成员数量（`CRPC_MEMBER_COUNT`，可捕获追加、中间插入或删除）；可捕获重排或改名的相对成员链（`CRPC_STEP`、`CRPC_STEP_SAME`、`CRPC_STEP_MIXED`、`CRPC_AFTER`）；`http_statistics` 的总宽度与尾字段位置；以及仅在 x86 与 x64 上的绝对 `sizeof`/`offsetof` 锚（`CRPC_ABS_SIZE`、`CRPC_ABS_OFF`）。成员数量正是能看到「尾追加被 x86 尾部填充吸收」这一情况的护栏。
+- [abi.zh-CN.md](abi.zh-CN.md) §4 现在给出「跨越 ABI 边界」的范围谓词，并列出 36 个仍无编译期护栏的范围内记录（`crpc_test_abi_docs` 扫描确认的确切数量）。`crpc_test_abi_docs` 会重新扫描 `include/crpc/**/*.hpp` 与 `src/abi_check.cpp`：新增跨边界记录若不加入护栏，也不更新该清单，测试即失败。
+- 已写入文档的盲区：成员数量护栏不校验名字（若记录存在相对链，则由相对链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获）；在 15 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排不会被该单元捕获。其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名；该单元的五条 `decltype` 断言点名了全部五个成员，因此其中任何一个改名都会在那里失败。`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
 - 影响：MINOR（仅构建期校验）。不破坏 ABI：不改变任何公开结构体布局，也不新增导出符号。运行时行为不变；构建约束收紧——护栏覆盖的布局变更现在会直接编译失败。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
 
 ### 客户端韧性流水线

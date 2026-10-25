@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <limits>
 
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <intrin.h>
+#endif
+
 #include <crpc/frame.hpp>
 #include <crpc/frame_compression.hpp>
 #include <crpc/wire.hpp>
@@ -40,6 +44,97 @@ constexpr crc32c_table make_crc32c_table() noexcept {
 }
 
 constexpr crc32c_table crc32c_lookup = make_crc32c_table();
+
+// Slicing-by-8: eight interleaved tables, so one pass consumes eight bytes with
+// eight independent table lookups instead of eight dependent byte steps. The
+// recurrence is unchanged (reflected CRC32C, polynomial 0x82F63B78); only the
+// evaluation order is. The tail keeps the single-byte table, so any length is
+// handled and the result is bit-identical to the byte loop.
+struct crc32c_table8 {
+    u32 entries[8][256];
+};
+
+constexpr crc32c_table8 make_crc32c_table8() noexcept {
+    crc32c_table8 table{};
+    for (u32 i = 0; i < 256; ++i) {
+        u32 value = make_crc32c_entry(i);
+        table.entries[0][i] = value;
+        for (int k = 1; k < 8; ++k) {
+            value = make_crc32c_entry(static_cast<u8>(value)) ^ (value >> 8);
+            table.entries[k][i] = value;
+        }
+    }
+    return table;
+}
+
+constexpr crc32c_table8 crc32c_lookup8 = make_crc32c_table8();
+
+// Hardware CRC32C (SSE4.2) is selected at run time. The instruction is part of
+// SSE4.2, which is not guaranteed by the x64 baseline, so a CPUID probe decides
+// once whether the hardware path is used; every other build and CPU takes the
+// portable slicing-by-8 path.
+#if defined(_MSC_VER) && defined(_M_X64)
+#define CRPC_CRC32C_HW 1
+#endif
+
+#if defined(CRPC_CRC32C_HW)
+[[nodiscard]] bool crc32c_cpu_has_sse42() noexcept {
+    int info[4] = {};
+    __cpuidex(info, 1, 0);
+    return (info[2] & (1 << 20)) != 0;
+}
+#endif
+
+[[nodiscard]] u32 crc32c_sb8(span<const std::byte> data) noexcept {
+    u32 crc = 0xFFFFFFFFu;
+    const std::byte* p = data.data();
+    std::size_t len = data.size();
+    while (len >= 8) {
+        const u32 low = static_cast<u32>(static_cast<u8>(p[0])) |
+                        (static_cast<u32>(static_cast<u8>(p[1])) << 8) |
+                        (static_cast<u32>(static_cast<u8>(p[2])) << 16) |
+                        (static_cast<u32>(static_cast<u8>(p[3])) << 24);
+        const u32 c = crc ^ low;
+        crc = crc32c_lookup8.entries[7][c & 0xFFu] ^
+              crc32c_lookup8.entries[6][(c >> 8) & 0xFFu] ^
+              crc32c_lookup8.entries[5][(c >> 16) & 0xFFu] ^
+              crc32c_lookup8.entries[4][(c >> 24) & 0xFFu] ^
+              crc32c_lookup8.entries[3][static_cast<u8>(p[4])] ^
+              crc32c_lookup8.entries[2][static_cast<u8>(p[5])] ^
+              crc32c_lookup8.entries[1][static_cast<u8>(p[6])] ^
+              crc32c_lookup8.entries[0][static_cast<u8>(p[7])];
+        p += 8;
+        len -= 8;
+    }
+    while (len--) {
+        crc = crc32c_lookup.entries
+                  [(crc ^ static_cast<u32>(static_cast<u8>(*p++))) & 0xFFu] ^
+              (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+#if defined(CRPC_CRC32C_HW)
+[[nodiscard]] u32 crc32c_hw(span<const std::byte> data) noexcept {
+    std::uint64_t crc = 0xFFFFFFFFull;
+    const std::byte* p = data.data();
+    std::size_t len = data.size();
+    while (len >= 8) {
+        std::uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) {
+            value |= static_cast<std::uint64_t>(static_cast<u8>(p[i]))
+                     << (8 * i);
+        }
+        crc = _mm_crc32_u64(crc, value);
+        p += 8;
+        len -= 8;
+    }
+    while (len--) {
+        crc = _mm_crc32_u8(static_cast<u32>(crc), static_cast<u8>(*p++));
+    }
+    return static_cast<u32>(crc ^ 0xFFFFFFFFull);
+}
+#endif
 
 } // namespace
 
@@ -192,12 +287,15 @@ namespace {
 // --- CRC32C ------------------------------------------------------------------
 
 u32 crc32c(span<const std::byte> data) noexcept {
-    u32 value = 0xFFFFFFFFu;
-    for (std::size_t i = 0; i < data.size(); ++i) {
-        const u8 byte = static_cast<u8>(data[i]);
-        value = crc32c_lookup.entries[(value ^ static_cast<u32>(byte)) & 0xFFu] ^ (value >> 8);
+#if defined(CRPC_CRC32C_HW)
+    // The probe runs once. The hardware path is a few CRC instructions per
+    // eight bytes; the fallback is the portable slicing-by-8 loop.
+    static const bool has_sse42 = crc32c_cpu_has_sse42();
+    if (has_sse42) {
+        return crc32c_hw(data);
     }
-    return value ^ 0xFFFFFFFFu;
+#endif
+    return crc32c_sb8(data);
 }
 
 // --- Header codec ------------------------------------------------------------
@@ -527,11 +625,59 @@ frame_decoder::frame_decoder(span<std::byte> payload_buffer, u32 max_frame) noex
       max_frame_(clamp_max_frame(max_frame)) {}
 
 void frame_decoder::feed(span<const std::byte> data) noexcept {
+    if (external_active_) {
+        drain_external();
+    }
     if (error_ != rpc_code::ok || data.empty()) {
         return;
     }
     if (!buffer_.append(data)) {
         error_ = rpc_code::resource_exhausted;
+    }
+}
+
+void frame_decoder::feed_external(span<const std::byte> data) noexcept {
+    if (external_active_) {
+        // A previous window was not drained: fold its tail into the buffer so
+        // the frame stream stays ordered.
+        drain_external();
+    }
+    if (error_ != rpc_code::ok || data.empty()) {
+        return;
+    }
+    if (buffer_.size() != read_offset_) {
+        // Bytes are already buffered from an earlier partial frame. Parsing
+        // `data` directly would put those bytes behind the buffered ones in the
+        // stream, so fall back to the copying path and let next() read the
+        // buffer.
+        feed(data);
+        return;
+    }
+    external_ = data;
+    external_offset_ = 0;
+    external_active_ = true;
+}
+
+void frame_decoder::drain_external() noexcept {
+    if (!external_active_) {
+        return;
+    }
+    // Invariant: external_active_ implies read_offset_ == 0. feed_external()
+    // only activates an external window when buffer_.size() == read_offset_,
+    // and every path that advances read_offset_ (consume/compact) clears it
+    // once it catches up to buffer_.size(), so the internal buffer is empty and
+    // no prefix is pending. next() consumes external bytes through
+    // external_offset_, never read_offset_, so draining only appends the
+    // external tail and deliberately leaves read_offset_ at 0.
+    const std::byte* const tail = external_.data() + external_offset_;
+    const std::size_t remaining = external_.size() - external_offset_;
+    external_ = span<const std::byte>();
+    external_offset_ = 0;
+    external_active_ = false;
+    if (remaining != 0 && error_ == rpc_code::ok) {
+        if (!buffer_.append(span<const std::byte>(tail, remaining))) {
+            error_ = rpc_code::resource_exhausted;
+        }
     }
 }
 
@@ -564,13 +710,22 @@ frame_decoder::result frame_decoder::next(frame& out, frame_compression_info* in
         return result::error;
     }
 
-    compact();
-    const std::size_t available = buffer_.size() - read_offset_;
+    // Frames come from the external chunk when one is active (feed_external),
+    // otherwise from the internal buffer. Only the internal path compacts.
+    const std::byte* base;
+    std::size_t available;
+    if (external_active_) {
+        base = external_.data() + external_offset_;
+        available = external_.size() - external_offset_;
+    } else {
+        compact();
+        base = buffer_.data() + read_offset_;
+        available = buffer_.size() - read_offset_;
+    }
     if (available < frame_header_size) {
         return result::need_more;
     }
 
-    const std::byte* const base = buffer_.data() + read_offset_;
     frame_header header;
     const status header_status =
         decode_frame_header(span<const std::byte>(base, frame_header_size), header, max_frame_);
@@ -608,10 +763,14 @@ frame_decoder::result frame_decoder::next(frame& out, frame_compression_info* in
     // the bytes are gone and the decoder stays usable, which is why error_ is
     // not touched here.
     const auto consume = [&]() noexcept {
-        read_offset_ += total;
-        if (read_offset_ == buffer_.size()) {
-            buffer_.clear();
-            read_offset_ = 0;
+        if (external_active_) {
+            external_offset_ += total;
+        } else {
+            read_offset_ += total;
+            if (read_offset_ == buffer_.size()) {
+                buffer_.clear();
+                read_offset_ = 0;
+            }
         }
     };
 
@@ -758,6 +917,9 @@ rpc_code frame_decoder::error() const noexcept { return error_; }
 bool frame_decoder::failed() const noexcept { return error_ != rpc_code::ok; }
 
 std::size_t frame_decoder::buffered() const noexcept {
+    if (external_active_) {
+        return external_.size() - external_offset_;
+    }
     return buffer_.size() - read_offset_;
 }
 
@@ -766,6 +928,9 @@ u32 frame_decoder::max_frame() const noexcept { return max_frame_; }
 void frame_decoder::reset() noexcept {
     buffer_.clear();
     read_offset_ = 0;
+    external_ = span<const std::byte>();
+    external_offset_ = 0;
+    external_active_ = false;
     error_ = rpc_code::ok;
 }
 

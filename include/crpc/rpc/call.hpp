@@ -63,8 +63,10 @@
 
 #include <crpc/buffer.hpp>
 #include <crpc/config.hpp>
+#include <crpc/delivery_mode.hpp>
 #include <crpc/endian.hpp>
 #include <crpc/error.hpp>
+#include <crpc/id.hpp>
 #include <crpc/observability/context.hpp>
 #include <crpc/span.hpp>
 
@@ -168,11 +170,9 @@ struct lane_token {
 
 // Delivery guarantee. The v1 core implements `reliable` (request/response) and
 // `unreliable` (fire-and-forget ONE_WAY). Ordered reliable lanes are carried by
-// the lane token but serial execution is a server concern.
-enum class delivery_mode : u8 {
-    reliable = 0,
-    unreliable = 1
-};
+// the lane token but serial execution is a server concern. The enum lives in
+// `crpc/delivery_mode.hpp` and is shared with the push hub, so a mode can be
+// forwarded between the RPC and push APIs without a conversion.
 
 // --- Call context ------------------------------------------------------------
 
@@ -225,7 +225,48 @@ struct call_context {
         }
         return std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
     }
+
+    // Sets the absolute deadline AND the `has_deadline` flag together. Assigning
+    // the raw `deadline` member without the flag is the silent trap this setter
+    // removes: a context that said `deadline = X` but `has_deadline = false`
+    // ran with no timeout at all. The flag is not optional any more.
+    void set_deadline(std::chrono::steady_clock::time_point when) noexcept {
+        deadline = when;
+        has_deadline = true;
+    }
+
+    // Sets a relative timeout from now, with the same flag handling.
+    void set_timeout(std::chrono::nanoseconds timeout) noexcept {
+        deadline = std::chrono::steady_clock::now() + timeout;
+        has_deadline = true;
+    }
+
+    // Declares the call idempotent. The idempotency flag and the key flag are
+    // kept consistent: a call that is idempotent is safe to retry, and the
+    // client allocates an idempotency key when one was not supplied.
+    void set_idempotent(bool value = true) noexcept { idempotent = value; }
 };
+
+// Functional-style context builders. Each returns a modified copy so a call
+// site can write `stub.call(req, with_timeout(ctx, 500ms))` without mutating a
+// shared context. They are the same contract as the setters above.
+[[nodiscard]] inline call_context with_deadline(
+    call_context ctx, std::chrono::steady_clock::time_point when) noexcept {
+    ctx.set_deadline(when);
+    return ctx;
+}
+
+[[nodiscard]] inline call_context with_timeout(
+    call_context ctx, std::chrono::nanoseconds timeout) noexcept {
+    ctx.set_timeout(timeout);
+    return ctx;
+}
+
+[[nodiscard]] inline call_context with_idempotent(call_context ctx,
+                                                  bool value = true) noexcept {
+    ctx.set_idempotent(value);
+    return ctx;
+}
 
 // --- Call slot ---------------------------------------------------------------
 
@@ -512,6 +553,13 @@ public:
     [[nodiscard]] bool valid() const noexcept { return slot_ != nullptr; }
     [[nodiscard]] bool ready() const noexcept { return slot_ != nullptr && result_ready(*slot_); }
 
+    // A default-constructed handle is "null": it holds no slot. These make a
+    // handle directly comparable with `nullptr`, which is what a handle stored
+    // in `std::optional` needs for `optional != nullptr`. `valid()` stays the
+    // explicit form; this is the same predicate.
+    [[nodiscard]] bool operator==(std::nullptr_t) const noexcept { return slot_ == nullptr; }
+    [[nodiscard]] bool operator!=(std::nullptr_t) const noexcept { return slot_ != nullptr; }
+
     [[nodiscard]] call_state state() const noexcept {
         return slot_ != nullptr ? load_state(*slot_) : call_state::idle;
     }
@@ -528,7 +576,11 @@ public:
         static_assert(std::is_default_constructible_v<T>,
                       "call<T>::get requires a default-constructible T");
         if (slot_ == nullptr) {
-            return rpc_result<T>(rpc_error(rpc_code::failed_precondition, "invalid call handle"));
+            // An invalid handle is a programming error, distinct from a wait
+            // that failed because the caller is on a shard thread outside a
+            // coroutine (which stays `failed_precondition`). Both used to answer
+            // `failed_precondition`, which made the two indistinguishable.
+            return rpc_result<T>(rpc_error(rpc_code::invalid_argument, "invalid call handle"));
         }
         {
             std::unique_lock<std::mutex> lock(slot_->wait_mutex);

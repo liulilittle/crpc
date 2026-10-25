@@ -55,9 +55,11 @@ class router;
 
 namespace http {
 
-// Server-Sent Events subset. SSE is available over HTTP/1.1 only, with a
-// single shard, in process. A request is attached to the server's push hub
-// under `?subscriber=<u64>` (optional; a fresh id is allocated when absent) and
+// Server-Sent Events subset. SSE is available over HTTP/1.1 and HTTP/2 (h2c
+// and h2), in process. A request is routed to the hub of the shard that owns
+// its topic (`push::topic_shard`), so a server with more than one shard serves
+// every topic instead of refusing it. It is attached to the hub under
+// `?subscriber=<u64>` (optional; a fresh id is allocated when absent) and
 // resumes the same subscription when it reconnects with `Last-Event-ID`.
 struct sse_options {
     // Comment-only heartbeat period. Zero disables the heartbeat; the idle
@@ -206,12 +208,14 @@ struct http_server_options {
     // 408 and the connection is closed. Zero disables the request bound.
     std::chrono::milliseconds request_timeout{30000};
 
-    // Server-Sent Events (HTTP/1.1, single shard) options. SSE routes are
-    // registered on the builder with `sse_route()`.
+    // Server-Sent Events (HTTP/1.1 and HTTP/2, h2c/h2) options. SSE routes are
+    // registered on the builder with `add_sse_route()`. Each topic is served by
+    // the hub of its owning shard.
     sse_options sse{};
 
-    // HTTP/1.1 long polling (single shard). Routes are registered on the
-    // builder with `add_longpoll_route()`.
+    // HTTP/1.1 long polling options. Routes are registered on the builder with
+    // `add_longpoll_route()`. Each topic is served by the hub of its owning
+    // shard.
     longpoll_options longpoll{};
 
     // --- HTTP content coding -------------------------------------------------
@@ -323,12 +327,14 @@ public:
         builder& options(const http_server_options& value);
         builder& set_parser_limits(const parser_limits& limits);
         builder& drain_timeout(std::chrono::milliseconds value);
-        // Registers an SSE endpoint. SSE requires `shards == 1`; `start()`
-        // fails with `failed_precondition` otherwise. An HTTP/2 request that
-        // targets an SSE path is answered with 501 (fail-closed, no stream).
+        // Registers an SSE endpoint. It is served over both HTTP/1.1 and
+        // HTTP/2 (h2c/h2): an HTTP/2 request opens one stream and streams events
+        // as DATA frames (END_STREAM only when the stream ends). The topic is
+        // routed to the hub of its owning shard, so `shards > 1` is supported.
         builder& add_sse_route(sse_route route);
         // Registers a long-poll endpoint (HTTP/1.1 only; HTTP/2 requests that
-        // match are answered with 501).
+        // match are answered with 501). The topic is routed to the hub of its
+        // owning shard, so `shards > 1` is supported.
         builder& add_longpoll_route(longpoll_route route);
         // Registers a file download endpoint (HTTP/1.1 only; HTTP/2 requests
         // that match are answered with 501).
@@ -368,11 +374,13 @@ public:
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] http_statistics stats() const noexcept;
 
-    // Publishes one payload to every SSE subscriber of `topic`. Single shard
-    // only. The call never blocks on a slow subscriber: the hub's bounds and
-    // overflow policy make every drop decision, and each attached SSE pump is
-    // woken after the publish. Returns false when the server is not running,
-    // has more than one shard, or `topic` is empty.
+    // Publishes one payload to every SSE subscriber of `topic`. The topic is
+    // routed to the hub of its owning shard (`push::topic_shard`): the call
+    // posts a task to that shard and waits until the message is queued, so a
+    // poll sent afterwards observes it. It never blocks on a slow subscriber:
+    // the hub's bounds and overflow policy make every drop decision, and every
+    // attached SSE pump is woken after the publish. Returns false when the
+    // server is not running or `topic` is empty.
     [[nodiscard]] bool publish(std::string_view topic, span<const std::byte> body,
                                push::delivery_mode mode =
                                    push::delivery_mode::reliable) noexcept;

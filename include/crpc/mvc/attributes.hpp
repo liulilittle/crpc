@@ -11,6 +11,13 @@
 //   };
 //   CRPC_HTTP_GET(user_controller, get_user, "/:id")
 //
+// A handler that has no controller type can use the two-argument lambda form;
+// the lambda is owned by the registration object, so it may capture:
+//
+//   CRPC_HTTP_GET("/health", [](const crpc::http::request&) {
+//       return crpc::mvc::with_status(200, "ok");
+//   })
+//
 // Field-level binding is declared on the request DTO with RTTI field
 // attributes. The attribute name is "crpc.from"; its first argument is the
 // source kind and its optional second argument is the source name:
@@ -50,16 +57,51 @@
 // per verb; the object has internal-to-the-header linkage via `inline`. The
 // member parameter is named `member` rather than `method` so it never collides
 // with the `::crpc::http::method` token in the verb argument.
+//
+// The ordinal and the object name come from `__COUNTER__`, not `__LINE__`: two
+// registrations expanded on the same source line would collide on `__LINE__`,
+// while the counter is unique per expansion.
 #define CRPC_MVC_ACTION(tag, controller_t, member, verb_enum, path_literal)     \
     inline const ::crpc::mvc::route_registrar<controller_t,                    \
                                               &controller_t::member>           \
         crpc_route_##tag##_##controller_t##_##member{                          \
             verb_enum, path_literal, #member,                                  \
-            static_cast<std::uint32_t>(__LINE__)};
+            static_cast<std::uint32_t>(__COUNTER__)};
 
-#define CRPC_HTTP_GET(controller_t, member, path_literal)                     \
+// Internal: the two-argument `CRPC_HTTP_GET("/path", lambda)` form. No
+// controller type is needed; the lambda is owned by a `lambda_route_registrar`.
+// `__COUNTER__` is expanded once here and reused for both the object name and
+// the ordinal.
+#define CRPC_MVC_ACTION_LAMBDA(tag, verb_enum, path_literal, callable)        \
+    CRPC_MVC_ACTION_LAMBDA_EXPAND(tag, verb_enum, path_literal, callable,      \
+                                  __COUNTER__)
+// Two levels of indirection so `__COUNTER__` is expanded before the token
+// paste: a `##` operand is not expanded, which would otherwise paste the
+// literal token `__COUNTER__` into the object name.
+#define CRPC_MVC_ACTION_LAMBDA_EXPAND(tag, verb_enum, path_literal, callable, \
+                                      ctr)                                    \
+    CRPC_MVC_ACTION_LAMBDA_INNER(tag, verb_enum, path_literal, callable, ctr)
+#define CRPC_MVC_ACTION_LAMBDA_INNER(tag, verb_enum, path_literal, callable,  \
+                                     ctr)                                     \
+    inline ::crpc::mvc::lambda_route_registrar                               \
+        crpc_route_lambda_##tag##_##ctr{                                      \
+            verb_enum, path_literal, #callable,                               \
+            static_cast<std::uint32_t>(ctr), callable};
+
+// `CRPC_HTTP_GET` accepts either the three-argument controller form
+// `(controller_t, member, path_literal)` or the two-argument lambda form
+// `(path_literal, callable)`; the argument count selects the expansion.
+#define CRPC_HTTP_GET_SELECT(_1, _2, _3, NAME, ...) NAME
+#define CRPC_HTTP_GET(...)                                                    \
+    CRPC_HTTP_GET_SELECT(__VA_ARGS__, CRPC_HTTP_GET_CTL,                      \
+                         CRPC_HTTP_GET_LAMBDA)(__VA_ARGS__)
+#define CRPC_HTTP_GET_CTL(controller_t, member, path_literal)                  \
     CRPC_MVC_ACTION(get, controller_t, member, ::crpc::http::method::get,      \
                     path_literal)
+#define CRPC_HTTP_GET_LAMBDA(path_literal, callable)                          \
+    CRPC_MVC_ACTION_LAMBDA(get, ::crpc::http::method::get, path_literal,       \
+                           callable)
+
 #define CRPC_HTTP_POST(controller_t, member, path_literal)                    \
     CRPC_MVC_ACTION(post, controller_t, member, ::crpc::http::method::post,    \
                     path_literal)

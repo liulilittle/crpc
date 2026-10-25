@@ -184,6 +184,19 @@ public:
                                          method_handler handler, void* self,
                                          method_options options = {});
 
+    // Strongly typed overloads. They forward to the `u64` versions and make a
+    // swapped service/method argument list a compile error, which the raw `u64`
+    // signature cannot catch.
+    [[nodiscard]] status register_service(service_id service, std::string name) {
+        return register_service(service.value, std::move(name));
+    }
+    [[nodiscard]] status register_method(service_id service, method_id method,
+                                         std::string name, method_handler handler,
+                                         void* self, method_options options = {}) {
+        return register_method(service.value, method.value, std::move(name), handler,
+                               self, options);
+    }
+
     // Freezes the registry. Idempotent; after this call registration fails and
     // lookups are lock-free.
     [[nodiscard]] status freeze() noexcept;

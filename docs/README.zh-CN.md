@@ -15,14 +15,18 @@
 | 5 | [构建与测试](building.zh-CN.md) | [Build and test](building.md) |
 | 6 | [工程原则](principles.zh-CN.md) | [Engineering principles](principles.md) |
 | 7 | [性能报告](performance.zh-CN.md) | [Performance report](performance.md) |
-| 8 | [发布说明](CHANGELOG.zh-CN.md) | [Release notes](CHANGELOG.md) |
+| 8 | [迁移指南](migration.zh-CN.md) | [Migration guide](migration.md) |
+| 9 | [API 参考](api/README.zh-CN.md) | [API reference](api/README.md) |
+| 10 | [教程](tutorial.zh-CN.md) | [Tutorial](tutorial.md) |
+| 11 | [示例](../examples/README.zh-CN.md) | [Examples](../examples/README.md) |
+| 12 | [发布说明](CHANGELOG.zh-CN.md) | [Release notes](CHANGELOG.md) |
 
 索引中的文档均已存在。各模块状态见第 3 份文档的状态矩阵与设计规格第 21 章；
 索引缺项或链接失效视为文档缺陷，不是疏漏。
 
 ## 阅读顺序
 
-- **使用这个库**：3（架构）→ 4（协议）→ 设计规格中的服务 API 章节。
+- **使用这个库**：10（教程）→ 9（API 参考）→ 3（架构）→ 4（协议）→ 设计规格中的服务 API 章节。
 - **参与开发**：6（工程原则）→ 1（设计规格）→ 5（构建与测试）。
 - **二进制层集成**：2（ABI 策略）。
 
@@ -31,7 +35,7 @@
 | 标记 | 含义 |
 |---|---|
 | implemented | 代码存在、测试通过、有文档。 |
-| in progress | 代码存在，但契约尚未冻结。 |
+| partial | 代码存在且有测试，但契约中有明确缺失的部分。 |
 | specified | 设计已冻结，尚无代码。 |
 
 各模块的权威状态见设计规格第 21 章。

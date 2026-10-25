@@ -227,6 +227,33 @@ public:
         return std::get<0>(std::move(storage_));
     }
 
+    // Value-or-fallback for an lvalue result. Same contract as the rvalue
+    // overload: an error result returns `fallback` and never touches the value
+    // slot, so it cannot terminate through `on_bad_access()`.
+    T value_or(T fallback) & {
+        if (!ok()) {
+            return fallback;
+        }
+        return std::get<0>(storage_);
+    }
+
+    T value_or(T fallback) const& {
+        if (!ok()) {
+            return fallback;
+        }
+        return std::get<0>(storage_);
+    }
+
+    // Returns the contained error, or `fallback` when the result is a success.
+    // The mirror of `value_or`: a success returns `fallback` and never reads
+    // the error slot.
+    rpc_error error_or(rpc_error fallback) const noexcept {
+        if (ok()) {
+            return fallback;
+        }
+        return std::get<1>(storage_);
+    }
+
 private:
     static void on_bad_access() noexcept {
         // A caller read a value from an error result. The library cannot throw

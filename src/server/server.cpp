@@ -5,6 +5,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -25,8 +26,53 @@
 namespace crpc {
 namespace {
 
-[[nodiscard]] std::chrono::steady_clock::time_point steady_now() noexcept {
-    return std::chrono::steady_clock::now();
+// Converts the injected monotonic nanosecond clock into the `time_point` the
+// dispatcher and the rate limiter's deadline rebasing take. This is the only
+// conversion site: every server-side read of "now" goes through
+// `server::impl::steady_now()`, which reads `options::clock_source`. Keeping a
+// second path here (a direct `std::chrono::steady_clock::now()`) is exactly the
+// split-clock defect the injection exists to remove.
+[[nodiscard]] std::chrono::steady_clock::time_point
+to_time_point(resilience::clock_source source) noexcept {
+    return std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(source.now_ns()));
+}
+
+// Send-path record pool sizing. The cap bounds how many records are ever
+// created: the pool grows on demand to the high-water mark of concurrent
+// outgoing frames and never shrinks, so the steady state allocates nothing. A
+// frame that arrives at the cap is refused, exactly as it was when `new`
+// failed. The retain limit bounds the pool's bytes: a record whose buffer grew
+// past it is released back to the allocator when the record returns, so a
+// burst of oversized frames cannot pin a large block for the server's life.
+inline constexpr std::size_t send_pool_max_ops_default = 8192;
+inline constexpr std::size_t send_buffer_retain_bytes_default = 1u << 20; // 1 MiB
+
+// Overridable through the environment so a test or a benchmark can exercise a
+// small cap and a small retain limit without a recompile. Read once, when the
+// pool is built. A missing or empty variable keeps the default.
+[[nodiscard]] std::size_t env_size_or(const char* name,
+                                      std::size_t fallback) noexcept {
+#if defined(_WIN32)
+    char* owned = nullptr;
+    std::size_t size = 0;
+    const bool present =
+        (_dupenv_s(&owned, &size, name) == 0 && owned != nullptr);
+    if (!present || owned[0] == '\0') {
+        std::free(owned);
+        return fallback;
+    }
+    const std::size_t parsed =
+        static_cast<std::size_t>(std::strtoull(owned, nullptr, 10));
+    std::free(owned);
+    return parsed;
+#else
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
+#endif
 }
 
 } // namespace
@@ -50,14 +96,123 @@ void wake_push_pump(server_connection* sc) noexcept;
 // `server::impl` (it needs the full type).
 void schedule_detach_connection(server_connection* sc) noexcept;
 
+class send_op_pool;
+
 // Owns the bytes of one outgoing frame until the backend completes the write.
+// `bytes` is a reusable `buffer`: `release_send_queue` / `send_op::complete`
+// only clear it, so its capacity survives from one frame to the next and the
+// steady-state cost of an outgoing frame is no allocation at all.
 struct send_op final : io::completion {
-    std::unique_ptr<std::byte[]> bytes;
+    buffer bytes;
     std::size_t size = 0;
     bool is_push = false;
     std::shared_ptr<server_connection> keep_alive;
+    // Set by `send_op_pool::acquire`; `complete` returns the record here. The
+    // pool is owned by `server::impl`, which outlives every completion (see
+    // `send_op::complete`), so this pointer stays valid for the record's life.
+    send_op_pool* pool = nullptr;
 
     void complete(io::io_result result) noexcept override;
+};
+
+// Bounded free-list pool of `send_op` records.
+//
+// Every outgoing frame (RESPONSE, GOAWAY, PUSH) borrows one record and its
+// byte buffer. The record is created on first use up to `max_ops_`, then
+// recycled forever, so an outgoing frame costs a pointer pop/push and no heap
+// allocation once the pool has reached its high-water mark. `release` keeps the
+// buffer while it is small enough to be worth reusing and drops a larger one,
+// which is what bounds the pool's retained bytes.
+class send_op_pool {
+public:
+    send_op_pool(std::size_t max_ops, std::size_t retain_bytes) noexcept
+        : max_ops_(max_ops == 0 ? 1 : max_ops), retain_bytes_(retain_bytes) {}
+
+    send_op_pool(const send_op_pool&) = delete;
+    send_op_pool& operator=(const send_op_pool&) = delete;
+
+    ~send_op_pool() = default; // `owned_` deletes every record
+
+    // Returns a record ready for use, or nullptr when the pool is at its cap
+    // or the allocation failed.
+    send_op* acquire() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!free_.empty()) {
+            send_op* op = free_.back();
+            free_.pop_back();
+            return op;
+        }
+        if (owned_.size() >= max_ops_) {
+            return nullptr;
+        }
+        std::unique_ptr<send_op> fresh(new (std::nothrow) send_op());
+        if (!fresh) {
+            return nullptr;
+        }
+        fresh->pool = this;
+        send_op* raw = fresh.get();
+        owned_.push_back(std::move(fresh));
+        send_ops_allocated_.store(owned_.size(), std::memory_order_relaxed);
+        return raw;
+    }
+
+    // Reserves room for `size` bytes in `op`'s buffer. A capacity growth is one
+    // real allocation, so it is counted; a buffer that is already large enough
+    // is not. Returns false when the buffer cannot grow.
+    bool reserve(send_op* op, std::size_t size) noexcept {
+        if (op == nullptr) {
+            return false;
+        }
+        const std::size_t before = op->bytes.capacity();
+        if (!op->bytes.reserve(size)) {
+            return false;
+        }
+        if (op->bytes.capacity() > before) {
+            send_buffers_allocated_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    // Returns a record to the free list. Safe to call more than once for a
+    // record only if it is re-acquired in between; the backend contract
+    // guarantees exactly one `complete` per push.
+    void release(send_op* op) noexcept {
+        if (op == nullptr) {
+            return;
+        }
+        op->keep_alive.reset();
+        op->is_push = false;
+        op->size = 0;
+        if (op->bytes.capacity() > retain_bytes_) {
+            op->bytes.release();
+        } else {
+            op->bytes.clear();
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        free_.push_back(op);
+    }
+
+    [[nodiscard]] std::size_t allocated() const noexcept {
+        return send_ops_allocated_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t buffers_allocated() const noexcept {
+        return send_buffers_allocated_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t live() const noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return owned_.size() - free_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<std::unique_ptr<send_op>> owned_;
+    std::vector<send_op*> free_;
+    std::size_t max_ops_;
+    std::size_t retain_bytes_;
+    std::atomic<std::size_t> send_ops_allocated_{0};
+    std::atomic<std::size_t> send_buffers_allocated_{0};
 };
 
 // One decoded request waiting for a handler coroutine.
@@ -122,7 +277,11 @@ struct server_connection {
     // queued here and handed to the sink one at a time. The queue is bounded by
     // per_connection_inflight: a handler sends at most one response.
     std::mutex send_mutex;
-    std::deque<std::unique_ptr<send_op>> send_queue;
+    // Raw pointers, not `unique_ptr`: the records are owned by the impl's
+    // `send_op_pool` and handed back to it (`release_send_queue`, or
+    // `send_op::complete` once the write finishes). Keeping the pool as the
+    // single owner is what makes the records reusable.
+    std::deque<send_op*> send_queue;
     bool send_busy = false;
 
     // Bytes of PUSH frames staged for the transport (in-flight plus queued).
@@ -169,6 +328,10 @@ struct server_connection {
     std::size_t on_data(span<const std::byte> data) noexcept;
     void submit(frame& request) noexcept;
     void complete_call_safe() noexcept;
+    // Returns every queued send record to the pool. Must be called with
+    // `send_mutex` held (or from the destructor, where nothing else can touch
+    // the queue).
+    void release_send_queue() noexcept;
 };
 
 void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
@@ -202,24 +365,28 @@ void finish_send(server_connection* sc, io::io_result result) noexcept {
         sc->send_busy = false;
         if (!sc->closed.load(std::memory_order_acquire) &&
             !sc->send_queue.empty()) {
-            std::unique_ptr<send_op> head = std::move(sc->send_queue.front());
+            next = sc->send_queue.front();
             sc->send_queue.pop_front();
             sc->send_busy = true;
-            next = head.release();
         } else if (sc->closed.load(std::memory_order_acquire)) {
-            // The peer is gone: nobody can consume these frames.
-            sc->send_queue.clear();
+            // The peer is gone: nobody can consume these frames. Hand the
+            // records back to the pool; they are owned by it, not by us.
+            sc->release_send_queue();
         }
     }
     // Push outside the lock: a synchronous completion re-enters finish_send.
     if (next != nullptr && sc->conn) {
         sc->conn->sink().push(
-            span<const std::byte>(next->bytes.get(), next->size), next);
+            span<const std::byte>(next->bytes.data(), next->size), next);
     }
 }
 
 struct server::impl {
     options opt;
+    // Send-path record pool. Declared after `opt` so the constructor can size
+    // it from the options; owned by the impl, so it outlives every completion
+    // (`send_op::complete` returns records here).
+    send_op_pool send_pool;
     rpc::service_registry registry;
     std::unique_ptr<rpc::dispatcher> dispatch;
     std::vector<std::unique_ptr<runtime>> shards;
@@ -289,7 +456,26 @@ struct server::impl {
     };
     std::unique_ptr<acceptor> accept_sink_impl;
 
-    explicit impl(options o) : opt(std::move(o)) {}
+    explicit impl(options o)
+        : opt(std::move(o)),
+          send_pool(env_size_or("CRPC_SEND_POOL_MAX_OPS",
+                                send_pool_max_ops_default),
+                    env_size_or("CRPC_SEND_BUFFER_RETAIN_BYTES",
+                                send_buffer_retain_bytes_default)) {
+        // An invalid clock keeps the pre-injection behaviour without making
+        // `server::options`'s default construction call into the library (see
+        // the field comment in server.hpp).
+        if (!opt.clock_source.valid()) {
+            opt.clock_source = resilience::monotonic_clock();
+        }
+    }
+
+    // The one server-side read of "now". Every consumer -- both rate buckets,
+    // the circuit breaker (through the clock it was constructed with) and the
+    // dispatcher's deadline check -- derives its instant from this clock.
+    [[nodiscard]] std::chrono::steady_clock::time_point steady_now() const noexcept {
+        return to_time_point(opt.clock_source);
+    }
 
     // Built once after `registry.freeze()`. Every registered service gets a
     // breaker (the pre-existing behaviour); the rate and bulkhead stages exist
@@ -302,7 +488,7 @@ struct server::impl {
             auto guard = std::make_unique<service_guard>();
             if (opt.resilience_enabled) {
                 if (opt.per_service_rate) {
-                    guard->rate.emplace(*opt.per_service_rate);
+                    guard->rate.emplace(*opt.per_service_rate, opt.clock_source);
                 }
                 if (opt.per_service_bulkhead) {
                     resilience::bulkhead_config config = *opt.per_service_bulkhead;
@@ -322,7 +508,8 @@ struct server::impl {
                 }
             }
             guard->breaker =
-                std::make_unique<resilience::circuit_breaker>(opt.breaker);
+                std::make_unique<resilience::circuit_breaker>(opt.breaker,
+                                                              opt.clock_source);
             guard_index.emplace(service.id(), guards.size());
             guards.push_back(std::move(guard));
         });
@@ -400,7 +587,7 @@ struct server::impl {
             sc->shard = shards[index].get();
             if (opt.resilience_enabled && opt.per_connection_rate) {
                 sc->rate = std::make_unique<resilience::rate_limiter>(
-                    *opt.per_connection_rate);
+                    *opt.per_connection_rate, opt.clock_source);
             }
             sc->conn = std::move(c);
             sc->source = std::make_unique<server_connection::reader_source>(sc.get());
@@ -440,8 +627,9 @@ struct server::impl {
         if (sc->closed.load(std::memory_order_acquire) || !sc->conn) {
             return false;
         }
-        std::unique_ptr<send_op> op(new (std::nothrow) send_op());
-        if (!op) {
+        // Borrow a pooled record; it is returned on every exit path below.
+        send_op* op = send_pool.acquire();
+        if (op == nullptr) {
             return false;
         }
         frame value;
@@ -449,14 +637,15 @@ struct server::impl {
         value.header.stream_id = stream_id;
         value.payload = payload;
         const std::size_t size = encoded_frame_size(value);
-        op->bytes.reset(new (std::nothrow) std::byte[size]);
-        if (!op->bytes) {
+        if (!send_pool.reserve(op, size)) {
+            send_pool.release(op);
             return false;
         }
         std::size_t written = 0;
         const status encoded =
-            encode_frame(span<std::byte>(op->bytes.get(), size), value, written);
+            encode_frame(span<std::byte>(op->bytes.data(), size), value, written);
         if (!encoded.ok()) {
+            send_pool.release(op);
             return false;
         }
         op->size = written;
@@ -482,19 +671,20 @@ struct server::impl {
                 if (is_push) {
                     sc->push_egress_bytes.fetch_sub(op->size);
                 }
+                send_pool.release(op);
                 return false;
             }
             if (sc->send_busy) {
                 // One push is already outstanding: hold this frame until its
                 // completion arrives. The transport refuses a second push.
-                sc->send_queue.push_back(std::move(op));
+                sc->send_queue.push_back(op);
                 return true;
             }
             sc->send_busy = true;
-            ready = op.release();
+            ready = op;
         }
         sc->conn->sink().push(
-            span<const std::byte>(ready->bytes.get(), ready->size), ready);
+            span<const std::byte>(ready->bytes.data(), ready->size), ready);
         return true;
     }
 
@@ -1302,10 +1492,31 @@ void send_op::complete(io::io_result result) noexcept {
             wake_push_pump(keep.get());
         }
     }
-    delete this;
+    // Return the record to the pool instead of deleting it: the pool is the
+    // single owner of every record. It stays alive for this call because
+    // `server::stop()` drains and closes every connection (and every backend
+    // `close()` waits for its user callbacks) before the impl that owns the
+    // pool is destroyed.
+    if (pool != nullptr) {
+        pool->release(this);
+    } else {
+        delete this;
+    }
+}
+
+void server_connection::release_send_queue() noexcept {
+    for (send_op* op : send_queue) {
+        if (op != nullptr && op->pool != nullptr) {
+            op->pool->release(op);
+        }
+    }
+    send_queue.clear();
 }
 
 server_connection::~server_connection() {
+    // Records still waiting for their turn are owned by the pool; give them
+    // back before the connection goes away.
+    release_send_queue();
     // Connection teardown order is part of the contract: detach from the hub
     // before the connection and its push token can disappear. The detach is
     // synchronous under push_mutex; a no-op when the terminal path already ran.
@@ -1346,7 +1557,10 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
         return 0;
     }
     std::lock_guard<std::mutex> lk(decode_mutex);
-    decoder.feed(data);
+    // Parse directly out of the transport's chunk: submit() copies the payload
+    // into the job before the next call, so the zero-copy window is exactly
+    // this loop. Only a trailing partial frame is copied into the decoder.
+    decoder.feed_external(data);
     for (;;) {
         frame value;
         const frame_decoder::result result = decoder.next(value);
@@ -1393,6 +1607,7 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
             }
         }
     }
+    decoder.drain_external();
     return data.size();
 }
 
@@ -1524,9 +1739,13 @@ server::builder& server::builder::handler_stack_bytes(std::size_t bytes) {
     return *this;
 }
 
-server::builder& server::builder::per_connection_inflight(std::size_t count) {
+server::builder& server::builder::max_inflight_per_connection(std::size_t count) {
     options_.per_connection_inflight = count;
     return *this;
+}
+
+server::builder& server::builder::per_connection_inflight(std::size_t count) {
+    return max_inflight_per_connection(count);
 }
 
 server::builder& server::builder::per_service_inflight(std::size_t count) {
@@ -1580,6 +1799,11 @@ server::builder& server::builder::push_egress_max_bytes(std::size_t bytes) {
 server::builder& server::builder::push_subscribe_options(
     push::subscribe_options options) {
     options_.push_subscribe = options;
+    return *this;
+}
+
+server::builder& server::builder::clock(resilience::clock_source source) {
+    options_.clock_source = source;
     return *this;
 }
 
@@ -1787,11 +2011,24 @@ server::statistics server::stats() const noexcept {
     return out;
 }
 
-bool server::publish(std::string_view topic, span<const std::byte> body,
-                     push::delivery_mode mode) noexcept {
-    if (topic.empty() || impl_->opt.shards != 1 ||
-        !impl_->running.load(std::memory_order_acquire)) {
-        return false;
+server::send_pool_counters server::send_pool_stats() const noexcept {
+    send_pool_counters out;
+    out.ops_allocated = impl_->send_pool.allocated();
+    out.buffers_allocated = impl_->send_pool.buffers_allocated();
+    out.ops_live = impl_->send_pool.live();
+    return out;
+}
+
+publish_result server::publish(std::string_view topic, span<const std::byte> body,
+                              push::delivery_mode mode) noexcept {
+    if (topic.empty()) {
+        return publish_result::code::empty_topic;
+    }
+    if (impl_->opt.shards != 1) {
+        return publish_result::code::unsupported_configuration;
+    }
+    if (!impl_->running.load(std::memory_order_acquire)) {
+        return publish_result::code::not_running;
     }
     try {
         std::vector<std::shared_ptr<server_connection>> snapshot;
@@ -1801,7 +2038,7 @@ bool server::publish(std::string_view topic, span<const std::byte> body,
         }
         std::lock_guard<std::recursive_mutex> lk(impl_->push_mutex);
         if (!impl_->push_hub) {
-            return false;
+            return publish_result::code::no_push_hub;
         }
         impl_->push_hub->publish(topic, body, mode);
         impl_->refresh_push_stats_locked();
@@ -1811,9 +2048,27 @@ bool server::publish(std::string_view topic, span<const std::byte> body,
             }
         }
     } catch (...) {
-        return false;
+        return publish_result::code::internal_error;
     }
-    return true;
+    return publish_result::code::ok;
+}
+
+const char* to_string(publish_result result) noexcept {
+    switch (result.value()) {
+    case publish_result::code::ok:
+        return "ok";
+    case publish_result::code::empty_topic:
+        return "empty_topic";
+    case publish_result::code::not_running:
+        return "not_running";
+    case publish_result::code::unsupported_configuration:
+        return "unsupported_configuration";
+    case publish_result::code::no_push_hub:
+        return "no_push_hub";
+    case publish_result::code::internal_error:
+        return "internal_error";
+    }
+    return "unknown";
 }
 
 } // namespace crpc

@@ -5,16 +5,25 @@
 一个用现代 C++17 构建大型服务器系统的框架：远程调用与服务器推送共用同一条连接、
 同一套帧格式、同一个协程模型。
 
-> 状态：**v0.1 构建中**。核心原语（wire、帧、编解码、传输契约）正在逐模块实现。
+> 状态：**v2.0.0**。核心原语（wire、帧、编解码、传输契约）与 call/server 门面均已就位。
 > 文档索引与当前实现状态见 [docs/README.zh-CN.md](docs/README.zh-CN.md)。
 
 ## 文档索引
 
 | 文档 | 中文 | English |
 |---|---|---|
-| 文档主页 | [docs/README.zh-CN.md](docs/README.zh-CN.md) | [docs/README.md](docs/README.md) |
 | 设计规格 | [docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md](docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md) | [English](docs/superpowers/specs/2026-10-19-crpc-design.md) |
 | ABI 策略 | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) | [docs/abi.md](docs/abi.md) |
+| 架构概览 | [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | [Architecture overview](docs/architecture.md) |
+| 线上协议 | [docs/protocol.zh-CN.md](docs/protocol.zh-CN.md) | [Wire protocol](docs/protocol.md) |
+| 构建与测试 | [docs/building.zh-CN.md](docs/building.zh-CN.md) | [Build and test](docs/building.md) |
+| 工程原则 | [docs/principles.zh-CN.md](docs/principles.zh-CN.md) | [Engineering principles](docs/principles.md) |
+| 性能报告 | [docs/performance.zh-CN.md](docs/performance.zh-CN.md) | [Performance report](docs/performance.md) |
+| 迁移指南 | [docs/migration.zh-CN.md](docs/migration.zh-CN.md) | [Migration guide](docs/migration.md) |
+| API 参考 | [docs/api/README.zh-CN.md](docs/api/README.zh-CN.md) | [API reference](docs/api/README.md) |
+| 教程 | [docs/tutorial.zh-CN.md](docs/tutorial.zh-CN.md) | [Tutorial](docs/tutorial.md) |
+| 示例 | [examples/README.zh-CN.md](examples/README.zh-CN.md) | [Examples](examples/README.md) |
+| 发布说明 | [docs/CHANGELOG.zh-CN.md](docs/CHANGELOG.zh-CN.md) | [Release notes](docs/CHANGELOG.md) |
 
 ## 这是什么
 

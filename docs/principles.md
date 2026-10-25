@@ -2,7 +2,7 @@
 
 [简体中文](principles.zh-CN.md) | **English**
 
-Version 1.0 / 2026-10-19
+Version 2.0 / 2026-10-24
 
 This document states the rules the implementation is held to, what each rule
 forbids, how the code enforces it, and how it is verified. A rule whose

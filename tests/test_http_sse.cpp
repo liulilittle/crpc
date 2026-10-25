@@ -12,7 +12,9 @@
 //     parked rather than dropped, publish never blocks, hub accounting is
 //     conserved, and reading again resumes delivery;
 //   * lifecycle: peer close and heartbeat write failure detach the hub token;
-//   * HTTP/2 requests to an SSE path fail closed with one complete response.
+//   * HTTP/2: a matching SSE route opens a stream whose events are DATA frames,
+//     with the handshake, heartbeat, reconnect replay, flow-control
+//     (WINDOW_UPDATE) backpressure and RST_STREAM detach covered.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -216,6 +218,23 @@ struct sse_parser {
     }
 };
 
+// Emits a response header block larger than the peer's default 16 KiB
+// SETTINGS_MAX_FRAME_SIZE, forcing the server to split it into HEADERS +
+// CONTINUATION (D1).
+status handle_many_headers(void*, const http::request&, const mvc::route_params&,
+                           const codec&, const codec_registry&,
+                           http::response& out) {
+    out.status_code = 200;
+    out.reason = "OK";
+    out.headers.add("Content-Type", "text/plain");
+    for (int i = 0; i < 400; ++i) {
+        out.headers.add("x-pad-" + std::to_string(i),
+                        std::string(64, static_cast<char>('a' + (i % 26))));
+    }
+    out.body = "headers";
+    return status{};
+}
+
 // --- Fixture -----------------------------------------------------------------
 
 struct sse_fixture {
@@ -229,6 +248,12 @@ struct sse_fixture {
                          std::string topic = "news",
                          std::string name = "http-sse")
         : endpoint_name(std::move(name)) {
+        mvc::route_entry headers;
+        headers.method = http::method::get;
+        headers.path = "/headers";
+        headers.name = "/headers";
+        headers.invoke = &handle_many_headers;
+        CRPC_CHECK(router.add(std::move(headers)).ok());
         const status frozen = router.freeze();
         CRPC_CHECK(frozen.ok());
         http::http_server::builder builder;
@@ -262,6 +287,18 @@ bool publish_text(http::http_server& server, std::string_view topic,
         topic,
         span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
                               text.size()));
+}
+
+// A topic name that `push::topic_shard` assigns to `shard`. Used to pin a test
+// to one hub when the server runs more than one shard.
+std::string topic_owned_by(u32 shard, u32 shard_count) {
+    for (int i = 0; i < 4096; ++i) {
+        const std::string name = "topic-" + std::to_string(i);
+        if (push::topic_shard(name, 0, shard_count) == shard) {
+            return name;
+        }
+    }
+    return std::string("topic");
 }
 
 // --- Framing / Last-Event-ID -------------------------------------------------
@@ -670,12 +707,236 @@ std::string h2_request(u32 stream_id, std::string_view method,
                     stream_id, block);
 }
 
-CRPC_TEST(h2_sse_route_fails_closed) {
+std::string h2_request_with_headers(
+    u32 stream_id, std::string_view method, std::string_view path,
+    const std::vector<h2::header_field>& extra, h2::hpack_encoder& encoder) {
+    std::vector<h2::header_field> fields;
+    fields.push_back({":method", std::string(method)});
+    fields.push_back({":scheme", "http"});
+    fields.push_back({":path", std::string(path)});
+    fields.push_back({":authority", "test"});
+    for (const h2::header_field& field : extra) {
+        fields.push_back(field);
+    }
+    std::string block;
+    (void)encoder.encode(
+        span<const h2::header_field>(fields.data(), fields.size()), block);
+    return h2_frame(h2::frame_type::headers,
+                    static_cast<u8>(h2::flags::end_headers |
+                                    h2::flags::end_stream),
+                    stream_id, block);
+}
+
+std::string h2_settings_initial_window(u32 window_size) {
+    h2::setting entry{static_cast<u16>(h2::setting_id::initial_window_size),
+                       window_size};
+    std::string payload(6, '\0');
+    std::size_t written = 0;
+    (void)h2::encode_settings(
+        span<std::byte>(reinterpret_cast<std::byte*>(payload.data()),
+                        payload.size()),
+        span<const h2::setting>(&entry, 1), written);
+    payload.resize(written);
+    return h2_frame(h2::frame_type::settings, 0, 0, payload);
+}
+
+std::string h2_window_update(u32 stream_id, u32 increment) {
+    std::string payload(4, '\0');
+    std::size_t written = 0;
+    (void)h2::encode_window_update(
+        span<std::byte>(reinterpret_cast<std::byte*>(payload.data()),
+                        payload.size()),
+        increment, written);
+    return h2_frame(h2::frame_type::window_update, 0, stream_id, payload);
+}
+
+std::string h2_rst_stream(u32 stream_id, h2::error_code code) {
+    std::string payload(4, '\0');
+    std::size_t written = 0;
+    (void)h2::encode_rst_stream(
+        span<std::byte>(reinterpret_cast<std::byte*>(payload.data()),
+                        payload.size()),
+        code, written);
+    return h2_frame(h2::frame_type::rst_stream, 0, stream_id, payload);
+}
+
+// A streaming reader for one HTTP/2 SSE stream. It decodes HEADERS +
+// CONTINUATION into `head_fields`, accumulates DATA into `body` and records
+// the stream state. The HPACK decoder is shared by every request on the
+// connection (as the protocol requires), so one reader serves a whole client.
+struct h2_sse_reader {
+    h2::hpack_decoder decoder;
+    std::string buf;
+    std::string header_block;
+    std::string body;
+    http::header_list head_fields;
+    int status = 0;
+    bool head_done = false;
+    bool end_stream = false;
+    bool got_rst = false;
+    u32 rst_stream = 0;
+    bool got_ping = false;
+    // Header-block fragmentation (D1): the first HEADERS must carry
+    // END_HEADERS only when it is also the whole block.
+    bool first_headers_end_headers = false;
+    bool saw_continuation = false;
+    bool continuation_end_headers = false;
+    std::size_t consumed = 0;
+
+    void pump(capture_source& source) {
+        const std::string snapshot = source.snapshot();
+        if (snapshot.size() <= consumed) {
+            return;
+        }
+        buf.append(snapshot.data() + consumed, snapshot.size() - consumed);
+        consumed = snapshot.size();
+        parse();
+    }
+
+    void feed(std::string_view delta) {
+        buf.append(delta.data(), delta.size());
+        parse();
+    }
+
+    [[nodiscard]] std::string header_value(std::string_view name) const {
+        for (const http::header& field : head_fields) {
+            if (field.name == name) {
+                return std::string(field.value);
+            }
+        }
+        return std::string{};
+    }
+
+    [[nodiscard]] std::size_t events() const {
+        return count_substring(body, "id: ");
+    }
+
+    // Drops the per-stream decode state but keeps the HPACK decoder (its
+    // dynamic table is shared by every request on the connection).
+    void reset_stream() {
+        buf.clear();
+        header_block.clear();
+        body.clear();
+        head_fields.clear();
+        status = 0;
+        head_done = false;
+        end_stream = false;
+        got_rst = false;
+        rst_stream = 0;
+        got_ping = false;
+        first_headers_end_headers = false;
+        saw_continuation = false;
+        continuation_end_headers = false;
+    }
+
+private:
+    void parse() {
+        for (;;) {
+            if (buf.size() < h2::frame_header_size) {
+                return;
+            }
+            h2::frame_header frame;
+            const span<const std::byte> head(
+                reinterpret_cast<const std::byte*>(buf.data()),
+                h2::frame_header_size);
+            if (!h2::decode_frame_header(head, frame, h2::max_max_frame_size)
+                     .ok()) {
+                return;
+            }
+            const std::size_t total = h2::frame_header_size + frame.length;
+            if (buf.size() < total) {
+                return;
+            }
+            const span<const std::byte> payload(
+                reinterpret_cast<const std::byte*>(buf.data()) +
+                    h2::frame_header_size,
+                frame.length);
+            handle(frame, payload);
+            buf.erase(0, total);
+        }
+    }
+
+    void handle(const h2::frame_header& frame,
+                span<const std::byte> payload) {
+        switch (frame.type) {
+        case h2::frame_type::headers: {
+            if (!saw_continuation) {
+                first_headers_end_headers =
+                    (frame.flags & h2::flags::end_headers) != 0;
+            }
+            h2::headers_payload decoded;
+            if (h2::decode_headers(payload, frame.flags, decoded).ok()) {
+                header_block.assign(
+                    reinterpret_cast<const char*>(decoded.header_block.data()),
+                    decoded.header_block.size());
+                if (decoded.end_stream) {
+                    end_stream = true;
+                }
+            }
+            break;
+        }
+        case h2::frame_type::continuation:
+            saw_continuation = true;
+            continuation_end_headers =
+                (frame.flags & h2::flags::end_headers) != 0;
+            header_block.append(reinterpret_cast<const char*>(payload.data()),
+                                payload.size());
+            break;
+        case h2::frame_type::data: {
+            span<const std::byte> decoded;
+            if (h2::decode_data(payload, frame.flags, decoded).ok()) {
+                body.append(reinterpret_cast<const char*>(decoded.data()),
+                            decoded.size());
+            }
+            if ((frame.flags & h2::flags::end_stream) != 0) {
+                end_stream = true;
+            }
+            break;
+        }
+        case h2::frame_type::rst_stream:
+            got_rst = true;
+            rst_stream = frame.stream_id;
+            break;
+        case h2::frame_type::ping:
+            got_ping = true;
+            break;
+        default:
+            break;
+        }
+        if ((frame.type == h2::frame_type::headers ||
+             frame.type == h2::frame_type::continuation) &&
+            (frame.flags & h2::flags::end_headers) != 0) {
+            http::header_list fields;
+            if (decoder
+                    .decode(span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(
+                                    header_block.data()),
+                                header_block.size()),
+                            fields)
+                    .ok()) {
+                head_fields = std::move(fields);
+                for (const http::header& field : head_fields) {
+                    if (field.name == ":status") {
+                        status = std::atoi(field.value.c_str());
+                    }
+                }
+                head_done = true;
+            }
+        }
+    }
+};
+
+CRPC_TEST(h2_sse_route_streams) {
     http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(25);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
     sse_fixture fx(options);
 
     capture_source capture;
     auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
     client->bind_source(&capture);
 
     h2::hpack_encoder encoder;
@@ -683,95 +944,619 @@ CRPC_TEST(h2_sse_route_fails_closed) {
     out += h2_request(1, "GET", "/events?topic=news", encoder);
     send_raw(*client, out);
 
-    h2::hpack_decoder decoder;
-    std::string buf;
-    std::string block;
-    std::string body;
-    bool in_headers = false;
-    int status = 0;
-    bool end_stream = false;
-    std::size_t consumed = 0;
-
-    const bool complete = crpc_test::wait_for(
+    h2_sse_reader reader;
+    const bool head = crpc_test::wait_for(
         [&] {
-            const std::string data = capture.snapshot();
-            if (data.size() > consumed) {
-                buf.append(data.data() + consumed, data.size() - consumed);
-                consumed = data.size();
-            }
-            for (;;) {
-                if (buf.size() < h2::frame_header_size) {
-                    return end_stream && status != 0;
-                }
-                h2::frame_header frame;
-                const span<const std::byte> head(
-                    reinterpret_cast<const std::byte*>(buf.data()),
-                    h2::frame_header_size);
-                if (!h2::decode_frame_header(head, frame,
-                                             h2::max_max_frame_size)
-                         .ok()) {
-                    return false;
-                }
-                const std::size_t total = h2::frame_header_size + frame.length;
-                if (buf.size() < total) {
-                    return end_stream && status != 0;
-                }
-                const span<const std::byte> payload(
-                    reinterpret_cast<const std::byte*>(buf.data()) +
-                        h2::frame_header_size,
-                    frame.length);
-                if (frame.type == h2::frame_type::headers) {
-                    h2::headers_payload decoded;
-                    if (!h2::decode_headers(payload, frame.flags, decoded).ok()) {
-                        return false;
-                    }
-                    block.assign(
-                        reinterpret_cast<const char*>(decoded.header_block.data()),
-                        decoded.header_block.size());
-                    in_headers = true;
-                    end_stream = end_stream || decoded.end_stream;
-                } else if (frame.type == h2::frame_type::continuation) {
-                    block.append(reinterpret_cast<const char*>(payload.data()),
-                                 payload.size());
-                } else if (frame.type == h2::frame_type::data) {
-                    span<const std::byte> decoded;
-                    if (h2::decode_data(payload, frame.flags, decoded).ok()) {
-                        body.append(reinterpret_cast<const char*>(decoded.data()),
-                                    decoded.size());
-                    }
-                    end_stream = end_stream ||
-                                 (frame.flags & h2::flags::end_stream) != 0;
-                }
-                if (in_headers &&
-                    (frame.type == h2::frame_type::headers
-                         ? (frame.flags & h2::flags::end_headers) != 0
-                         : (frame.flags & h2::flags::end_headers) != 0)) {
-                    http::header_list fields;
-                    if (decoder
-                            .decode(span<const std::byte>(
-                                        reinterpret_cast<const std::byte*>(
-                                            block.data()),
-                                        block.size()),
-                                    fields)
-                            .ok()) {
-                        for (const http::header& field : fields) {
-                            if (field.name == ":status") {
-                                status = std::atoi(field.value.c_str());
-                            }
-                        }
-                    }
-                    in_headers = false;
-                }
-                buf.erase(0, total);
-            }
+            reader.pump(capture);
+            return reader.head_done;
         },
         5000);
+    CRPC_CHECK(head);
+    CRPC_CHECK_EQ(200, reader.status);
+    CRPC_CHECK(reader.header_value("content-type")
+                   .find("text/event-stream") != std::string::npos);
+    CRPC_CHECK(reader.header_value("cache-control")
+                   .find("no-cache") != std::string::npos);
+    // A stream response carries no Content-Length and stays open.
+    CRPC_CHECK(reader.header_value("content-length").empty());
+    CRPC_CHECK_FALSE(reader.end_stream);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
 
+    // Heartbeat while otherwise idle.
+    const bool heartbeat = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find(":hb") != std::string::npos;
+        },
+        5000);
+    CRPC_CHECK(heartbeat);
+    CRPC_CHECK_FALSE(reader.end_stream);
+
+    // Publish -> delivery as DATA frames on the same stream.
+    CRPC_CHECK(publish_text(*fx.server, "news", "hello"));
+    const bool event = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("id: 1:1") != std::string::npos &&
+                   reader.body.find("data: hello") != std::string::npos;
+        },
+        5000);
+    CRPC_CHECK(event);
+    CRPC_CHECK_FALSE(reader.end_stream);
+    CRPC_CHECK_EQ(std::size_t{1}, count_substring(reader.body, "data: hello"));
+}
+
+CRPC_TEST(h2_sse_close_detaches_and_second_stream_works) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=41", encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+
+    // The peer resets the stream: the hub token detaches, the connection stays.
+    send_raw(*client, h2_rst_stream(1, h2::error_code::cancel));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // A second stream on the same connection is served normally.
+    reader.reset_stream();
+    out = h2_request(3, "GET", "/events?topic=news&subscriber=41", encoder);
+    send_raw(*client, out);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+    CRPC_CHECK(publish_text(*fx.server, "news", "again"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("data: again") != std::string::npos;
+        },
+        5000));
+}
+
+CRPC_TEST(h2_sse_reconnect_replays_unacked) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+
+    // First stream: subscriber 43. Two events are delivered, then the stream is
+    // reset before either is acknowledged.
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=43", encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK(publish_text(*fx.server, "news", "one"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "two"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.events() >= 2;
+        },
+        5000));
+    CRPC_CHECK(reader.body.find("id: 1:2") != std::string::npos);
+
+    send_raw(*client, h2_rst_stream(1, h2::error_code::cancel));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // Published while detached: replayed after attach, not lost.
+    CRPC_CHECK(publish_text(*fx.server, "news", "three"));
+
+    // Cursor 1:1 is clamped to the delivered high water (2): ack 1, replay 2+3.
+    reader.reset_stream();
+    const std::vector<h2::header_field> extra{{"last-event-id", "1:1"}};
+    out = h2_request_with_headers(3, "GET",
+                                  "/events?topic=news&subscriber=43", extra,
+                                  encoder);
+    send_raw(*client, out);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    const bool replayed = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.events() >= 2;
+        },
+        5000);
+    CRPC_CHECK(replayed);
+    CRPC_CHECK(reader.body.find("id: 1:1") == std::string::npos);
+    CRPC_CHECK(reader.body.find("id: 1:2") != std::string::npos);
+    CRPC_CHECK(reader.body.find("id: 1:3") != std::string::npos);
+}
+
+CRPC_TEST(h2_sse_backpressure_window_update) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    // Advertise a tiny stream window so the first event must park.
+    out += h2_settings_initial_window(64);
+    out += h2_request(1, "GET", "/events?topic=news", encoder);
+    send_raw(*client, out);
+
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+
+    const std::string payload(1024, 'x');
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    const bool partial = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("id: 1:1") != std::string::npos;
+        },
+        5000);
+    CRPC_CHECK(partial);
+    // Only the first 64 window bytes are on the wire; the tail parks.
+    CRPC_CHECK(reader.body.size() < payload.size() + 20);
+
+    // Open both windows: the parked remainder flows and completes the event.
+    std::string resume;
+    resume += h2_window_update(0, 1u << 20);
+    resume += h2_window_update(1, 1u << 20);
+    send_raw(*client, resume);
+    const bool complete = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return count_substring(reader.body, "x") >= payload.size();
+        },
+        5000);
     CRPC_CHECK(complete);
-    CRPC_CHECK_EQ(501, status);
-    CRPC_CHECK(body.find("not supported") != std::string::npos);
-    CRPC_CHECK(end_stream);
-    CRPC_CHECK_EQ(std::size_t{0}, fx.server->stats().sse_connections);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_events_delivered);
+    CRPC_CHECK_EQ(std::size_t{1},
+                  fx.server->stats().sse_hub_published);
+}
+
+// --- HTTP/2 SSE audit gaps ---------------------------------------------------
+
+// D1: a header block larger than the peer's SETTINGS_MAX_FRAME_SIZE must be
+// split as HEADERS (no END_HEADERS) + CONTINUATION (END_HEADERS). The HEADERS
+// frame must never carry END_HEADERS while a CONTINUATION follows.
+CRPC_TEST(h2_response_header_block_uses_continuation) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/headers", encoder);
+    send_raw(*client, out);
+
+    h2_sse_reader reader;
+    // The response deliberately carries a header list larger than the default
+    // 16 KiB limit; allow it so the block can be decoded.
+    reader.decoder.set_max_header_list_size(1u << 20);
+    const bool head = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000);
+    CRPC_CHECK(head);
+    CRPC_CHECK_EQ(200, reader.status);
+    // The block was split across frames.
+    CRPC_CHECK(reader.saw_continuation);
+    CRPC_CHECK_FALSE(reader.first_headers_end_headers);
+    CRPC_CHECK(reader.continuation_end_headers);
+    // Every added header survived the split.
+    CRPC_CHECK_FALSE(reader.header_value("x-pad-0").empty());
+    CRPC_CHECK_FALSE(reader.header_value("x-pad-399").empty());
+}
+
+// D2: a second SSE request on the same connection replaces the first stream.
+// The replaced stream must be terminated (RST_STREAM) instead of lingering
+// open with its record and parked bytes until the connection closes.
+CRPC_TEST(h2_sse_replaces_stream_with_rst) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=61", encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+
+    // A second SSE request on a new stream replaces the first.
+    reader.reset_stream();
+    out = h2_request(3, "GET", "/events?topic=news&subscriber=62", encoder);
+    send_raw(*client, out);
+    const bool reset = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.got_rst && reader.rst_stream == 1;
+        },
+        5000);
+    CRPC_CHECK(reset);
+
+    // The replacement stream is served normally.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+    CRPC_CHECK(publish_text(*fx.server, "news", "after"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("data: after") != std::string::npos;
+        },
+        5000));
+}
+
+// D3: an event larger than the send-queue bound fails the stream. The already
+// taken reliable event must survive the reset and be replayed on reconnect
+// (at-least-once), not silently dropped.
+CRPC_TEST(h2_sse_oversize_event_preserves_replay) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    options.h2_max_send_queue_bytes = 512;
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+
+    // A tiny window makes the oversize event fail with ENHANCE_YOUR_CALM
+    // instead of parking.
+    std::string out(h2_preface);
+    out += h2_settings_initial_window(64);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=63", encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+
+    const std::string payload(1024, 'y');
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    const bool reset = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.got_rst;
+        },
+        5000);
+    CRPC_CHECK(reset);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // Reconnect with the same subscriber and a window large enough to carry
+    // the replayed event: it must come back.
+    out = h2_settings_initial_window(1u << 20);
+    out += h2_request(3, "GET", "/events?topic=news&subscriber=63", encoder);
+    send_raw(*client, out);
+    reader.reset_stream();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    const bool replayed = crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("id: 1:1") != std::string::npos &&
+                   count_substring(reader.body, "y") >= payload.size();
+        },
+        5000);
+    CRPC_CHECK(replayed);
+}
+
+// D4: the SSE head and retry hint must arm the slow-read stall deadline. With
+// a zero window the retry hint parks and the stream must be closed once the
+// stall deadline fires, not left open until the probe PING alone.
+CRPC_TEST(h2_sse_retry_hint_arms_stall) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(100);
+    options.sse.retry = std::chrono::milliseconds(1000);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    // Zero stream window: HEADERS still flows (not flow-controlled) but the
+    // retry hint DATA frame parks.
+    out += h2_settings_initial_window(0);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=64", encoder);
+    send_raw(*client, out);
+
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+    CRPC_CHECK_EQ(std::size_t{1}, fx.server->stats().sse_connections);
+
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+    CRPC_CHECK(fx.server->stats().sse_slow_closes >= std::size_t{1});
+}
+
+// R18: while an SSE event parks behind a zero window the server must probe the
+// peer with a PING instead of waiting forever.
+CRPC_TEST(h2_sse_zero_window_probe_ping) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    options.h2_probe_interval = std::chrono::milliseconds(50);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    std::string out(h2_preface);
+    out += h2_settings_initial_window(64);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=65", encoder);
+    send_raw(*client, out);
+
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK_EQ(200, reader.status);
+
+    const std::string payload(1024, 'z');
+    CRPC_CHECK(publish_text(*fx.server, "news", payload));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.got_ping;
+        },
+        5000));
+}
+
+// An over-large reconnect cursor is clamped to the server's delivered high
+// water: only the events after the clamp point are replayed.
+CRPC_TEST(h2_sse_reconnect_clamps_oversize_cursor) {
+    http::http_server_options options;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    sse_fixture fx(options);
+
+    capture_source capture;
+    auto client = fx.connect();
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+
+    std::string out(h2_preface);
+    out += h2_request(1, "GET", "/events?topic=news&subscriber=66", encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK(publish_text(*fx.server, "news", "one"));
+    CRPC_CHECK(publish_text(*fx.server, "news", "two"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.events() >= 2;
+        },
+        5000));
+    CRPC_CHECK(reader.body.find("id: 1:2") != std::string::npos);
+
+    send_raw(*client, h2_rst_stream(1, h2::error_code::cancel));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // Published while detached: replayed after attach, not lost.
+    CRPC_CHECK(publish_text(*fx.server, "news", "three"));
+
+    reader.reset_stream();
+    const std::vector<h2::header_field> extra{{"last-event-id", "1:99"}};
+    out = h2_request_with_headers(3, "GET",
+                                  "/events?topic=news&subscriber=66", extra,
+                                  encoder);
+    send_raw(*client, out);
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.events() >= 1;
+        },
+        5000));
+    // The cursor 1:99 is clamped to the delivered high water (2): only 1:3
+    // replays; the already-acknowledged 1:1 and 1:2 do not.
+    CRPC_CHECK(reader.body.find("id: 1:3") != std::string::npos);
+    CRPC_CHECK(reader.body.find("id: 1:1") == std::string::npos);
+    CRPC_CHECK(reader.body.find("id: 1:2") == std::string::npos);
+}
+
+// A reconnect whose Last-Event-ID carries a different epoch must not
+// acknowledge anything in the new hub (h2 counterpart of the HTTP/1.1 case).
+CRPC_TEST(h2_sse_epoch_change_is_not_acknowledged) {
+    inproc_backend backend;
+    mvc::router router;
+    CRPC_CHECK(router.freeze().ok());
+
+    const auto build = [&](u64 epoch) {
+        http::http_server_options options;
+        options.idle_timeout = std::chrono::milliseconds(0);
+        options.request_timeout = std::chrono::milliseconds(0);
+        options.sse.heartbeat = std::chrono::milliseconds(0);
+        options.sse.slow_timeout = std::chrono::milliseconds(0);
+        options.sse.epoch = epoch;
+        http::http_server::builder builder;
+        builder.add_listener(endpoint::inproc("http-sse-h2-epoch"), backend);
+        builder.router(router);
+        builder.options(options);
+        http::sse_route route;
+        route.path = "/events";
+        route.topic = "news";
+        builder.add_sse_route(std::move(route));
+        auto server = builder.build();
+        CRPC_CHECK(server != nullptr);
+        CRPC_CHECK(server->start().ok());
+        return server;
+    };
+
+    {
+        auto server = build(1);
+        capture_source capture;
+        auto client =
+            backend.connect(endpoint::inproc("http-sse-h2-epoch"), connect_options{});
+        client->bind_source(&capture);
+        h2::hpack_encoder encoder;
+        std::string out(h2_preface);
+        out += h2_request(1, "GET", "/events?topic=news&subscriber=67", encoder);
+        send_raw(*client, out);
+        h2_sse_reader reader;
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] {
+                reader.pump(capture);
+                return reader.head_done;
+            },
+            5000));
+        CRPC_CHECK(publish_text(*server, "news", "old"));
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] {
+                reader.pump(capture);
+                return reader.body.find("id: 1:1") != std::string::npos;
+            },
+            5000));
+        client->close();
+        CRPC_CHECK(crpc_test::wait_for(
+            [&] { return server->stats().sse_connections == 0; }, 5000));
+        server->stop();
+    }
+
+    auto server = build(2);
+    capture_source capture;
+    auto client =
+        backend.connect(endpoint::inproc("http-sse-h2-epoch"), connect_options{});
+    client->bind_source(&capture);
+    h2::hpack_encoder encoder;
+    // Cursor from epoch 1. It must not acknowledge anything in the new hub.
+    std::string out(h2_preface);
+    out += h2_request_with_headers(1, "GET",
+                                   "/events?topic=news&subscriber=67",
+                                   {{"last-event-id", "1:1"}}, encoder);
+    send_raw(*client, out);
+    h2_sse_reader reader;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.head_done;
+        },
+        5000));
+    CRPC_CHECK(publish_text(*server, "news", "new"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            reader.pump(capture);
+            return reader.body.find("id: 2:1") != std::string::npos &&
+                   reader.body.find("data: new") != std::string::npos;
+        },
+        5000));
 }
 
 // --- HTTP/1.1 long polling ---------------------------------------------------
@@ -2282,26 +3067,164 @@ CRPC_TEST(longpoll_h2_fails_closed) {
     client->close();
 }
 
-CRPC_TEST(longpoll_multishard_unavailable_503) {
+// A multi-shard server routes a long-poll topic to the hub of its owning shard
+// instead of answering 503, and a publish posted from the application thread
+// reaches that hub.
+CRPC_TEST(longpoll_multishard_routes_and_publishes) {
     http::http_server_options options;
     options.shards = 2;
     options.idle_timeout = std::chrono::milliseconds(0);
     options.request_timeout = std::chrono::milliseconds(0);
     options.longpoll.timeout = std::chrono::milliseconds(0);
     options.longpoll.max_timeout = std::chrono::milliseconds(0);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
     longpoll_fixture fx(options, "http-lp-multi");
 
+    const u64 subscriber = (1ull << 32) + 73;
     capture_source capture;
     auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
     client->bind_source(&capture);
     lp_parser parser;
     send_raw(*client,
-             http1("GET", poll_target((1ull << 32) + 73, "timeout=0")));
+             http1("GET", poll_target(subscriber, "timeout=0")));
     CRPC_CHECK(wait_polls(parser, capture, 1));
-    CRPC_CHECK_EQ(503, parser.responses[0].status);
-    CRPC_CHECK(parser.responses[0].head.find("Retry-After: 1") !=
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    // The publish is routed to the owning shard's hub; the subscriber is
+    // served by that hub even though the connection may sit on any shard.
+    CRPC_CHECK(publish_text(*fx.server, "news", "cross"));
+    send_raw(*client,
+             http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 2));
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("cross"), parser.responses[1].body);
+    CRPC_CHECK(parser.responses[1].head.find("X-CRPC-Event-ID: 1:1") !=
                std::string::npos);
     client->close();
+}
+
+// A waiting long poll on the non-owning shard is woken by a publish that is
+// posted to the owning shard.
+CRPC_TEST(longpoll_multishard_waiting_poll_wakes) {
+    http::http_server_options options;
+    options.shards = 2;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.longpoll.timeout = std::chrono::milliseconds(5000);
+    options.longpoll.max_timeout = std::chrono::milliseconds(5000);
+    options.longpoll.slow_timeout = std::chrono::milliseconds(0);
+    longpoll_fixture fx(options, "http-lp-multi-wake");
+
+    // Land the client on the shard that does NOT own "news": the accept path
+    // assigns shards round-robin, so consuming `target` connections first puts
+    // the real client on shard `target`.
+    const u32 owner = push::topic_shard("news", 0, 2);
+    const u32 target = (owner + 1) % 2;
+    for (u32 i = 0; i < target; ++i) {
+        auto dummy = fx.connect();
+        dummy->close();
+    }
+
+    const u64 subscriber = (1ull << 32) + 75;
+    capture_source capture;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&capture);
+    lp_parser parser;
+    send_raw(*client, http1("GET", poll_target(subscriber, "timeout=0")));
+    CRPC_CHECK(wait_polls(parser, capture, 1));
+    CRPC_CHECK_EQ(204, parser.responses[0].status);
+
+    send_raw(*client, http1("GET", poll_target(subscriber)));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
+
+    const auto begin = std::chrono::steady_clock::now();
+    CRPC_CHECK(publish_text(*fx.server, "news", "wake"));
+    CRPC_CHECK(wait_polls(parser, capture, 2, 2000));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    CRPC_CHECK(elapsed < 1000);
+    CRPC_CHECK_EQ(200, parser.responses[1].status);
+    CRPC_CHECK_EQ(std::string("wake"), parser.responses[1].body);
+    client->close();
+}
+
+// An SSE session on the non-owning shard subscribes on the owning hub: a
+// publish posted to the owning shard is delivered, and a reconnect replays the
+// unacknowledged reliable messages from the same hub.
+CRPC_TEST(sse_multishard_cross_shard_delivery_and_replay) {
+    http::http_server_options options;
+    options.shards = 2;
+    options.idle_timeout = std::chrono::milliseconds(0);
+    options.request_timeout = std::chrono::milliseconds(0);
+    options.sse.heartbeat = std::chrono::milliseconds(0);
+    options.sse.slow_timeout = std::chrono::milliseconds(0);
+    const std::string topic = topic_owned_by(0, 2);
+    sse_fixture fx(options, "/events", topic, "http-sse-multi");
+
+    // Force the client onto shard 1, the non-owner of `topic` (owned by 0).
+    {
+        auto dummy = fx.connect();
+        dummy->close();
+    }
+
+    capture_source first;
+    auto client = fx.connect();
+    CRPC_CHECK(client != nullptr);
+    client->bind_source(&first);
+    send_raw(*client,
+             http1("GET", "/events?topic=" + topic + "&subscriber=9"));
+    sse_parser first_parser;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            first_parser.pump(first);
+            return first_parser.head_done;
+        },
+        5000));
+    CRPC_CHECK(first_parser.head.find("200 OK") != std::string::npos);
+
+    // Publish -> delivery on the owning hub from a session on the other shard.
+    CRPC_CHECK(publish_text(*fx.server, topic, "one"));
+    CRPC_CHECK(publish_text(*fx.server, topic, "two"));
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            first_parser.pump(first);
+            return first_parser.events() >= 2;
+        },
+        5000));
+    CRPC_CHECK(first_parser.body.find("id: 1:2") != std::string::npos);
+
+    client->close();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return fx.server->stats().sse_connections == 0; }, 5000));
+
+    // Published while detached: replayed after the reconnect, not lost.
+    CRPC_CHECK(publish_text(*fx.server, topic, "three"));
+
+    capture_source second;
+    auto again = fx.connect();
+    CRPC_CHECK(again != nullptr);
+    again->bind_source(&second);
+    send_raw(*again,
+             http1("GET", "/events?topic=" + topic + "&subscriber=9",
+                   "Last-Event-ID: 1:99\r\n"));
+    sse_parser second_parser;
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] {
+            second_parser.pump(second);
+            return second_parser.head_done && second_parser.events() >= 1;
+        },
+        5000));
+    // The over-large cursor is clamped to the delivered high water (2): only
+    // seq 3 is replayed.
+    CRPC_CHECK(second_parser.body.find("id: 1:3") != std::string::npos);
+    CRPC_CHECK(second_parser.body.find("data: three") != std::string::npos);
+    CRPC_CHECK(second_parser.body.find("id: 1:1") == std::string::npos);
+    CRPC_CHECK(second_parser.body.find("id: 1:2") == std::string::npos);
+    again->close();
 }
 
 } // namespace

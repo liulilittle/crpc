@@ -228,6 +228,9 @@ public:
 
     // Framework -> backend.  `data` is plaintext; the completion runs exactly
     // once, after the encrypted bytes have been accepted by the transport.
+    // The caller may reuse `data` as soon as push() returns: any unwritten
+    // remainder is copied out of the borrowed span before push() returns, so
+    // the borrow window never extends past the call.
     void push(span<const std::byte> data, completion* c) noexcept override;
 
     // Installs the plaintext consumer.  While it returns 0, decrypted bytes are

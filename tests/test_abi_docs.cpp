@@ -177,7 +177,7 @@ CRPC_TEST(abi_docs_english_says_assertions_are_not_implemented) {
     CRPC_CHECK(has(text, "There is no size-tag pattern today"));
 }
 
-CRPC_TEST(abi_docs_english_says_no_abi_checker_runs) {
+CRPC_TEST(abi_docs_english_describes_the_export_gate) {
     const fs::path root = repo_root();
     CRPC_CHECK(!root.empty());
     if (root.empty()) {
@@ -185,9 +185,21 @@ CRPC_TEST(abi_docs_english_says_no_abi_checker_runs) {
     }
     const std::string text = read_text(root / "docs" / "abi.md");
 
-    CRPC_CHECK(has(text, "No ABI checker is implemented"));
-    CRPC_CHECK_FALSE(has(text, "CI runs the ABI check"));
-    CRPC_CHECK_FALSE(has(text, "CI compares exported symbols"));
+    // The gate is real: the script exists and both test runners invoke it.
+    CRPC_CHECK_FALSE(read_text(root / "scripts" / "export_gate.py").empty());
+    const std::string ps1 = read_text(root / "scripts" / "test.ps1");
+    CRPC_CHECK(has(ps1, "export_gate.py"));
+    const std::string sh = read_text(root / "scripts" / "test.sh");
+    CRPC_CHECK(has(sh, "export_gate.py"));
+
+    // The document names the gate and its baseline file.
+    CRPC_CHECK(has(text, "scripts/export_gate.py"));
+    CRPC_CHECK(has(text, "scripts/export_baseline.txt"));
+    CRPC_CHECK(has_phrase(text, "is run by"));
+
+    // The stale "no checker" claim must not return.
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "No ABI checker is implemented"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "CI does not compare exported symbols"));
 }
 
 CRPC_TEST(abi_docs_chinese_does_not_claim_header_assertions) {
@@ -221,7 +233,7 @@ CRPC_TEST(abi_docs_chinese_does_not_claim_size_tag_pattern) {
     CRPC_CHECK(has(text, "当前没有 size-tag 模式"));
 }
 
-CRPC_TEST(abi_docs_chinese_does_not_claim_ci_abi_check) {
+CRPC_TEST(abi_docs_chinese_describes_the_export_gate) {
     const fs::path root = repo_root();
     CRPC_CHECK(!root.empty());
     if (root.empty()) {
@@ -229,10 +241,21 @@ CRPC_TEST(abi_docs_chinese_does_not_claim_ci_abi_check) {
     }
     const std::string text = read_text(root / "docs" / "abi.zh-CN.md");
 
-    CRPC_CHECK(has(text, "未实现 ABI 检查器"));
-    CRPC_CHECK_FALSE(has(text, "CI 运行 ABI 检查任务"));
-    // Migration guides are absent; the text must say so rather than point at one.
-    CRPC_CHECK(has(text, "均不存在"));
+    // The gate is real: the script exists and both test runners invoke it.
+    CRPC_CHECK_FALSE(read_text(root / "scripts" / "export_gate.py").empty());
+    const std::string ps1 = read_text(root / "scripts" / "test.ps1");
+    CRPC_CHECK(has(ps1, "export_gate.py"));
+    const std::string sh = read_text(root / "scripts" / "test.sh");
+    CRPC_CHECK(has(sh, "export_gate.py"));
+
+    // The document names the gate and its baseline file.
+    CRPC_CHECK(has(text, "scripts/export_gate.py"));
+    CRPC_CHECK(has(text, "scripts/export_baseline.txt"));
+    CRPC_CHECK(has(text, "scripts/test.ps1"));
+
+    // The stale claims must not return.
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "未实现 ABI 检查器"));
+    CRPC_CHECK_FALSE(forbidden_phrase(text, "均不存在"));
 }
 
 CRPC_TEST(abi_docs_chinese_is_clean_utf8) {
@@ -979,8 +1002,8 @@ CRPC_TEST(abi_docs_english_states_the_guard_facts) {
     const std::string text = read_text(root / "docs" / "abi.md");
 
     // Counts and scope wording.
-    CRPC_CHECK(has_phrase(text, "14 of the public records"));
-    CRPC_CHECK(has_phrase(text, "an exact member count for the 14 records"));
+    CRPC_CHECK(has_phrase(text, "15 of the public records"));
+    CRPC_CHECK(has_phrase(text, "an exact member count for the 15 records"));
     CRPC_CHECK(has_phrase(text, "have **no compile-time layout guard at all**"));
 
     // The four standard-library-bearing records are described one by one, and
@@ -1021,8 +1044,8 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
     CRPC_CHECK(!text.empty());
 
     // Counts and scope wording, mirroring the English document.
-    CRPC_CHECK(has_phrase(text, "14 个公开记录"));
-    CRPC_CHECK(has_phrase(text, "**14 个**记录的精确成员数量"));
+    CRPC_CHECK(has_phrase(text, "15 个公开记录"));
+    CRPC_CHECK(has_phrase(text, "**15 个**记录的精确成员数量"));
     CRPC_CHECK(has_phrase(text, "**没有任何编译期布局护栏**"));
 
     // The four standard-library-bearing records, described one by one.

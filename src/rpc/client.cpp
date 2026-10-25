@@ -22,6 +22,39 @@ u32 next_candidate(u32& counter) noexcept {
 
 } // namespace
 
+// Recursive write lock with a deferred failure report. The outermost release
+// reports a fatal write error once, with `write_mutex_` no longer held, so the
+// report can take `completion_mutex_` without inverting against a completion
+// callback that starts a new call.
+struct client::write_lock {
+    explicit write_lock(client& owner) noexcept : owner_(owner) {
+        owner_.write_mutex_.lock();
+        ++owner_.write_depth_;
+    }
+    ~write_lock() {
+        --owner_.write_depth_;
+        owner_.write_mutex_.unlock();
+        if (owner_.write_depth_ == 0) {
+            owner_.report_write_failure();
+        }
+    }
+    write_lock(const write_lock&) = delete;
+    write_lock& operator=(const write_lock&) = delete;
+    write_lock(write_lock&&) = delete;
+    write_lock& operator=(write_lock&&) = delete;
+
+private:
+    client& owner_;
+};
+
+void client::report_write_failure() noexcept {
+    if (!write_failed_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    const std::error_code ec = write_fail_ec_;
+    (void)fail_all(map_error(ec), ec.message());
+}
+
 u32 allocate_stream_id(u32& counter, bool (*in_flight)(void* ctx, u32 id), void* ctx) noexcept {
     for (;;) {
         const u32 id = next_candidate(counter);
@@ -60,24 +93,30 @@ client::~client() {
 }
 
 bool client::is_open() const noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    return !closed_ && conn_ != nullptr && conn_->is_open();
+    if (closed_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lk(write_mutex_);
+    return conn_ != nullptr && conn_->is_open();
 }
 
 void client::close() noexcept {
+    if (closed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Fails every in-flight call first (idempotent; only the first caller wins
+    // the closed transition). This takes no lock the writer path holds, so a
+    // concurrent start_call either publishes before the transition (and is
+    // failed here) or observes closed_ and rejects.
+    (void)fail_all(rpc_code::shutting_down, "client closed");
+    // Move the transport out and close it without holding any lock. A
+    // synchronous in-process close calls the peer's terminal hook, which may
+    // take the server's push lock; holding a client lock there would invert
+    // against the server send path (push lock -> this lock), a potential
+    // deadlock TSan reports. The local owner closes after the unlock.
     std::unique_ptr<connection> closing;
     {
-        std::lock_guard<std::recursive_mutex> lk(mutex_);
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        fail_all(rpc_code::shutting_down, "client closed");
-        // Move the transport out and close it without holding this lock. A
-        // synchronous in-process close calls the peer's terminal hook, which
-        // may take the server's push lock; holding this lock there would invert
-        // against the server send path (push lock -> this lock), a potential
-        // deadlock TSan reports. The local owner closes after the unlock.
+        std::lock_guard<std::recursive_mutex> lk(write_mutex_);
         closing = std::move(conn_);
     }
     if (closing) {
@@ -88,20 +127,40 @@ void client::close() noexcept {
 // --- Reader ------------------------------------------------------------------
 
 std::size_t client::on_data(span<const std::byte> data) noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    decoder_.feed(data);
+    std::lock_guard<std::recursive_mutex> lk(read_mutex_);
     if (in_process_) {
         // Re-entered from a synchronous push: the outer loop will drain these
-        // bytes after the current frame is handled.
+        // bytes after the current frame is handled. The chunk does not outlive
+        // this call, so it must go through the copying path (which also drains
+        // any external chunk the outer loop still holds).
+        decoder_.feed(data);
         return data.size();
     }
+    // Parse directly out of the transport's chunk: handle_frame() consumes the
+    // payload before next() is called again, so the zero-copy window is this
+    // loop. Only a trailing partial frame is copied into the decoder.
+    decoder_.feed_external(data);
     in_process_ = true;
     frame value;
     frame_decoder::result result = frame_decoder::result::need_more;
-    while ((result = decoder_.next(value)) == frame_decoder::result::frame_ready) {
+    // A dropped frame consumes its bytes and leaves the decoder usable, so it
+    // is not a terminal outcome: keep parsing the rest of this chunk, matching
+    // server_connection::on_data. Borrowing mode has no payload buffer, so a
+    // compressed frame fails hard instead and frame_dropped is unreachable
+    // here today; the branch is kept so a future payload buffer cannot
+    // silently truncate the chunk.
+    for (;;) {
+        result = decoder_.next(value);
+        if (result == frame_decoder::result::frame_dropped) {
+            continue;
+        }
+        if (result != frame_decoder::result::frame_ready) {
+            break;
+        }
         handle_frame(value);
     }
     in_process_ = false;
+    decoder_.drain_external();
     if (result == frame_decoder::result::error) {
         protocol_failure();
     }
@@ -109,21 +168,19 @@ std::size_t client::on_data(span<const std::byte> data) noexcept {
 }
 
 void client::on_eof() noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    if (closed_) {
+    std::lock_guard<std::recursive_mutex> lk(read_mutex_);
+    if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    closed_ = true;
-    fail_all(rpc_code::eof, "peer closed the connection");
+    (void)fail_all(rpc_code::eof, "peer closed the connection");
 }
 
 void client::on_error(std::error_code ec) noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    if (closed_) {
+    std::lock_guard<std::recursive_mutex> lk(read_mutex_);
+    if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    closed_ = true;
-    fail_all(map_error(ec), ec.message());
+    (void)fail_all(map_error(ec), ec.message());
 }
 
 void client::handle_frame(const frame& value) {
@@ -149,16 +206,24 @@ void client::handle_frame(const frame& value) {
 }
 
 void client::handle_response(const frame& value) {
-    const auto it = in_flight_.find(value.header.stream_id);
-    if (it == in_flight_.end()) {
-        // Unknown or late stream: dropped, never delivered to a recycled slot.
-        return;
-    }
-    call_slot* slot = it->second;
     rpc_code code = rpc_code::ok;
     rpc_error error;
     span<const std::byte> body;
     const status decoded = decode_response(value.payload, code, error, body);
+
+    // Hold the completion lock across the lookup: a handle destructor could
+    // otherwise detach and recycle the slot between the lookup and the claim.
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    call_slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        const auto it = in_flight_.find(value.header.stream_id);
+        if (it == in_flight_.end()) {
+            // Unknown or late stream: dropped, never delivered to a recycled slot.
+            return;
+        }
+        slot = it->second;
+    }
     if (!decoded.ok()) {
         finish(*slot, call_state::failed, rpc_code::decode_error,
                rpc_error(rpc_code::decode_error, "response decode failed"), span<const std::byte>());
@@ -174,22 +239,34 @@ void client::handle_push(const frame& value) {
         return;
     }
 
-    if (envelope.mode == push::delivery_mode::reliable) {
-        const auto known = push_ack_upto_.find(value.header.stream_id);
-        if (known != push_ack_upto_.end() && envelope.seq <= known->second) {
-            // A replayed or stale reliable message: at-least-once delivery is
-            // made at-most-once here by the monotonic per-stream sequence.
-            return;
+    push::push_sink_fn sink = nullptr;
+    void* sink_ctx = nullptr;
+    bool alloc_failed = false;
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        if (envelope.mode == push::delivery_mode::reliable) {
+            const auto known = push_ack_upto_.find(value.header.stream_id);
+            if (known != push_ack_upto_.end() && envelope.seq <= known->second) {
+                // A replayed or stale reliable message: at-least-once delivery
+                // is made at-most-once here by the monotonic per-stream
+                // sequence.
+                return;
+            }
+            try {
+                push_ack_upto_[value.header.stream_id] = envelope.seq;
+            } catch (...) {
+                alloc_failed = true;
+            }
         }
-        try {
-            push_ack_upto_[value.header.stream_id] = envelope.seq;
-        } catch (...) {
-            protocol_failure();
-            return;
-        }
+        sink = push_sink_;
+        sink_ctx = push_sink_ctx_;
+    }
+    if (alloc_failed) {
+        protocol_failure();
+        return;
     }
 
-    if (push_sink_ != nullptr) {
+    if (sink != nullptr) {
         push::push_message_view message;
         message.stream_id = value.header.stream_id;
         message.topic_id = envelope.topic_id;
@@ -199,7 +276,7 @@ void client::handle_push(const frame& value) {
         message.seq = envelope.seq;
         message.topic_seq = envelope.topic_seq;
         message.body = envelope.body;
-        push_sink_(push_sink_ctx_, message);
+        sink(sink_ctx, message);
     }
 
     if (envelope.mode == push::delivery_mode::reliable) {
@@ -215,7 +292,7 @@ void client::handle_push_ack(const frame&) {
 }
 
 void client::set_push_sink(push::push_sink_fn sink, void* ctx) noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::lock_guard<std::mutex> lk(map_mutex_);
     push_sink_ = sink;
     push_sink_ctx_ = ctx;
 }
@@ -264,6 +341,12 @@ void client::handle_ping(const frame& value) {
     if (value.payload.size() != 8) {
         return;
     }
+    // frame_scratch_ and the write queue are writer state; a PING arrives on
+    // the reader, so it takes the write lock for the reply.
+    write_lock w(*this);
+    if (closed_.load(std::memory_order_acquire) || conn_ == nullptr) {
+        return;
+    }
     frame pong;
     pong.header.type = frame_type::pong;
     pong.header.stream_id = 0;
@@ -282,19 +365,17 @@ void client::handle_ping(const frame& value) {
 }
 
 void client::handle_goaway(const frame&) {
-    if (closed_) {
+    if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    closed_ = true;
-    fail_all(rpc_code::shutting_down, "peer sent GOAWAY");
+    (void)fail_all(rpc_code::shutting_down, "peer sent GOAWAY");
 }
 
 void client::protocol_failure() {
-    if (closed_) {
+    if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    closed_ = true;
-    fail_all(rpc_code::protocol_error, "frame decode error");
+    (void)fail_all(rpc_code::protocol_error, "frame decode error");
 }
 
 // --- Writer ------------------------------------------------------------------
@@ -303,7 +384,7 @@ void client::on_write_complete(io::io_result result) noexcept {
     // Runs on the backend thread; serialize with start_request/flush_write on
     // the caller thread (A-4). A synchronous implementation re-enters through
     // flush_write, hence the recursive lock.
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    write_lock lk(*this);
     write_in_flight_ = false;
     if (!result.ok()) {
         write_error_ = true;
@@ -319,7 +400,7 @@ void client::on_write_complete(io::io_result result) noexcept {
 }
 
 void client::flush_write() {
-    if (write_in_flight_ || closed_ || conn_ == nullptr) {
+    if (write_in_flight_ || closed_.load(std::memory_order_acquire) || conn_ == nullptr) {
         return;
     }
     for (;;) {
@@ -339,8 +420,12 @@ void client::flush_write() {
         if (write_error_) {
             const std::error_code ec = write_ec_;
             write_error_ = false;
-            closed_ = true;
-            fail_all(map_error(ec), ec.message());
+            closed_.store(true, std::memory_order_release);
+            // Record the failure; the outermost write-lock holder reports it
+            // after releasing the lock (see write_lock), so no completion lock
+            // is ever taken under the write lock.
+            write_fail_ec_ = ec;
+            write_failed_.store(true, std::memory_order_release);
             return;
         }
         if (write_in_flight_) {
@@ -361,6 +446,10 @@ void client::enqueue_raw(span<const std::byte> bytes) {
 }
 
 void client::send_rst(u32 stream_id, rpc_code code) {
+    write_lock w(*this);
+    if (closed_.load(std::memory_order_acquire) || conn_ == nullptr || !conn_->is_open()) {
+        return;
+    }
     std::byte payload[4];
     endian::store_le32(payload, static_cast<u32>(code));
     frame rst;
@@ -381,6 +470,10 @@ void client::send_rst(u32 stream_id, rpc_code code) {
 }
 
 void client::send_push_ack(u32 stream_id, u64 seq) {
+    write_lock w(*this);
+    if (closed_.load(std::memory_order_acquire) || conn_ == nullptr || !conn_->is_open()) {
+        return;
+    }
     std::byte payload[push::push_ack_size];
     endian::store_le64(payload, seq);
     frame ack;
@@ -412,6 +505,13 @@ call_id client::next_call_id() {
 
 call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context& ctx,
                               rpc_error& failure) {
+    // The slot fields, the stream-id allocation (which probes in_flight_) and
+    // the closed check are all map state.
+    std::lock_guard<std::mutex> map(map_mutex_);
+    if (closed_.load(std::memory_order_acquire)) {
+        failure = rpc_error(rpc_code::shutting_down, "client is closed");
+        return nullptr;
+    }
     call_slot* slot = pool_.try_acquire();
     if (slot == nullptr) {
         failure = rpc_error(rpc_code::resource_exhausted, "call slot pool exhausted");
@@ -492,49 +592,64 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
         envelope.call_flags = static_cast<u8>(envelope.call_flags | call_flag_has_extensions);
     }
 
-    const std::size_t payload_size = encoded_call_envelope_size(envelope);
-    payload_scratch_.clear();
-    if (!payload_scratch_.reserve(payload_size)) {
-        return status{rpc_code::resource_exhausted};
-    }
-    std::size_t payload_written = 0;
-    status encoded = encode_call_envelope(span<std::byte>(payload_scratch_.data(), payload_size),
-                                          envelope, payload_written);
-    if (!encoded.ok()) {
-        return encoded;
+    {
+        write_lock w(*this);
+        const std::size_t payload_size = encoded_call_envelope_size(envelope);
+        payload_scratch_.clear();
+        if (!payload_scratch_.reserve(payload_size)) {
+            return status{rpc_code::resource_exhausted};
+        }
+        std::size_t payload_written = 0;
+        status encoded = encode_call_envelope(
+            span<std::byte>(payload_scratch_.data(), payload_size), envelope, payload_written);
+        if (!encoded.ok()) {
+            return encoded;
+        }
+
+        frame request;
+        request.header.type = slot.one_way ? frame_type::one_way : frame_type::request;
+        request.header.flags = slot.one_way ? frame_flag_unreliable : 0;
+        request.header.stream_id = slot.stream_id;
+        request.payload = span<const std::byte>(payload_scratch_.data(), payload_written);
+
+        const std::size_t frame_size = encoded_frame_size(request);
+        if (out_.size() - out_sent_ + frame_size > options_.max_pending_write_bytes) {
+            return status{rpc_code::resource_exhausted};
+        }
+        frame_scratch_.clear();
+        if (!frame_scratch_.reserve(frame_size)) {
+            return status{rpc_code::resource_exhausted};
+        }
+        std::size_t frame_written = 0;
+        encoded = encode_frame(span<std::byte>(frame_scratch_.data(), frame_size), request,
+                               frame_written);
+        if (!encoded.ok()) {
+            return encoded;
+        }
+
+        {
+            std::lock_guard<std::mutex> map(map_mutex_);
+            // Re-check under the map lock: a close between begin_call and here
+            // must reject the call rather than publish a slot nothing will
+            // ever complete.
+            if (closed_.load(std::memory_order_acquire)) {
+                return status{rpc_code::shutting_down};
+            }
+            if (!out_.append(span<const std::byte>(frame_scratch_.data(), frame_written))) {
+                return status{rpc_code::resource_exhausted};
+            }
+            slot.written = true;
+            in_flight_.emplace(slot.stream_id, &slot);
+            if (slot.has_deadline) {
+                deadlines_.emplace(slot.deadline, &slot);
+            }
+        }
+        set_state(slot, call_state::sent);
+        flush_write();
     }
 
-    frame request;
-    request.header.type = slot.one_way ? frame_type::one_way : frame_type::request;
-    request.header.flags = slot.one_way ? frame_flag_unreliable : 0;
-    request.header.stream_id = slot.stream_id;
-    request.payload = span<const std::byte>(payload_scratch_.data(), payload_written);
-
-    const std::size_t frame_size = encoded_frame_size(request);
-    if (out_.size() - out_sent_ + frame_size > options_.max_pending_write_bytes) {
-        return status{rpc_code::resource_exhausted};
-    }
-    frame_scratch_.clear();
-    if (!frame_scratch_.reserve(frame_size)) {
-        return status{rpc_code::resource_exhausted};
-    }
-    std::size_t frame_written = 0;
-    encoded = encode_frame(span<std::byte>(frame_scratch_.data(), frame_size), request, frame_written);
-    if (!encoded.ok()) {
-        return encoded;
-    }
-    if (!out_.append(span<const std::byte>(frame_scratch_.data(), frame_written))) {
-        return status{rpc_code::resource_exhausted};
-    }
-
-    slot.written = true;
-    in_flight_.emplace(slot.stream_id, &slot);
-    if (slot.has_deadline) {
-        deadlines_.emplace(slot.deadline, &slot);
-    }
-    set_state(slot, call_state::sent);
-    flush_write();
-
+    // Complete a ONE_WAY outside the write lock: finish takes the completion
+    // lock, and no path may hold the write lock while taking it.
     if (slot.one_way) {
         finish(slot, call_state::completed, rpc_code::ok, rpc_error{}, span<const std::byte>());
     }
@@ -543,38 +658,68 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
 
 void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
                     span<const std::byte> body) {
-    if (finish_slot(slot, terminal, code, std::move(error), body)) {
-        remove_in_flight(slot);
-        // The atomic claim inside invoke_callback decides whether `then` or
-        // this completion path runs the callback exactly once.
-        slot.invoke_callback();
+    // Hold the completion lock from before the claim until after the callback
+    // returns, so a handle destructor cannot detach and recycle the slot while
+    // this path still touches it. `map_mutex_` is released before the callback
+    // runs, so a slow callback never blocks a writer.
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    if (!finish_slot(slot, terminal, code, std::move(error), body)) {
+        return;
     }
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        remove_in_flight(slot);
+    }
+    // The atomic claim inside invoke_callback decides whether `then` or this
+    // completion path runs the callback exactly once.
+    slot.invoke_callback();
 }
 
 void client::cancel_slot(call_slot& slot) noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    if (finish_slot(slot, call_state::canceled, rpc_code::canceled,
-                    rpc_error(rpc_code::canceled, "call canceled"), span<const std::byte>())) {
-        if (slot.written && !closed_ && conn_ != nullptr && conn_->is_open()) {
-            send_rst(slot.stream_id, rpc_code::canceled);
+    bool won = false;
+    bool written = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        won = finish_slot(slot, call_state::canceled, rpc_code::canceled,
+                          rpc_error(rpc_code::canceled, "call canceled"),
+                          span<const std::byte>());
+        if (won) {
+            std::lock_guard<std::mutex> map(map_mutex_);
+            written = slot.written;
+            remove_in_flight(slot);
         }
-        remove_in_flight(slot);
-        slot.invoke_callback();
     }
-}
-
-void client::fail_all(rpc_code code, std::string message) {
-    if (in_flight_.empty()) {
+    if (!won) {
         return;
     }
+    // The RST is a write: send it with the completion lock released, so the
+    // write lock is never taken under the completion lock.
+    if (written) {
+        send_rst(slot.stream_id, rpc_code::canceled);
+    }
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    slot.invoke_callback();
+}
+
+bool client::fail_all(rpc_code code, std::string message) {
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
     std::vector<call_slot*> slots;
-    slots.reserve(in_flight_.size());
-    for (const auto& entry : in_flight_) {
-        slots.push_back(entry.second);
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        if (closed_.exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        slots.reserve(in_flight_.size());
+        for (const auto& entry : in_flight_) {
+            slots.push_back(entry.second);
+        }
+        in_flight_.clear();
+        deadlines_.clear();
     }
     for (call_slot* slot : slots) {
         finish(*slot, call_state::failed, code, rpc_error(code, message), span<const std::byte>());
     }
+    return true;
 }
 
 void client::remove_in_flight(call_slot& slot) {
@@ -599,18 +744,28 @@ void client::remove_deadline(call_slot& slot) {
 }
 
 void client::poll() noexcept {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    if (closed_ || deadlines_.empty()) {
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    if (closed_.load(std::memory_order_acquire)) {
         return;
     }
-    const auto now = options_.clock(options_.clock_ctx);
-    auto it = deadlines_.begin();
-    while (it != deadlines_.end() && it->first <= now) {
-        call_slot* slot = it->second;
-        it = deadlines_.erase(it);
-        if (slot == nullptr || result_ready(*slot)) {
-            continue;
+    std::vector<call_slot*> expired;
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        if (deadlines_.empty()) {
+            return;
         }
+        const auto now = options_.clock(options_.clock_ctx);
+        auto it = deadlines_.begin();
+        while (it != deadlines_.end() && it->first <= now) {
+            call_slot* slot = it->second;
+            it = deadlines_.erase(it);
+            if (slot == nullptr || result_ready(*slot)) {
+                continue;
+            }
+            expired.push_back(slot);
+        }
+    }
+    for (call_slot* slot : expired) {
         rpc_error error(rpc_code::deadline_exceeded, "deadline exceeded");
         // Local-only marker: the facade distinguishes this from a
         // server-produced deadline (which must not open the breaker).
@@ -633,10 +788,10 @@ void client::cancel_thunk(void* ctx, call_slot* slot) noexcept {
 }
 
 void client::detach_slot(call_slot& slot) noexcept {
-    // Every completion callback invocation runs under `mutex_`, so holding it
-    // here guarantees that once this returns no callback is running and none
-    // can start for this slot.
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    // Every completion callback invocation runs under `completion_mutex_`, so
+    // holding it here guarantees that once this returns no callback is running
+    // and none can start for this slot.
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
     slot.callback_armed.store(false, std::memory_order_release);
     slot.callback_invoke = nullptr;
     slot.callback_owner = nullptr;
@@ -654,11 +809,15 @@ void client::release_slot_under_lock(call_slot* slot) noexcept {
     if (slot == nullptr) {
         return;
     }
-    // The response thread reads slot.stream_id/has_deadline under this lock
-    // (handle_response -> finish -> remove_in_flight). Resetting outside it let
-    // the two run concurrently on the same slot (TSan, pre-existing).
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
-    remove_in_flight(*slot);
+    // A response thread reads slot.stream_id/has_deadline under `map_mutex_`
+    // (handle_response -> finish -> remove_in_flight). The completion lock is
+    // taken first so no completion is still touching the slot, and the reset in
+    // `pool_.release` cannot race the response thread.
+    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    {
+        std::lock_guard<std::mutex> map(map_mutex_);
+        remove_in_flight(*slot);
+    }
     pool_.release(slot);
 }
 

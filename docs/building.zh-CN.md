@@ -2,7 +2,7 @@
 
 [English](building.md) | **简体中文**
 
-版本 1.0 / 2026-10-19
+版本 2.0 / 2026-10-24
 
 本文说明如何在 Windows 与 Linux 上配置、构建、测试和诊断 CRPC。一键脚本是受支持的入口；CI 设计为调用同一批脚本，而不是复制构建逻辑。
 
@@ -67,7 +67,7 @@ export CRPC_COROCC_DIR=/path/to/corocc
 |---|---|---|
 | `CRPC_BUILD_TESTS` | `ON` | 构建 `tests/` 并注册 CTest 条目 |
 | `CRPC_BUILD_BENCH` | `OFF` | 构建 `bench/`；基准程序不注册进 CTest，shared 构建下基准可执行文件与 `crpc.dll` 同处构建根目录 |
-| `CRPC_BUILD_EXAMPLES` | `OFF` | 加入 `examples/`；该目录尚无 `CMakeLists.txt`，保持关闭 |
+| `CRPC_BUILD_EXAMPLES` | `OFF` | 构建 `examples/`；`examples/CMakeLists.txt` 构建 `crpc_example_quickstart` 并注册进 CTest |
 | `CRPC_WARNINGS_AS_ERRORS` | `ON` | `/W4 /WX` 或 `-Werror` |
 | `CRPC_ENABLE_LTO` | `ON` | 支持且未启用消毒器时，Release 使用 IPO/LTO |
 | `CRPC_BUILD_SHARED` | `OFF` | 构建共享库而不是静态归档 |
@@ -246,7 +246,7 @@ Debug 构建遇到 CRT 断言、无效参数、纯虚调用或访问违例时可
 |---|---|
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | 指向仓库根，而不是 `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | 指向包含 `include/corocc/coro.h` 的根 |
-| 配置在 `examples` 失败 | 保持 `CRPC_BUILD_EXAMPLES` 关闭；该目录没有 `CMakeLists.txt` |
+| `examples` 未构建 | 示例现已可用：设置 `CRPC_BUILD_EXAMPLES=ON`；`examples/CMakeLists.txt` 构建 `crpc_example_quickstart` 并注册进 CTest |
 | 在 MSVC 上请求消毒器 | TSan 不可用；TSan 任务使用 Linux/Clang |
 | 找不到 `cmake` 或 `ninja` | 脚本搜索 `PATH`、Program Files 与 VS 包；安装或加入 `PATH` |
 | Windows 上测试挂起 | 检查 `.opencode/tmp/out/dumps`、测试日志与 300 秒 CTest 超时 |

@@ -16,7 +16,11 @@ languages; the pairs are linked at the top of each file.
 | 5 | [Build and test](building.md) | [构建与测试](building.zh-CN.md) |
 | 6 | [Engineering principles](principles.md) | [工程原则](principles.zh-CN.md) |
 | 7 | [Performance report](performance.md) | [性能报告](performance.zh-CN.md) |
-| 8 | [Release notes](CHANGELOG.md) | [发布说明](CHANGELOG.zh-CN.md) |
+| 8 | [Migration guide](migration.md) | [迁移指南](migration.zh-CN.md) |
+| 9 | [API reference](api/README.md) | [API 参考](api/README.zh-CN.md) |
+| 10 | [Tutorial](tutorial.md) | [教程](tutorial.zh-CN.md) |
+| 11 | [Examples](../examples/README.md) | [示例](../examples/README.zh-CN.md) |
+| 12 | [Release notes](CHANGELOG.md) | [发布说明](CHANGELOG.zh-CN.md) |
 
 All documents in the index are present. Their per-module status is recorded in
 the status matrix of document 3 and in the design specification's chapter 21; a
@@ -24,8 +28,8 @@ missing entry or a broken link is a documentation defect, not an oversight.
 
 ## Reading order
 
-- **Using the library**: 3 (architecture) → 4 (protocol) → the design
-  specification's service API chapter.
+- **Using the library**: 10 (tutorial) → 9 (API reference) → 3 (architecture) → 4
+  (protocol) → the design specification's service API chapter.
 - **Contributing**: 6 (principles) → 1 (design specification) → 5 (build and
   test).
 - **Integrating at the binary level**: 2 (ABI policy).
@@ -35,7 +39,7 @@ missing entry or a broken link is a documentation defect, not an oversight.
 | Mark | Meaning |
 |---|---|
 | implemented | Code exists, tests pass, documented. |
-| in progress | Code exists but the contract is not frozen. |
+| partial | Code exists and is tested, but a documented part is missing. |
 | specified | Design frozen, no code yet. |
 
 The design specification's chapter 21 carries the authoritative per-module

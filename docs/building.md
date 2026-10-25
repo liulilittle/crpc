@@ -2,7 +2,7 @@
 
 [简体中文](building.zh-CN.md) | **English**
 
-Version 1.0 / 2026-10-19
+Version 2.0 / 2026-10-24
 
 This document describes how to configure, build, test and diagnose CRPC on
 Windows and Linux. The one-click scripts are the supported entry point; CI is
@@ -96,7 +96,7 @@ stated so a build without corocc is not mistaken for a broken build.
 |---|---|---|
 | `CRPC_BUILD_TESTS` | `ON` | build `tests/` and register CTest entries |
 | `CRPC_BUILD_BENCH` | `OFF` | build `bench/`; benchmarks are not registered in CTest, and in a shared build the benchmark executables sit in the build root next to `crpc.dll` |
-| `CRPC_BUILD_EXAMPLES` | `OFF` | add `examples/`; the directory has no `CMakeLists.txt` yet, so keep it off |
+| `CRPC_BUILD_EXAMPLES` | `OFF` | build `examples/`; `examples/CMakeLists.txt` builds `crpc_example_quickstart` and registers it in CTest |
 | `CRPC_WARNINGS_AS_ERRORS` | `ON` | `/W4 /WX` or `-Werror` |
 | `CRPC_ENABLE_LTO` | `ON` | IPO/LTO for Release when supported and no sanitizer is active |
 | `CRPC_BUILD_SHARED` | `OFF` | build a shared library instead of a static archive |
@@ -316,7 +316,7 @@ green on x64 Debug and x86 Debug; rerun the scripts to confirm the current tree.
 |---|---|
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | point it at the checkout root, not `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | point it at the root containing `include/corocc/coro.h` |
-| configure fails on `examples` | keep `CRPC_BUILD_EXAMPLES` off; the tree has no `CMakeLists.txt` |
+| examples are not built | examples are now available: set `CRPC_BUILD_EXAMPLES=ON`; `examples/CMakeLists.txt` builds `crpc_example_quickstart` and registers it in CTest |
 | a sanitizer is requested on MSVC | TSan is unavailable; use Linux/Clang for the TSan job |
 | `cmake` or `ninja` not found | the scripts search `PATH`, Program Files and the VS bundle; install CMake/Ninja or add them to `PATH` |
 | a test hangs on Windows | inspect `.opencode/tmp/out/dumps`, the test log, and the 300 s CTest timeout |

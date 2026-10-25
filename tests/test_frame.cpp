@@ -372,6 +372,44 @@ CRPC_TEST(crc32c_known_vectors) {
     CRPC_CHECK_EQ(crc32c(as_span(incrementing)), 0x46DD794Eu);
 }
 
+CRPC_TEST(crc32c_matches_reference_over_lengths) {
+    // Independent reference: the original per-byte table loop, rebuilt here so
+    // the test does not depend on the implementation's table. The optimized
+    // crc32c() (slicing-by-8 and, when the CPU has SSE4.2, the hardware path)
+    // must agree with it on every length, including non-multiples of eight and
+    // buffers larger than the slicing block.
+    u32 table[256];
+    for (u32 i = 0; i < 256; ++i) {
+        u32 value = i;
+        for (int bit = 0; bit < 8; ++bit) {
+            value = (value & 1u) != 0 ? (0x82F63B78u ^ (value >> 1)) : (value >> 1);
+        }
+        table[i] = value;
+    }
+    const auto reference = [table](span<const std::byte> data) -> u32 {
+        u32 value = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            const u32 byte = static_cast<u32>(static_cast<unsigned char>(data[i]));
+            value = table[(value ^ byte) & 0xFFu] ^ (value >> 8);
+        }
+        return value ^ 0xFFFFFFFFu;
+    };
+
+    std::vector<std::byte> buffer(70000);
+    for (std::size_t i = 0; i < buffer.size(); ++i) {
+        buffer[i] = static_cast<std::byte>(static_cast<unsigned>(i * 131u + 17u));
+    }
+    for (std::size_t len = 0; len <= 2048; ++len) {
+        const span<const std::byte> view(buffer.data(), len);
+        CRPC_CHECK_EQ(crc32c(view), reference(view));
+    }
+    // A few large sizes around the 64 KiB receive-buffer boundary.
+    for (const std::size_t len : {4096u, 8192u, 16384u, 32768u, 65536u, 69999u}) {
+        const span<const std::byte> view(buffer.data(), len);
+        CRPC_CHECK_EQ(crc32c(view), reference(view));
+    }
+}
+
 CRPC_TEST(frame_crc_round_trip_and_corruption_detection) {
     const std::vector<std::byte> payload = bytes_of("hello");
     const std::vector<std::byte> encoded =
@@ -832,6 +870,184 @@ CRPC_TEST(frame_decoder_reset_after_error) {
 CRPC_TEST(frame_decoder_clamps_max_frame) {
     frame_decoder decoder(0xFFFFFFFFu);
     CRPC_CHECK_EQ(decoder.max_frame(), max_frame_hard_cap);
+}
+
+// --- Zero-copy external feed -------------------------------------------------
+
+// feed_external() must hand back a payload that points straight into the
+// caller's chunk (no copy into the decoder), and drain_external() must leave
+// nothing buffered for a chunk that ended on a frame boundary.
+CRPC_TEST(frame_decoder_external_borrows_payload) {
+    const std::vector<std::byte> payload = bytes_of("zero-copy");
+    const std::vector<std::byte> encoded =
+        encode_simple(frame_type::request, 21, 0, payload);
+    std::vector<std::byte> chunk = encoded;
+
+    frame_decoder decoder;
+    decoder.feed_external(as_span(chunk));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.payload.size(), payload.size());
+    // The payload is the chunk's own bytes, not a copy.
+    CRPC_CHECK_EQ(value.payload.data(), chunk.data() + frame_header_size);
+    CRPC_CHECK_EQ(static_cast<int>(value.payload[0]), static_cast<int>(payload[0]));
+    decoder.drain_external();
+    CRPC_CHECK_EQ(decoder.buffered(), static_cast<std::size_t>(0));
+    CRPC_CHECK_FALSE(decoder.failed());
+}
+
+CRPC_TEST(frame_decoder_external_two_frames_in_one_chunk) {
+    const std::vector<std::byte> p1 = bytes_of("first");
+    const std::vector<std::byte> p2 = bytes_of("second!");
+    const std::vector<std::byte> f1 = encode_simple(frame_type::request, 31, 0, p1);
+    const std::vector<std::byte> f2 = encode_simple(frame_type::response, 32, 0, p2);
+    std::vector<std::byte> chunk = f1;
+    chunk.insert(chunk.end(), f2.begin(), f2.end());
+
+    frame_decoder decoder;
+    decoder.feed_external(as_span(chunk));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 31u);
+    CRPC_CHECK_EQ(value.payload.data(), chunk.data() + frame_header_size);
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 32u);
+    CRPC_CHECK_EQ(value.payload.data(), chunk.data() + f1.size() + frame_header_size);
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::need_more));
+    decoder.drain_external();
+    CRPC_CHECK_EQ(decoder.buffered(), static_cast<std::size_t>(0));
+}
+
+// A trailing partial frame is the only part copied: drain_external() must keep
+// it so a later feed() completes the frame, and the completed payload must be
+// correct.
+CRPC_TEST(frame_decoder_external_carries_partial_tail) {
+    const std::vector<std::byte> p1 = bytes_of("head");
+    const std::vector<std::byte> p2 = bytes_of("tail-frame");
+    const std::vector<std::byte> f1 = encode_simple(frame_type::request, 41, 0, p1);
+    const std::vector<std::byte> f2 = encode_simple(frame_type::response, 42, 0, p2);
+
+    std::vector<std::byte> chunk = f1;
+    chunk.insert(chunk.end(), f2.begin(), f2.begin() + 6);  // header only (partial header)
+
+    frame_decoder decoder;
+    decoder.feed_external(as_span(chunk));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 41u);
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::need_more));
+    decoder.drain_external();
+    CRPC_CHECK_EQ(decoder.buffered(), static_cast<std::size_t>(6));
+
+    decoder.feed(span<const std::byte>(f2.data() + 6, f2.size() - 6));
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 42u);
+    CRPC_CHECK_EQ(value.payload.size(), p2.size());
+    for (std::size_t i = 0; i < p2.size(); ++i) {
+        CRPC_CHECK_EQ(static_cast<int>(value.payload[i]), static_cast<int>(p2[i]));
+    }
+}
+
+// When bytes are already buffered from an earlier partial frame, feed_external()
+// must fall back to the copying path so the frame stream stays ordered.
+CRPC_TEST(frame_decoder_external_falls_back_when_buffered) {
+    const std::vector<std::byte> payload = bytes_of("ordered");
+    const std::vector<std::byte> encoded =
+        encode_simple(frame_type::request, 51, 0, payload);
+
+    frame_decoder decoder;
+    decoder.feed(span<const std::byte>(encoded.data(), 8));  // half a header
+    decoder.feed_external(span<const std::byte>(encoded.data() + 8, encoded.size() - 8));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 51u);
+    CRPC_CHECK_EQ(value.payload.size(), payload.size());
+    decoder.drain_external();
+}
+
+// feed() while an external chunk is still active must drain it first (preserving
+// ordering) and then append the new bytes.
+CRPC_TEST(frame_decoder_external_then_feed_completes) {
+    const std::vector<std::byte> payload = bytes_of("interleave");
+    const std::vector<std::byte> encoded =
+        encode_simple(frame_type::request, 61, 0, payload);
+
+    frame_decoder decoder;
+    decoder.feed_external(span<const std::byte>(encoded.data(), 10));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::need_more));
+    // No drain_external() call: feed() must fold the external tail in itself.
+    decoder.feed(span<const std::byte>(encoded.data() + 10, encoded.size() - 10));
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.header.stream_id, 61u);
+    CRPC_CHECK_EQ(value.payload.size(), payload.size());
+}
+
+CRPC_TEST(frame_decoder_external_error_latches_and_reset) {
+    const std::vector<std::byte> bad = raw_header(0, 0x0D, 0, 0, 0, 0);
+    frame_decoder decoder;
+    decoder.feed_external(as_span(bad));
+    frame value;
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(decoder.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+    decoder.drain_external();
+    CRPC_CHECK(decoder.failed());
+    CRPC_CHECK_EQ(decoder.buffered(), static_cast<std::size_t>(0));
+
+    decoder.reset();
+    CRPC_CHECK_FALSE(decoder.failed());
+    const std::vector<std::byte> payload = bytes_of("after");
+    const std::vector<std::byte> good = encode_simple(frame_type::request, 62, 0, payload);
+    decoder.feed_external(as_span(good));
+    CRPC_CHECK_EQ(static_cast<int>(decoder.next(value)),
+                  static_cast<int>(frame_decoder::result::frame_ready));
+    CRPC_CHECK_EQ(value.payload.size(), payload.size());
+    decoder.drain_external();
+}
+
+// feed_external() must be a drop-in replacement for feed(): same frame stream
+// for arbitrary split points, including a split in the middle of a frame.
+CRPC_TEST(frame_decoder_external_matches_feed) {
+    std::vector<std::byte> stream;
+    for (std::size_t i = 0; i < 6; ++i) {
+        const std::vector<std::byte> payload(i * 7 + 1, static_cast<std::byte>(0xA0 + i));
+        const std::vector<std::byte> frame_bytes =
+            encode_simple(frame_type::request, static_cast<u32>(70 + i),
+                          (i % 2 == 0) ? frame_flag_crc32c : 0, payload);
+        stream.insert(stream.end(), frame_bytes.begin(), frame_bytes.end());
+    }
+
+    for (std::size_t chunk = 1; chunk <= stream.size(); chunk += 5) {
+        frame_decoder decoder;
+        std::size_t offset = 0;
+        std::vector<u32> ids;
+        while (offset < stream.size()) {
+            const std::size_t take = std::min(chunk, stream.size() - offset);
+            decoder.feed_external(span<const std::byte>(stream.data() + offset, take));
+            offset += take;
+            frame value;
+            while (decoder.next(value) == frame_decoder::result::frame_ready) {
+                ids.push_back(value.header.stream_id);
+            }
+            decoder.drain_external();
+        }
+        CRPC_CHECK_EQ(ids.size(), static_cast<std::size_t>(6));
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            CRPC_CHECK_EQ(ids[i], static_cast<u32>(70 + i));
+        }
+    }
 }
 
 // --- Mutation loops ----------------------------------------------------------

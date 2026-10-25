@@ -104,6 +104,15 @@ struct hub::impl {
     u64 now_ns = 0;
     hub::connection_id next_connection = 1;
     hub_stats counters;
+    // Incremental aggregates for `stats()`. The server reads these on every
+    // PUSH_ACK (`refresh_push_stats_locked`), so a full scan of every
+    // subscriber and subscription would be O(subscribers x subscriptions) per
+    // acknowledgement. Each mutation below keeps them exact, and `stats()`
+    // becomes O(1). The names mirror the derived `hub_stats` fields.
+    u64 live_subscriptions = 0;
+    u64 live_nonempty_queues = 0;
+    u64 live_queued_messages = 0;
+    u64 live_queued_bytes = 0;
     std::map<std::string, topic_state, std::less<>> topics;
     std::unordered_map<subscriber_id, subscriber_state> subscribers;
     std::unordered_map<hub::connection_id, subscriber_id> connections;
@@ -181,8 +190,7 @@ struct hub::impl {
         if (front.mode == delivery_mode::reliable) {
             mark_replay_in_queue(sub, front.seq, false);
         }
-        sub.queued_bytes -= front.bytes;
-        sub.queue.pop_front();
+        queue_pop_front(sub);
     }
 
     void clear_queue(subscription_state& sub) noexcept {
@@ -191,10 +199,7 @@ struct hub::impl {
                 mark_replay_in_queue(sub, message.seq, false);
             }
         }
-        sub.queue.clear();
-        sub.queued_bytes = 0;
-        sub.high_water = false;
-        sub.high_water_since_ns = 0;
+        queue_clear(sub);
     }
 
     void note_high_water(subscription_state& sub) noexcept {
@@ -202,6 +207,87 @@ struct hub::impl {
             sub.queued_bytes > options.slow_watermark_bytes && !sub.high_water) {
             sub.high_water = true;
             sub.high_water_since_ns = now_ns;
+        }
+    }
+
+    // --- incremental accounting ----------------------------------------------
+    //
+    // Every mutation of a subscription's queue, or of the subscription table,
+    // must go through one of these so the O(1) aggregates above stay exact. A
+    // missed mutation would silently corrupt `stats()`; tests/test_push.cpp
+    // walks every path (subscribe, publish, overflow, retransmit, ack, take,
+    // detach, disconnect) and compares the aggregates against the counters.
+
+    void queue_push_back(subscription_state& sub, queued_message&& message) noexcept {
+        if (sub.queue.empty()) {
+            ++live_nonempty_queues;
+        }
+        ++live_queued_messages;
+        live_queued_bytes += message.bytes;
+        sub.queued_bytes += message.bytes;
+        sub.queue.push_back(std::move(message));
+    }
+
+    void queue_push_front(subscription_state& sub, queued_message&& message) noexcept {
+        if (sub.queue.empty()) {
+            ++live_nonempty_queues;
+        }
+        ++live_queued_messages;
+        live_queued_bytes += message.bytes;
+        sub.queued_bytes += message.bytes;
+        sub.queue.push_front(std::move(message));
+    }
+
+    void queue_pop_front(subscription_state& sub) noexcept {
+        const queued_message& front = sub.queue.front();
+        live_queued_bytes -= front.bytes;
+        --live_queued_messages;
+        sub.queued_bytes -= front.bytes;
+        sub.queue.pop_front();
+        if (sub.queue.empty()) {
+            --live_nonempty_queues;
+        }
+    }
+
+    [[nodiscard]] std::deque<queued_message>::iterator queue_erase(
+        subscription_state& sub, std::deque<queued_message>::iterator it) noexcept {
+        live_queued_bytes -= it->bytes;
+        --live_queued_messages;
+        sub.queued_bytes -= it->bytes;
+        it = sub.queue.erase(it);
+        if (sub.queue.empty()) {
+            --live_nonempty_queues;
+        }
+        return it;
+    }
+
+    void queue_clear(subscription_state& sub) noexcept {
+        if (!sub.queue.empty()) {
+            --live_nonempty_queues;
+            live_queued_messages -= static_cast<u64>(sub.queue.size());
+            live_queued_bytes -= sub.queued_bytes;
+        }
+        sub.queue.clear();
+        sub.queued_bytes = 0;
+        sub.high_water = false;
+        sub.high_water_since_ns = 0;
+    }
+
+    void account_subscription_add(subscription_state& sub) noexcept {
+        ++live_subscriptions;
+        if (!sub.queue.empty()) {
+            ++live_nonempty_queues;
+            live_queued_messages += static_cast<u64>(sub.queue.size());
+            live_queued_bytes += sub.queued_bytes;
+        }
+    }
+
+    void account_subscription_remove(subscription_state& sub) noexcept {
+        --live_subscriptions;
+        if (!sub.queue.empty()) {
+            --live_nonempty_queues;
+            live_queued_messages -= static_cast<u64>(sub.queue.size());
+            live_queued_bytes -= sub.queued_bytes;
         }
     }
 
@@ -214,6 +300,7 @@ struct hub::impl {
         for (auto& kv : it->second.subscriptions) {
             remove_topic_subscriber(kv.first, id);
             counters.dropped_disconnected += static_cast<u64>(kv.second.queue.size());
+            account_subscription_remove(kv.second);
         }
         if (it->second.active != hub::invalid_connection) {
             connections.erase(it->second.active);
@@ -259,8 +346,7 @@ struct hub::impl {
         message.mode = delivery_mode::reliable;
         message.payload = entry.payload;
         message.bytes = entry.bytes;
-        sub.queue.push_back(std::move(message));
-        sub.queued_bytes += entry.bytes;
+        queue_push_back(sub, std::move(message));
         entry.in_queue = true;
         if (entry.transmitted) {
             ++entry.attempts;
@@ -409,8 +495,7 @@ struct hub::impl {
             sub.replay.push_back(std::move(entry));
         }
 
-        sub.queue.push_back(std::move(message));
-        sub.queued_bytes += bytes;
+        queue_push_back(sub, std::move(message));
         note_high_water(sub);
         return false;
     }
@@ -489,8 +574,7 @@ struct hub::impl {
                     ++it;
                     continue;
                 }
-                sub.queued_bytes -= it->bytes;
-                it = sub.queue.erase(it);
+                it = queue_erase(sub, it);
                 ++counters.dropped_overflow;
             }
         }
@@ -514,8 +598,7 @@ struct hub::impl {
             message.mode = delivery_mode::reliable;
             message.payload = entry.payload;
             message.bytes = entry.bytes;
-            sub.queue.push_front(std::move(message));
-            sub.queued_bytes += entry.bytes;
+            queue_push_front(sub, std::move(message));
             entry.in_queue = true;
             if (entry.transmitted) {
                 ++entry.attempts;
@@ -548,11 +631,9 @@ struct hub::impl {
         out.mode = front.mode;
         out.payload = front.payload;
 
-        const std::size_t bytes = front.bytes;
         const bool was_reliable = front.mode == delivery_mode::reliable;
         const u64 seq = front.seq;
-        sub.queued_bytes -= bytes;
-        sub.queue.pop_front();
+        queue_pop_front(sub);
         ++counters.delivered;
         if (was_reliable) {
             mark_replay_transmitted(sub, seq);
@@ -629,6 +710,7 @@ struct hub::impl {
             if (!inserted.second) {
                 return status(rpc_error(rpc_code::internal, "subscribe insert failed"));
             }
+            account_subscription_add(inserted.first->second);
             topic_state& ts = topics[inserted.first->first];
             ts.subscribers.push_back(id);
             return status{};
@@ -818,8 +900,7 @@ struct hub::impl {
         }
         for (auto it = sub.queue.begin(); it != sub.queue.end();) {
             if (it->mode == delivery_mode::reliable && it->seq <= seq) {
-                sub.queued_bytes -= it->bytes;
-                it = sub.queue.erase(it);
+                it = queue_erase(sub, it);
             } else {
                 ++it;
             }
@@ -939,6 +1020,7 @@ status hub::unsubscribe(std::string_view topic, subscriber_id id) noexcept {
         return status(rpc_code::not_found);
     }
     impl_->remove_topic_subscriber(topic, id);
+    impl_->account_subscription_remove(sub_it->second);
     sit->second.subscriptions.erase(sub_it);
     if (sit->second.subscriptions.empty() &&
         sit->second.active == invalid_connection) {
@@ -954,6 +1036,7 @@ status hub::unsubscribe_all(subscriber_id id) noexcept {
     }
     for (auto& kv : sit->second.subscriptions) {
         impl_->remove_topic_subscriber(kv.first, id);
+        impl_->account_subscription_remove(kv.second);
     }
     if (sit->second.active != invalid_connection) {
         impl_->connections.erase(sit->second.active);
@@ -1028,23 +1111,16 @@ bool hub::poll_event(hub_event& out) noexcept {
 }
 
 hub_stats hub::stats() const noexcept {
+    // O(1): the four derived fields are maintained incrementally by
+    // queue_push_*/queue_pop_front/queue_erase/queue_clear and the
+    // subscription add/remove helpers. `active_connections` is the live size of
+    // the connection map. No subscriber or subscription is visited.
     hub_stats result = impl_->counters;
     result.active_connections = static_cast<u64>(impl_->connections.size());
-    result.active_subscriptions = 0;
-    result.active_queues = 0;
-    result.queued_messages = 0;
-    result.queued_bytes = 0;
-    for (const auto& kv : impl_->subscribers) {
-        for (const auto& skv : kv.second.subscriptions) {
-            ++result.active_subscriptions;
-            const subscription_state& sub = skv.second;
-            if (!sub.queue.empty()) {
-                ++result.active_queues;
-            }
-            result.queued_messages += static_cast<u64>(sub.queue.size());
-            result.queued_bytes += static_cast<u64>(sub.queued_bytes);
-        }
-    }
+    result.active_subscriptions = impl_->live_subscriptions;
+    result.active_queues = impl_->live_nonempty_queues;
+    result.queued_messages = impl_->live_queued_messages;
+    result.queued_bytes = impl_->live_queued_bytes;
     return result;
 }
 

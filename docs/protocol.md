@@ -2,7 +2,7 @@
 
 [简体中文](protocol.zh-CN.md) | **English**
 
-Version 1.0 / 2026-10-19
+Version 2.0 / 2026-10-24
 
 This document specifies the CRPC binary stream carried by TCP and by the in-process backend. The frame layout is derived from `include/crpc/frame.hpp` and `src/frame/frame.cpp`; the call envelope and response layout from the same header and from `src/rpc/client.cpp` / `src/rpc/dispatcher.cpp`. The HTTP/2 mapping is derived from `http2/*`. Where the design and the code differ, both are stated and the code is identified as current behaviour.
 
@@ -293,6 +293,8 @@ The header and `PING` vectors are asserted by `tests/test_frame.cpp`; envelope f
 
 `frame_decoder` accepts arbitrarily split chunks, including one byte at a time and several frames in one chunk. `feed()` copies input into an internal buffer; the caller's span need not outlive the call. `next()` returns `need_more`, `frame_ready` or `error`. In borrowing mode a payload points into the decoder buffer and is invalidated by the next `feed()`/`next()`; in copying mode it is copied into the caller's buffer and invalidated by the next `next()`, and an oversized payload is `resource_exhausted`.
 
+`feed_external()` is the zero-copy form of `feed()` for a caller-owned chunk. It borrows `data` and decodes complete frames straight out of it, so in borrowing mode a returned payload points into `data`; in copying mode the payload is still copied into the decoder's payload buffer. `data` must stay valid until `drain_external()` returns, and the usual shape is one `feed_external()`, a `next()` loop, then `drain_external()`, all inside the scope that owns `data`. `drain_external()` copies only the trailing bytes that do not complete a frame back into the internal buffer, so a later `feed()`/`feed_external()` completes them; the frame stream is the same `feed()` would produce, with the per-chunk copy removed, and ordering is preserved. If bytes are already buffered from an earlier partial frame, or a previous chunk was not drained, `feed_external()` falls back to the copying path of `feed()` and the frames borrow the internal buffer instead; calling `feed()` while an external chunk is active first drains it. After an error both calls are no-ops that only release the external state. The measured effect is recorded in [performance §2.4](performance.md#s2-4).
+
 The decoder never allocates for a payload whose header has not passed validation. It compacts only when the dead prefix is at least 4 KiB and at least half the buffer, to avoid quadratic copying. `decode_frame` requires the input size to equal the encoded size exactly; trailing bytes are a length mismatch. `decode_frame_header` validates only the header and leaves CRC to the payload-aware decoders. `decode_call_envelope` and `decode_response` borrow the body (and idempotency key) from the input; the views are valid only while the input is.
 
 ## 16. Session handshake <a id="s16"></a>
@@ -410,12 +412,12 @@ a dead connection. Subscriptions survive detach so a reconnect with the same
 `slow_subscriber` event is not emitted, and memory is bounded by the hub's
 per-subscription queues and their overflow policy instead.
 
-## 20. HTTP/1.1 Server-Sent Events (implemented subset) <a id="s20"></a>
+## 20. Server-Sent Events (implemented subset) <a id="s20"></a>
 
-This section is normative for the implemented SSE subset: HTTP/1.1, a single
-shard, in process. Long polling is specified in section 23; HTTP/2 SSE,
-cross-shard publish, authentication and `content_coding` are outside this
-subset. The framing helpers live in
+This section is normative for the implemented SSE subset: HTTP/1.1 and HTTP/2
+(h2c/h2), in process, with one or more shards. Long polling is specified in
+section 23; authentication and `content_coding` are outside this subset. The
+framing helpers live in
 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`; the server wiring lives in
 `src/http/server.cpp`.
 
@@ -426,21 +428,32 @@ override the registered route: `topic` (must be non-empty), `mode`
 (`reliable` or `unreliable`), `ordered` (`0`/`1` or `false`/`true`) and
 `subscriber` (a non-zero u64; a fresh id is allocated when absent). An optional
 `Last-Event-ID: <epoch>:<seq>` resumes a subscription. Routes are registered
-with `http_server::builder::add_sse_route()`. SSE requires
-`http_server_options::shards == 1`; `start()` fails with `failed_precondition`
-otherwise.
+with `http_server::builder::add_sse_route()`. The topic is routed to the hub of
+its owning shard (`push::topic_shard(topic, 0, shards)`), so `shards > 1` is
+supported: only the owning shard's hub holds the topic's subscriptions and
+queue.
 
 ### 20.2 Response and events
 
-The response is `200` with `Content-Type: text/event-stream; charset=utf-8`,
-`Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no` and
-`Transfer-Encoding: chunked` (there is no `Content-Length`; the response uses a
-hand-written head because `http::serialize` always appends the terminating
-chunk). Event frames are `id: <epoch>:<seq>\ndata: <payload>\n\n`. A payload
-that is not valid UTF-8 text is base64 encoded and marked `data: b64:<...>`;
-only binary events carry the `b64:` prefix. A comment-only heartbeat `:hb\n\n`
-is emitted every `sse_options::heartbeat` (default 15 s; zero disables). A
-configured `retry:` hint is sent once at the start.
+Over HTTP/1.1 the response is `200` with
+`Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache`,
+`Connection: keep-alive`, `X-Accel-Buffering: no` and `Transfer-Encoding:
+chunked` (there is no `Content-Length`; the response uses a hand-written head
+because `http::serialize` always appends the terminating chunk). Event frames
+are `id: <epoch>:<seq>\ndata: <payload>\n\n`. A payload that is not valid UTF-8
+text is base64 encoded and marked `data: b64:<...>`; only binary events carry
+the `b64:` prefix. A comment-only heartbeat `:hb\n\n` is emitted every
+`sse_options::heartbeat` (default 15 s; zero disables). A configured `retry:`
+hint is sent once at the start.
+
+Over HTTP/2 the same status and headers (minus the connection-specific
+`Connection` and `Transfer-Encoding`) are sent as a HEADERS frame with
+END_STREAM clear, and every event is a DATA frame on the same stream. END_STREAM
+is set only on the empty DATA frame that ends the stream (server shutdown); an
+event DATA frame never sets it. A header block larger than the peer's
+`SETTINGS_MAX_FRAME_SIZE` is split into HEADERS plus one or more CONTINUATION
+frames: only the frame that completes the block carries END_HEADERS (RFC 7540
+6.2). The HEADERS frame of a split block never sets END_HEADERS.
 
 ### 20.3 Delivery, backpressure and close
 
@@ -457,6 +470,16 @@ makes every drop decision, and `http_server::publish()` never blocks. Closing
 detaches from the hub before the transport and its token are destroyed; the
 terminating chunk is bound to the close, not emitted between events.
 
+Over HTTP/2 the staged bytes also include the connection's parked send queue, so
+the same bound applies to a zero-window peer: `WINDOW_UPDATE` resumes delivery
+and the periodic zero-window probe PING detects a dead peer (R18).
+
+Known limitation (shared with HTTP/1.1): the delivered high-water advances as
+soon as a frame is enqueued, even when only part of it is on the wire and the
+stream is reset before the parked remainder is flushed. A reconnect therefore
+does not replay that partially-written event. The h2 stall deadline and the RST
+path both close such a stream promptly, so the window is narrow.
+
 ### 20.4 Reconnect and replay
 
 A reconnect with the same `subscriber` reuses the existing subscription: the
@@ -467,10 +490,40 @@ unacknowledged reliable messages. A cursor whose epoch differs from the current
 server epoch is not acknowledged. The event id therefore carries both epoch and
 sequence, and a client must de-duplicate on the `(epoch, seq)` pair.
 
-### 20.5 HTTP/2
+### 20.5 Cross-shard routing and publish
 
-SSE is not implemented over HTTP/2 in this subset. A request whose path matches
-an SSE route is answered with a complete `501` response; no stream is opened.
+`http_server_options::shards > 1` runs one hub per shard. A topic is owned by
+exactly one hub: `push::topic_shard(topic, 0, shards)`. `http_server::publish`
+computes the owning shard and posts a task to that shard's runtime; the task
+takes the hub mutex, publishes to the owning hub, then wakes every session. A
+request on any shard (SSE or long polling) subscribes on the owning hub, so only
+that hub holds the topic's subscriptions and queue: every topic keeps a single
+writer. The shared hub mutex serializes a session's cross-shard `try_take` and
+the publish, and the wake is posted only after the publish completes, so
+ordering, backpressure and reliable replay are unchanged. The periodic long-poll
+TTL sweep calls `unsubscribe_all` on every hub so a subscriber that outlived its
+session on any shard is still reclaimed.
+
+### 20.6 HTTP/2 lifecycle
+
+A matching HTTP/2 request opens one stream and
+streams events as DATA frames; the connection stays usable, so other streams
+are unaffected. A `RST_STREAM` for the SSE stream detaches the hub subscription
+but keeps the connection; a peer reset, a write failure or `slow_timeout` ends
+the stream, and a server shutdown ends it with an empty END_STREAM DATA frame.
+A session owns one SSE stream, so a second SSE request on the same connection
+replaces the first and sends `RST_STREAM` (CANCEL) for the replaced stream: its
+connection record and any parked bytes are released instead of lingering until
+the connection closes.
+
+A single event whose frame is larger than the sum of the available stream window
+and `http_server_options::h2_max_send_queue_bytes` (default 1 MiB) can never be
+parked and fails the stream with `ENHANCE_YOUR_CALM`. The already-taken reliable
+event is not lost: the hub replay entry stays unacknowledged and `attach()`
+replays it on the next reconnect with the same `subscriber` (at-least-once). The
+fail-closed boundary is the hub's `subscribe_options::retransmit_budget`
+(default 3): once a permanently-oversize event has exhausted that many replay
+attempts the subscription is disconnected with `not_acknowledged`.
 
 ## 21. HTTP content coding (implemented subset) <a id="s21"></a>
 
@@ -606,13 +659,14 @@ over HTTP/2 (fail closed); no file is streamed.
 
 ## 23. HTTP/1.1 long polling (implemented subset) <a id="s23"></a>
 
-This section is normative for the implemented long-poll subset: HTTP/1.1, a
-single shard, in process. Routes are registered with
+This section is normative for the implemented long-poll subset: HTTP/1.1, in
+process, with one or more shards. Routes are registered with
 `http_server::builder::add_longpoll_route()`; the session state machine lives in
-`src/http/server.cpp`. Long polling requires
-`http_server_options::shards == 1`; a request on a multi-shard server is
-answered `503`. Long-poll paths, SSE paths and download paths are mutually
-exclusive (`start()` rejects a conflict). SSE behaviour is unchanged.
+`src/http/server.cpp`. The topic is routed to the hub of its owning shard
+(`push::topic_shard(topic, 0, shards)`), so a request on a multi-shard server is
+served by the owning shard's hub rather than answered `503`. Long-poll paths,
+SSE paths and download paths are mutually exclusive (`start()` rejects a
+conflict). SSE behaviour is unchanged.
 
 ### 23.1 Request and subscription identity
 
@@ -723,7 +777,7 @@ destroyed.
 
 | Dimension | SSE | Long polling |
 |---|---|---|
-| Framing | chunked `text/event-stream` events | one `Content-Length` raw body per `200` |
+| Framing | chunked `text/event-stream` events (HTTP/1.1); DATA frames (HTTP/2) | one `Content-Length` raw body per `200` |
 | Timeout | heartbeat comments; no 204 | `204`, no body |
 | ACK | reconnect `Last-Event-ID` | next poll cursor (cumulative) |
 | Connection ownership | dedicated stream, idle disabled | keep-alive, idle re-armed after each poll |

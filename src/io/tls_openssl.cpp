@@ -628,11 +628,13 @@ public:
                     return make_error_code(tls_errc::ssl_configuration_error);
                 }
                 if (cfg.verify == tls_verify_mode::peer) {
-                    if (SSL_set1_host(ssl_, hostname_.c_str()) != 1) {
+                    X509_VERIFY_PARAM* param = SSL_get0_param(ssl_);
+                    if (X509_VERIFY_PARAM_set1_host(param, hostname_.c_str(), 0) != 1) {
                         ERR_clear_error();
                         return make_error_code(tls_errc::ssl_configuration_error);
                     }
-                    SSL_set_hostflags(ssl_, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                    X509_VERIFY_PARAM_set_hostflags(
+                        param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
                 }
             }
 
@@ -703,6 +705,7 @@ public:
             if (state_ == state::failed || state_ == state::closed) {
                 return;
             }
+            eof_signaled_ = true;
             if (rbio_ != nullptr) {
                 // Make an empty memory BIO report EOF (0) instead of "retry".
                 // A truncated record still fails inside SSL_read, which is the
@@ -730,6 +733,8 @@ public:
         }
         bool immediate = false;
         io_result immediate_result{};
+        completion* canceled_write = nullptr;
+        io_result canceled_result{};
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ == state::failed) {
@@ -753,20 +758,19 @@ public:
                 immediate_result =
                     io_result{std::make_error_code(std::errc::value_too_large), 0};
             } else {
-                try {
-                    write_buffer_.assign(data.begin(), data.end());
-                    write_length_ = write_buffer_.size();
-                    write_offset_ = 0;
-                    write_completion_ = c;
-                } catch (const std::bad_alloc&) {
-                    write_buffer_.clear();
-                    write_length_ = 0;
-                    write_offset_ = 0;
-                    write_completion_ = nullptr;
-                    immediate = true;
-                    immediate_result =
-                        io_result{std::make_error_code(std::errc::not_enough_memory), 0};
-                }
+                // Borrow the caller's span. The common case completes the
+                // write synchronously inside drive() below, so no copy of the
+                // plaintext is needed. If the write parks (transport backlog,
+                // or SSL_write wants read/write), materialize_borrowed_locked()
+                // copies the unwritten remainder into write_buffer_ before
+                // push() returns, which is what preserves the "the caller may
+                // reuse the span afterwards" contract.
+                borrowed_plaintext_ = data;
+                write_buffer_.clear();
+                write_buffer_base_ = 0;
+                write_length_ = data.size();
+                write_offset_ = 0;
+                write_completion_ = c;
             }
         }
         if (immediate) {
@@ -774,6 +778,15 @@ public:
             return;
         }
         drive();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            materialize_borrowed_locked(canceled_write, canceled_result);
+        }
+        // The completion runs outside the lock: it is user code and must not be
+        // invoked while mutex_ is held (it may re-enter the stream).
+        if (canceled_write != nullptr) {
+            canceled_write->complete(canceled_result);
+        }
     }
 
     void bind_source(source* plaintext) noexcept {
@@ -800,6 +813,8 @@ public:
                 canceled = write_completion_;
                 write_completion_ = nullptr;
                 write_buffer_.clear();
+                write_buffer_base_ = 0;
+                borrowed_plaintext_ = span<const std::byte>();
                 write_length_ = 0;
                 write_offset_ = 0;
                 source_terminal_ = true;
@@ -810,6 +825,8 @@ public:
                 canceled = write_completion_;
                 write_completion_ = nullptr;
                 write_buffer_.clear();
+                write_buffer_base_ = 0;
+                borrowed_plaintext_ = span<const std::byte>();
                 write_length_ = 0;
                 write_offset_ = 0;
                 if (ssl_ != nullptr && established_ever_) {
@@ -946,7 +963,15 @@ private:
                         } else {
                             plaintext_pending_.clear();
                             plaintext_offset_ = 0;
-                            if (!app_paused_) {
+                            if (eof_signaled_ && bio_pending(rbio_) == 0) {
+                                // The transport reported EOF and the read BIO is
+                                // empty: a clean EOF. OpenSSL 3.x/4.x reports an
+                                // empty-BIO read as an unexpected EOF, so the
+                                // signal is classified here rather than from
+                                // SSL_get_error(); a record truncated mid-flight
+                                // still fails inside SSL_read below.
+                                state_ = state::closed;
+                            } else if (!app_paused_) {
                                 ERR_clear_error();
                                 const int result =
                                     SSL_read(ssl_, scratch_.data(),
@@ -1080,6 +1105,8 @@ private:
         if (write_length_ == 0) {
             completed = write_completion_;
             write_completion_ = nullptr;
+            borrowed_plaintext_ = span<const std::byte>();
+            write_buffer_base_ = 0;
             result = io_result{{}, 0};
             return;
         }
@@ -1096,9 +1123,20 @@ private:
 
         const std::size_t remaining = write_length_ - write_offset_;
         const std::size_t count = std::min(remaining, k_write_chunk);
+        // The plaintext is either the caller's borrowed span (the common
+        // synchronous case) or write_buffer_ once a parked write was
+        // materialised. In the materialised case write_buffer_ holds the bytes
+        // from write_buffer_base_ on, so the index into it is offset by the
+        // base; write_offset_/write_length_ keep describing the full accepted
+        // range so the completion still reports the original byte count.
+        const bool borrowed = !borrowed_plaintext_.empty();
+        const std::byte* const plaintext =
+            borrowed ? borrowed_plaintext_.data() : write_buffer_.data();
+        const std::size_t index =
+            borrowed ? write_offset_ : write_offset_ - write_buffer_base_;
         ERR_clear_error();
-        const int written = SSL_write(
-            ssl_, write_buffer_.data() + write_offset_, to_int_size(count));
+        const int written = SSL_write(ssl_, plaintext + index,
+                                      to_int_size(count));
         if (written == to_int_size(count)) {
             write_offset_ += count;
             if (write_offset_ == write_length_) {
@@ -1106,6 +1144,8 @@ private:
                 completed = write_completion_;
                 write_completion_ = nullptr;
                 write_buffer_.clear();
+                write_buffer_base_ = 0;
+                borrowed_plaintext_ = span<const std::byte>();
                 write_length_ = 0;
                 write_offset_ = 0;
                 result = io_result{{}, total};
@@ -1127,6 +1167,38 @@ private:
             }
         }
         drain_wbio_locked();
+    }
+
+    // Called at the end of push(), after drive(), while mutex_ is held. If the
+    // write parked with the caller's borrowed plaintext still active, copy the
+    // unwritten remainder into write_buffer_ so the borrowed span can be
+    // released when push() returns. A fully written or failed write has already
+    // cleared borrowed_plaintext_ in try_write_locked()/deliver_*().
+    //
+    // If the copy itself throws bad_alloc the write can no longer be completed
+    // later, so `canceled`/`result` receive the parked completion and its
+    // not_enough_memory result. The caller completes it after the lock is
+    // released, preserving the "push completes exactly once" contract.
+    void materialize_borrowed_locked(completion*& canceled,
+                                     io_result& result) noexcept {
+        if (borrowed_plaintext_.empty()) {
+            return;
+        }
+        if (write_completion_ != nullptr) {
+            try {
+                write_buffer_.assign(borrowed_plaintext_.data() + write_offset_,
+                                     borrowed_plaintext_.data() + write_length_);
+                write_buffer_base_ = write_offset_;
+            } catch (const std::bad_alloc&) {
+                canceled = write_completion_;
+                write_completion_ = nullptr;
+                result =
+                    io_result{std::make_error_code(std::errc::not_enough_memory),
+                              0};
+                fail_locked(std::make_error_code(std::errc::not_enough_memory));
+            }
+        }
+        borrowed_plaintext_ = span<const std::byte>();
     }
 
     void post_handshake_locked(std::error_code& ec) noexcept {
@@ -1207,6 +1279,8 @@ private:
             canceled = write_completion_;
             write_completion_ = nullptr;
             write_buffer_.clear();
+            write_buffer_base_ = 0;
+            borrowed_plaintext_ = span<const std::byte>();
             write_length_ = 0;
             write_offset_ = 0;
         }
@@ -1234,6 +1308,8 @@ private:
             canceled = write_completion_;
             write_completion_ = nullptr;
             write_buffer_.clear();
+            write_buffer_base_ = 0;
+            borrowed_plaintext_ = span<const std::byte>();
             write_length_ = 0;
             write_offset_ = 0;
         }
@@ -1382,11 +1458,21 @@ private:
     bool established_ever_ = false;
     bool session_reused_ = false;
     bool source_terminal_ = false;
+    // Set by on_eof(): the transport reported that the peer closed its side.
+    // A read that then finds the read BIO empty is a clean EOF, not a protocol
+    // error (OpenSSL 3.x/4.x reports an empty-BIO read as an unexpected EOF).
+    bool eof_signaled_ = false;
     std::error_code error_{};
 
     source* plaintext_ = nullptr;
 
     std::vector<std::byte> write_buffer_;
+    // Non-empty only while a push() is borrowing the caller's span and has not
+    // yet materialised it into write_buffer_; see push()/materialize_borrowed_locked().
+    span<const std::byte> borrowed_plaintext_;
+    // Offset of write_buffer_[0] within the accepted plaintext range once a
+    // parked borrowed write has been materialised; 0 otherwise.
+    std::size_t write_buffer_base_ = 0;
     std::size_t write_length_ = 0;
     std::size_t write_offset_ = 0;
     completion* write_completion_ = nullptr;

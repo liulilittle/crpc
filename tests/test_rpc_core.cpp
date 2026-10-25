@@ -6,8 +6,10 @@
 // background thread.
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -208,6 +210,97 @@ private:
     stalling_sink sink_;
     io::source* bound_ = nullptr;
     bool open_ = true;
+};
+
+// A backend whose sink captures writes and completes synchronously, while the
+// receive side is fed by the test itself from any thread through
+// `client::source()`. It models a production backend that delivers on a shard
+// thread different from the caller: a write never re-enters the reader, so the
+// reader and the writer are genuinely concurrent.
+class manual_connection final : public connection {
+public:
+    io::source& source() noexcept override { return dummy_; }
+    io::sink& sink() noexcept override { return sink_; }
+    void bind_source(io::source*) noexcept override {}
+    void resume_read() noexcept override {}
+    void close() noexcept override { open_ = false; }
+    [[nodiscard]] bool is_open() const noexcept override { return open_; }
+    [[nodiscard]] endpoint remote() const override { return endpoint::inproc("manual"); }
+
+    [[nodiscard]] std::size_t pushes() const noexcept { return sink_.pushes; }
+
+private:
+    class capture_sink final : public io::sink {
+    public:
+        void push(span<const std::byte> data, io::completion* c) noexcept override {
+            ++pushes;
+            // Report the whole span accepted, like the in-process backend: a
+            // short count would make flush_write re-push the tail forever.
+            c->complete(io::io_result{{}, data.size()});
+        }
+        std::size_t pushes = 0;
+    };
+
+    dummy_source dummy_;
+    capture_sink sink_;
+    bool open_ = true;
+};
+
+// Encodes a success RESPONSE frame carrying `body` for `stream_id`.
+std::vector<std::byte> make_response_bytes(u32 stream_id, const std::string& body) {
+    buffer payload;
+    (void)encode_response(
+        rpc_code::ok, rpc_error{},
+        span<const std::byte>(reinterpret_cast<const std::byte*>(body.data()), body.size()),
+        payload);
+    frame response;
+    response.header.type = frame_type::response;
+    response.header.stream_id = stream_id;
+    response.payload = payload.readable();
+    std::vector<std::byte> out(encoded_frame_size(response));
+    std::size_t written = 0;
+    (void)encode_frame(span<std::byte>(out.data(), out.size()), response, written);
+    out.resize(written);
+    return out;
+}
+
+// Hands request stream ids from the writer threads to the single responder
+// thread. Keeping exactly one reader preserves the backend contract while
+// letting many callers issue requests concurrently.
+class id_queue {
+public:
+    void push(u32 id) {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            ids_.push_back(id);
+        }
+        cv_.notify_one();
+    }
+
+    bool pop(u32& out) {
+        std::unique_lock<std::mutex> lk(mutex_);
+        cv_.wait(lk, [this] { return !ids_.empty() || done_; });
+        if (ids_.empty()) {
+            return false;
+        }
+        out = ids_.back();
+        ids_.pop_back();
+        return true;
+    }
+
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<u32> ids_;
+    bool done_ = false;
 };
 
 // A monotonic clock a test can advance.
@@ -708,6 +801,129 @@ CRPC_TEST(client_unreliable_one_way) {
     CRPC_CHECK(server.saw(frame_type::one_way));
 }
 
+// --- Concurrency (gap P2: one lock serialized the whole RPC path) ------------
+
+// A completion callback running on the reader thread must not block a caller
+// starting another request on a different thread. With a single recursive lock
+// for the whole path the callback holds it for its entire duration, so the
+// concurrent `start_call` cannot publish and the writer never finishes; the
+// test times out and fails. With the split locks the callback holds only the
+// completion lock, which `start_call` does not take.
+CRPC_TEST(client_slow_callback_does_not_block_start_call) {
+    auto conn = std::make_unique<manual_connection>();
+    client_options options;
+    options.slot_capacity = 32;
+    client c(std::move(conn), options);
+
+    std::atomic<bool> callback_entered{false};
+    std::atomic<bool> release_callback{false};
+    std::atomic<bool> writer_done{false};
+
+    const std::string body = "x";
+    auto started = c.start_call<std::string>(1, 1, bytes_of(body));
+    CRPC_CHECK(started.ok());
+    auto handle = std::move(started).value();
+    const u32 stream_id = handle.slot()->stream_id;
+
+    handle.then([&callback_entered, &release_callback](call<std::string>&) {
+        callback_entered.store(true, std::memory_order_release);
+        while (!release_callback.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    const std::vector<std::byte> response = make_response_bytes(stream_id, "r");
+    std::thread reader([&c, &response] {
+        (void)c.source().on_data(span<const std::byte>(response.data(), response.size()));
+    });
+
+    const auto enter_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!callback_entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < enter_deadline) {
+        std::this_thread::yield();
+    }
+    CRPC_CHECK(callback_entered.load(std::memory_order_acquire));
+
+    // Keep the second handle alive past the join: destroying it would detach
+    // under the completion lock, which the running callback holds.
+    std::unique_ptr<call<std::string>> second;
+    std::thread writer([&c, &body, &writer_done, &second] {
+        auto other = c.start_call<std::string>(1, 1, bytes_of(body));
+        if (other.ok()) {
+            second = std::make_unique<call<std::string>>(std::move(other).value());
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    const auto writer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!writer_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < writer_deadline) {
+        std::this_thread::yield();
+    }
+    const bool progressed = writer_done.load(std::memory_order_acquire);
+
+    release_callback.store(true, std::memory_order_release);
+    reader.join();
+    writer.join();
+    second.reset();
+
+    CRPC_CHECK(progressed);
+}
+
+// Many caller threads issuing round trips on one connection while a single
+// responder thread delivers the responses. Exercises the read/write/map split
+// under real contention; a lost wakeup, a UAF or a missed completion shows up
+// as a hang, a failed count or a sanitizer report.
+CRPC_TEST(client_multithreaded_round_trips) {
+    auto conn = std::make_unique<manual_connection>();
+    client_options options;
+    options.slot_capacity = 256;
+    client c(std::move(conn), options);
+
+    id_queue queue;
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+    constexpr int kTotal = kThreads * kPerThread;
+
+    std::thread responder([&c, &queue] {
+        u32 id = 0;
+        while (queue.pop(id)) {
+            const std::vector<std::byte> response = make_response_bytes(id, "ok");
+            (void)c.source().on_data(span<const std::byte>(response.data(), response.size()));
+        }
+    });
+
+    const std::string body = "payload";
+    std::atomic<int> completed{0};
+    std::vector<std::thread> writers;
+    writers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&c, &queue, &completed, &body] {
+            for (int i = 0; i < kPerThread; ++i) {
+                auto started = c.start_call<std::string>(1, 1, bytes_of(body));
+                if (!started.ok()) {
+                    continue;
+                }
+                auto handle = std::move(started).value();
+                queue.push(handle.slot()->stream_id);
+                const auto result_value = handle.get();
+                if (result_value.ok() && result_value.value() == "ok") {
+                    completed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    queue.finish();
+    responder.join();
+
+    CRPC_CHECK_EQ(kTotal, completed.load());
+    CRPC_CHECK_EQ(0u, c.in_flight());
+    CRPC_CHECK_EQ(0u, c.slots_in_use());
+}
+
 // --- Dispatcher --------------------------------------------------------------
 
 CRPC_TEST(dispatcher_unknown_service_and_method) {
@@ -942,6 +1158,109 @@ CRPC_TEST(client_slots_released_and_no_leak) {
         }
     }
     CRPC_CHECK_EQ(0u, c.slots_in_use());
+}
+
+// The low-level client's in-flight and deadline sets used to be `std::unordered_map`
+// and `std::multimap`, which allocated a node on every insert. They are now
+// fixed-capacity open-addressing containers (`stream_map`, `deadline_map`). This
+// locks their observable behaviour -- insert, lookup, ordered iteration, erase
+// with backward-shift, and growth past the initial capacity -- so a regression
+// to an allocating container is caught by the suite, not only by the benchmark.
+CRPC_TEST(client_call_maps_are_allocation_free_containers) {
+    stream_map flights;
+    flights.init(4);
+    CRPC_CHECK(flights.empty());
+    CRPC_CHECK(flights.size() == 0u);
+
+    call_slot slot_a;
+    call_slot slot_b;
+    flights.emplace(1, &slot_a);
+    flights.emplace(2, &slot_b);
+    CRPC_CHECK(flights.size() == 2u);
+    CRPC_CHECK(flights.find(1)->second == &slot_a);
+    CRPC_CHECK(flights.find(2)->second == &slot_b);
+    CRPC_CHECK(flights.find(3) == flights.end());
+
+    std::size_t seen = 0;
+    for (auto& entry : flights) {
+        CRPC_CHECK(entry.second == &slot_a || entry.second == &slot_b);
+        ++seen;
+    }
+    CRPC_CHECK(seen == 2u);
+
+    flights.erase(flights.find(1));
+    CRPC_CHECK(flights.size() == 1u);
+    CRPC_CHECK(flights.find(1) == flights.end());
+    CRPC_CHECK(flights.find(2)->second == &slot_b);
+    flights.erase(flights.find(2));
+    CRPC_CHECK(flights.empty());
+
+    // Growth: insert far past the initial capacity and look every key up.
+    for (u32 id = 10; id < 100; ++id) {
+        flights.emplace(id, &slot_a);
+    }
+    CRPC_CHECK(flights.size() == 90u);
+    for (u32 id = 10; id < 100; ++id) {
+        CRPC_CHECK(flights.find(id)->second == &slot_a);
+    }
+    // Erasing every key leaves the table empty and usable again.
+    for (u32 id = 10; id < 100; ++id) {
+        flights.erase(flights.find(id));
+    }
+    CRPC_CHECK(flights.empty());
+    flights.emplace(7, &slot_b);
+    CRPC_CHECK(flights.find(7)->second == &slot_b);
+
+    // Erase in a different order than insertion: the backward-shift repair must
+    // keep every surviving key reachable (this is the bug the benchmark caught).
+    stream_map order;
+    order.init(8);
+    for (u32 id = 1; id <= 64; ++id) {
+        order.emplace(id, &slot_a);
+    }
+    for (u32 id = 1; id <= 64; id += 2) {
+        order.erase(order.find(id));
+    }
+    for (u32 id = 2; id <= 64; id += 2) {
+        CRPC_CHECK(order.find(id)->second == &slot_a);
+    }
+    for (u32 id = 1; id <= 64; id += 2) {
+        CRPC_CHECK(order.find(id) == order.end());
+    }
+    CRPC_CHECK(order.size() == 32u);
+
+    deadline_map deadlines;
+    deadlines.init(4);
+    CRPC_CHECK(deadlines.empty());
+    const auto t0 = std::chrono::steady_clock::time_point{};
+    deadlines.emplace(t0, &slot_a);
+    deadlines.emplace(t0, &slot_b);
+    deadlines.emplace(t0 + std::chrono::milliseconds(1), &slot_a);
+    CRPC_CHECK(deadlines.size() == 3u);
+    const auto range = deadlines.equal_range(t0);
+    std::size_t same_key = 0;
+    bool saw_a = false;
+    bool saw_b = false;
+    for (auto it = range.first; it != range.second; ++it) {
+        ++same_key;
+        if (it->second == &slot_a) {
+            saw_a = true;
+        }
+        if (it->second == &slot_b) {
+            saw_b = true;
+        }
+    }
+    CRPC_CHECK(same_key == 2u);
+    CRPC_CHECK(saw_a && saw_b);
+    // Iteration is ordered by deadline, so the earliest entry comes first.
+    CRPC_CHECK(deadlines.begin()->first == t0);
+    // Erasing through the range keeps the range end valid, as with a multimap.
+    for (auto it = range.first; it != range.second;) {
+        it = deadlines.erase(it);
+    }
+    CRPC_CHECK(deadlines.size() == 1u);
+    CRPC_CHECK(deadlines.begin()->first == t0 + std::chrono::milliseconds(1));
+    CRPC_CHECK(deadlines.begin()->second == &slot_a);
 }
 
 } // namespace

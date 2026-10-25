@@ -960,4 +960,134 @@ CRPC_TEST(stream_shapes_state_machine) {
                   code_id(rpc_code::canceled));
 }
 
+// `stats()` is O(1): the four derived fields are maintained incrementally at
+// every mutation point. This case drives each path and compares the aggregates
+// against the value that a full scan of the subscription table would produce.
+// A missed mutation point (an unaccounted push/pop/erase/clear/subscribe/
+// unsubscribe) shows up here as a wrong count.
+CRPC_TEST(hub_stats_aggregates_track_every_mutation) {
+    hub h;
+    subscribe_options opts;
+    opts.max_messages = 2;
+    opts.on_overflow = overflow_policy::drop_oldest;
+
+    // --- A: push_back, overflow pop, ack erase, take pop -------------------
+    CRPC_CHECK(h.subscribe("a", 1, delivery_mode::reliable, false, opts).ok());
+    const hub::connection_id c1 = h.attach(1);
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(0));
+
+    h.publish("a", as_bytes("1234"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(4));
+
+    h.publish("a", as_bytes("5678"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(8));
+
+    // Overflow drop_oldest pops the front: the count stays bounded.
+    h.publish("a", as_bytes("9012"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(8));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(1));
+
+    // Cumulative ack erases the queued reliable run.
+    CRPC_CHECK(h.ack(1, "a", 3).ok());
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(0));
+
+    // take pops the front.
+    h.publish("a", as_bytes("pq"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(2));
+    push_message taken;
+    CRPC_CHECK(h.try_take(c1, std::string_view("a"), taken));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(0));
+
+    // --- B: front replay push_front ----------------------------------------
+    // Two unacknowledged entries survive a detach in the replay window and are
+    // re-queued at the front by attach(front).
+    h.publish("a", as_bytes("pq"), delivery_mode::reliable); // seq 5, unacked
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(2));
+    CRPC_CHECK(h.detach(c1).ok());
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(0));
+    const hub::connection_id c1b = h.attach(1, attach_replay::front);
+    CRPC_CHECK(c1b != hub::invalid_connection);
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(4));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(1));
+
+    // --- C: detach clears, release keeps -----------------------------------
+    CRPC_CHECK(h.subscribe("b", 2, delivery_mode::reliable, false, opts).ok());
+    const hub::connection_id c2 = h.attach(2);
+    h.publish("b", as_bytes("xyz"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(3));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(7));
+    CRPC_CHECK(h.detach(c2).ok());
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(4));
+    const hub::connection_id c2b = h.attach(2, attach_replay::none);
+    h.publish("b", as_bytes("abc"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(3));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(7));
+    CRPC_CHECK(h.release(c2b).ok());
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(3));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(7));
+
+    // --- D: unsubscribe ------------------------------------------------------
+    CRPC_CHECK(h.unsubscribe("b", 2).ok());
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(4));
+    CRPC_CHECK(h.unsubscribe("a", 1).ok());
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(h.stats().queued_bytes, static_cast<u64>(0));
+
+    // --- E: ordered gap clear_queue, unsubscribe_all ------------------------
+    CRPC_CHECK(h.subscribe("g", 7, delivery_mode::reliable, true, opts).ok());
+    CRPC_CHECK(h.subscribe("h", 9, delivery_mode::reliable, false, opts).ok());
+    publish_options first;
+    first.has_topic_seq = true;
+    first.topic_seq = 1;
+    h.publish("g", as_bytes("one"), delivery_mode::reliable, first);
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(2));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(1));
+    publish_options gap;
+    gap.has_topic_seq = true;
+    gap.topic_seq = 3;
+    h.publish("g", as_bytes("two"), delivery_mode::reliable, gap);
+    // The gap cleared "g"'s queue, then the new message was queued.
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().active_queues, static_cast<u64>(1));
+    CRPC_CHECK(h.unsubscribe_all(7).ok());
+    CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK_EQ(h.stats().queued_messages, static_cast<u64>(0));
+
+    // --- F: disconnect_subscriber ------------------------------------------
+    hub d;
+    subscribe_options drop;
+    drop.max_messages = 1;
+    drop.on_overflow = overflow_policy::disconnect_subscriber;
+    CRPC_CHECK(d.subscribe("d", 8, delivery_mode::reliable, false, drop).ok());
+    const hub::connection_id c8 = d.attach(8);
+    CRPC_CHECK(c8 != hub::invalid_connection);
+    d.publish("d", as_bytes("1"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(d.stats().active_subscriptions, static_cast<u64>(1));
+    CRPC_CHECK_EQ(d.stats().queued_messages, static_cast<u64>(1));
+    d.publish("d", as_bytes("2"), delivery_mode::reliable);
+    CRPC_CHECK_EQ(d.stats().active_subscriptions, static_cast<u64>(0));
+    CRPC_CHECK_EQ(d.stats().active_queues, static_cast<u64>(0));
+    CRPC_CHECK_EQ(d.stats().queued_messages, static_cast<u64>(0));
+    CRPC_CHECK_EQ(d.stats().queued_bytes, static_cast<u64>(0));
+}
+
 CRPC_TEST_MAIN()

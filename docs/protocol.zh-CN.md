@@ -2,7 +2,7 @@
 
 [English](protocol.md) | **简体中文**
 
-版本 1.0 / 2026-10-19
+版本 2.0 / 2026-10-24
 
 本文规定 TCP 与进程内后端承载的 CRPC 二进制流。帧布局取自 `include/crpc/frame.hpp` 与 `src/frame/frame.cpp`；调用信封与响应布局取自同一个头文件以及 `src/rpc/client.cpp` / `src/rpc/dispatcher.cpp`。HTTP/2 映射取自 `http2/*`。设计规格与代码不一致时，两者都会写明，并注明代码是当前行为。
 
@@ -290,6 +290,8 @@ decode: (u >> 1) ^ (~(u & 1) + 1)
 
 `frame_decoder` 接受任意切分的块，包括逐字节输入和一块多帧。`feed()` 把输入复制到内部缓冲区；调用方的 span 不必活过本次调用。`next()` 返回 `need_more`、`frame_ready` 或 `error`。借用模式下负载指向解码器缓冲区，下一次 `feed()`/`next()` 后失效；复制模式下负载被复制到调用方缓冲区，下一次 `next()` 后失效，超长负载返回 `resource_exhausted`。
 
+`feed_external()` 是 `feed()` 针对调用方自有块的零拷贝形式。它借用 `data` 并直接从中解码完整帧，因此在借用模式下返回的负载指向 `data`；在复制模式下负载仍被复制到解码器的负载缓冲区。`data` 必须一直有效到 `drain_external()` 返回，常见形态是在持有 `data` 的作用域内依次调用一次 `feed_external()`、一个 `next()` 循环、再一次 `drain_external()`。`drain_external()` 只把未完成一帧的尾部字节复制回内部缓冲区，因此后续 `feed()`/`feed_external()` 会补全它们；产生的帧流与 `feed()` 完全相同，只是去掉了每块一次的拷贝，且顺序保持不变。若已有来自更早部分帧的字节被缓冲，或上一个块未 drain，`feed_external()` 回退到 `feed()` 的复制路径，帧改为借用内部缓冲区；在外部块仍活跃时调用 `feed()` 会先将其 drain。出错后两者都是仅释放外部状态的空操作。实测效果记录在 [performance §2.4](performance.zh-CN.md#s2-4)。
+
 解码器不会为头部尚未通过校验的负载分配内存。只有当死前缀至少 4 KiB 且至少占缓冲区一半时才压缩，避免二次复制。`decode_frame` 要求输入大小恰好等于编码大小；尾随字节是长度不匹配。`decode_frame_header` 只校验头部，CRC 留给能访问负载的解码器。`decode_call_envelope` 与 `decode_response` 借用输入中的正文（以及幂等键）；视图只在输入有效期间有效。
 
 ## 16. 会话握手 <a id="s16"></a>
@@ -378,29 +380,41 @@ HTTP 服务端门面（`http/server.hpp`）自行实现 HTTP/1.1、h2c 与 h2 �
 
 本子集未接 `hub::tick` 的慢订阅检测：不产生 `slow_subscriber` 事件，内存由 hub 的每订阅有界队列及其溢出策略兜底。
 
-## 20. HTTP/1.1 Server-Sent Events（已实现子集） <a id="s20"></a>
+## 20. Server-Sent Events（已实现子集） <a id="s20"></a>
 
-本节对已实现的 SSE 子集具有规范效力：HTTP/1.1、单分片、进程内。长轮询见第 23 节；HTTP/2 SSE、跨分片发布、鉴权与 `content_coding` 不属于本子集。分帧辅助位于 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`；服务端接线位于 `src/http/server.cpp`。
+本节对已实现的 SSE 子集具有规范效力：HTTP/1.1 与 HTTP/2（h2c/h2）、进程内，支持单分片或多分片。长轮询见第 23 节；鉴权与 `content_coding` 不属于本子集。分帧辅助位于 `include/crpc/http/sse.hpp` / `src/http/sse.cpp`；服务端接线位于 `src/http/server.cpp`。
 
 ### 20.1 请求
 
-`GET <sse-path>`；`Accept: text/event-stream` 可选。查询参数覆盖已注册路由：`topic`（必须非空）、`mode`（`reliable` 或 `unreliable`）、`ordered`（`0`/`1` 或 `false`/`true`）与 `subscriber`（非零 u64；缺省时分配新 id）。可选的 `Last-Event-ID: <epoch>:<seq>` 用于续订。路由通过 `http_server::builder::add_sse_route()` 注册。SSE 要求 `http_server_options::shards == 1`，否则 `start()` 以 `failed_precondition` 失败。
+`GET <sse-path>`；`Accept: text/event-stream` 可选。查询参数覆盖已注册路由：`topic`（必须非空）、`mode`（`reliable` 或 `unreliable`）、`ordered`（`0`/`1` 或 `false`/`true`）与 `subscriber`（非零 u64；缺省时分配新 id）。可选的 `Last-Event-ID: <epoch>:<seq>` 用于续订。路由通过 `http_server::builder::add_sse_route()` 注册。主题按 `push::topic_shard(topic, 0, shards)` 路由到其所属分片的 hub，因此支持 `shards > 1`：仅属主分片的 hub 持有该主题的订阅与队列。
 
 ### 20.2 响应与事件
 
-响应为 `200`，携带 `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no` 与 `Transfer-Encoding: chunked`（没有 `Content-Length`；响应头为手写，因为 `http::serialize` 总会追加终止块）。事件帧为 `id: <epoch>:<seq>\ndata: <payload>\n\n`。非合法 UTF-8 文本的负载会做 base64 编码并标记为 `data: b64:<...>`；只有二进制事件带 `b64:` 前缀。每 `sse_options::heartbeat`（默认 15 秒，0 关闭）发送一次注释心跳 `:hb\n\n`。配置的 `retry:` 提示仅在开头发送一次。
+在 HTTP/1.1 上，响应为 `200`，携带 `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no` 与 `Transfer-Encoding: chunked`（没有 `Content-Length`；响应头为手写，因为 `http::serialize` 总会追加终止块）。事件帧为 `id: <epoch>:<seq>\ndata: <payload>\n\n`。非合法 UTF-8 文本的负载会做 base64 编码并标记为 `data: b64:<...>`；只有二进制事件带 `b64:` 前缀。每 `sse_options::heartbeat`（默认 15 秒，0 关闭）发送一次注释心跳 `:hb\n\n`。配置的 `retry:` 提示仅在开头发送一次。
+
+在 HTTP/2 上，相同的响应状态与头部（去掉连接相关的 `Connection` 与 `Transfer-Encoding`）以 END_STREAM 未置位的 HEADERS 帧发送，之后每个事件是同一流上的 DATA 帧。END_STREAM 仅在结束流的空 DATA 帧（服务关闭）上置位；事件 DATA 帧永不置位。大于对端 `SETTINGS_MAX_FRAME_SIZE` 的头部块会拆分为 HEADERS 加一条或多条 CONTINUATION：只有完成该块的帧才携带 END_HEADERS（RFC 7540 6.2）；被拆分的 HEADERS 帧绝不置位 END_HEADERS。
 
 ### 20.3 投递、背压与关闭
 
 已打开的 SSE 响应独占其连接：不使用 HTTP/1.1 流水线，且禁用 idle 截止时间。存活检测来自心跳写（写失败即关闭会话）以及 `sse_options::slow_timeout`：当暂存输出非空而对端停止排空时关闭。暂存输出（写队列加在途写）由 `sse_options::egress_cap_bytes` 限制（默认取 `http_server_options::egress_cap_bytes`，1 MiB）。达到上限时泵停止调用 `try_take`，并把已取出的消息停靠（而非丢弃）；所有丢弃决策由 hub 的 `subscribe_options`（`max_messages`、`max_bytes`、`overflow_policy`）作出，`http_server::publish()` 永不阻塞。关闭时必须在传输与其令牌被销毁之前先从 hub detach；终止块与关闭绑定，不在事件之间发送。
 
+在 HTTP/2 上，暂存字节还包括连接停靠的发送队列，因此同一上限同样约束零窗口对端：`WINDOW_UPDATE` 恢复投递，周期性零窗口探测 PING 检测死对端（R18）。
+
+已知限制（与 HTTP/1.1 相同）：已交付高水位在帧入队时即推进，即使只有部分字节上线、且流在停靠余量被排空前被重置。因此重连不会重放该部分写入的事件。h2 停滞截止时间与 RST 路径都会迅速关闭这种流，因此窗口很窄。
+
 ### 20.4 重连与重放
 
 以同一 `subscriber` 重连会复用既有订阅：服务端绝不重复订阅。服务端把 `Last-Event-ID` 序号 clamp 到它为该 (subscriber, topic) 已交付过的最高序号，然后调用 `hub.ack(cursor)`（累积）与 `hub.attach()`，后者重放未确认的可靠消息。epoch 与当前服务端 epoch 不一致的游标不会被确认。因此事件 id 同时携带 epoch 与序号，客户端必须以 `(epoch, seq)` 去重。
 
-### 20.5 HTTP/2
+### 20.5 跨分片路由与发布
 
-本子集不支持 HTTP/2 SSE。命中 SSE 路由的请求会收到一个完整的 `501` 响应，不会打开流。
+`http_server_options::shards > 1` 时每个分片运行一个 hub。一个主题恰属一个 hub：`push::topic_shard(topic, 0, shards)`。`http_server::publish` 计算属主分片并向该分片的 runtime 投递任务；任务持有 hub 互斥锁、向属主 hub 发布，然后唤醒所有会话。任意分片上的请求（SSE 或长轮询）都在属主 hub 上订阅，因此仅该 hub 持有主题的订阅与队列：每个主题保持单一写者。共享的 hub 互斥锁串行化会话的跨分片 `try_take` 与发布，且唤醒仅在发布完成后投递，因此顺序、背压与可靠重放不变。周期性长轮询 TTL 清扫对每个 hub 调用 `unsubscribe_all`，因此在任一分片上超出会话存活期的订阅仍会被回收。
+
+### 20.6 HTTP/2 生命周期
+
+命中 SSE 路由的 HTTP/2 请求打开一条流，事件以 DATA 帧流式发送；连接本身仍可复用，其他流不受影响。对 SSE 流的 `RST_STREAM` 会 detach hub 订阅但保留连接；对端重置、写失败或 `slow_timeout` 结束该流；服务关闭以带 END_STREAM 的空 DATA 帧结束该流。一个会话只占用一条 SSE 流，因此同一连接上的第二个 SSE 请求会替换第一条，并向被替换的流发送 `RST_STREAM`（CANCEL）：其连接记录与停靠字节被释放，而不是滞留到连接关闭。
+
+单条事件的帧若大于可用流窗口与 `http_server_options::h2_max_send_queue_bytes`（默认 1 MiB）之和，则永远无法停靠，流以 `ENHANCE_YOUR_CALM` 失败。已取出的可靠事件不会丢失：hub 重放条目保持未确认，`attach()` 会在以同一 `subscriber` 的下次重连时重放它（至少一次）。失败封闭边界是 hub 的 `subscribe_options::retransmit_budget`（默认 3）：永久超限的事件耗尽这么多次重放尝试后，订阅会以 `not_acknowledged` 断开。
 
 ## 21. HTTP 内容编码（已实现子集） <a id="s21"></a>
 
@@ -463,7 +477,7 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 
 ## 23. HTTP/1.1 长轮询（已实现子集） <a id="s23"></a>
 
-本节对已实现的长轮询子集具有规范效力：HTTP/1.1、单分片、进程内。路由通过 `http_server::builder::add_longpoll_route()` 注册；会话状态机位于 `src/http/server.cpp`。长轮询要求 `http_server_options::shards == 1`；多分片服务器上的请求返回 `503`。长轮询、SSE 与下载三组路径互斥（`start()` 拒绝冲突）。SSE 行为不变。
+本节对已实现的长轮询子集具有规范效力：HTTP/1.1、进程内，支持单分片或多分片。路由通过 `http_server::builder::add_longpoll_route()` 注册；会话状态机位于 `src/http/server.cpp`。主题按 `push::topic_shard(topic, 0, shards)` 路由到其所属分片的 hub，因此多分片服务器上的请求由属主分片的 hub 服务，而非返回 `503`。长轮询、SSE 与下载三组路径互斥（`start()` 拒绝冲突）。SSE 行为不变。
 
 ### 23.1 请求与订阅标识
 
@@ -503,7 +517,7 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 
 | 维度 | SSE | 长轮询 |
 |---|---|---|
-| 分帧 | chunked `text/event-stream` 事件 | 每个 `200` 一条带 `Content-Length` 的原始 body |
+| 分帧 | HTTP/1.1 上 chunked `text/event-stream` 事件；HTTP/2 上 DATA 帧 | 每个 `200` 一条带 `Content-Length` 的原始 body |
 | 超时 | 注释心跳；无 204 | `204`，无 body |
 | ACK | 重连 `Last-Event-ID` | 下一次 poll 游标（累积） |
 | 连接归属 | 独占流，禁用 idle | keep-alive，每次 poll 后重新武装 idle |

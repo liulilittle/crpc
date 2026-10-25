@@ -19,16 +19,16 @@
 //    listed in stage_kind so the next slice can convert them without inventing
 //    a second vocabulary:
 //      - the per-connection flood bucket (server.cpp submit(), `if (rate)`,
-//        1358) -- see connection_rate;
+//        1426) -- see connection_rate;
 //      - the per-connection in-flight cap (server.cpp submit(),
-//        `per_connection_inflight`, 1383);
+//        `per_connection_inflight`, 1451);
 //      - the client connection pool capacity (client_facade.cpp acquire_slot,
 //        `"connection pool is saturated"` / `"connection pool is exhausted"`,
-//        787/793). It HAS a stage name (pool_capacity, this file, 128), so it
+//        1122/1128). It HAS a stage name (pool_capacity, this file, 128), so it
 //        is "named but not converted", unlike the entry below, which has no
 //        stage at all;
 //      - `cannot track endpoint candidates` (client_facade.cpp begin_attempt,
-//        `tried.reset(pool_count)`, 495-505): PENDING, no stage yet.
+//        `tried.reset(pool_count)`, 829-839): PENDING, no stage yet.
 //        It is an allocation failure, not an admission decision, and it is
 //        deliberately not retried.
 // 2. The rate stages are the ONLY stages whose code depends on the deadline.
@@ -40,42 +40,42 @@
 // 3. A probe does NOT bypass every stage. It bypasses per-endpoint /
 //    per-service rate and bulkhead, but the per-service in-flight cap still
 //    applies (server.cpp handle_request(), `if (!enter_service_cap(*guard))`,
-//    1063, sits outside the `if (opt.resilience_enabled && !probe)`
-//    guard at 995). Never write "probes skip admission".
+//    1293, sits outside the `if (opt.resilience_enabled && !probe)`
+//    guard at 1215). Never write "probes skip admission".
 // 4. Refactoring a rejection branch is NOT a no-op. Four fields drift
 //    silently if the branch is collapsed:
 //      a. rpc_error::retryable -- send_error() sets it from is_retryable()
-//         (server.cpp, `error.retryable = is_retryable(code)`, 874).
+//         (server.cpp, `error.retryable = is_retryable(code)`, 1065).
 //      b. rpc_error::retry_after -- the bulkhead falls back to
 //         overload_retry_after when the permit carries 0 (server.cpp,
 //         `bulkhead_permit.retry_after().count() > 0
 //              ? bulkhead_permit.retry_after() : opt.overload_retry_after`,
-//         1049-1052).
+//         1275-1277).
 //      c. the per-stage statistics counter -- rate_limited_service,
 //         deadline_rejected, bulkhead_rejected, rejected and breaker_open are
 //         five DIFFERENT counters with different meanings (server.cpp,
-//         1020,1022,1047,1065,975).
+//         1240,1242,1272,1295,1191).
 //      d. the error message text -- seven distinct strings (server.cpp,
 //         "rate limit exceeded"/"overloaded" in the forced-error path,
-//         890-891; "service circuit breaker is open":980;
-//         "service rate limit cannot meet the deadline":1029;
-//         "service rate limit reached":1037; "service bulkhead is full":1056;
-//         "service concurrency limit reached":1071).
+//         1106-1107; "service circuit breaker is open":1196;
+//         "service rate limit cannot meet the deadline":1249;
+//         "service rate limit reached":1257; "service bulkhead is full":1281;
+//         "service concurrency limit reached":1301).
 //    S1 acceptance therefore compares code + retryable + retry_after +
 //    message + counter delta, field by field.
 // 5. A one-way request has no response frame (server.cpp handle_request(),
-//    `wants_response = job.header.type != frame_type::one_way`, 885;
+//    `wants_response = job.header.type != frame_type::one_way`, 934;
 //    every send_error() call site is inside `if (wants_response)`). It can
 //    never be degraded and can never carry crpc-degradable, so
 //    fallback_eligible() rejects `one_way` unconditionally.
 // 6. Four admission refusals DO write the reserved `crpc-degradable: true`
 //    response meta entry, and only when the request still has at least
 //    min_remaining_ns of wire deadline left:
-//      - the per-service breaker (`!permit.allowed()`, send_error at 1005);
-//      - the per-service rate bucket, success exit (send_error at 1065);
-//      - the per-service bulkhead (send_error at 1090);
-//      - the per-service in-flight cap (send_error at 1109).
-//    The rate bucket's OTHER exit -- deadline not met (send_error at 1054) --
+//      - the per-service breaker (`!permit.allowed()`, send_error at 1195);
+//      - the per-service rate bucket, success exit (send_error at 1255);
+//      - the per-service bulkhead (send_error at 1280);
+//      - the per-service in-flight cap (send_error at 1299).
+//    The rate bucket's OTHER exit -- deadline not met (send_error at 1244) --
 //    never sets it: a deadline miss is not degradable (fallback_eligible()
 //    rejects deadline_exceeded first). The connection-level flood bucket and
 //    the per-connection cap (both reach send_error() through the forced-error
@@ -110,6 +110,15 @@ namespace crpc::resilience {
 // marker for it, because a fallback value could not be delivered before the
 // caller's deadline either. Both readers share this constant; a second literal
 // would be a second deadline policy.
+//
+// This is the single authority for the server's admission floor. The client has
+// no equivalent floor on purpose: `client.cpp` and `client_facade.cpp` only ask
+// whether the call has already expired locally, which is a different question.
+// A future client-side "give up early" floor MUST reuse this constant rather
+// than add a second 1'000'000 or 1ms literal. `fallback_policy::min_remaining`
+// is a different, caller-configured floor ("is the degraded value still
+// deliverable"); `set_fallback` defaults it to this constant, never to a
+// literal. See docs/abi.md section 4.
 inline constexpr u64 min_remaining_ns = 1'000'000;
 
 // Where a request was refused. The names follow the real branches in
@@ -119,39 +128,39 @@ enum class stage_kind : u8 {
     // Per-connection token bucket, before any job allocation. Load shedding:
     // the bucket exists to avoid the work of a full request, so answering with
     // a fallback value would defeat it (server.cpp submit(), `if (rate)`,
-    // 1358).
+    // 1614).
     connection_rate,
     // Per-service token bucket. Two outcomes, see reject_code()
-    // (server.cpp handle_request(), `if (guard->rate)`, 996).
+    // (server.cpp handle_request(), `if (guard->rate)`, 1216).
     service_rate,
     // Per-service bounded concurrency (server.cpp handle_request(),
-    // `if (guard->bulkhead)`, 1043).
+    // `if (guard->bulkhead)`, 1268).
     service_bulkhead,
     // Per-service in-flight cap. Applies to probes too (server.cpp
-    // handle_request(), `if (!enter_service_cap(*guard))`, 1063).
+    // handle_request(), `if (!enter_service_cap(*guard))`, 1293).
     service_capacity,
     // Per-endpoint token bucket on the client (client_facade.cpp
-    // begin_attempt(), `if (pool.rate.has_value())`, 616).
+    // begin_attempt(), `if (pool.rate.has_value())`, 950).
     // Two outcomes, exactly like service_rate.
     endpoint_rate,
     // Per-endpoint bounded concurrency on the client (client_facade.cpp
-    // begin_attempt(), `if (pool.bulkhead.has_value())`, 646).
+    // begin_attempt(), `if (pool.bulkhead.has_value())`, 980).
     endpoint_bulkhead,
     // Endpoint / service circuit breaker (server.cpp
-    // `permit = guard->breaker->allow()`, 973; client_facade.cpp
-    // `pools[index]->breaker.allow()`, 541).
+    // `permit = guard->breaker->allow()`, 1022; client_facade.cpp
+    // `pools[index]->breaker.allow()`, 875).
     breaker,
     // Client-local: no usable endpoint was selected. This is a PRE-SEND
     // failure; the request never left the process (client_facade.cpp
-    // `failure = rpc_error(..., "no usable endpoint")`, 579, and
-    // `"no endpoint configured"`, 478).
+    // `failure = rpc_error(..., "no usable endpoint")`, 913, and
+    // `"no endpoint configured"`, 812).
     dispatch,
     // The caller's deadline elapsed before the attempt started
-    // (client_facade.cpp `"deadline already passed"`, 465).
+    // (client_facade.cpp `"deadline already passed"`, 799).
     deadline,
     // Client-local capacity: the connection pool is saturated or exhausted
     // (client_facade.cpp `"connection pool is saturated"` / `"exhausted"`,
-    // 788,794). Named after the resource, not after
+    // 1122,1128). Named after the resource, not after
     // `client_detail::failure_origin::local_gate`, which also covers the
     // client rate and bulkhead rejections and therefore means something else.
     pool_capacity
@@ -160,8 +169,8 @@ enum class stage_kind : u8 {
 // The three admission outcomes. RESERVED: no stage consumes this type yet. S1
 // and S2 must not change any control flow based on it -- probe semantics are
 // already expressed structurally by the `!probe` guard (server.cpp,
-// 995) and by the position of the per-service cap outside it
-// (1063). The type exists only so a future slice does not have to
+// 1048) and by the position of the per-service cap outside it
+// (1126). The type exists only so a future slice does not have to
 // invent a second vocabulary; `probe_bypass` means "the half-open probe is
 // allowed past THIS stage", never a global pass.
 enum class admission_decision : u8 { admit, reject, probe_bypass };
@@ -229,7 +238,7 @@ enum class admission_decision : u8 { admit, reject, probe_bypass };
     case stage_kind::endpoint_bulkhead:
     case stage_kind::service_capacity:
         // `service_capacity` answers `overload` and nothing else; the only
-        // producer is the per-service cap (server.cpp, 1063).
+        // producer is the per-service cap (server.cpp, 1126).
         return code == rpc_code::overload;
     case stage_kind::service_rate:
     case stage_kind::endpoint_rate:

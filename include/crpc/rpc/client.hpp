@@ -9,11 +9,41 @@
 // The client does not spawn any thread. It runs on whatever thread drives the
 // backend: the in-process backend delivers `source::on_data` synchronously on
 // the pushing thread, and a production backend delivers on its shard thread.
-// The write loop (`start_request`/`flush_write`) may run on a caller thread
-// while a sink completion runs on the backend thread, so the mutating entry
-// points are serialized by a recursive lock (A-4). The lock is recursive
-// because a synchronous backend completes `push` inside `flush_write` and the
-// completion re-enters `flush_write`.
+//
+// A single recursive lock used to serialize the whole path, so a reader
+// delivering a response and a caller starting a request could never make
+// progress at the same time, and a slow completion callback stalled every
+// writer for its whole duration. The path is now split across four locks:
+//
+//   * `read_mutex_` (recursive) -- the inbound drain (`decoder_` and the
+//     re-entrancy flag). Held for a whole drain so a frame's payload stays
+//     valid while it is handled. Recursive because a synchronous backend
+//     re-enters `on_data` from inside `flush_write` on the same thread.
+//   * `write_mutex_` (recursive) -- the writer state (`out_`, the scratch
+//     buffers, `conn_`) and the write loop. Recursive because a synchronous
+//     sink completes `push` inside `flush_write`.
+//   * `map_mutex_` -- the in-flight/deadline maps, the stream and call
+//     counters, the PUSH sink, and the `closed_` transition.
+//   * `completion_mutex_` (recursive) -- serializes the terminal completion
+//     against a handle's detach/recycle. It is held from before the terminal
+//     claim until after the callback returns, so a handle destructor can never
+//     free a slot a completion is still touching (CF-1).
+//
+// Invariants that keep the four from deadlocking:
+//   * `map_mutex_` is innermost: it is never held while taking another client
+//     lock.
+//   * `completion_mutex_` is never held while taking `write_mutex_` (the cancel
+//     RST and the transport close run after it is released), so a writer that
+//     re-enters the reader under `write_mutex_` cannot invert against a
+//     completion.
+//   * `read_mutex_` and `write_mutex_` may nest in either order, but only on
+//     the synchronous in-process path; the backend serializes source callbacks
+//     per connection (I8), so at most one thread is ever inside a drain and
+//     the two orders never interleave across threads.
+//
+// The completion callback runs under `completion_mutex_` with `map_mutex_`
+// released, so a slow callback blocks other completions and a handle detach,
+// but never a writer or the reader's own frame drain.
 //
 // `get()` blocks the calling thread on a condition variable until the terminal
 // state. On the single-threaded in-process path the response has already been
@@ -37,6 +67,7 @@
 #define CRPC_RPC_CLIENT_HPP
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <map>
@@ -87,6 +118,354 @@ struct client_options {
 [[nodiscard]] CRPC_API u32 allocate_stream_id(u32& counter, bool (*in_flight)(void* ctx, u32 id),
                                               void* ctx) noexcept;
 
+// --- Allocation-free call maps -----------------------------------------------
+//
+// The low-level client used to keep its in-flight set in a `std::unordered_map`
+// and its deadline set in a `std::multimap`. Both allocate a node (and, for the
+// multimap, a header) on every insert, so a call reached the system allocator
+// even when its call slot came from a pool. These two containers provide the
+// exact subset of the STL API the client uses, over a fixed array allocated once
+// at construction, so insert/erase/lookup allocate nothing per call.
+//
+// `stream_map` is an open-addressing table keyed by the 31-bit stream id. Stream
+// id 0 is never allocated (`allocate_stream_id` skips it), so 0 is the empty
+// sentinel and no separate occupancy bitmap is needed. Deletion uses
+// backward-shift, which keeps the probe chains intact without tombstones.
+class stream_map {
+public:
+    stream_map() { init(16); }
+    ~stream_map() = default;
+    stream_map(const stream_map&) = delete;
+    stream_map& operator=(const stream_map&) = delete;
+
+    // `capacity` is a hint for the initial table size; the table still grows on
+    // demand, so a client that never sees more than a handful of in-flight calls
+    // never allocates past construction.
+    void init(u32 capacity) {
+        std::size_t size = 2;
+        while (size < static_cast<std::size_t>(capacity) * 2) {
+            size <<= 1;
+        }
+        capacity_ = static_cast<u32>(size);
+        slots_.reset(new std::pair<u32, call_slot*>[capacity_]);
+        clear();
+    }
+
+    class iterator {
+    public:
+        iterator() = default;
+        iterator(stream_map* owner, u32 index) : owner_(owner), index_(index) {}
+        std::pair<u32, call_slot*>& operator*() const { return owner_->slots_[index_]; }
+        std::pair<u32, call_slot*>* operator->() const { return &owner_->slots_[index_]; }
+        iterator& operator++() {
+            index_ = owner_->next_used(index_ + 1);
+            return *this;
+        }
+        bool operator==(const iterator& other) const {
+            return owner_ == other.owner_ && index_ == other.index_;
+        }
+        bool operator!=(const iterator& other) const { return !(*this == other); }
+
+    private:
+        friend class stream_map;
+        stream_map* owner_ = nullptr;
+        u32 index_ = 0;
+    };
+
+    [[nodiscard]] iterator find(u32 key) const {
+        if (capacity_ == 0) {
+            return end();
+        }
+        u32 index = hash(key) & (capacity_ - 1);
+        for (u32 probe = 0; probe < capacity_; ++probe) {
+            const u32 slot_key = slots_[index].first;
+            if (slot_key == 0) {
+                return end();
+            }
+            if (slot_key == key) {
+                return iterator(const_cast<stream_map*>(this), index);
+            }
+            index = (index + 1) & (capacity_ - 1);
+        }
+        return end();
+    }
+
+    void emplace(u32 key, call_slot* value) {
+        if (size_ + 1 > capacity_ * 3 / 4) {
+            grow();
+        }
+        u32 index = hash(key) & (capacity_ - 1);
+        for (;;) {
+            const u32 slot_key = slots_[index].first;
+            if (slot_key == 0) {
+                ++size_;
+            }
+            if (slot_key == 0 || slot_key == key) {
+                slots_[index].first = key;
+                slots_[index].second = value;
+                return;
+            }
+            index = (index + 1) & (capacity_ - 1);
+        }
+    }
+
+    void erase(iterator it) {
+        if (it.owner_ != this) {
+            return;
+        }
+        const u32 index = it.index_;
+        slots_[index].first = 0;
+        slots_[index].second = nullptr;
+        --size_;
+        // Backward-shift deletion: scan forward from the hole and pull forward
+        // every entry whose ideal slot is at or before the hole, so no lookup
+        // that used to reach it is broken. The scan stops at the first empty
+        // slot, which must exist because the table is never full.
+        u32 i = index;
+        u32 j = index;
+        for (;;) {
+            j = (j + 1) & (capacity_ - 1);
+            const u32 next_key = slots_[j].first;
+            if (next_key == 0) {
+                break;
+            }
+            const u32 ideal = hash(next_key) & (capacity_ - 1);
+            if (cyclically_between(ideal, i, j)) {
+                slots_[i] = slots_[j];
+                slots_[j].first = 0;
+                slots_[j].second = nullptr;
+                i = j;
+            }
+        }
+        slots_[i].first = 0;
+        slots_[i].second = nullptr;
+    }
+
+    [[nodiscard]] u32 size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    void clear() noexcept {
+        if (capacity_ == 0) {
+            return;
+        }
+        for (u32 i = 0; i < capacity_; ++i) {
+            slots_[i].first = 0;
+            slots_[i].second = nullptr;
+        }
+        size_ = 0;
+    }
+
+    [[nodiscard]] iterator begin() const {
+        return iterator(const_cast<stream_map*>(this), next_used(0));
+    }
+    [[nodiscard]] iterator end() const {
+        return iterator(const_cast<stream_map*>(this), capacity_);
+    }
+
+private:
+    static u32 hash(u32 key) noexcept { return key * 2654435761u; }
+
+    // True when the hole `i` lies in the entry's probe chain, i.e. in the
+    // cyclic half-open range `[ideal, j)` for the entry at `j`. Only then may
+    // that entry be pulled back into the hole without breaking its lookup.
+    static bool cyclically_between(u32 ideal, u32 i, u32 j) noexcept {
+        if (ideal <= j) {
+            return ideal <= i && i < j;
+        }
+        return i >= ideal || i < j;
+    }
+
+    void grow() {
+        const u32 new_capacity = capacity_ == 0 ? 16 : capacity_ * 2;
+        std::unique_ptr<std::pair<u32, call_slot*>[]> fresh(
+            new std::pair<u32, call_slot*>[new_capacity]());
+        for (u32 i = 0; i < capacity_; ++i) {
+            const u32 key = slots_[i].first;
+            if (key == 0) {
+                continue;
+            }
+            u32 index = hash(key) & (new_capacity - 1);
+            while (fresh[index].first != 0) {
+                index = (index + 1) & (new_capacity - 1);
+            }
+            fresh[index] = slots_[i];
+        }
+        slots_ = std::move(fresh);
+        capacity_ = new_capacity;
+    }
+
+    [[nodiscard]] u32 next_used(u32 from) const noexcept {
+        for (u32 i = from; i < capacity_; ++i) {
+            if (slots_[i].first != 0) {
+                return i;
+            }
+        }
+        return capacity_;
+    }
+
+    std::unique_ptr<std::pair<u32, call_slot*>[]> slots_;
+    u32 capacity_ = 0;
+    u32 size_ = 0;
+};
+
+// Intrusive singly-linked list of `(deadline, call_slot*)` sorted by deadline,
+// with a free list over a fixed array. `poll()` walks it from the earliest
+// deadline; `equal_range` finds the exact-key run that `remove_deadline()`
+// scans. Insert and erase are linear but allocate nothing, and erasing a node
+// only unlinks it, so every other iterator stays valid (the property the
+// `std::multimap` it replaces gave callers).
+class deadline_map {
+private:
+    static constexpr u32 kNone = 0xFFFFFFFFu;
+
+    struct entry {
+        std::chrono::steady_clock::time_point first{};
+        call_slot* second = nullptr;
+        u32 next = kNone;
+    };
+
+public:
+    deadline_map() { init(16); }
+    ~deadline_map() = default;
+    deadline_map(const deadline_map&) = delete;
+    deadline_map& operator=(const deadline_map&) = delete;
+
+    void init(u32 capacity) {
+        capacity_ = capacity == 0 ? 1 : capacity;
+        entries_.reset(new entry[capacity_]);
+        head_ = kNone;
+        free_head_ = 0;
+        size_ = 0;
+        for (u32 i = 0; i < capacity_; ++i) {
+            entries_[i].next = (i + 1 < capacity_) ? (i + 1) : kNone;
+        }
+    }
+
+    class iterator {
+    public:
+        iterator() = default;
+        iterator(deadline_map* owner, u32 index) : owner_(owner), index_(index) {}
+        entry& operator*() const { return owner_->entries_[index_]; }
+        entry* operator->() const { return &owner_->entries_[index_]; }
+        iterator& operator++() {
+            index_ = owner_->entries_[index_].next;
+            return *this;
+        }
+        bool operator==(const iterator& other) const {
+            return owner_ == other.owner_ && index_ == other.index_;
+        }
+        bool operator!=(const iterator& other) const { return !(*this == other); }
+
+    private:
+        friend class deadline_map;
+        deadline_map* owner_ = nullptr;
+        u32 index_ = 0;
+    };
+
+    void emplace(std::chrono::steady_clock::time_point deadline, call_slot* slot) {
+        if (free_head_ == kNone) {
+            grow();
+        }
+        u32 prev = kNone;
+        u32 cur = head_;
+        while (cur != kNone && entries_[cur].first < deadline) {
+            prev = cur;
+            cur = entries_[cur].next;
+        }
+        const u32 node = free_head_;
+        free_head_ = entries_[node].next;
+        entries_[node].first = deadline;
+        entries_[node].second = slot;
+        entries_[node].next = cur;
+        if (prev == kNone) {
+            head_ = node;
+        } else {
+            entries_[prev].next = node;
+        }
+        ++size_;
+    }
+
+    [[nodiscard]] std::pair<iterator, iterator> equal_range(
+        std::chrono::steady_clock::time_point deadline) {
+        u32 first = head_;
+        while (first != kNone && entries_[first].first < deadline) {
+            first = entries_[first].next;
+        }
+        u32 last = first;
+        while (last != kNone && entries_[last].first == deadline) {
+            last = entries_[last].next;
+        }
+        return {iterator(this, first), iterator(this, last)};
+    }
+
+    iterator erase(iterator it) {
+        if (it.owner_ != this || it.index_ == kNone) {
+            return end();
+        }
+        const u32 index = it.index_;
+        const u32 next = entries_[index].next;
+        u32 prev = kNone;
+        u32 cur = head_;
+        while (cur != kNone && cur != index) {
+            prev = cur;
+            cur = entries_[cur].next;
+        }
+        if (cur == kNone) {
+            return end();
+        }
+        if (prev == kNone) {
+            head_ = next;
+        } else {
+            entries_[prev].next = next;
+        }
+        entries_[index].next = free_head_;
+        free_head_ = index;
+        --size_;
+        return iterator(this, next);
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] u32 size() const noexcept { return size_; }
+
+    void clear() noexcept {
+        head_ = kNone;
+        free_head_ = 0;
+        size_ = 0;
+        for (u32 i = 0; i < capacity_; ++i) {
+            entries_[i].next = (i + 1 < capacity_) ? (i + 1) : kNone;
+        }
+    }
+
+    [[nodiscard]] iterator begin() { return iterator(this, head_); }
+    [[nodiscard]] iterator end() { return iterator(this, kNone); }
+
+private:
+    void grow() {
+        const u32 new_capacity = capacity_ == 0 ? 16 : capacity_ * 2;
+        std::unique_ptr<entry[]> fresh(new entry[new_capacity]);
+        u32 live = 0;
+        for (u32 cur = head_; cur != kNone; cur = entries_[cur].next) {
+            fresh[live].first = entries_[cur].first;
+            fresh[live].second = entries_[cur].second;
+            fresh[live].next = (live + 1 < new_capacity) ? (live + 1) : kNone;
+            ++live;
+        }
+        for (u32 i = live; i < new_capacity; ++i) {
+            fresh[i].next = (i + 1 < new_capacity) ? (i + 1) : kNone;
+        }
+        entries_ = std::move(fresh);
+        capacity_ = new_capacity;
+        head_ = live == 0 ? kNone : 0;
+        free_head_ = live < new_capacity ? live : kNone;
+    }
+
+    std::unique_ptr<entry[]> entries_;
+    u32 capacity_ = 0;
+    u32 head_ = kNone;
+    u32 free_head_ = kNone;
+    u32 size_ = 0;
+};
+
 class CRPC_API client {
 public:
     explicit client(std::unique_ptr<connection> connection, client_options options = {});
@@ -113,11 +492,9 @@ public:
     [[nodiscard]] rpc_result<call<Resp>> start_call(u64 service_id, u64 method_id,
                                                     span<const std::byte> request_body,
                                                     call_context ctx = {}) {
-        // Serializes with a backend-thread write completion (A-4).
-        std::lock_guard<std::recursive_mutex> lk(mutex_);
-        if (closed_) {
-            return rpc_result<call<Resp>>(rpc_error(rpc_code::shutting_down, "client is closed"));
-        }
+        // `begin_call` takes the map lock and rejects a closed client; the
+        // encode/publish path takes the write lock. No lock is held across the
+        // two, so a close between them is caught by the publish-time re-check.
         rpc_error failure;
         call_slot* slot = begin_call(service_id, method_id, ctx, failure);
         if (slot == nullptr) {
@@ -135,6 +512,17 @@ public:
         handle.generation_ = slot->generation;
         handle.pool_ = &pool_;
         return rpc_result<call<Resp>>(std::move(handle));
+    }
+
+    // Strongly typed overload. The `service_id` / `method_id` newtypes make a
+    // swapped argument list a compile error, which the `u64` overload above
+    // cannot catch.
+    template <typename Resp>
+    [[nodiscard]] rpc_result<call<Resp>> start_call(service_id service, method_id method,
+                                                    span<const std::byte> request_body,
+                                                    call_context ctx = {}) {
+        return start_call<Resp>(service.value, method.value, request_body,
+                                std::move(ctx));
     }
 
     // Installs the PUSH sink. The sink runs on the reader thread (the thread
@@ -162,7 +550,7 @@ public:
     void poll() noexcept;
 
     [[nodiscard]] u32 in_flight() const noexcept {
-        std::lock_guard<std::recursive_mutex> lk(mutex_);
+        std::lock_guard<std::mutex> lk(map_mutex_);
         return static_cast<u32>(in_flight_.size());
     }
     [[nodiscard]] u32 slots_in_use() const noexcept { return pool_.in_use(); }
@@ -203,6 +591,15 @@ private:
     void handle_push_ack(const frame& value);
 
     // --- writer ---
+    // RAII holder of `write_mutex_`. Tracks the recursion depth so that a fatal
+    // write error recorded deep in a nested `flush_write` is reported once, by
+    // the outermost holder, after the write lock is released. Reporting it while
+    // the write lock were held would take `completion_mutex_` under
+    // `write_mutex_`, inverting against a completion callback that starts a new
+    // call. Defined in client.cpp.
+    struct write_lock;
+    void report_write_failure() noexcept;
+
     void on_write_complete(io::io_result result) noexcept;
     void flush_write();
     void enqueue_raw(span<const std::byte> bytes);
@@ -217,13 +614,17 @@ private:
     void finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
                 span<const std::byte> body);
     void cancel_slot(call_slot& slot) noexcept;
-    // Disarms a slot's completion callback under `mutex_` and synchronizes with
-    // any callback already running, so the caller may then recycle the slot
-    // safely (CF-1).
+    // Disarms a slot's completion callback under `completion_mutex_` and
+    // synchronizes with any callback already running, so the caller may then
+    // recycle the slot safely (CF-1).
     void detach_slot(call_slot& slot) noexcept;
-    // Returns a finished slot to the pool under `mutex_` (see owner_release).
+    // Returns a finished slot to the pool under `completion_mutex_` (see
+    // owner_release).
     void release_slot_under_lock(call_slot* slot) noexcept;
-    void fail_all(rpc_code code, std::string message);
+    // Marks the client closed (once) and fails every in-flight call. Returns
+    // true when this call performed the transition. The caller must hold no
+    // lock a completion callback could need.
+    bool fail_all(rpc_code code, std::string message);
     void protocol_failure();
     void remove_in_flight(call_slot& slot);
     void remove_deadline(call_slot& slot);
@@ -243,18 +644,20 @@ private:
     buffer frame_scratch_;
     buffer out_;
     std::size_t out_sent_ = 0;
+    int write_depth_ = 0;
+    std::error_code write_fail_ec_{};
+    std::atomic<bool> write_failed_{false};
     bool write_in_flight_ = false;
     bool short_write_ = false;
     bool write_error_ = false;
     bool in_push_ = false;
     std::error_code write_ec_{};
     std::size_t requested_ = 0;
-    bool closed_ = false;
     bool in_process_ = false;
     u32 stream_seq_ = 0;
     u64 seq_ = 0;
-    std::unordered_map<u32, call_slot*> in_flight_;
-    std::multimap<std::chrono::steady_clock::time_point, call_slot*> deadlines_;
+    stream_map in_flight_;
+    deadline_map deadlines_;
     push::push_sink_fn push_sink_ = nullptr;
     void* push_sink_ctx_ = nullptr;
     // Highest reliable push sequence accepted per push stream. A PUSH at or
@@ -262,9 +665,19 @@ private:
     std::unordered_map<u32, u64> push_ack_upto_;
     write_completion completion_;
     reader_source source_;
-    // Guards the mutating entry points against a backend-thread completion.
-    // Recursive because a synchronous sink completion re-enters flush_write.
-    mutable std::recursive_mutex mutex_;
+    // --- Locks (see the thread-model note above) ---
+    // Inbound drain: decoder_ and the re-entrancy flag.
+    mutable std::recursive_mutex read_mutex_;
+    // Writer state: out_/scratch buffers/conn_ and the write loop.
+    mutable std::recursive_mutex write_mutex_;
+    // In-flight/deadline maps, stream/call counters, PUSH sink and the
+    // closed_ transition. Innermost lock.
+    mutable std::mutex map_mutex_;
+    // Terminal completion vs. handle detach/recycle. Held across the callback.
+    mutable std::recursive_mutex completion_mutex_;
+    // Set once on the first terminal event. Read under map_mutex_ for the
+    // closed-vs-publish protocol and atomically on the hot writer path.
+    std::atomic<bool> closed_{false};
 };
 
 } // namespace crpc::rpc

@@ -2,7 +2,7 @@
 
 [简体中文](abi.zh-CN.md) | **English**
 
-Version 1.0 / 2026-10-19
+Version 2.0 / 2026-10-24
 
 This document defines what CRPC guarantees at the binary level, what it does not,
 and how a change that breaks binary compatibility is handled. It is normative:
@@ -27,6 +27,11 @@ The wire protocol has its own version (`protocol_version`, currently `1`). It is
 independent of the library version: a library patch release never changes the
 wire format, and a wire change always requires a protocol version bump plus a
 documented migration.
+
+The 2.0.0 release is a MAJOR change: the layout of `http::http_statistics`
+grew (§4), and `server::options` grew as well (§4). The 1.0.0 layout
+(`bd006b2`) is the last compatible release; 2.0.0 is not forward-compatible
+with a 1.0.x binary.
 
 ## 2. What crosses the ABI boundary
 
@@ -62,7 +67,7 @@ Types in the `crpc::client_detail` and `crpc::rpc_detail` namespaces, and in
 the anonymous or nested `detail` namespaces of the other headers, are
 **implementation-internal**: they do not appear in a *consumer-facing* exported
 signature. They are not, however, all invisible to the consumer's compiler.
-`client_facade.hpp:845` instantiates `client_detail::call_state<Resp>` inside
+`client_facade.hpp:898` instantiates `client_detail::call_state<Resp>` inside
 the consumer's own translation unit
 (`std::make_shared<client_detail::call_state<Resp>>()` in a header-inline
 template), and `call_state` holds `call_core` **by value**. A layout change in
@@ -91,6 +96,18 @@ one-byte field already pushes `sizeof(call_core)` to 496, and a single field
 wider than the three remaining bytes crosses immediately. Either way the x64
 failure mode returns on x86.
 
+`call_core` is decorated `CRPC_API` (`client_facade.hpp:295`) and its members
+therefore appear in the shared library's export table. That decoration is a
+**link-time requirement, not an ABI promise**: header-inline templates
+(`client_detail::wake_functor`, `call<Resp>::get()`, `start_encoded`) compile
+into the consumer's translation unit and call `call_core::signal`,
+`mark_degraded`, `clear_degraded`, `degraded`, `reset_for_attempt`, its
+constructor and its destructor, so a shared build that hid them would fail to
+link any consumer that instantiates a call. Their presence in the export table
+does **not** put them in the §2 whitelist, does not make their layout stable
+across a header change, and does not allow a consumer to name them (§2 already
+forbids `detail` types as consumer-facing).
+
 The other internal types do not all cross the boundary the same way, and the
 difference matters. Only `call_state_base` and `call_state<Resp>` are
 polymorphic; `connection_slot` and `client_liveness` are plain structs with
@@ -99,15 +116,15 @@ no vptr, and `rpc_detail::always_false` is stateless.
   translation unit allocates the derived object, so a layout change to either
   is a change to a consumer-allocated size.
 - `connection_slot` and `client_liveness` are plain structs with no vptr, and
-  they are **allocated only by the library** (`src/client/client_facade.cpp:845`
-  and `:212`; there is no construction site in any header) and reached through
+  they are **allocated only by the library** (`src/client/client_facade.cpp:1146`
+  and `:396`; there is no construction site in any header) and reached through
   `std::shared_ptr<connection_slot>` and `std::weak_ptr<client_liveness>`.
   Their size therefore never crosses the boundary as a consumer-allocated
   object. Their **member offsets are still baked into consumer translation
   units** by header-inline code, though: `live_owner` reads
   `client_liveness::alive` (`client_facade.hpp:399`) and `client::issue`
   reads `connection_slot::mutex`, `healthy` and `conn`
-  (`client_facade.hpp:1019-1021`), both compiled in the consumer's own
+  (`client_facade.hpp:1079-1081`), both compiled in the consumer's own
   translation unit. Adding a field to either type still breaks a consumer built
   from older headers; for `client_liveness::alive` the failure is a missed
   death check that hands out a dangling `client*`. They are listed here
@@ -193,7 +210,7 @@ extension.
 
 The layout invariants that are checkable without header changes live in one
 internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
-14 of the public records, an exact member count for the 14 records listed in
+15 of the public records, an exact member count for the 15 records listed in
 that file, a relative member chain over the counters of `http_statistics`,
 `client::statistics`, `client::resilience_statistics`,
 `resilience::fallback_statistics` and `server::statistics`
@@ -207,19 +224,33 @@ fails the build in the cases those guards cover.
 The guards do **not** cover every type that crosses the ABI boundary, and the
 set of records that do cross it is defined precisely rather than left open:
 
-> **Scope.** A plain aggregate record that appears by value, by reference, or as
-> an out-parameter in a `CRPC_API` function signature, or that a virtual
-> interface passes by value. Option structs that are only ever handed to inline
+> **Scope.** A plain aggregate record that appears **by value** in a `CRPC_API`
+> function signature, or that a virtual interface passes by value, is in scope.
+> A record that appears **by reference or as an out-parameter** is also in scope
+> **when the library writes to it or reads fields from it across the boundary**;
+> a `const&` parameter is in scope as well when the callee compiles the field
+> offsets into the library. Option structs that are only ever handed to inline
 > constructors or builder methods are outside this scope, because they never
 > cross a shared-library boundary: the caller compiles the constructor into its
 > own object file, so both sides always agree on the layout.
 
-The excluded option structs are therefore not omissions: `http_server_options`,
-`io::tls_config`, `rpc::method_options`, `resilience::breaker_config`,
-`resilience::retry_policy`, `resilience::rate_limit_config`,
-`resilience::bulkhead_config` and `push::subscribe_options` all reach the library
-only through inline builders, so no compiled boundary separates their layout
-from the caller's.
+The option structs that reach the library through an **out-of-line** function are
+in scope, not excluded, because the caller builds the argument from its own
+headers and the library reads it from its own: `http_server_options` and
+`io::tls_config` (by value into `http_server::http_server` / `listen_tls`, and
+`tls_config` returned by value from `tls_context::config`), `rpc::method_options`
+(by value into `method_slot` / `service_registry::register_method`),
+`push::subscribe_options` (by value into `hub::subscribe`), and
+`resilience::rate_limit_config` / `breaker_config` / `bulkhead_config` /
+`retry_policy` (by reference into the corresponding constructors). The structs
+that are genuinely outside this scope are the ones with **no** out-of-line entry
+point at all; the list below is maintained by `crpc_test_abi_docs`, not by hand.
+
+`resilience::fallback_context` is in scope for the same reason even though no
+signature spells its name: the library builds it and calls the consumer's
+`fallback_fn` with it, so both sides must agree on the field offsets. It is
+hand-anchored in `src/abi_check.cpp` (32 bytes on x86 and x64, offsets
+`0/2/8/16/17/18/19/24`) and is therefore **not** in the unguarded list below.
 
 Records **in scope** that have **no compile-time layout guard at all** are listed
 below, fully qualified. This list is generated by `crpc_test_abi_docs`, which
@@ -273,6 +304,21 @@ members are private, and it is outside the scope above for the same reason (it i
 returned by value from a virtual method, but it is an encapsulated class rather
 than a plain aggregate).
 
+`server::builder` is a second encapsulated exported class that needs an explicit
+statement. It is decorated (`class CRPC_API builder`) and its out-of-line member
+functions read the private `options_` member of a consumer-allocated object, so
+its layout is ABI-relevant; it is not in the list above because it is not a plain
+aggregate record. The member-count and `offsetof` guards cannot be applied to its
+private data members, and its width is not a fixed number: it is
+`sizeof(server::options)` plus its three `std::vector` members, rounded to its
+alignment, and the vector width changes with the standard library's debug
+configuration (MSVC x64: 392 bytes in Release, 416 in Debug; x86: 304 / 312).
+`src/abi_check.cpp` therefore pins the structural relation rather than an
+absolute size, and requires the builder to keep the options alignment; that
+catches an added, removed or re-typed builder member on every target and
+configuration. A reorder of the three same-width vectors, like any
+other change the guards cannot see, remains MAJOR under §7.
+
 The guards are not uniform across change kinds or across architectures, and the
 difference matters when judging whether a given change is caught:
 
@@ -285,7 +331,7 @@ difference matters when judging whether a given change is caught:
   caught by the member-type assertions in `src/abi_check.cpp`. The member-count
   guard does **not** validate names: a structured binding only binds one local
   name per member in declaration order. The only cross-ABI record with no
-  relative chain is `rpc_error` among the 14 member-counted records (the
+  relative chain is `rpc_error` among the 15 member-counted records (the
   unguarded records in §4 have no chain at all, and `status` has no public data
   member, so a rename cannot occur there), so a rename in `rpc_error` is not
   caught by a chain. The four HTTP/2 value types `http2::h2_error`,
@@ -351,18 +397,18 @@ dependency and is not a CRPC ABI mechanism. A size-tagged options struct is
 planned, not implemented; while it is absent, callers and the library must be
 built from the same headers.
 
-The last released layout is 1.0.0 (`bd006b2`), where `http_statistics` had 9
-fields and `sizeof` was 72 bytes; it had no long-poll counters at all. In this
-unreleased cycle the struct gained 19 fields: the whole long-poll block
+The 1.0.0 layout (`bd006b2`), the last compatible release, had 9 fields and
+`sizeof` was 72 bytes; it had no long-poll counters at all. In the 2.0.0
+release the struct gained 19 fields: the whole long-poll block
 (`longpoll_waiters`, `longpoll_subscribers`, `longpoll_replay_window`,
 `longpoll_events`, `longpoll_timeouts`, `longpoll_ack_clamped`,
 `longpoll_conflicts`, `longpoll_restarts`, `longpoll_overloaded`) plus ten
 SSE/compression/download counters. `sizeof` grew from 72 (9 fields) to 224
 (28 fields). The nine fields that 1.0.0 shipped keep their offsets
 (`active_connections` 0 … `timed_out_connections` 64). Adding a field to a
-public struct is a MAJOR change (§1), so this cycle is ABI breaking.
+public struct is a MAJOR change (§1), so 2.0.0 is ABI breaking.
 
-The move of `longpoll_replay_window` is internal to that unreleased cycle: it
+The move of `longpoll_replay_window` is internal to the 2.0.0 release: it
 was first placed at offset 168, before the six counters, and later moved to the
 end (offset 216). The counters that followed it then each moved one
 `std::size_t` earlier (8 bytes on the audited 64-bit builds):
@@ -392,6 +438,39 @@ Additive types do not change existing layouts. `client::resilience_statistics`
 seven-counter value type) and `client::fallback_stats()` are MINOR additions.
 The fallback primitives in `crpc/resilience/fallback.hpp` are header-only and
 add no exported symbol; only the by-value return adds one.
+
+`server::options` gained a trailing `resilience::clock_source clock_source`
+field. Every existing member keeps its offset (`send_goaway_on_stop` stays 249
+on x64 and 225 on x86, `push_subscribe` stays 264 / 232), so a consumer that
+only reads those members keeps working **within one header set**, but
+`sizeof(server::options)` grows from 304 to **320** on x64 and from 256 to
+**264** on x86, and `sizeof(server::builder)` grows with it (376 → 392 on x64,
+296 → 304 on x86) because the builder holds the options by value. Passing an
+options struct by value into the library constructor is an exported signature,
+so this is a **MAJOR** change under §1, not a MINOR extension: a consumer must
+be rebuilt from the same headers. The same field is the one injection point for
+the server clock: the per-connection rate bucket, the per-service rate bucket,
+the per-service circuit breaker and the dispatcher's deadline check all read it,
+so a partially injected server would interpret one request's deadline against
+two different "now" values.
+
+`client::set_fallback`, `client::run_fallback` and `client::record_fallbacks`
+are new exported symbols and therefore MINOR additions; they change no layout.
+`set_fallback` takes a `void*` plus a `noexcept` `retain`/`release` pair rather
+than a standard-library owning type, so the reference it keeps is created and
+destroyed by the caller's own code and no consumer-side control block crosses
+the boundary.
+
+`resilience::min_remaining_ns` (1'000'000 ns) is the single authority for the
+server's admission floor: the dispatcher's pre-execution deadline refusal and
+the server's four `crpc-degradable` decisions both read it. The client has **no**
+equivalent floor — its deadline checks only ask whether the call already expired
+locally, which is deliberate asymmetry, not a defect. Any future client-side
+"give up early" floor must reuse this constant; a second `1'000'000` or `1ms`
+literal would be a second deadline policy. `fallback_policy::min_remaining` is a
+different, caller-configured floor ("is the degraded value still deliverable");
+`set_fallback` documents that callers pass this constant for it, and the
+signature carries no default argument, so no literal can hide there.
 
 ## 5. Enum values
 
@@ -456,16 +535,23 @@ configure-time check for such a mismatch, and adding one is not implemented.
 
 1. A change that breaks §2–§5 requires a MAJOR version bump.
 2. The same commit updates this document and the changelog
-   ([CHANGELOG.md](CHANGELOG.md)). A migration guide (`docs/migration.md`) does
-   not exist; a compatibility shim is added when feasible.
+   ([CHANGELOG.md](CHANGELOG.md)), and records the breaking change in the migration
+   guide ([migration.md](migration.md)) when the MAJOR bump is a layout or
+   signature change; a compatibility shim is added when feasible.
 3. The changelog states explicitly: "ABI breaking: <symbol> changed from … to …".
-4. No ABI checker is implemented: `scripts/abi_check.ps1` and
-   `scripts/abi_check.sh` do not exist, and CI does not compare exported symbols
-   or layout assertions. The internal `src/abi_check.cpp` translation unit
-   guards the layout of the public records at compile time, but it is not a
-   symbol-table comparison against the previous release. Until such a job
-   exists, the comparison is a manual review of the diff against the previous
-   release.
+4. The export gate `scripts/export_gate.py` is run by `scripts/test.ps1` and
+   `scripts/test.sh` whenever `CRPC_BUILD_SHARED=ON`. It statically scans
+   `include/crpc/**` and requires: (A) every non-template class with
+   out-of-line members carries `CRPC_API`; (B) every decorated class actually
+   exports a symbol, checked against `dumpbin /exports` or `nm -D -C`; (C)
+   every namespace-scope declaration without a body carries `CRPC_API`; (D) no
+   class template carries `CRPC_API`; and (E) an exported class does not derive
+   from an undecorated non-template base. Reviewed implementation-detail
+   exceptions live in `scripts/export_baseline.txt`; a missing or stale entry
+   fails the gate. The internal `src/abi_check.cpp` translation unit guards
+   the layout of the public records at compile time. Neither compares the
+   export table against the previous release: that comparison remains a manual
+   review of the diff against the previous release.
 
 ## 9. What is not guaranteed
 
