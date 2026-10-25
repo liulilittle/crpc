@@ -17,9 +17,11 @@
 //   * `method_meta` carries the service id and the (non-owning) method name.
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
+#include <crpc/rpc/method_macro.hpp>
 #include <crpc/rpc/method_meta.hpp>
 
 #include "test_framework.hpp"
@@ -99,6 +101,43 @@ struct declaring_controller {
     static constexpr u64 id_inside_class() { return method_id_from<declaring_controller>(); }
 };
 
+// --- CRPC_RPC_METHOD ---------------------------------------------------------
+
+// A controller that declares its methods with the macro. The controller type is
+// incomplete inside its own body, so the macro must be able to derive the service
+// id from an incomplete type exactly where it is expanded.
+struct macro_controller {
+    CRPC_RPC_METHOD(macro_controller, ping, "macro.ping")
+};
+
+// Two methods in one controller: the macro must generate a distinct static member
+// per method, all sharing the controller's service id.
+struct macro_controller_two {
+    CRPC_RPC_METHOD(macro_controller_two, ping, "macro.ping")
+    CRPC_RPC_METHOD(macro_controller_two, pong, "macro.pong")
+};
+
+// The generated member exists, is a compile-time constant, and carries the
+// controller's service id and the declared method name.
+static_assert(std::is_same_v<decltype(macro_controller::crpc_rpc_meta_ping),
+                             const method_meta>,
+              "the macro must generate a constexpr method_meta member");
+static_assert(macro_controller::crpc_rpc_meta_ping.service_id ==
+                  method_id_from<macro_controller>(),
+              "the macro must carry the controller's service id");
+static_assert(std::string_view(macro_controller::crpc_rpc_meta_ping.name) ==
+                  std::string_view("macro.ping"),
+              "the macro must carry the declared method name");
+static_assert(macro_controller_two::crpc_rpc_meta_ping.service_id ==
+                  macro_controller_two::crpc_rpc_meta_pong.service_id,
+              "methods of one controller share its service id");
+static_assert(std::string_view(macro_controller_two::crpc_rpc_meta_pong.name) ==
+                  std::string_view("macro.pong"),
+              "the macro must carry the declared method name");
+static_assert(macro_controller::crpc_rpc_meta_ping.service_id !=
+                  macro_controller_two::crpc_rpc_meta_ping.service_id,
+              "distinct controllers must have distinct service ids");
+
 } // namespace
 
 // --- Runtime checks ----------------------------------------------------------
@@ -156,6 +195,28 @@ CRPC_TEST(method_meta_is_a_standard_layout_aggregate) {
     static_assert(std::is_standard_layout_v<method_meta>, "method_meta must be standard layout");
     static_assert(std::is_trivially_copyable_v<method_meta>, "method_meta must be trivially copyable");
     CRPC_CHECK(true);
+}
+
+CRPC_TEST(macro_generates_a_method_meta_with_service_id_and_name) {
+    const method_meta& ping = macro_controller::crpc_rpc_meta_ping;
+    CRPC_CHECK_EQ(ping.service_id, method_id_from<macro_controller>());
+    CRPC_CHECK(ping.name != nullptr);
+    CRPC_CHECK_EQ(std::string(ping.name), std::string("macro.ping"));
+}
+
+CRPC_TEST(macro_supports_multiple_methods_in_one_controller) {
+    const method_meta& ping = macro_controller_two::crpc_rpc_meta_ping;
+    const method_meta& pong = macro_controller_two::crpc_rpc_meta_pong;
+    CRPC_CHECK_EQ(ping.service_id, method_id_from<macro_controller_two>());
+    CRPC_CHECK_EQ(pong.service_id, method_id_from<macro_controller_two>());
+    CRPC_CHECK_EQ(std::string(ping.name), std::string("macro.ping"));
+    CRPC_CHECK_EQ(std::string(pong.name), std::string("macro.pong"));
+    CRPC_CHECK(ping.service_id != method_id_from<macro_controller>());
+}
+
+CRPC_TEST(macro_meta_is_usable_as_a_constant_expression) {
+    constexpr u64 id = macro_controller::crpc_rpc_meta_ping.service_id;
+    CRPC_CHECK_EQ(id, method_id_from<macro_controller>());
 }
 
 CRPC_TEST_MAIN()
