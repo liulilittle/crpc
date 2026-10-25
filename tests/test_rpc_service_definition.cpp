@@ -266,10 +266,15 @@ CRPC_TEST(service_name_comes_from_the_declared_macro) {
 }
 
 // Without `CRPC_RPC_SERVICE` the name falls back to the compiler's type-name
-// spelling (non-empty in this RTTI-enabled build).
+// spelling when the translation unit can write `typeid`, and to an empty string
+// otherwise (the documented no-RTTI case, e.g. GCC/Clang `-fno-rtti`).
 CRPC_TEST(service_name_falls_back_to_the_type_name) {
     const std::string fallback = service_name_of<fallback_controller>();
+#if CRPC_RPC_TYPEID_AVAILABLE
     CRPC_CHECK_FALSE(fallback.empty());
+#else
+    CRPC_CHECK(fallback.empty());
+#endif
 }
 
 // A controller with no `CRPC_RPC_SERVICE` still registers its service and is
