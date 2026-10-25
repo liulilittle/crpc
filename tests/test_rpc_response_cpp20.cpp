@@ -126,6 +126,18 @@ task coro_await_ready(coro_result* out) {
                     std::memory_order_release);
 }
 
+// A start-failure response: there is no call to wait for, so the awaiter must
+// report ready and `await_resume()` must return the wrapped error. With a
+// `ready()`-only `await_ready()` the coroutine would suspend and never resume.
+task coro_await_start_failure(coro_result* out) {
+    auto r = crpc::response<int>::error(
+        crpc::rpc_error(crpc::rpc_code::unavailable, "no endpoint"));
+    const crpc::rpc::rpc_result<int> got = co_await r;
+    out->value.store(got.ok() ? got.value() : -1, std::memory_order_release);
+    out->code.store(got.ok() ? 0 : static_cast<int>(got.code()),
+                    std::memory_order_release);
+}
+
 } // namespace
 
 // co_await suspends an in-flight call and resumes the coroutine with the
@@ -269,6 +281,20 @@ CRPC_TEST(response_cpp20_co_await_ready_no_suspend) {
     CRPC_CHECK(t.done());
     CRPC_CHECK_EQ(0, out.code.load(std::memory_order_acquire));
     CRPC_CHECK_EQ(0, out.value.load(std::memory_order_acquire));
+}
+
+// A start-failure response has no call to wait for: `await_ready()` must report
+// ready (its `valid()` is false) so the coroutine resumes immediately and
+// `await_resume()` returns the wrapped error. A `ready()`-only `await_ready()`
+// would suspend forever.
+CRPC_TEST(response_cpp20_co_await_start_failure_no_suspend) {
+    coro_result out;
+    task t = coro_await_start_failure(&out);
+    t.resume();
+    CRPC_CHECK(t.done());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  out.code.load(std::memory_order_acquire));
+    CRPC_CHECK_EQ(-1, out.value.load(std::memory_order_acquire));
 }
 
 CRPC_TEST_MAIN()

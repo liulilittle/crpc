@@ -2074,7 +2074,7 @@ public:
     auto operator co_await() {
         struct awaiter {
             response& r;
-            bool await_ready() const noexcept { return r.ready(); }
+            bool await_ready() const noexcept { return r.ready() || !r.valid(); }
             void await_suspend(std::coroutine_handle<> h) {
                 // `(void)`: `response::then` is [[nodiscard]], and a discarded
                 // return would be a warning promoted to an error under /WX.
