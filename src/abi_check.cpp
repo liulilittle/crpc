@@ -531,8 +531,8 @@ static_assert(alignof(server::builder) == alignof(server::options),
 // `rpc_error` and `status` deliberately carry no absolute size. Both own
 // `std::string` and `std::vector` members, whose width is a property of the
 // standard library configuration, not of this library: measured with MSVC
-// 19.44 the pair is 80 bytes on x64 Release and 96 in Debug
-// (`_ITERATOR_DEBUG_LEVEL=2`), 56 on x86 Release and 64 in Debug, and 112 with
+// 19.51 the pair is 88 bytes on x64 Release and 104 in Debug
+// (`_ITERATOR_DEBUG_LEVEL=2`), 64 on x86 Release and 72 in Debug, and 120 with
 // libstdc++ in `_GLIBCXX_DEBUG` mode. Pinning any one of those numbers would
 // break the other required configurations, so these two records are guarded by
 // their member count, their standard-layout precondition and the

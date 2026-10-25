@@ -62,3 +62,12 @@
 2. 用新头文件重新分配或值初始化每个 `http_statistics`、`server::options` 与 `server::builder`；不要反序列化 1.0.0 的数据块。
 3. 链接 2.0.0 的库。
 4. 重新运行测试套件：`src/abi_check.cpp` 中的布局护栏会在 x86 与 x64 上断言 `sizeof(server::options)` 与 `sizeof(http_statistics)`。
+
+## 5. 未发布：`rpc_error` 布局与 `failure_origin` 迁移
+
+未发布的错误诊断工作在 2.0.0 之上属于 MAJOR 变更：
+
+- `rpc_error` 新增两个数据成员（`origin`、`attempts`），追加在 `metadata` 之后。初始化前五个成员仍可编译；按旧 `rpc_error` 分配或复制则不行。
+- `failure_origin` 从 `client_detail` 迁入 `crpc`，重命名了两个导出符号（`breaker_record_for`、`result_origin`）。`client_detail::failure_origin` 别名保持源码兼容，但链接到旧符号的消费方必须重新链接。
+
+每个消费方必须用同一份头文件重建并重新链接。旧/新 mangled 名见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)。

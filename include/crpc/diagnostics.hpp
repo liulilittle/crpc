@@ -6,8 +6,7 @@
 // the second.
 //
 // The predicates are a *view* over `rpc_error::origin`, not a second source of
-// truth. They deliberately overlap: a `local_gate` failure is both `is_local`
-// and `is_circuit_breaker`, and a `local_lifecycle` failure is both `is_local`
+// truth. They deliberately overlap: a `local_lifecycle` failure is both `is_local`
 // and `is_fallback`. A caller asks the question it cares about; it does not
 // switch on a single enum. Because the mapping is derived from the existing
 // `failure_origin` values it can never disagree with the origin the call
@@ -64,12 +63,24 @@ CRPC_API bool is_server(const rpc_error& err) noexcept;
 // hold a library lock while the hook runs, so the hook may call
 // `set_completion_hook`/`on_completion` again. The hook must not throw; it is
 // declared `noexcept` for that reason.
+//
+// When no user hook is installed, `on_completion` falls back to the process-wide
+// `obs::interceptor_chain` (see `obs::set_default_interceptor_chain`): it runs
+// the chain's `after_call` point with a context built from the terminal error.
+// With no chain installed the notification is a no-op.
 namespace diagnostics {
 
 using completion_hook = void (*)(const rpc_error&, void* self) noexcept;
 
 CRPC_API void set_completion_hook(completion_hook hook, void* self) noexcept;
 CRPC_API void on_completion(const rpc_error& err) noexcept;
+
+// True when a terminal call will be observed by a completion hook: either a user
+// hook is installed or the default observability interceptor chain is present.
+// `response::notify_completion` consults this to skip enrichment work when
+// nothing is listening, so the no-observer hot path stays lock- and
+// allocation-free.
+CRPC_API bool has_completion_observer() noexcept;
 
 } // namespace diagnostics
 

@@ -15,6 +15,7 @@
 #include <utility>
 
 #include <crpc/client_facade.hpp>
+#include <crpc/observability/interceptor.hpp>
 #include <crpc/runtime.hpp>
 #include <crpc/server.hpp>
 
@@ -184,6 +185,36 @@ void clear_hook_on_completion(const crpc::rpc_error&, void* self) noexcept {
     crpc::diagnostics::set_completion_hook(nullptr, nullptr);
 }
 
+// Clears the process-wide default interceptor chain for the duration of a test,
+// so an installed chain cannot leak into the next case.
+struct default_chain_scope {
+    default_chain_scope() noexcept {
+        crpc::obs::set_default_interceptor_chain(nullptr);
+    }
+    ~default_chain_scope() {
+        crpc::obs::set_default_interceptor_chain(nullptr);
+    }
+    default_chain_scope(const default_chain_scope&) = delete;
+    default_chain_scope& operator=(const default_chain_scope&) = delete;
+};
+
+// Records the `after_call` notification the default hook forwards.
+struct after_call_recorder final : crpc::obs::interceptor {
+    int calls = 0;
+    crpc::rpc_code last_code = crpc::rpc_code::ok;
+    std::string last_message;
+    crpc::obs::hook_point last_point = crpc::obs::hook_point::count;
+
+    bool on_hook(crpc::obs::hook_point point,
+                 crpc::obs::call_context& context) override {
+        ++calls;
+        last_point = point;
+        last_code = context.result;
+        last_message = context.error_message;
+        return true;
+    }
+};
+
 // A backend whose connection accepts and never completes a write: the call
 // stays in flight so it can be cancelled before `get()`.
 struct stalled_connection final : crpc::connection {
@@ -288,6 +319,84 @@ CRPC_TEST(diagnostics_completion_hook_runs_without_holding_a_lock) {
     // The hook cleared itself; the next notification is a no-op.
     crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::ok));
     CRPC_CHECK_EQ(1, probe.calls);
+}
+
+CRPC_TEST(diagnostics_has_completion_observer_reports_hook_and_chain) {
+    completion_hook_scope hook_scope;
+    default_chain_scope chain_scope;
+    completion_probe probe;
+
+    CRPC_CHECK_FALSE(crpc::diagnostics::has_completion_observer());
+
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+    CRPC_CHECK(crpc::diagnostics::has_completion_observer());
+
+    crpc::diagnostics::set_completion_hook(nullptr, nullptr);
+    CRPC_CHECK_FALSE(crpc::diagnostics::has_completion_observer());
+
+    // The default observability chain counts as an observer too, so
+    // `notify_completion` still enriches when only the chain is installed.
+    crpc::obs::interceptor_chain chain;
+    after_call_recorder recorder;
+    CRPC_CHECK(chain.add(crpc::obs::hook_point::after_call, &recorder));
+    chain.freeze();
+    crpc::obs::set_default_interceptor_chain(&chain);
+    CRPC_CHECK(crpc::diagnostics::has_completion_observer());
+}
+
+CRPC_TEST(diagnostics_default_hook_triggers_installed_interceptor) {
+    completion_hook_scope hook_scope;
+    default_chain_scope chain_scope;
+
+    crpc::obs::interceptor_chain chain;
+    after_call_recorder recorder;
+    CRPC_CHECK(chain.add(crpc::obs::hook_point::after_call, &recorder));
+    chain.freeze();
+    crpc::obs::set_default_interceptor_chain(&chain);
+
+    crpc::rpc_error error(crpc::rpc_code::unavailable, "no endpoint");
+    error.origin = crpc::failure_origin::local_capacity;
+    crpc::diagnostics::on_completion(error);
+
+    CRPC_CHECK_EQ(1, recorder.calls);
+    CRPC_CHECK(recorder.last_point == crpc::obs::hook_point::after_call);
+    CRPC_CHECK(recorder.last_code == crpc::rpc_code::unavailable);
+    CRPC_CHECK(recorder.last_message == "no endpoint");
+
+    // A success carries `ok` and an empty message.
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::ok));
+    CRPC_CHECK_EQ(2, recorder.calls);
+    CRPC_CHECK(recorder.last_code == crpc::rpc_code::ok);
+    CRPC_CHECK(recorder.last_message.empty());
+}
+
+CRPC_TEST(diagnostics_default_hook_is_noop_without_interceptor) {
+    completion_hook_scope hook_scope;
+    default_chain_scope chain_scope;
+
+    // No hook and no chain: the notification must be a safe no-op, and the
+    // observer query must report false so `notify_completion` skips enrichment.
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::internal));
+    CRPC_CHECK_FALSE(crpc::diagnostics::has_completion_observer());
+}
+
+CRPC_TEST(diagnostics_user_hook_takes_precedence_over_default_chain) {
+    completion_hook_scope hook_scope;
+    default_chain_scope chain_scope;
+    completion_probe probe;
+
+    crpc::obs::interceptor_chain chain;
+    after_call_recorder recorder;
+    CRPC_CHECK(chain.add(crpc::obs::hook_point::after_call, &recorder));
+    chain.freeze();
+    crpc::obs::set_default_interceptor_chain(&chain);
+
+    crpc::diagnostics::set_completion_hook(&record_completion, &probe);
+    crpc::diagnostics::on_completion(crpc::rpc_error(crpc::rpc_code::overload));
+
+    CRPC_CHECK_EQ(1, probe.calls);
+    // The user hook replaced the default: the chain is not also run.
+    CRPC_CHECK_EQ(0, recorder.calls);
 }
 
 CRPC_TEST(diagnostics_response_get_notifies_computed_success_once) {

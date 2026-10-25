@@ -2,8 +2,10 @@
 // hook.
 #include <crpc/diagnostics.hpp>
 
-#include <mutex>
+#include <atomic>
 #include <string>
+
+#include <crpc/observability/interceptor.hpp>
 
 namespace crpc {
 namespace {
@@ -87,32 +89,43 @@ bool is_server(const rpc_error& err) noexcept {
 namespace diagnostics {
 namespace {
 
-// One process-wide hook. The mutex publishes the hook/cookie pair as a unit and
-// is only ever held for the copy: `on_completion` releases it before invoking
-// the hook so a hook may re-enter `set_completion_hook` or `on_completion`.
-std::mutex g_hook_mutex;
-completion_hook g_hook = nullptr;
-void* g_hook_self = nullptr;
+// One process-wide hook, published as an atomic pair. The cookie is stored
+// first and the hook last, so a reader that observes the hook (acquire) also
+// observes the matching cookie (release). `on_completion` reads both without a
+// lock, so a hook may re-enter `set_completion_hook` or `on_completion` without
+// deadlocking, and a terminal `get()` with no observer installed takes no lock.
+std::atomic<completion_hook> g_hook{nullptr};
+std::atomic<void*> g_hook_self{nullptr};
 
 } // namespace
 
 void set_completion_hook(completion_hook hook, void* self) noexcept {
-    std::lock_guard<std::mutex> lock(g_hook_mutex);
-    g_hook = hook;
-    g_hook_self = self;
+    g_hook_self.store(self, std::memory_order_release);
+    g_hook.store(hook, std::memory_order_release);
+}
+
+bool has_completion_observer() noexcept {
+    if (g_hook.load(std::memory_order_acquire) != nullptr) {
+        return true;
+    }
+    return obs::default_interceptor_chain() != nullptr;
 }
 
 void on_completion(const rpc_error& err) noexcept {
-    completion_hook hook = nullptr;
-    void* self = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_hook_mutex);
-        hook = g_hook;
-        self = g_hook_self;
-    }
+    const completion_hook hook = g_hook.load(std::memory_order_acquire);
     if (hook != nullptr) {
-        hook(err, self);
+        hook(err, g_hook_self.load(std::memory_order_acquire));
+        return;
     }
+    // Default hook: trigger the installed observability interceptor chain, if
+    // any. With no chain installed the notification is a no-op.
+    obs::interceptor_chain* const chain = obs::default_interceptor_chain();
+    if (chain == nullptr) {
+        return;
+    }
+    obs::call_context context;
+    context.set_error(err.code, err.message);
+    (void)chain->run(obs::hook_point::after_call, context);
 }
 
 } // namespace diagnostics

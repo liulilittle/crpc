@@ -2,6 +2,50 @@
 
 [简体中文](CHANGELOG.zh-CN.md) | **English**
 
+## Unreleased
+
+### Error diagnostics
+
+- `rpc_error` now carries where a terminal failure originated and how many
+  attempts the logical call made: `failure_origin origin` (default
+  `local_lifecycle`) and `std::uint32_t attempts` (default `0`), appended after
+  `metadata` (`include/crpc/error.hpp:179-183`). Aggregate and positional
+  initialisers that name the first five members keep compiling.
+- `crpc::to_string(const rpc_error&)` renders the code, message, origin and
+  attempt count as one line. Seven classification predicates (`is_local`,
+  `is_network`, `is_timeout`, `is_circuit_breaker`, `is_rate_limiter`,
+  `is_fallback`, `is_server`) map `origin` to the subsystem that failed, so a
+  caller asks the question it cares about instead of switching on one enum.
+- A process-wide completion hook (`diagnostics::set_completion_hook` /
+  `on_completion`) observes every terminal `response<Resp>::get()` outcome
+  exactly once, outside any library lock. When no user hook is installed it runs
+  the process-wide `obs::interceptor_chain`
+  (`obs::set_default_interceptor_chain`) at `after_call`, so an installed
+  interceptor sees the terminal error; with no observer installed the path is a
+  lock- and allocation-free no-op.
+- `response<Resp>::get()` attaches the call's W3C trace id to the terminal
+  error metadata under `trace_id` when the call carried a valid trace context,
+  so a failure can be correlated with its trace without re-deriving the context.
+- Impact: MINOR for the additive behaviour; the ABI section below is MAJOR.
+
+### ABI breaking: `rpc_error` layout and the `failure_origin` move
+
+- `rpc_error` grew from five to seven data members (`origin`, `attempts`). A
+  public struct layout change is MAJOR ([abi.md](abi.md) §1). The two fields
+  were appended at the end with defaults, so a consumer that *initialises* the
+  first five members keeps compiling, but one that allocated or copied an old
+  `rpc_error` must be rebuilt from the same headers.
+- `failure_origin` moved from `client_detail` into `crpc` (the core error
+  header) so `rpc_error` can carry it without a dependency cycle. This renamed
+  two exported symbols: the enum type now mangles as `crpc::failure_origin`
+  instead of `crpc::client_detail::failure_origin`.
+  - `ABI breaking: crpc::client_detail::breaker_record_for(crpc::client_detail::failure_origin, crpc::rpc_code)` changed from `?breaker_record_for@client_detail@crpc@@YA?AW4breaker_record@12@W4failure_origin@12@W4rpc_code@2@@Z` to `?breaker_record_for@client_detail@crpc@@YA?AW4breaker_record@12@W4failure_origin@2@W4rpc_code@2@@Z`.
+  - `ABI breaking: crpc::client_detail::result_origin(const crpc::rpc_error&)` changed from `?result_origin@client_detail@crpc@@YA?AW4failure_origin@12@AEBUrpc_error@2@@Z` to `?result_origin@client_detail@crpc@@YA?AW4failure_origin@2@AEBUrpc_error@2@@Z`.
+  `client_detail::failure_origin` remains an alias, so existing spellings still
+  compile, but the linked symbol changed.
+- Impact: MAJOR. Rebuild every consumer from the same headers and relink. See
+  [abi.md](abi.md) §1, §4 and §8.3, and [migration.md](migration.md).
+
 ## 2.0.0 - 2026-10-24
 
 ### Changed (MINOR, behaviour only)
@@ -198,8 +242,8 @@ the low-level forms keep their signatures and the new names are canonical.
   member-counted records, `rpc_error` is the only one without a relative chain,
   so a reorder inside it is not caught by this unit. Its constructors name only
   `code`, `message` and `retryable`, so they do not catch a rename of
-  `retry_after` or `metadata`; the unit's five `decltype` assertions name all
-  five members, so a rename of any of them fails there. The absolute `sizeof` of
+  `retry_after` or `metadata`; the unit's seven `decltype` assertions name all
+  seven members, so a rename of any of them fails there. The absolute `sizeof` of
   `rpc_error` and `status` is deliberately not pinned because it follows the
   standard-library configuration. See [abi.md](abi.md) §4.
 - Impact: MINOR (build-time validation only). No ABI break: no public struct

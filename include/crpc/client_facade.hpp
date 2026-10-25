@@ -1004,14 +1004,17 @@ public:
             return state_ != nullptr ? state_->core.attempts : 0;
         }
 
-        // The per-call context captured at start. `normalize_context` fixes it
-        // before the first attempt and never mutates the trace afterwards, so the
-        // trace id a caller supplied is the one the terminal diagnostics report.
-        [[nodiscard]] rpc::call_context context() const noexcept {
+        // The W3C trace id captured at start. `normalize_context` fixes the
+        // context before the first attempt and never mutates the trace afterwards,
+        // so the id a caller supplied is the one the terminal diagnostics report.
+        // This is deliberately narrower than exposing the whole `call_context`:
+        // only the trace id is needed by the diagnostics path, and the rest of the
+        // context is an implementation detail.
+        [[nodiscard]] obs::trace_id trace_id() const noexcept {
             if (state_ == nullptr) {
-                return rpc::call_context{};
+                return obs::trace_id{};
             }
-            return state_->core.ctx;
+            return state_->core.ctx.trace.trace;
         }
 
         // Non-blocking read of the terminal outcome. `code()` reads the atomic
@@ -1460,6 +1463,9 @@ public:
 
     private:
         friend class crpc::client;
+        // `response<Resp>` enriches the terminal error with the call's trace id.
+        template <typename>
+        friend class response;
 
         template <typename F>
         static void then_thunk(void* storage, void* owner,
@@ -2279,12 +2285,11 @@ private:
     // results have no live handle and keep the diagnostics they already carry.
     [[nodiscard]] rpc_error with_call_diagnostics(rpc_error error) const {
         if (!computed_ && result_->ok()) {
-            const rpc::call_context ctx = result_->value().context();
+            const obs::trace_id trace = result_->value().trace_id();
             error.origin = result_->value().origin();
             error.attempts = result_->value().attempts();
-            if (ctx.trace.trace.valid()) {
-                error.metadata.set(k_trace_id_metadata,
-                                   format_trace_id(ctx.trace.trace));
+            if (trace.valid()) {
+                error.metadata.set(k_trace_id_metadata, format_trace_id(trace));
             }
         }
         return error;
@@ -2326,8 +2331,24 @@ private:
             return;
         }
         completion_notified_ = true;
-        diagnostics::on_completion(with_call_diagnostics(
-            value.ok() ? rpc_error(rpc_code::ok) : value.error()));
+        // Nothing is listening: skip the error copy and the call-handle lock
+        // that `with_call_diagnostics` would take, so the no-observer hot path
+        // stays lock- and allocation-free.
+        if (!diagnostics::has_completion_observer()) {
+            return;
+        }
+        if (value.ok()) {
+            // A success has no error, but the hook's `ok` record still carries
+            // the call's terminal origin/attempts for diagnostics.
+            diagnostics::on_completion(
+                with_call_diagnostics(rpc_error(rpc_code::ok)));
+            return;
+        }
+        // The terminal error was already enriched by `read_result`/`try_get`
+        // (a computed or start-failure error has no live handle to enrich), so
+        // the hook observes the same diagnostics as the returned error without
+        // a second copy and mutex round-trip.
+        diagnostics::on_completion(value.error());
     }
 
     // Type-erased consuming hooks (`response_base`). `get_erased` returns the

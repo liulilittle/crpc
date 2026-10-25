@@ -90,3 +90,18 @@ now exported from a shared build; see [CHANGELOG.md](CHANGELOG.md).
 3. Relink against the 2.0.0 library.
 4. Re-run the test suite: the layout guards in `src/abi_check.cpp` assert
    `sizeof(server::options)` and `sizeof(http_statistics)` on x86 and x64.
+
+## 5. Unreleased: `rpc_error` layout and the `failure_origin` move
+
+The unreleased diagnostics work is a MAJOR change on top of 2.0.0:
+
+- `rpc_error` gained two data members (`origin`, `attempts`), appended after
+  `metadata`. Initialising the first five members still compiles; allocating or
+  copying an old `rpc_error` does not.
+- `failure_origin` moved from `client_detail` into `crpc`, which renamed two
+  exported symbols (`breaker_record_for`, `result_origin`). The
+  `client_detail::failure_origin` alias keeps source compatibility, but a
+  consumer linked against the old symbol must relink.
+
+Rebuild every consumer from the same headers and relink. The old and new mangled
+names are listed in [CHANGELOG.md](CHANGELOG.md).

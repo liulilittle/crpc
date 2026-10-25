@@ -2,6 +2,25 @@
 
 [English](CHANGELOG.md) | **简体中文**
 
+## 未发布
+
+### 错误诊断
+
+- `rpc_error` 现在携带终结失败的来源与逻辑调用尝试次数：`failure_origin origin`（默认 `local_lifecycle`）与 `std::uint32_t attempts`（默认 `0`），追加在 `metadata` 之后（`include/crpc/error.hpp:179-183`）。按名称初始化前五个成员的聚合/位置初始化保持可编译。
+- `crpc::to_string(const rpc_error&)` 把码、消息、来源与尝试次数渲染为一行。七个分类谓词（`is_local`、`is_network`、`is_timeout`、`is_circuit_breaker`、`is_rate_limiter`、`is_fallback`、`is_server`）把 `origin` 映射到失败的子系统，调用方询问它关心的问题，而不必在单个枚举上 switch。
+- 进程级完成钩子（`diagnostics::set_completion_hook` / `on_completion`）恰好一次地观察每个终结的 `response<Resp>::get()` 结果，且不持任何库锁。当未安装用户钩子时，它在 `after_call` 运行进程级 `obs::interceptor_chain`（`obs::set_default_interceptor_chain`），使已安装的拦截器看到终结错误；未安装观察者时该路径为无锁、无分配的 no-op。
+- `response<Resp>::get()` 在调用携带有效 trace 上下文时，把调用的 W3C trace id 挂到终结错误的 metadata 的 `trace_id` 键下，使失败可与产生它的 trace 关联，无需重新推导上下文。
+- 影响：行为为 MINOR；下方 ABI 部分为 MAJOR。
+
+### ABI 破坏：`rpc_error` 布局与 `failure_origin` 迁移
+
+- `rpc_error` 由五个数据成员增至七个（`origin`、`attempts`）。公开结构体布局变更属于 MAJOR（[abi.zh-CN.md](abi.zh-CN.md) §1）。两个字段追加在末尾且有默认值，因此*初始化*前五个成员的消费者保持可编译，但按旧 `rpc_error` 分配或复制的消费者必须用同一份头文件重建。
+- `failure_origin` 从 `client_detail` 迁入 `crpc`（核心错误头），使 `rpc_error` 无需循环依赖即可携带它。这重命名了两个导出符号：枚举类型现在 mangle 为 `crpc::failure_origin`，而非 `crpc::client_detail::failure_origin`。
+  - `ABI 破坏：crpc::client_detail::breaker_record_for(crpc::client_detail::failure_origin, crpc::rpc_code)` 由 `?breaker_record_for@client_detail@crpc@@YA?AW4breaker_record@12@W4failure_origin@12@W4rpc_code@2@@Z` 改为 `?breaker_record_for@client_detail@crpc@@YA?AW4breaker_record@12@W4failure_origin@2@W4rpc_code@2@@Z`。
+  - `ABI 破坏：crpc::client_detail::result_origin(const crpc::rpc_error&)` 由 `?result_origin@client_detail@crpc@@YA?AW4failure_origin@12@AEBUrpc_error@2@@Z` 改为 `?result_origin@client_detail@crpc@@YA?AW4failure_origin@2@AEBUrpc_error@2@@Z`。
+  `client_detail::failure_origin` 仍是别名，既有拼写仍可编译，但链接的符号已改变。
+- 影响：MAJOR。每个消费者必须用同一份头文件重建并重新链接。见 [abi.zh-CN.md](abi.zh-CN.md) §1、§4 与 §8.3，以及 [migration.zh-CN.md](migration.zh-CN.md)。
+
 ## 2.0.0 - 2026-10-24
 
 ### 变更（MINOR，仅行为）
@@ -94,7 +113,7 @@
 
 - 新增内部翻译单元 `src/abi_check.cpp`（不进入任何头文件，也不导出符号），对跨越 ABI 边界的一部分公开记录做编译期断言：15 个记录的标准布局属性；15 个记录的精确成员数量（`CRPC_MEMBER_COUNT`，可捕获追加、中间插入或删除）；可捕获重排或改名的相对成员链（`CRPC_STEP`、`CRPC_STEP_SAME`、`CRPC_STEP_MIXED`、`CRPC_AFTER`）；`http_statistics` 的总宽度与尾字段位置；以及仅在 x86 与 x64 上的绝对 `sizeof`/`offsetof` 锚（`CRPC_ABS_SIZE`、`CRPC_ABS_OFF`）。成员数量正是能看到「尾追加被 x86 尾部填充吸收」这一情况的护栏。
 - [abi.zh-CN.md](abi.zh-CN.md) §4 现在给出「跨越 ABI 边界」的范围谓词，并列出 36 个仍无编译期护栏的范围内记录（`crpc_test_abi_docs` 扫描确认的确切数量）。`crpc_test_abi_docs` 会重新扫描 `include/crpc/**/*.hpp` 与 `src/abi_check.cpp`：新增跨边界记录若不加入护栏，也不更新该清单，测试即失败。
-- 已写入文档的盲区：成员数量护栏不校验名字（若记录存在相对链，则由相对链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获）；在 15 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排不会被该单元捕获。其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名；该单元的五条 `decltype` 断言点名了全部五个成员，因此其中任何一个改名都会在那里失败。`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
+- 已写入文档的盲区：成员数量护栏不校验名字（若记录存在相对链，则由相对链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获）；在 15 个有成员数量护栏的记录中，`rpc_error` 是唯一没有相对链的，因此其内部的重排不会被该单元捕获。其构造函数只点名 `code`、`message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名；该单元的七条 `decltype` 断言点名了全部七个成员，因此其中任何一个改名都会在那里失败。`rpc_error` 与 `status` 的绝对 `sizeof` 被刻意不锁定，因为它取决于标准库配置。见 [abi.zh-CN.md](abi.zh-CN.md) §4。
 - 影响：MINOR（仅构建期校验）。不破坏 ABI：不改变任何公开结构体布局，也不新增导出符号。运行时行为不变；构建约束收紧——护栏覆盖的布局变更现在会直接编译失败。见 [abi.zh-CN.md](abi.zh-CN.md) §4 与 §8。
 
 ### 客户端韧性流水线

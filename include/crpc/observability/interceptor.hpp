@@ -239,6 +239,16 @@ private:
     bool frozen_ = false;
 };
 
+// Process-wide chain consulted by the default diagnostics completion hook.
+//
+// `set_default_interceptor_chain` installs (or, with a null pointer, clears) the
+// chain that `diagnostics::on_completion` runs at `after_call` when no user
+// completion hook is installed. Both functions are safe to call from any thread;
+// the pointer is atomic because the hook may run concurrently with installation.
+// A null chain makes the default hook a no-op, which is the out-of-the-box state.
+CRPC_API void set_default_interceptor_chain(interceptor_chain* chain) noexcept;
+CRPC_API interceptor_chain* default_interceptor_chain() noexcept;
+
 } // namespace obs
 } // namespace crpc
 

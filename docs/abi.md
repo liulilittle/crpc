@@ -33,6 +33,14 @@ grew (§4), and `server::options` grew as well (§4). The 1.0.0 layout
 (`bd006b2`) is the last compatible release; 2.0.0 is not forward-compatible
 with a 1.0.x binary.
 
+The unreleased diagnostics work adds a further MAJOR break on top of 2.0.0:
+`rpc_error` grew from five to seven data members (`origin`, `attempts`), and
+`failure_origin` moved from `client_detail` into `crpc`, which renamed two
+exported symbols (`breaker_record_for`, `result_origin`). The old layout is not
+forward-compatible. The change, the old and new mangled names, and the rebuild
+requirement are recorded in [CHANGELOG.md](CHANGELOG.md) and [migration.md](migration.md),
+as §8.3 requires.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:
@@ -358,7 +366,7 @@ difference matters when judging whether a given change is caught:
 The unit does not pin the size of types that own standard-library members
 (`rpc_error`, `status`, `buffer`, `endpoint`), because their width is a property
 of the standard library configuration rather than of this library: `rpc_error`
-and `status` measure 80 bytes on x64 Release and 96 in Debug, and 56 versus 64
+and `status` measure 88 bytes on x64 Release and 104 in Debug, and 64 versus 72
 on x86, with the same headers. What actually guards each of them differs, and
 only the first is fully guarded:
 
@@ -381,7 +389,7 @@ because its absolute size is deliberately not pinned; `rpc_error` is the only
 one of the four whose member types are pinned.
 
 These four are not asserted to be standard-layout either, although `rpc_error`,
-`status` and `endpoint` in fact are on the toolchains audited here (MSVC 19.44,
+`status` and `endpoint` in fact are on the toolchains audited here (MSVC 19.51,
 GCC 13, Clang 18), and `buffer` is on MSVC and GCC but not on Clang. The reason
 is not that `offsetof` would be ill-formed — it is well-formed and yields the
 expected values — but that the offsets are a property of the standard-library
