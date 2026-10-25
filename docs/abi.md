@@ -337,11 +337,11 @@ difference matters when judging whether a given change is caught:
   caught by a chain. The four HTTP/2 value types `http2::h2_error`,
   `http2::connection_options`, `http2::stream_snapshot` and
   `http2::window_credit` **do** have `CRPC_AFTER` chains, so their renames are
-  caught. For `rpc_error`, the unit names all five members (`code`, `message`,
-  `retryable`, `retry_after`, `metadata`) in `decltype` type assertions, so a
-  rename fails that translation unit; its constructors name only `code`,
-  `message` and `retryable`, so they do not catch a rename of `retry_after` or
-  `metadata`.
+  caught. For `rpc_error`, the unit names all seven members (`code`, `message`,
+  `retryable`, `retry_after`, `metadata`, `origin`, `attempts`) in `decltype`
+  type assertions, so a rename fails that translation unit; its constructors name
+  only `code`, `message` and `retryable`, so they do not catch a rename of
+  `retry_after`, `metadata`, `origin` or `attempts`.
 - A field appended at the end is caught by the member count on every
   architecture, and additionally by the absolute `sizeof` anchor on x86 and x64.
   The member count is what makes the x86 case work: on x86
@@ -364,8 +364,8 @@ only the first is fully guarded:
 
 - `rpc_error` has public members, so it is covered by its member count and by an
   assertion on the declared type of every member (`code`, `message`,
-  `retryable`, `retry_after`, `metadata`). Both are independent of the build
-  type.
+  `retryable`, `retry_after`, `metadata`, `origin`, `attempts`). Both are
+  independent of the build type.
 - `status` has no public data member, so neither a member count nor a member
   type can be asserted. It is covered only by the
   `sizeof(status) == sizeof(rpc_error)` and `alignof(status) ==

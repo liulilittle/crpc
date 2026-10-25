@@ -106,11 +106,12 @@ namespace {
 //   * the binding names are new local names, not references to the member
 //     names, so the binding itself does not validate names. A rename is caught
 //     by the relative chain where one exists; the only member-counted record
-//     with no chain is `rpc_error`, whose five members are named one by one in
-//     the five `decltype` assertions below, so a rename of any of them fails
+//     with no chain is `rpc_error`, whose seven members are named one by one in
+//     the seven `decltype` assertions below, so a rename of any of them fails
 //     this translation unit. Its constructors name only `code`, `message` and
-//     `retryable`, so they do not catch a rename of `retry_after` or
-//     `metadata`. (`status` has no public data member; HTTP/2 records have chains.)
+//     `retryable`, so they do not catch a rename of `retry_after`, `metadata`,
+//     `origin` or `attempts`. (`status` has no public data member; HTTP/2
+//     records have chains.)
 //   * a reorder that keeps the count is not detected here either; the relative
 //     chains cover it where they exist. `rpc_error` has no relative chain, so a
 //     reorder in `rpc_error` is not detected by this unit;
@@ -178,7 +179,7 @@ CRPC_MEMBER_COUNT(server_statistics, server::statistics, active_connections,
                   push_queued_messages, push_queued_bytes, push_egress_bytes,
                   push_egress_high_water, push_dropped_overflow, push_acks)
 CRPC_MEMBER_COUNT(rpc_error, rpc_error, code, message, retryable, retry_after,
-                  metadata)
+                  metadata, origin, attempts)
 CRPC_MEMBER_COUNT(h2_error, http2::h2_error, code, scope, stream_id)
 CRPC_MEMBER_COUNT(connection_options, http2::connection_options, role,
                   local_settings, initial_connection_send_window,
@@ -488,7 +489,7 @@ CRPC_ABS_OFF(server::options, clock_source, 304);
 // The member counts still catch an appended or removed field; the relative
 // chains catch a reorder or a mid-record insertion where they exist. The only
 // member-counted record without a relative chain is `rpc_error`: a reorder
-// inside it is not caught here, but a rename is caught by the five `decltype`
+// inside it is not caught here, but a rename is caught by the seven `decltype`
 // assertions above. What is *not* guarded outside x86/x64 is a change that
 // preserves the member count and the relative order but alters the absolute
 // width, which in practice means a change to the standard library's own types.
@@ -557,6 +558,10 @@ static_assert(
     "rpc_error::retry_after must stay std::chrono::milliseconds");
 static_assert(std::is_same<decltype(rpc_error::metadata), metadata_list>::value,
               "rpc_error::metadata must stay metadata_list");
+static_assert(std::is_same<decltype(rpc_error::origin), failure_origin>::value,
+              "rpc_error::origin must stay failure_origin");
+static_assert(std::is_same<decltype(rpc_error::attempts), std::uint32_t>::value,
+              "rpc_error::attempts must stay std::uint32_t");
 
 // `status` has no public data member, so its member types cannot be named from
 // here. Its single member is a `rpc_error`, and the `sizeof`/`alignof` pair

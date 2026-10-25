@@ -144,6 +144,30 @@ private:
     container_type entries_;
 };
 
+// --- Failure origin ----------------------------------------------------------
+//
+// Where a failed attempt failed. The origin decides whether the endpoint
+// breaker is touched at all, whether a retry is legal without idempotency, and
+// whether `unknown_side_effect` can apply. Local admission and lifecycle
+// failures say nothing about the endpoint.
+//
+// This enum is a core error concept rather than a client-facade detail: it
+// moved here from `client_facade.hpp` so that `rpc_error` can carry it. The
+// facade already includes `error.hpp`, so the reverse dependency would have
+// been a cycle. `client_facade.hpp` keeps a `client_detail::failure_origin`
+// alias so existing spellings keep compiling.
+enum class failure_origin : std::uint8_t {
+    local_lifecycle,
+    local_gate,
+    local_capacity,
+    endpoint_open,
+    endpoint_pre_send,
+    endpoint_sent,
+    remote,
+    timeout,
+    cancel
+};
+
 struct rpc_error {
     rpc_code code = rpc_code::ok;
     std::string message;
@@ -152,6 +176,11 @@ struct rpc_error {
     // A server hint for when to try again. Zero means "no hint".
     std::chrono::milliseconds retry_after{0};
     metadata_list metadata;
+    // Where the terminal failure originated. Defaults to the least committal
+    // origin: a local lifecycle failure.
+    failure_origin origin = failure_origin::local_lifecycle;
+    // How many attempts the logical call made before the terminal outcome.
+    std::uint32_t attempts = 0;
 
     rpc_error() = default;
 

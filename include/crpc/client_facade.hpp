@@ -406,17 +406,11 @@ enum class breaker_record : u8 {
 // breaker is touched at all, whether a retry is legal without idempotency, and
 // whether `unknown_side_effect` can apply. Local admission and lifecycle
 // failures say nothing about the endpoint.
-enum class failure_origin : u8 {
-    local_lifecycle,
-    local_gate,
-    local_capacity,
-    endpoint_open,
-    endpoint_pre_send,
-    endpoint_sent,
-    remote,
-    timeout,
-    cancel
-};
+//
+// The enum moved to `error.hpp` (the core error header) so that `rpc_error` can
+// carry it without a dependency cycle; this alias keeps the existing
+// `client_detail::failure_origin` spelling valid.
+using failure_origin = crpc::failure_origin;
 
 // Maps an origin and the terminal code to the single breaker outcome.
 [[nodiscard]] CRPC_API breaker_record breaker_record_for(failure_origin origin,

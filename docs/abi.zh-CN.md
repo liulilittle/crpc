@@ -226,9 +226,9 @@ vector 的重排与其它护栏看不见的变更一样，仍按第 7 节属 MAJ
   个有成员数量护栏的记录而言；§4 中无护栏的记录则根本没有链，`status` 没有公开数据成员，改名不可能发生），因此 `rpc_error`
   中的改名不由链捕获。四个 HTTP/2 值类型 `http2::h2_error`、`http2::connection_options`、
   `http2::stream_snapshot`、`http2::window_credit` **都有** `CRPC_AFTER` 链，
-  因此它们的改名会被捕获。对 `rpc_error`，该单元在 `decltype` 类型断言中逐个点名其五个成员（`code`、`message`、
-  `retryable`、`retry_after`、`metadata`），因此改名会使该翻译单元编译失败；其构造函数只点名 `code`、
-  `message`、`retryable`，所以不会捕获 `retry_after` 或 `metadata` 的改名。
+  因此它们的改名会被捕获。对 `rpc_error`，该单元在 `decltype` 类型断言中逐个点名其七个成员（`code`、`message`、
+   `retryable`、`retry_after`、`metadata`、`origin`、`attempts`），因此改名会使该翻译单元编译失败；其构造函数只点名 `code`、
+   `message`、`retryable`，所以不会捕获 `retry_after`、`metadata`、`origin` 或 `attempts` 的改名。
 - 在末尾追加字段：由成员数量在所有架构上捕获，并且在 x86 与 x64 上还会被绝对
   `sizeof` 锚额外捕获。x86 之所以必须依赖成员数量，是因为 x86 上
   `server::statistics` 为 104 字节而最后一个字段结束于 100，末尾 4 字节是填充；
@@ -244,8 +244,8 @@ vector 的重排与其它护栏看不见的变更一样，仍按第 7 节属 MAJ
 分别为 56 与 64 字节。这四者实际受到的守护并不相同，且只有第一个是完整的：
 
 - `rpc_error` 有公开成员，因此由成员数量以及每个成员的声明类型断言
-  （`code`、`message`、`retryable`、`retry_after`、`metadata`）覆盖，二者都与
-  构建类型无关。
+   （`code`、`message`、`retryable`、`retry_after`、`metadata`、`origin`、`attempts`）覆盖，二者都与
+   构建类型无关。
 - `status` 没有公开数据成员，成员数量与成员类型都无法断言。它只由
   `sizeof(status) == sizeof(rpc_error)` 与
   `alignof(status) == alignof(rpc_error)` 关系覆盖；这能抓到新增存储，但抓不到
