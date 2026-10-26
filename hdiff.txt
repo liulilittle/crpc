@@ -1,0 +1,78 @@
+正在比较文件 F:\CRPC\.OPENCODE\TMP\AUDIT-DL-A\WSRC\INCLUDE\CRPC\RPC\client.hpp 和 F:\CRPC\INCLUDE\CRPC\RPC\CLIENT.HPP
+***** F:\CRPC\.OPENCODE\TMP\AUDIT-DL-A\WSRC\INCLUDE\CRPC\RPC\client.hpp
+   41:  //     under `map_mutex_` inside that completion scope.
+   42:  //   * `completion_mutex_` is never held while taking `write_mutex_` (the cancel
+   43:  //     RST and the transport close run after it is released), so a writer that
+   44:  //     re-enters the reader under `write_mutex_` cannot invert against a
+   45:  //     completion.
+   46:  //   * `read_mutex_` and `write_mutex_` may nest in either order, but only on
+***** F:\CRPC\INCLUDE\CRPC\RPC\CLIENT.HPP
+   41:  //     under `map_mutex_` inside that completion scope.
+   42:  //   * `completion_mutex_` is never held while taking `write_mutex_`, so a writer
+   43:  //     that re-enters the reader under `write_mutex_` cannot invert against a
+   44:  //     completion. This is enforced structurally, not by discipline: an RST that
+   45:  //     a cancellation wants to write is queued (`queue_rst`) and written by the
+   46:  //     outermost `completion_guard` release (`flush_pending_rst`), because a
+   47:  //     cancellation can run inside a `then` callback (a callback destroying a
+   48:  //     written sibling handle) while an outer completion scope is still held.
+   49:  //     Writing it there would create a real ABBA with the writer path
+   50:  //     (write -> reader -> completion).
+   51:  //   * `read_mutex_` and `write_mutex_` may nest in either order, but only on
+*****
+
+***** F:\CRPC\.OPENCODE\TMP\AUDIT-DL-A\WSRC\INCLUDE\CRPC\RPC\client.hpp
+   52:  // released, so a slow callback blocks other completions and a handle detach,
+   53:  // but never a writer or the reader's own frame drain.
+   54:  //
+***** F:\CRPC\INCLUDE\CRPC\RPC\CLIENT.HPP
+   57:  // released, so a slow callback blocks other completions and a handle detach,
+   58:  // but never a writer or the reader's own frame drain. A callback may destroy a
+   59:  // handle other than its own (a "sibling"); it must not destroy the handle it
+   60:  // was invoked for, and it must not start a blocking call on the same client.
+   61:  //
+*****
+
+***** F:\CRPC\.OPENCODE\TMP\AUDIT-DL-A\WSRC\INCLUDE\CRPC\RPC\client.hpp
+  663:      void cancel_slot(call_slot& slot) noexcept;
+  664:      // Disarms a slot's completion callback under `completion_mutex_` and
+***** F:\CRPC\INCLUDE\CRPC\RPC\CLIENT.HPP
+  670:      void cancel_slot(call_slot& slot) noexcept;
+  671:      // RAII holder of `completion_mutex_`. Tracks the nesting depth so the
+  672:      // outermost release can flush RSTs that were queued while the lock was
+  673:      // held: writing an RST takes `write_mutex_`, and the writer path re-enters
+  674:      // the reader (which needs `completion_mutex_`), so an RST must never be
+  675:      // written while this lock is held by any frame on the stack.
+  676:      struct completion_guard {
+  677:          explicit completion_guard(client& owner) noexcept;
+  678:          ~completion_guard();
+  679:          completion_guard(const completion_guard&) = delete;
+  680:          completion_guard& operator=(const completion_guard&) = delete;
+  681:  
+  682:      private:
+  683:          client& owner_;
+  684:      };
+  685:      // Queues a stream id whose RST must be written once the completion lock is
+  686:      // fully released. Requires `completion_mutex_` to be held.
+  687:      void queue_rst(u32 stream_id) noexcept;
+  688:      // Writes every queued RST. Must be called with no completion lock held.
+  689:      void flush_pending_rst() noexcept;
+  690:      // Disarms a slot's completion callback under `completion_mutex_` and
+*****
+
+***** F:\CRPC\.OPENCODE\TMP\AUDIT-DL-A\WSRC\INCLUDE\CRPC\RPC\client.hpp
+  726:      mutable std::recursive_mutex completion_mutex_;
+  727:      // Set once on the first terminal event. Read under map_mutex_ for the
+***** F:\CRPC\INCLUDE\CRPC\RPC\CLIENT.HPP
+  752:      mutable std::recursive_mutex completion_mutex_;
+  753:      // Depth of the current thread's `completion_mutex_` nesting. Only touched
+  754:      // while that lock is held, so a plain int is enough.
+  755:      int completion_depth_ = 0;
+  756:      // Stream ids whose RST could not be written while a completion lock was
+  757:      // held (a `then` callback that destroys a written sibling cancels it, and
+  758:      // the writer path re-enters the reader, which needs the completion lock).
+  759:      // The outermost completion scope flushes them after releasing the lock.
+  760:      // Guarded by `completion_mutex_`.
+  761:      std::vector<u32> rst_pending_;
+  762:      // Set once on the first terminal event. Read under map_mutex_ for the
+*****
+

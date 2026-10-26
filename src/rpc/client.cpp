@@ -252,7 +252,7 @@ void client::handle_response(const frame& value) {
     // the completion callback never runs under `map_mutex_` -- a callback that
     // destroys its handle re-enters `map_mutex_` through
     // `release_slot_under_lock`, and a non-recursive `map_mutex_` would throw.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     call_slot* slot = nullptr;
     {
         std::lock_guard<std::mutex> map(map_mutex_);
@@ -519,6 +519,48 @@ void client::send_rst(u32 stream_id, rpc_code code) {
     flush_write();
 }
 
+// --- Completion scope and deferred RST ---------------------------------------
+
+client::completion_guard::completion_guard(client& owner) noexcept : owner_(owner) {
+    owner_.completion_mutex_.lock();
+    ++owner_.completion_depth_;
+}
+
+client::completion_guard::~completion_guard() {
+    --owner_.completion_depth_;
+    owner_.completion_mutex_.unlock();
+    if (owner_.completion_depth_ == 0) {
+        owner_.flush_pending_rst();
+    }
+}
+
+void client::queue_rst(u32 stream_id) noexcept {
+    // Called with `completion_mutex_` held. The vector may allocate, and every
+    // caller is `noexcept`; a failure drops the RST, which is best-effort (the
+    // peer also learns about the cancel from the deadline or the close).
+    try {
+        rst_pending_.push_back(stream_id);
+    } catch (...) {
+    }
+}
+
+void client::flush_pending_rst() noexcept {
+    // No completion lock is held here, so taking `write_mutex_` is safe even
+    // though the write path may re-enter the reader and take the completion
+    // lock. Swap the queue out under the lock, then write outside it.
+    std::vector<u32> pending;
+    {
+        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        if (rst_pending_.empty()) {
+            return;
+        }
+        pending.swap(rst_pending_);
+    }
+    for (const u32 stream_id : pending) {
+        send_rst(stream_id, rpc_code::canceled);
+    }
+}
+
 void client::send_push_ack(u32 stream_id, u64 seq) {
     write_lock w(*this);
     if (closed_.load(std::memory_order_acquire) || conn_ == nullptr || !conn_->is_open()) {
@@ -722,7 +764,7 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
     // entry already gone and cannot hand the slot back to the pool while the
     // removal below still reads it. The callback itself runs with the map lock
     // released, so it may re-enter the map.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     if (!finish_slot(slot, terminal, code, std::move(error), body)) {
         return;
     }
@@ -741,10 +783,8 @@ void client::cancel_slot(call_slot& slot) noexcept {
     {
         // `completion_mutex_` is the outer lock and `map_mutex_` the inner one.
         // Holding both across the claim and the in-flight removal keeps the slot
-        // from being recycled in between (CF-1). Both are released before the
-        // RST is written: `send_rst` takes `write_mutex_`, which must never be
-        // acquired under `completion_mutex_`.
-        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        // from being recycled in between (CF-1).
+        completion_guard lk(*this);
         std::lock_guard<std::mutex> map(map_mutex_);
         won = finish_slot(slot, call_state::canceled, rpc_code::canceled,
                           rpc_error(rpc_code::canceled, "call canceled"),
@@ -757,12 +797,17 @@ void client::cancel_slot(call_slot& slot) noexcept {
     if (!won) {
         return;
     }
-    // The RST is a write: send it with the completion lock released, so the
-    // write lock is never taken under the completion lock.
+    // The RST is a write, and writing takes `write_mutex_` whose path re-enters
+    // the reader and therefore `completion_mutex_`. A cancel that runs inside a
+    // `then` callback (a callback destroying a written sibling) is nested inside
+    // an outer completion scope, so writing here would invert the two locks.
+    // Queue it instead: the outermost completion scope writes it after the lock
+    // is released.
     if (written) {
-        send_rst(slot.stream_id, rpc_code::canceled);
+        completion_guard lk(*this);
+        queue_rst(slot.stream_id);
     }
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     slot.invoke_callback();
 }
 
@@ -778,7 +823,7 @@ bool client::fail_all(rpc_code code, std::string_view message) {
     // Re-reading `in_flight_` each round only ever hands `finish` a slot that
     // was observed live under the lock, and holding the completion lock keeps
     // it alive until its claim is done.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     {
         std::lock_guard<std::mutex> map(map_mutex_);
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
@@ -853,7 +898,7 @@ void client::poll() noexcept {
     // live under the lock, and `completion_mutex_` (held throughout) prevents
     // any concurrent detach/release in between.
     try {
-        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        completion_guard lk(*this);
         for (;;) {
             call_slot* victim = nullptr;
             {
@@ -875,10 +920,11 @@ void client::poll() noexcept {
                         continue;
                     }
                     victim = slot;
-                    // `finish` removes this entry through `remove_in_flight`;
-                    // consuming it here keeps the loop monotone even if the
-                    // claim is lost to another terminal path.
-                    deadlines_.erase(it);
+                    // The deadline entry is NOT erased here. `finish` removes it
+                    // through `remove_in_flight`, and building the error below
+                    // allocates: if that throws, the entry must still be armed so
+                    // the next poll retries the call instead of leaving it in
+                    // flight with no deadline at all.
                     break;
                 }
                 if (victim == nullptr) {
@@ -897,8 +943,8 @@ void client::poll() noexcept {
         }
     } catch (...) {
         // Allocation failure while building a deadline error. The client stays
-        // usable; any call whose deadline entry was not consumed is retried on
-        // the next poll. The catch body performs no allocation.
+        // usable and the call's deadline entry is still armed, so the next poll
+        // retries it. The catch body performs no allocation.
     }
 }
 
@@ -915,7 +961,7 @@ void client::detach_slot(call_slot& slot) noexcept {
     // Every completion callback invocation runs under `completion_mutex_`, so
     // holding it here guarantees that once this returns no callback is running
     // and none can start for this slot.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     slot.callback_armed.store(false, std::memory_order_release);
     slot.callback_invoke = nullptr;
     slot.callback_owner = nullptr;
@@ -944,7 +990,7 @@ void client::release_slot_under_lock(call_slot* slot) noexcept {
     // running for this slot (CF-1), and the in-flight removal happens under the
     // map lock so a response thread's claim cannot race the reset in
     // `pool_.release`.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     std::lock_guard<std::mutex> map(map_mutex_);
     remove_in_flight(*slot);
     pool_.release(slot);

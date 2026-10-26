@@ -39,10 +39,15 @@
 //     reintroduced. `finish` claims the terminal state and runs the callback
 //     under `completion_mutex_`; the in-flight removal is done by the caller
 //     under `map_mutex_` inside that completion scope.
-//   * `completion_mutex_` is never held while taking `write_mutex_` (the cancel
-//     RST and the transport close run after it is released), so a writer that
-//     re-enters the reader under `write_mutex_` cannot invert against a
-//     completion.
+//   * `completion_mutex_` is never held while taking `write_mutex_`, so a writer
+//     that re-enters the reader under `write_mutex_` cannot invert against a
+//     completion. This is enforced structurally, not by discipline: an RST that
+//     a cancellation wants to write is queued (`queue_rst`) and written by the
+//     outermost `completion_guard` release (`flush_pending_rst`), because a
+//     cancellation can run inside a `then` callback (a callback destroying a
+//     written sibling handle) while an outer completion scope is still held.
+//     Writing it there would create a real ABBA with the writer path
+//     (write -> reader -> completion).
 //   * `read_mutex_` and `write_mutex_` may nest in either order, but only on
 //     the synchronous in-process path; the backend serializes source callbacks
 //     per connection (I8), so at most one thread is ever inside a drain and
@@ -50,7 +55,9 @@
 //
 // The completion callback runs under `completion_mutex_` with `map_mutex_`
 // released, so a slow callback blocks other completions and a handle detach,
-// but never a writer or the reader's own frame drain.
+// but never a writer or the reader's own frame drain. A callback may destroy a
+// handle other than its own (a "sibling"); it must not destroy the handle it
+// was invoked for, and it must not start a blocking call on the same client.
 //
 // `get()` blocks the calling thread on a condition variable until the terminal
 // state. On the single-threaded in-process path the response has already been
@@ -661,6 +668,25 @@ private:
     void finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
                 span<const std::byte> body);
     void cancel_slot(call_slot& slot) noexcept;
+    // RAII holder of `completion_mutex_`. Tracks the nesting depth so the
+    // outermost release can flush RSTs that were queued while the lock was
+    // held: writing an RST takes `write_mutex_`, and the writer path re-enters
+    // the reader (which needs `completion_mutex_`), so an RST must never be
+    // written while this lock is held by any frame on the stack.
+    struct completion_guard {
+        explicit completion_guard(client& owner) noexcept;
+        ~completion_guard();
+        completion_guard(const completion_guard&) = delete;
+        completion_guard& operator=(const completion_guard&) = delete;
+
+    private:
+        client& owner_;
+    };
+    // Queues a stream id whose RST must be written once the completion lock is
+    // fully released. Requires `completion_mutex_` to be held.
+    void queue_rst(u32 stream_id) noexcept;
+    // Writes every queued RST. Must be called with no completion lock held.
+    void flush_pending_rst() noexcept;
     // Disarms a slot's completion callback under `completion_mutex_` and
     // synchronizes with any callback already running, so the caller may then
     // recycle the slot safely (CF-1).
@@ -724,6 +750,15 @@ private:
     mutable std::mutex map_mutex_;
     // Terminal completion vs. handle detach/recycle. Held across the callback.
     mutable std::recursive_mutex completion_mutex_;
+    // Depth of the current thread's `completion_mutex_` nesting. Only touched
+    // while that lock is held, so a plain int is enough.
+    int completion_depth_ = 0;
+    // Stream ids whose RST could not be written while a completion lock was
+    // held (a `then` callback that destroys a written sibling cancels it, and
+    // the writer path re-enters the reader, which needs the completion lock).
+    // The outermost completion scope flushes them after releasing the lock.
+    // Guarded by `completion_mutex_`.
+    std::vector<u32> rst_pending_;
     // Set once on the first terminal event. Read under map_mutex_ for the
     // closed-vs-publish protocol and atomically on the hot writer path.
     std::atomic<bool> closed_{false};
