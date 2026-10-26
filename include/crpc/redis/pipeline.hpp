@@ -43,12 +43,12 @@
 #include <crpc/error.hpp>
 #include <crpc/redis/resp.hpp>
 
+// `connection` is an alias for the shared byte transport, so the alias header
+// must be visible here: an alias cannot be forward-declared.
+#include <crpc/redis/connection.hpp>
+
 namespace crpc {
 namespace redis {
-
-// Defined in connection.hpp. `command_channel` only stores a pointer, so the
-// feature headers do not need the transport header (and its io/runtime pulls).
-class connection;
 
 // One Redis command: the command name followed by its arguments, each a bulk
 // string on the wire. Redis commands are binary safe, so `std::string` is the

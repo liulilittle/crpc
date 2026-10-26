@@ -4,6 +4,26 @@
 
 ## 未发布
 
+### ABI 破坏：Redis 传输层迁移到 `crpc::net`
+
+- 字节级的 `connection`、`connection_config`、`connection_pool` 与
+  `pool_config` 本来就不含任何协议知识，因此从
+  `include/crpc/redis/connection.hpp` / `src/redis/connection.cpp` 迁移到
+  `include/crpc/net/connection.hpp` / `src/net/connection.cpp`。memcached、
+  数据库适配器与消息队列客户端共用同一套传输与连接池，而不再各自复制一份。
+- `crpc::redis::connection` 等旧名字以 `using` 别名保留在
+  `<crpc/redis/connection.hpp>` 中，按旧名书写的源码无需修改即可编译。
+- 链接符号发生变化，按 [abi.md](abi.md) §1 属 MAJOR：
+  - `ABI 破坏：crpc::redis::connection::connection(crpc::connection_config, crpc::backend_factory&, crpc::runtime*)` 由 `??0connection@redis@crpc@@QEAA@Uconnection_config@12@AEAVbackend_factory@2@PEAVruntime@2@@Z` 变为 `??0connection@net@crpc@@QEAA@Uconnection_config@12@AEAVbackend_factory@2@PEAVruntime@2@@Z`。
+  - `ABI 破坏：crpc::redis::connection::write(crpc::span<std::byte const>)` 由 `?write@connection@redis@crpc@@QEAA?AVstatus@3@V?$span@$$CBW4byte@std@@@3@@Z` 变为 `?write@connection@net@crpc@@QEAA?AVstatus@3@V?$span@$$CBW4byte@std@@@3@@Z`。
+  - 该命名空间变更同样适用于 `connection`、`connection_pool` 的全部成员以及
+    `crpc::redis::pool_config`。消费者必须用新头文件重新编译。
+- 两处前向声明改为包含头文件：`redis::pipeline.hpp` 与 `redis::sentinel.hpp`
+  现在包含别名头文件，因为别名无法前向声明。
+- 影响：ABI 为 MAJOR；消费者源码无需改动。验证：静态 x64 Debug 全量 74/74；
+  `CRPC_BUILD_SHARED=ON` 构建下共享库消费者门禁
+  （`crpc_test_shared_link`）通过。
+
 ### 可靠性：可靠流水线路径不再死锁
 
 - `rpc::client` 在 `completion_mutex_` 与 `map_mutex_` 上存在两套互逆的锁序：完成路径先 completion 后 map，而 `release_slot_under_lock`（句柄析构路径）先 map 后 completion。inproc 后端上并发 > 1、batch > 1 的流水线负载约三分之一概率命中。现在全文件只有一种顺序：`completion_mutex_` 外层、`map_mutex_` 内层。

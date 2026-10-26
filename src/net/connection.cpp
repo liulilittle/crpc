@@ -1,4 +1,4 @@
-﻿// CRPC Redis -- asynchronous connection management.
+// CRPC Redis -- asynchronous connection management.
 //
 // The transport is a thin, protocol-free layer over CRPC's `io::source` /
 // `io::sink` pair. Three properties are implemented here and tested in
@@ -16,7 +16,7 @@
 //     the next operation re-establishes it through the same backend with a
 //     bounded exponential backoff. An explicit `reconnect()` always tears the
 //     current link down and builds a new one; `close()` is terminal.
-#include <crpc/redis/connection.hpp>
+#include <crpc/net/connection.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -31,7 +31,7 @@
 #include <vector>
 
 namespace crpc {
-namespace redis {
+namespace net {
 namespace {
 
 // Translates a backend `std::error_code` into the RPC error model. The mapping
@@ -990,5 +990,5 @@ std::size_t connection_pool::total() const noexcept {
     return self.total;
 }
 
-} // namespace redis
+} // namespace net
 } // namespace crpc

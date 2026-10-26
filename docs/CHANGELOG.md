@@ -4,6 +4,30 @@
 
 ## Unreleased
 
+### ABI breaking: the Redis transport moved to `crpc::net`
+
+- The byte-level `connection`, `connection_config`, `connection_pool` and
+  `pool_config` were protocol-agnostic all along, so they moved from
+  `include/crpc/redis/connection.hpp` / `src/redis/connection.cpp` to
+  `include/crpc/net/connection.hpp` / `src/net/connection.cpp`. memcached, the
+  database adapters and the message-queue clients share one transport and one
+  pool instead of each growing a copy.
+- `crpc::redis::connection` and friends remain available as `using` aliases in
+  `<crpc/redis/connection.hpp>`, so source that spells the old names still
+  compiles with no edits.
+- The linked symbols changed, which is MAJOR by ([abi.md](abi.md) §1):
+  - `ABI breaking: crpc::redis::connection::connection(crpc::connection_config, crpc::backend_factory&, crpc::runtime*)` changed from `??0connection@redis@crpc@@QEAA@Uconnection_config@12@AEAVbackend_factory@2@PEAVruntime@2@@Z` to `??0connection@net@crpc@@QEAA@Uconnection_config@12@AEAVbackend_factory@2@PEAVruntime@2@@Z`.
+  - `ABI breaking: crpc::redis::connection::write(crpc::span<std::byte const>)` changed from `?write@connection@redis@crpc@@QEAA?AVstatus@3@V?$span@$$CBW4byte@std@@@3@@Z` to `?write@connection@net@crpc@@QEAA?AVstatus@3@V?$span@$$CBW4byte@std@@@3@@Z`.
+  - The same namespace change applies to every member of `connection` and
+    `connection_pool`, and to `crpc::redis::pool_config`. A consumer must be
+    rebuilt against the new headers.
+- Two forward declarations became includes: `redis::pipeline.hpp` and
+  `redis::sentinel.hpp` now include the alias header, because an alias cannot be
+  forward-declared.
+- Impact: MAJOR for ABI; no source change for consumers. Verified: full suite
+  74/74 in a static x64 Debug build, plus the shared-build consumer gate
+  (`crpc_test_shared_link`) passing in a `CRPC_BUILD_SHARED=ON` build.
+
 ### Reliability: the reliable pipelined path no longer deadlocks
 
 - `rpc::client` had two mutually inverted lock orders on `completion_mutex_` and

@@ -24,14 +24,17 @@
 #include <vector>
 
 #include <crpc/config.hpp>
+#include <crpc/redis/connection.hpp>
 
 namespace crpc {
 class runtime;
 class backend_factory;
 namespace redis {
 
-class connection;
-struct connection_config;
+// Aliases for the shared byte transport: an alias cannot be forward-declared,
+// so the transport header is included above.
+using connection = crpc::net::connection;
+using connection_config = crpc::net::connection_config;
 
 // A host/port pair used for masters, replicas and sentinels alike.
 #if defined(CRPC_COMPILER_MSVC)
