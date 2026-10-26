@@ -294,6 +294,7 @@ is guarded.
 - `::crpc::inproc_pair`
 - `::crpc::io::io_result`
 - `::crpc::memcached::binary_header`
+- `::crpc::memcached::connection_transport_config`
 - `::crpc::memcached::text_reply`
 - `::crpc::mvc::binding_limits`
 - `::crpc::mvc::file_part`
