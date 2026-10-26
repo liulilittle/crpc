@@ -394,6 +394,92 @@ CRPC_TEST(hub_reliable_budget_exhausted) {
     CRPC_CHECK(seen);
 }
 
+// Regression: `disconnect_subscriber` must not read a topic view that aliases
+// the subscriber's own subscription-map key it is about to erase. The
+// retransmission-budget path (`replay_unacked` -> `disconnect_subscriber`)
+// passes `kv.first`; without an intermediate copy the later `push_event` reads
+// freed memory. Repeated here so the ASan red state is deterministic, and the
+// event topic is checked so a silent garbage read also fails without ASan.
+CRPC_TEST(hub_retransmit_budget_disconnect_topic_lifetime) {
+    constexpr int kIterations = 64;
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+        hub h;
+        subscribe_options options;
+        options.retransmit_budget = 1;
+        const std::string topic = "budget-topic-" + std::to_string(iteration);
+        CRPC_CHECK(h.subscribe(topic, 5, delivery_mode::reliable, false, options).ok());
+        const hub::connection_id connection = h.attach(5);
+        CRPC_CHECK(connection != hub::invalid_connection);
+
+        h.publish(topic, as_bytes("m"), delivery_mode::reliable);
+        push_message message;
+        CRPC_CHECK(h.try_take(connection, topic, message)); // transmit: transmitted=true
+        CRPC_CHECK(h.retransmit(5).ok());                  // attempts=1
+        CRPC_CHECK(h.try_take(connection, topic, message)); // retransmit delivered again
+        if (iteration % 2 == 0) {
+            CRPC_CHECK(h.retransmit(5).ok()); // attempts>=budget -> disconnect
+        } else {
+            CRPC_CHECK(h.retransmit(5, topic).ok()); // same path, topic overload
+        }
+
+        CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(1));
+        CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(0));
+
+        bool saw_disconnect = false;
+        hub_event event;
+        while (h.poll_event(event)) {
+            if (event.kind == hub_event_kind::not_acknowledged &&
+                code_id(event.code) == code_id(rpc_code::not_acknowledged)) {
+                saw_disconnect = true;
+                CRPC_CHECK_EQ(event.topic, topic);
+                CRPC_CHECK_EQ(event.subscriber, static_cast<u64>(5));
+            }
+        }
+        CRPC_CHECK(saw_disconnect);
+    }
+}
+
+// Same aliasing hazard through the `attach(tail)` replay path: a detached
+// connection re-attaches, replays the unacknowledged window, exhausts the
+// budget and disconnects, again with a topic view borrowed from the map entry
+// that is erased.
+CRPC_TEST(hub_attach_tail_budget_disconnect_topic_lifetime) {
+    constexpr int kIterations = 64;
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+        hub h;
+        subscribe_options options;
+        options.retransmit_budget = 1;
+        const std::string topic = "tail-topic-" + std::to_string(iteration);
+        CRPC_CHECK(h.subscribe(topic, 6, delivery_mode::reliable, false, options).ok());
+        const hub::connection_id first = h.attach(6);
+        CRPC_CHECK(first != hub::invalid_connection);
+
+        h.publish(topic, as_bytes("m"), delivery_mode::reliable);
+        push_message message;
+        CRPC_CHECK(h.try_take(first, topic, message));
+        CRPC_CHECK(h.retransmit(6).ok()); // attempts=1
+        CRPC_CHECK(h.try_take(first, topic, message));
+
+        CRPC_CHECK(h.detach(first).ok()); // queue cleared, entries stay unacked
+        (void)h.attach(6);                // tail replay -> budget overrun -> disconnect
+
+        CRPC_CHECK_EQ(h.stats().not_acknowledged, static_cast<u64>(1));
+        CRPC_CHECK_EQ(h.stats().active_subscriptions, static_cast<u64>(0));
+
+        bool saw_disconnect = false;
+        hub_event event;
+        while (h.poll_event(event)) {
+            if (event.kind == hub_event_kind::not_acknowledged &&
+                code_id(event.code) == code_id(rpc_code::not_acknowledged)) {
+                saw_disconnect = true;
+                CRPC_CHECK_EQ(event.topic, topic);
+                CRPC_CHECK_EQ(event.subscriber, static_cast<u64>(6));
+            }
+        }
+        CRPC_CHECK(saw_disconnect);
+    }
+}
+
 // --- Hub: ordered mode -------------------------------------------------------
 
 CRPC_TEST(hub_ordered_in_order) {

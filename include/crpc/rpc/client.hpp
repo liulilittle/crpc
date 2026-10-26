@@ -16,9 +16,11 @@
 // writer for its whole duration. The path is now split across four locks:
 //
 //   * `read_mutex_` (recursive) -- the inbound drain (`decoder_` and the
-//     re-entrancy flag). Held for a whole drain so a frame's payload stays
-//     valid while it is handled. Recursive because a synchronous backend
-//     re-enters `on_data` from inside `flush_write` on the same thread.
+//     re-entrancy flag). Held only while frames are extracted; each ready
+//     frame's payload is copied out and handled after the lock is released, so
+//     no completion lock is ever taken under the reader lock. Recursive because
+//     a synchronous backend re-enters `on_data` from inside `flush_write` on the
+//     same thread.
 //   * `write_mutex_` (recursive) -- the writer state (`out_`, the scratch
 //     buffers, `conn_`) and the write loop. Recursive because a synchronous
 //     sink completes `push` inside `flush_write`.
@@ -30,8 +32,13 @@
 //     free a slot a completion is still touching (CF-1).
 //
 // Invariants that keep the four from deadlocking:
-//   * `map_mutex_` is innermost: it is never held while taking another client
-//     lock.
+//   * `completion_mutex_` is the outer lock and `map_mutex_` the inner one:
+//     every path that needs both takes them in that order. The reverse order
+//     (`map_mutex_` then `completion_mutex_`) was a real ABBA deadlock between
+//     `handle_response` and `release_slot_under_lock`; it must not be
+//     reintroduced. `finish` claims the terminal state and runs the callback
+//     under `completion_mutex_`; the in-flight removal is done by the caller
+//     under `map_mutex_` inside that completion scope.
 //   * `completion_mutex_` is never held while taking `write_mutex_` (the cancel
 //     RST and the transport close run after it is released), so a writer that
 //     re-enters the reader under `write_mutex_` cannot invert against a
@@ -450,6 +457,13 @@ private:
             fresh[live].next = (live + 1 < new_capacity) ? (live + 1) : kNone;
             ++live;
         }
+        // The last live node must terminate the live list. Linking it to `live`
+        // (the first free node) would absorb the whole free list into the live
+        // list, so a later insert would find `free_head_` pointing at a live
+        // node and create a cycle.
+        if (live > 0) {
+            fresh[live - 1].next = kNone;
+        }
         for (u32 i = live; i < new_capacity; ++i) {
             fresh[i].next = (i + 1 < new_capacity) ? (i + 1) : kNone;
         }
@@ -484,14 +498,32 @@ public:
     // Fails every in-flight call with shutting_down and closes the transport.
     void close() noexcept;
 
+    // Flushes any bytes staged for the sink but not yet handed to it. `start_call`
+    // only stages the request; the caller (or a synchronous in-process consumer)
+    // flushes here. This takes `write_mutex_` itself and is safe to call when no
+    // other lock is held: the synchronous in-process drain it triggers re-enters
+    // `on_data`, whose completion path takes `completion_mutex_`, so a caller that
+    // holds a facade connection-slot lock must flush outside that lock.
+    void flush_pending();
+
     // Starts a call. `request_body` and the response are encoded/decoded with
     // `call_codec<Resp>`; the request body is taken already encoded. Returns a
     // call handle or a failure (pool exhausted, expired deadline, write-queue
     // overflow, closed client).
+    //
+    // `flush = false` stages the frame without handing it to the transport. The
+    // caller must then call `flush_pending()` after releasing every other lock it
+    // holds: on the in-process path the flush drains the peer synchronously, and
+    // that drain re-enters `on_data`, whose completion path takes
+    // `completion_mutex_`. The facade uses this form because it calls `start_call`
+    // under its connection-slot lock. The default flushes here, which is outside
+    // every lock this function takes, so a direct low-level caller keeps the
+    // documented "start_call sends" behaviour.
     template <typename Resp>
     [[nodiscard]] rpc_result<call<Resp>> start_call(u64 service_id, u64 method_id,
                                                     span<const std::byte> request_body,
-                                                    call_context ctx = {}) {
+                                                    call_context ctx = {},
+                                                    bool flush = true) {
         // `begin_call` takes the map lock and rejects a closed client; the
         // encode/publish path takes the write lock. No lock is held across the
         // two, so a close between them is caught by the publish-time re-check.
@@ -511,6 +543,9 @@ public:
         handle.slot_ = slot;
         handle.generation_ = slot->generation;
         handle.pool_ = &pool_;
+        if (flush) {
+            flush_pending();
+        }
         return rpc_result<call<Resp>>(std::move(handle));
     }
 
@@ -520,9 +555,10 @@ public:
     template <typename Resp>
     [[nodiscard]] rpc_result<call<Resp>> start_call(service_id service, method_id method,
                                                     span<const std::byte> request_body,
-                                                    call_context ctx = {}) {
+                                                    call_context ctx = {},
+                                                    bool flush = true) {
         return start_call<Resp>(service.value, method.value, request_body,
-                                std::move(ctx));
+                                std::move(ctx), flush);
     }
 
     // Installs the PUSH sink. The sink runs on the reader thread (the thread
@@ -580,6 +616,17 @@ private:
     };
 
     // --- reader entry points (called through reader_source) ---
+    // A decoded frame whose payload has been copied out of the decoder. The
+    // decoder's payload span is only valid until the next `next()`/`feed()`, so
+    // `on_data` copies each ready frame here and calls `handle_frame` after the
+    // read/decoder lock is released. This keeps `completion_mutex_` out of the
+    // reader lock scope (see the thread-model note above).
+    struct pending_frame {
+        frame_header header{};
+        ordered_extension ordered{};
+        buffer payload;
+    };
+
     std::size_t on_data(span<const std::byte> data) noexcept;
     void on_eof() noexcept;
     void on_error(std::error_code ec) noexcept;
@@ -623,8 +670,10 @@ private:
     void release_slot_under_lock(call_slot* slot) noexcept;
     // Marks the client closed (once) and fails every in-flight call. Returns
     // true when this call performed the transition. The caller must hold no
-    // lock a completion callback could need.
-    bool fail_all(rpc_code code, std::string message);
+    // lock a completion callback could need. `message` is a view: the callers
+    // (`close`, `on_eof`, `on_error`) are `noexcept`, so constructing a
+    // `std::string` parameter at the call site would allocate there.
+    bool fail_all(rpc_code code, std::string_view message);
     void protocol_failure();
     void remove_in_flight(call_slot& slot);
     void remove_deadline(call_slot& slot);

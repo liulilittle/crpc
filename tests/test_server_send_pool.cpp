@@ -132,16 +132,16 @@ CRPC_TEST(send_pool_reuses_records_without_allocation) {
     fixture f;
     CRPC_CHECK(start(f));
 
-    CRPC_CHECK_EQ(200, echo_calls(*f.cli, std::string(64, 'x'), 200));
+    CRPC_CHECK_EQ(std::size_t{200}, echo_calls(*f.cli, std::string(64, 'x'), 200));
 
     const crpc::server::send_pool_counters before = f.srv->send_pool_stats();
     CRPC_CHECK(before.ops_allocated >= 1);
-    CRPC_CHECK_EQ(200, echo_calls(*f.cli, std::string(64, 'x'), 200));
+    CRPC_CHECK_EQ(std::size_t{200}, echo_calls(*f.cli, std::string(64, 'x'), 200));
     const crpc::server::send_pool_counters after = f.srv->send_pool_stats();
 
     CRPC_CHECK_EQ(before.ops_allocated, after.ops_allocated);
     CRPC_CHECK_EQ(before.buffers_allocated, after.buffers_allocated);
-    CRPC_CHECK_EQ(0, after.ops_live);
+    CRPC_CHECK_EQ(std::size_t{0}, after.ops_live);
 }
 
 // A buffer that grew past the retain limit is released when its record returns
@@ -161,23 +161,23 @@ CRPC_TEST(send_pool_releases_oversized_buffer) {
     CRPC_CHECK(start(f));
 
     // Warm up with a small frame so the record's buffer is small.
-    CRPC_CHECK_EQ(50, echo_calls(*f.cli, std::string(32, 'x'), 50));
+    CRPC_CHECK_EQ(std::size_t{50}, echo_calls(*f.cli, std::string(32, 'x'), 50));
     const crpc::server::send_pool_counters small = f.srv->send_pool_stats();
 
     // A frame larger than the 64 KiB retain limit grows the buffer.
     const std::string large(256 * 1024, 'y');
-    CRPC_CHECK_EQ(1, echo_calls(*f.cli, large, 1));
+    CRPC_CHECK_EQ(std::size_t{1}, echo_calls(*f.cli, large, 1));
     const crpc::server::send_pool_counters grew = f.srv->send_pool_stats();
     CRPC_CHECK(grew.buffers_allocated > small.buffers_allocated);
     CRPC_CHECK_EQ(small.ops_allocated, grew.ops_allocated);
 
     // The large buffer was released on return, so the small frame reallocates.
-    CRPC_CHECK_EQ(50, echo_calls(*f.cli, std::string(32, 'x'), 50));
+    CRPC_CHECK_EQ(std::size_t{50}, echo_calls(*f.cli, std::string(32, 'x'), 50));
     const crpc::server::send_pool_counters reallocated =
         f.srv->send_pool_stats();
     CRPC_CHECK(reallocated.buffers_allocated > grew.buffers_allocated);
     CRPC_CHECK_EQ(grew.ops_allocated, reallocated.ops_allocated);
-    CRPC_CHECK_EQ(0, reallocated.ops_live);
+    CRPC_CHECK_EQ(std::size_t{0}, reallocated.ops_live);
 }
 
 // The pool never creates more than its cap records, even when many connections
@@ -194,7 +194,7 @@ CRPC_TEST(send_pool_is_bounded_by_its_cap) {
     CRPC_CHECK(start(f));
 
     // One round-trip creates at least one record.
-    CRPC_CHECK_EQ(1, echo_calls(*f.cli, std::string(32, 'x'), 1));
+    CRPC_CHECK_EQ(std::size_t{1}, echo_calls(*f.cli, std::string(32, 'x'), 1));
     const crpc::server::send_pool_counters after_one = f.srv->send_pool_stats();
     CRPC_CHECK(after_one.ops_allocated >= 1);
 
@@ -216,7 +216,7 @@ CRPC_TEST(send_pool_is_bounded_by_its_cap) {
 
     const crpc::server::send_pool_counters burst = f.srv->send_pool_stats();
     CRPC_CHECK(burst.ops_allocated <= 4);
-    CRPC_CHECK_EQ(0, burst.ops_live);
+    CRPC_CHECK_EQ(std::size_t{0}, burst.ops_live);
 }
 
 CRPC_TEST_MAIN()

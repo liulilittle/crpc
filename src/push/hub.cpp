@@ -297,6 +297,17 @@ struct hub::impl {
         if (it == subscribers.end()) {
             return;
         }
+        // `topic` may alias a key inside this subscriber's own subscription map
+        // (`replay_unacked` passes `kv.first`). That map is erased below, which
+        // would leave the view dangling before `push_event` reads it. Copy it
+        // while the source is still alive; `push_event` copies again into the
+        // queued event, so the event is unaffected by the later erase.
+        std::string topic_copy;
+        try {
+            topic_copy.assign(topic.data(), topic.size());
+        } catch (...) {
+            // Allocation failure: keep the event, with an empty topic.
+        }
         for (auto& kv : it->second.subscriptions) {
             remove_topic_subscriber(kv.first, id);
             counters.dropped_disconnected += static_cast<u64>(kv.second.queue.size());
@@ -312,7 +323,7 @@ struct hub::impl {
         if (code == rpc_code::not_acknowledged) {
             ++counters.not_acknowledged;
         }
-        push_event(kind, id, topic, code, 0, 0);
+        push_event(kind, id, topic_copy, code, 0, 0);
     }
 
     [[nodiscard]] bool requeue(subscriber_state& state, subscription_state& sub,

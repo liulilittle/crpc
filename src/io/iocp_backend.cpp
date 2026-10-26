@@ -457,14 +457,19 @@ namespace {
 void initiate_close(conn_state* st) noexcept {
     std::vector<io::completion*> canceled;
     bool need_finalize = false;
-    bool had_inflight_send = false;
+    bool send_delivery_pending = false;
     {
         std::lock_guard<std::mutex> lk(st->m);
         if (st->phase != conn_phase::open) {
             return;
         }
         st->phase = conn_phase::closing;
-        had_inflight_send = st->send_inflight;
+        // `send_inflight` is cleared by `handle_send_complete` at the top of the
+        // completion, *before* it runs the user callback, so `send_inflight ==
+        // false` does not mean the borrowed completion is no longer in use.
+        // `send_delivery_done` is the flag that becomes true only after that
+        // callback has returned; it is the one that must gate the wait.
+        send_delivery_pending = !st->send_delivery_done;
         if (st->send_inflight) {
             // Keep the chunk whose WSASend is outstanding; complete the rest.
             while (st->sendq.size() > 1) {
@@ -499,11 +504,15 @@ void initiate_close(conn_state* st) noexcept {
     // before it runs the user callback, so without this wait `close()` could
     // return while the callback is still about to run on a completion the caller
     // already freed (a real access violation, reproduced once per ~30 runs).
+    // The condition is `send_delivery_pending`, not `send_inflight`: a send that
+    // already completed at the kernel level but is still inside its user
+    // callback must be waited for too, otherwise the caller frees the
+    // completion while the pump is still touching it.
     //
     // The wait is skipped on the pump thread itself, where a completion callback
     // may legitimately close the connection; it is bounded only while the backend
     // is shutting down, because the pump may have exited without delivering.
-    if (had_inflight_send && st->backend != nullptr) {
+    if (send_delivery_pending && st->backend != nullptr) {
         const DWORD self = ::GetCurrentThreadId();
         if (self != st->backend->pump_tid.load(std::memory_order_acquire)) {
             std::unique_lock<std::mutex> lk(st->m);
@@ -864,15 +873,21 @@ void handle_send_complete(overlapped_op* op, std::size_t bytes,
             outcome.first->complete(outcome.second);
         }
     }
-    {
-        // The completion callbacks have run: close() may now return safely.
-        std::lock_guard<std::mutex> lk(st->m);
-        st->send_delivery_done = true;
-    }
-    st->delivery_cv.notify_all();
     if (post_next) {
         post_send(st);
     }
+    {
+        // The completion callbacks have run and the next send (if any) has been
+        // posted.  Recompute the flag from the live state instead of setting it
+        // unconditionally: a callback may have re-entered `push` (exactly what
+        // `rpc::client::on_write_complete -> flush_write` does), which posted a
+        // nested send and cleared `send_delivery_done` while this handler was
+        // still running.  Setting it to `true` here would let a concurrent
+        // `close()` return while that nested WSASend is still in flight.
+        std::lock_guard<std::mutex> lk(st->m);
+        st->send_delivery_done = !st->send_inflight && st->sendq.empty();
+    }
+    st->delivery_cv.notify_all();
 
     bool need_finalize = false;
     {

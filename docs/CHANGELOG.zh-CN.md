@@ -4,6 +4,14 @@
 
 ## 未发布
 
+### 可靠性：可靠流水线路径不再死锁
+
+- `rpc::client` 在 `completion_mutex_` 与 `map_mutex_` 上存在两套互逆的锁序：完成路径先 completion 后 map，而 `release_slot_under_lock`（句柄析构路径）先 map 后 completion。inproc 后端上并发 > 1、batch > 1 的流水线负载约三分之一概率命中。现在全文件只有一种顺序：`completion_mutex_` 外层、`map_mutex_` 内层。
+- `poll()` 与 `fail_all()` 不再快照裸 `call_slot*`。`then` 回调在完成锁内运行，且合法地可以销毁**兄弟**句柄——那会把兄弟的槽位还回池；预先收集的快照因此可能去 finish 一个已回收的槽位，把伪造的 `timed_out` 写进去（若该槽位已被重新获取，则写进一个全新的、从未发送的调用）。两者现在每轮只取一个仍存活的 victim 并立刻 finish。
+- `rpc::client::start_call` 新增尾部参数 `bool flush = true`。默认值保持文档化的「start_call 会发送」语义；`client_facade` 传 `false`，改在新 `flush_pending()` 里于连接槽位锁之外 flush，这正是让同步 inproc drain 安全的关键。源码兼容；模板在消费者侧实例化，库符号未变。
+- 影响：MINOR。新增回归 `tests/test_poll_recycle.cpp`（2 个 case）覆盖两个回收窗口；对旧形状 200/200 check 失败。
+
+
 ### 错误诊断
 
 - `rpc_error` 现在携带终结失败的来源与逻辑调用尝试次数：`failure_origin origin`（默认 `local_lifecycle`）与 `std::uint32_t attempts`（默认 `0`），追加在 `metadata` 之后（`include/crpc/error.hpp:179-183`）。按名称初始化前五个成员的聚合/位置初始化保持可编译。

@@ -72,6 +72,17 @@ status flag_body(void*, const call_envelope&, span<const std::byte>, buffer&, ca
     return status{};
 }
 
+// Returns a fully populated rpc_error. `respond_error` used to rebuild the
+// error from only its code and message, which silently dropped all of this.
+status metadata_error_body(void*, const call_envelope&, span<const std::byte>, buffer&,
+                           call_context&) {
+    rpc_error error(rpc_code::unavailable, "handler metadata");
+    error.retryable = true;
+    error.retry_after = std::chrono::milliseconds(37);
+    error.metadata.set("handler.marker", "kept");
+    return status{std::move(error)};
+}
+
 // --- Transport fixtures ------------------------------------------------------
 
 // A completion that does nothing; the in-process sink completes synchronously.
@@ -1017,6 +1028,39 @@ CRPC_TEST(dispatcher_handler_exception_maps_to_internal) {
     std::string body = "x";
     built_request request = make_call(1, 1, bytes_of(body), false, 0);
     CRPC_CHECK_EQ(rpc_code::internal, dispatch_code(d, request.value, now));
+}
+
+CRPC_TEST(dispatcher_preserves_handler_error_metadata) {
+    service_registry reg;
+    (void)reg.register_service(1, "svc");
+    (void)reg.register_method(1, 1, "meta", &metadata_error_body, nullptr);
+    (void)reg.freeze();
+    dispatcher d(reg);
+    const auto now = std::chrono::steady_clock::now();
+
+    std::string body = "x";
+    built_request request = make_call(1, 1, bytes_of(body), false, 0);
+    buffer response;
+    bool has_response = false;
+    CRPC_CHECK(d.dispatch(request.value, response, has_response, now).ok());
+    CRPC_CHECK(has_response);
+    if (!has_response) {
+        return;
+    }
+
+    rpc_code code = rpc_code::ok;
+    rpc_error error;
+    span<const std::byte> decoded_body;
+    CRPC_CHECK(decode_response(response.readable(), code, error, decoded_body).ok());
+    CRPC_CHECK_EQ(rpc_code::unavailable, code);
+    CRPC_CHECK_EQ(std::string("handler metadata"), error.message);
+    CRPC_CHECK(error.retryable);
+    CRPC_CHECK_EQ(37, static_cast<int>(error.retry_after.count()));
+    const std::string* marker = error.metadata.find("handler.marker");
+    CRPC_CHECK(marker != nullptr);
+    if (marker != nullptr) {
+        CRPC_CHECK_EQ(std::string("kept"), *marker);
+    }
 }
 
 CRPC_TEST(dispatcher_expired_deadline_skips_handler) {

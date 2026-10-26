@@ -1061,22 +1061,35 @@ struct server::impl {
     void send_error(const std::shared_ptr<server_connection>& sc, std::uint32_t stream_id,
                     rpc_code code, std::chrono::milliseconds retry_after,
                     const char* message, bool degradable = false) noexcept {
-        rpc_error error(code, message != nullptr ? std::string(message) : std::string());
-        error.retryable = is_retryable(code);
-        error.retry_after = retry_after;
-        // The single place the reserved marker is written. Only the four
-        // pre-execution admission refusals pass `degradable = true`; every other
-        // call site leaves it false, so a handler that returns the same code
-        // never advertises degradability. See resilience/admission.hpp (6).
-        if (degradable) {
-            error.metadata.set(resilience::degradable_metadata_key,
-                               resilience::degraded_metadata_value);
+        // This function is noexcept because it runs on the shard and is called
+        // from `handle_request`, which is also noexcept. Building the error
+        // allocates (the message string, the metadata vector and the response
+        // buffer), so an allocation failure would otherwise reach
+        // `std::terminate`. Degrade by dropping this response instead: the
+        // client observes its own deadline, which is recoverable, while a
+        // process abort is not.
+        try {
+            rpc_error error(code, message != nullptr ? std::string(message) : std::string());
+            error.retryable = is_retryable(code);
+            error.retry_after = retry_after;
+            // The single place the reserved marker is written. Only the four
+            // pre-execution admission refusals pass `degradable = true`; every
+            // other call site leaves it false, so a handler that returns the
+            // same code never advertises degradability. See
+            // resilience/admission.hpp (6).
+            if (degradable) {
+                error.metadata.set(resilience::degradable_metadata_key,
+                                   resilience::degraded_metadata_value);
+            }
+            buffer payload;
+            if (!rpc::encode_response(code, error, span<const std::byte>(), payload).ok()) {
+                return;
+            }
+            (void)send_payload(sc, stream_id, frame_type::response, payload.readable());
+        } catch (...) {
+            // Allocation failure while building the error. Dropping the frame
+            // is the only action that cannot itself allocate.
         }
-        buffer payload;
-        if (!rpc::encode_response(code, error, span<const std::byte>(), payload).ok()) {
-            return;
-        }
-        (void)send_payload(sc, stream_id, frame_type::response, payload.readable());
     }
 
     // True when the request's wire deadline is below the floor the dispatcher
@@ -1414,17 +1427,27 @@ struct server::impl {
     }
 
     void send_goaway() noexcept {
-        std::vector<std::shared_ptr<server_connection>> snapshot;
-        {
-            std::lock_guard<std::mutex> lk(connections_mutex);
-            snapshot = connections;
-        }
-        std::byte payload[8];
-        endian::store_le32(payload, 0);
-        endian::store_le32(payload + 4, static_cast<u32>(rpc_code::shutting_down));
-        for (const std::shared_ptr<server_connection>& sc : snapshot) {
-            (void)send_payload(sc, 0, frame_type::goaway,
-                         span<const std::byte>(payload, sizeof(payload)));
+        // Copying `connections` allocates, and this function is noexcept (it is
+        // called from `stop()`, which cannot propagate). An allocation failure
+        // would reach `std::terminate`. Degrade by dropping the GOAWAY instead:
+        // the peer converges on its own deadline, which is recoverable, while a
+        // process abort is not. The catch body performs no allocation.
+        try {
+            std::vector<std::shared_ptr<server_connection>> snapshot;
+            {
+                std::lock_guard<std::mutex> lk(connections_mutex);
+                snapshot = connections;
+            }
+            std::byte payload[8];
+            endian::store_le32(payload, 0);
+            endian::store_le32(payload + 4, static_cast<u32>(rpc_code::shutting_down));
+            for (const std::shared_ptr<server_connection>& sc : snapshot) {
+                (void)send_payload(sc, 0, frame_type::goaway,
+                             span<const std::byte>(payload, sizeof(payload)));
+            }
+        } catch (...) {
+            // Allocation failure while snapshotting the connection list. The
+            // GOAWAY is dropped; `close_all()` still runs.
         }
     }
 
