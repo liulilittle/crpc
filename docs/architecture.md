@@ -357,7 +357,8 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | push | implemented | `test_push.cpp`, `test_push_e2e.cpp`, `test_http_sse.cpp`; PUSH/PUSH_ACK wired to `rpc::client` and the server push pump; SSE and long polling wired in `http_server` |
 | flow | partial | `test_flow.cpp`; not wired to transport |
 | shard/coroutines | implemented | `test_server_client.cpp`; `src/runtime/runtime.cpp` calls `coro_rt_*`; automatic `clamp(cores-1,1,32)` shard count not implemented |
-| compression | implemented | HTTP gzip/deflate streaming codec implemented, tested (`test_content_coding.cpp`) and wired into `http_server` (`test_http_coding.cpp`); CRPC frame compression: lz4 block implemented and tested (`test_frame_compression.cpp`), zstd reserved and fail-closed, gzip reserved for the next slice; a `COMPRESSED` frame is decompressed or rejected, never delivered as plaintext (it used to be delivered verbatim) |
+| compression | implemented | HTTP gzip/deflate streaming codec implemented, tested (`test_content_coding.cpp`) and wired into `http_server` (`test_http_coding.cpp`); CRPC frame compression: none/lz4/gzip/deflate/lz77/zip implemented and tested (`test_frame_compression.cpp`, 61 cases), zstd reserved and fail-closed; a `COMPRESSED` frame is decompressed or rejected, never delivered as plaintext (it used to be delivered verbatim) |
+| Redis client | implemented (shared build covers the Redis header exports; under `CRPC_BUILD_SHARED=ON`, `ctest -R 'redis\|abi_docs\|shared_link'` passes) | `test_redis_*.cpp` covers RESP2/3, connection pool, pipeline, transaction, Pub/Sub, Streams, cluster, Sentinel, typed helpers and RTTI binding; `test_redis_header_conflict.cpp` pins `stream_entry` vs `redis_stream_entry`. Static build is the default tested configuration; the shared build is supported with the same API and its Redis header exports are covered. |
 | SSE / long polling | implemented | `test_http_sse.cpp`; SSE writer and long-poll routes wired in `src/http/server.cpp` |
 
 ## 20. Verification map <a id="s20"></a>
@@ -382,5 +383,8 @@ The test tree discovers one executable per `tests/test_<area>.cpp` and registers
 | `test_observability.cpp` | traceparent, baggage, interceptor chain, logger, tracer |
 | `test_push.cpp` | fan-out, overflow, replay/dedup, ordered gaps, slow subscribers, streams |
 | `test_flow.cpp` | directional RTT baseline, queue signal, pacer, window, stale samples |
+| `test_frame_compression.cpp` | frame compression container, none/lz4/gzip/deflate/lz77/zip codecs, fail-closed table, unreliable drop, limits, never-inflate and mutation fuzz |
+| `test_redis_*.cpp` | RESP2/3, pool/connection, pipeline, transaction, Pub/Sub, Streams, cluster, Sentinel, typed helpers, RTTI binding and header coexistence |
+| `test_distributed_rpc.cpp`, `test_distributed_push.cpp` | discovery/failover, partition replay, registry/watch recovery and multi-hop push |
 
 These are functional tests, not a substitute for the sanitizer matrix. `scripts/test.ps1` and `scripts/test.sh` build and run them; ASan/LSan/UBSan/TSan are the merge gates described in [Build and test](building.md). Fuzzing exists only as in-suite never-crash cases for the HTTP/2 frame and connection paths; standalone fuzz targets are **specified, not implemented**.

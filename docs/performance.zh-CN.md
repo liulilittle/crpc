@@ -13,6 +13,7 @@
 |---|---|
 | [1](#s1) | 测量方法 |
 | [2](#s2) | 已记录证据 |
+| [2.5](#s2-5) | 压缩、RPC 矩阵与 Redis 基准（2026-10-26） |
 | [3](#s3) | 预算与目标 |
 | [4](#s4) | 基准计划 |
 | [5](#s5) | 设计拒绝的反模式 |
@@ -167,6 +168,115 @@ disconnect），并把聚合值与全量扫描会得到的结果对比。
 `frame_decoder_external_matches_feed` 在每一种切分点（包括在一帧中间切分）都
 验证产生相同的帧流。
 
+### 2.5 压缩、RPC 矩阵与 Redis 基准（2026-10-26） <a id="s2-5"></a>
+
+源码：`bench/bench_compression.cpp`、`bench/bench_rpc_matrix.cpp` 与
+`bench/bench_redis.cpp`（目标 `crpc_bench_compression`、
+`crpc_bench_rpc_matrix`、`crpc_bench_redis`）。工具链：MSVC x64 **Debug**
+（`/W4 /WX`）、AMD Ryzen 9 7945HX（16 核 / 32 线程）、单进程
+`inproc_backend`、无网络、无消毒器。每个用例先预热，多次运行取中位数。Debug
+数字只用于同环境回归对比，不代表 Release 或生产容量。运行方法、场景与完整场景证据见
+[distributed-testing.zh-CN.md](distributed-testing.zh-CN.md)。
+
+**帧压缩（文本 payload，wire/plain）。** 基准走真实帧路径（header + 4 字节逻辑
+长度前缀 + 编解码流），不是裸编解码调用。
+
+| 算法 | 4 KiB | 64 KiB |
+|---|---:|---:|
+| none | 1.004 | 1.000 |
+| lz4 | 0.026 | 0.005 |
+| deflate | 0.027 | 0.004 |
+| lz77 | 0.048 | 0.025 |
+| zip | 0.034 | 0.005 |
+| gzip | 0.031 | 0.005 |
+
+**帧压缩吞吐（文本，Debug）。**
+
+| 用例 | 编码 | 解码 |
+|---|---:|---:|
+| text 4 KiB lz4 | 307.9 MiB/s | 316.3 MiB/s |
+| text 64 KiB lz4 | 343.0 MiB/s | 474.3 MiB/s |
+| text 4 KiB deflate | 5.57 MiB/s | 90.75 MiB/s |
+| text 4 KiB gzip | 5.51 MiB/s | 66.95 MiB/s |
+
+不可压缩二进制：所有算法按设计回退到 `none`，ratio 为 1.0。例如 lz4 尝试编码
+4 KiB 时为 84.0 MiB/s，最终 `chosen=none`。该轮共记录 120 个 case
+（`.opencode/tmp/distbench-compression.log`）。
+
+**可靠 RPC 延迟（闭环，depth 1；5 × 2000 样本取中位）。**
+
+| Payload | p50 | p99 |
+|---|---:|---:|
+| 16 B | 64.0 µs | 177.1 µs |
+| 256 B | 59.3 µs | 174.8 µs |
+| 4 KiB | 67.1 µs | 194.8 µs |
+
+**可靠 RPC 吞吐（闭环，payload × 并发，0 errors）。**
+
+| Payload | c=1 | c=4 |
+|---|---:|---:|
+| 16 B | 83.1 µs/call（约 12.0k/s） | 96.9 µs/call（约 10.3k/s） |
+| 256 B | 113.9 µs/call（约 8.8k/s） | 85.8 µs/call（约 11.7k/s） |
+| 4 KiB | 123.9 µs/call（约 8.1k/s） | 99.1 µs/call（约 10.1k/s） |
+| 64 KiB | 265.1 µs/call（约 3.8k/s） | 272.5 µs/call（约 3.7k/s） |
+
+**不可靠 `ONE_WAY` 发射/投递（0 errors，drained = yes）。**
+
+| Payload | c=1 issued/delivered | c=4 issued/delivered |
+|---|---:|---:|
+| 16 B | 10000 / 10000，0.4894 s（约 20.4k/s） | 10000 / 10000，0.5816 s（约 17.2k/s） |
+| 4 KiB | 4000 / 4000，0.2004 s（约 20.0k/s） | 4000 / 4000，0.2665 s（约 15.0k/s） |
+
+**流水线批次吞吐（Debug，2026-10-26）。** 上面的闭环用例发一个调用就等它；流水线用例先发出
+1/16/64 个批次的调用再等待其中任意一个，这才是吞吐型调用方使用的形状。每个用例先预热，
+运行三次计时迭代，报告中位数、p99 与 spread。`batch=1` 与闭环形状相同，是用例自身的一致性
+检查。
+
+可靠，中位数 ns/call（payload × batch × 并发；`hang` 表示流水线用例死锁，watchdog 记录了
+闭环回退，见 [distributed-testing.zh-CN.md §7](distributed-testing.zh-CN.md#s7)）：
+
+| Payload | batch | c=1 | c=2 | c=4 |
+|---|---:|---:|---:|---:|
+| 16 B | 1 | 88.1 µs | 75.0 µs | 80.4 µs |
+| 16 B | 16 | 54.9 µs | 51.9 µs | hang（约 0.009 M/s） |
+| 16 B | 64 | 46.7 µs | 82.1 µs | hang（约 0.010 M/s） |
+| 256 B | 1 | 74.6 µs | 82.1 µs | 71.5 µs |
+| 256 B | 16 | 45.2 µs | 72.7 µs | hang（约 0.009 M/s） |
+| 256 B | 64 | hang（约 0.008 M/s） | hang（约 0.009 M/s） | hang（约 0.009 M/s） |
+
+不可靠 `ONE_WAY`，中位数投递 M calls/s（16 B；全部 drained，0 errors）：
+
+| batch | c=1 | c=2 | c=4 |
+|---:|---:|---:|---:|
+| 1 | 0.029 | 0.025 | 0.024 |
+| 16 | 0.028 | 0.019 | 0.020 |
+| 64 | 0.025 | 0.018 | 0.019 |
+
+在本 Debug 构建中，可靠流水线路径在高 batch × 并发下不可用：并发发射路径与进程内后端的同步
+完成路径死锁，watchdog 杀掉用例并记录闭环回退，而不是流水线数字。`ONE_WAY` 路径不会死锁
+（其发射路径不等待），因此其流水线数字是完整的。该死锁是库层发现，不是基准假象；复现与
+调用栈见 `.superpowers/sdd/bench-pipeline-report.md`，并记为
+[distributed-testing.zh-CN.md §8](distributed-testing.zh-CN.md#s8) 的局限。挂起是时序相关的，
+因此挂起的用例集合在多次运行间会变化；回退总是被显式记录。
+
+**Redis 客户端（分层隔离）。** 连接池用例使用空传输；pipeline 用例使用线缆形状的
+executor（RESP 编码 + 解析），两者都不含真实服务器或网络。
+
+| 用例 | 结果 |
+|---|---:|
+| connection_pool acquire/release | 792.4 ns/op，0 idle，0 error |
+| RESP encode command（1 参数，1 B wire） | 3275.4 ns/op |
+| RESP parse bulk reply | 4085.4 ns/op |
+| pipeline batch=1 | 15157.7 ns/batch，约 0.07 M cmds/s |
+| pipeline batch=16 | 194894.4 ns/batch，约 0.08 M cmds/s |
+| pipeline batch=64 | 763389.9 ns/batch，约 0.08 M cmds/s |
+
+日志：`.opencode/tmp/distbench-redis.log`。
+
+分布式正确性套件不是基准，这里只记录其环境与规模，便于与数字一起查找：两个可执行
+文件、5 + 3 个用例、150 + 64 个断言、0 失败，各连续运行 5 次零失败。见
+[distributed-testing.zh-CN.md §3](distributed-testing.zh-CN.md#s3)。
+
 ## 3. 预算与目标 <a id="s3"></a>
 
 内存预算来自设计 §17.1；状态按代码实际情况评估。
@@ -203,14 +313,25 @@ disconnect），并把聚合值与全量扫描会得到的结果对比。
 ## 4. 基准计划 <a id="s4"></a>
 
 基准现在落地为 `bench/bench_rpc.cpp`（§2.3）。当前用例为 64 B 同步时延、管线深度
-1/16/64 与 1/2/4 分片（inproc），Windows 上另有 IOCP loopback；更宽的矩阵仍待补：
+1/16/64 与 1/2/4 分片（inproc），Windows 上另有 IOCP loopback。更宽的矩阵包括：
 
-- `bench/bench_rpc.cpp` —— 扩展到 16 B/256 B/1 KiB、1/8/64/512 连接、
+- `bench/bench_rpc_matrix.cpp` —— 已实现：16 B/256 B/4 KiB/64 KiB payload、
+  1/2/4 调用线程、可靠闭环延迟/吞吐、不可靠 `ONE_WAY` 发射/投递，以及流水线批次吞吐
+  （batch 1/16/64 × 并发 1/2/4，可靠与 `ONE_WAY`），并带子进程 watchdog：当流水线路径
+  死锁时回退到闭环（§2.5）。
+- `bench/bench_compression.cpp` —— 已实现：none/lz4/deflate/lz77/zip/gzip
+  在文本与不可压缩二进制、4 KiB/64 KiB 下的测量（§2.5）。
+- `bench/bench_redis.cpp` —— 已实现：连接池 acquire/release、RESP 编码/解析与
+  pipeline 批量吞吐（§2.5）。
+- `bench/bench_rpc.cpp` —— 仍待扩展到 1 KiB、1/8/64/512 连接、
   epoll loopback，以及可靠/不可靠/有序 lane 分开运行。
 - `bench/bench_http.cpp` —— HTTP/1.1 与 HTTP/2 请求/响应、
   keep-alive、头部大小、上传/下载流。
 - `bench/bench_codec.cpp` —— crpc-binary、JSON、XML、INI、
   TOML 与模式格式，在 64 B、256 B、1 KiB 下，热缓存且测量路径无分配。
+
+三个已实现基准的运行命令、子串过滤与场景解读见
+[distributed-testing.zh-CN.md §5](distributed-testing.zh-CN.md#s5)。
 
 每次运行报告 §1 的全部字段。计数器由客户端在解码响应后递增，绝不由服务端写完字节后递增。CPU
 利用率单独采样；每消息系统调用数在平台追踪器可用时统计。进程内结果作为框架上界报告，不作为网络结果。
@@ -240,8 +361,8 @@ disconnect），并把聚合值与全量扫描会得到的结果对比。
 它必须说明测量了哪些后端、哪些代码路径被关闭（消毒器、追踪、日志）。目标未达成时，报告写出实测值与差距；
 不得用推算替代缺失的测量。
 
-当前状态：库有功能测试覆盖、HTTP 服务端门面、进程内与 IOCP 端到端 RPC 基准（§2.3）以及
-线格式/编解码微基准。5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 单客户端 0.275M RPC/s、
+当前状态：库有功能测试覆盖、HTTP 服务端门面、进程内与 IOCP 端到端 RPC 基准（§2.3）、
+线格式/编解码微基准，以及 §2.5 的压缩/RPC 矩阵/Redis 基准。5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 单客户端 0.275M RPC/s、
 多线程 0.773M RPC/s、IOCP p99 170.2 µs）；进程内 p99 目标在 MSVC 上以 22.6 µs **达成**。128 字节调用槽预算在
 已测工具链上仍是**未达成的 440 字节**。实测数值、被否决的实验与剩余差距记录于 §2 与 §3；
 随仓库发布的微基准日志为 `docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`。

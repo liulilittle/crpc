@@ -353,7 +353,8 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 推送 | 已实现 | `test_push.cpp`、`test_push_e2e.cpp`、`test_http_sse.cpp`；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump；SSE 与长轮询已接入 `http_server` |
 | 流控 | 部分 | `test_flow.cpp`；未接入传输 |
 | 分片/协程 | 已设计 | 无 `shard` 类型或 `coro_rt_*` 调用 |
-| 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：lz4 block 已实现并测试（`test_frame_compression.cpp`），zstd 保留且 fail-closed，gzip 留待下一阶段；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
+| 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：none/lz4/gzip/deflate/lz77/zip 已实现并测试（`test_frame_compression.cpp`，61 个用例），zstd 保留且 fail-closed；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
+| Redis 客户端 | 已实现（shared 构建已覆盖 Redis 头导出，`CRPC_BUILD_SHARED=ON` 下 `ctest -R 'redis\|abi_docs\|shared_link'` 通过） | `test_redis_*.cpp` 覆盖 RESP2/3、连接池、pipeline、事务、Pub/Sub、Streams、cluster、Sentinel、类型化辅助与 RTTI 绑定；`test_redis_header_conflict.cpp` 钉住 `stream_entry` 与 `redis_stream_entry` 的区分。已测配置为静态构建；shared 构建受支持，API 相同，且其 Redis 头导出已覆盖。 |
 | SSE / 长轮询 | 已实现 | `test_http_sse.cpp`；SSE writer 与长轮询路由已接入 `src/http/server.cpp` |
 
 ## 20. 验证映射 <a id="s20"></a>
@@ -378,5 +379,8 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | `test_observability.cpp` | traceparent、baggage、拦截器链、日志、追踪 |
 | `test_push.cpp` | 扇出、溢出、重放/去重、有序缺口、慢订阅者、流 |
 | `test_flow.cpp` | 有向 RTT 基线、排队信号、pacer、窗口、过期样本 |
+| `test_frame_compression.cpp` | 帧压缩容器、none/lz4/gzip/deflate/lz77/zip 编解码、fail-closed 表、不可靠丢弃、上限、永不放大与变异 fuzz |
+| `test_redis_*.cpp` | RESP2/3、池/连接、pipeline、事务、Pub/Sub、Streams、cluster、Sentinel、类型化辅助、RTTI 绑定与头文件共存 |
+| `test_distributed_rpc.cpp`、`test_distributed_push.cpp` | discovery/故障转移、分区重放、registry/watch 恢复与多跳 push |
 
 这些是功能测试，不能替代消毒器矩阵。`scripts/test.ps1` 与 `scripts/test.sh` 负责构建并运行它们；ASan/LSan/UBSan/TSan 是[构建与测试](building.zh-CN.md)中描述的合并门禁。模糊测试目前只以 HTTP/2 帧与连接路径的“永不崩溃”用例存在；独立 fuzz 目标属于**已设计，未实现**。

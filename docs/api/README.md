@@ -104,6 +104,25 @@ the authoritative declaration.
 | [`codec.hpp`](../../include/crpc/codec.hpp) | `codec_registry`, `encode_into`, `decode_from` | The codec registry and the typed serialization interface. |
 | [`codec_id.hpp`](../../include/crpc/codec_id.hpp) | `codec_id` | Codec identifiers. |
 
+## Redis client
+
+| Header | Key types | What it is |
+|---|---|---|
+| [`redis/resp.hpp`](../../include/crpc/redis/resp.hpp) | `resp_value`, `resp_parser`, `resp_encoder`, `resp_protocol` | RESP2/RESP3 value model, incremental parser and encoder. |
+| [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp) | `connection`, `connection_pool`, `connection_config`, `pool_config` | Byte transport over `io::source`/`io::sink`, reconnect/backoff and pooling. |
+| [`redis/pipeline.hpp`](../../include/crpc/redis/pipeline.hpp) | `command`, `command_executor`, `message_channel`, `command_channel`, `pipeline` | One command stream, batches and the transport-facing RESP channel. |
+| [`redis/pubsub.hpp`](../../include/crpc/redis/pubsub.hpp) | `pubsub`, `pubsub_message`, `pubsub_kind` | Pub/Sub subscribe/unsubscribe, message decoding and `PUBLISH`/`PUBSUB`. |
+| [`redis/sentinel.hpp`](../../include/crpc/redis/sentinel.hpp) | `sentinel`, `sentinel_options`, `sentinel_status`, `sentinel_connection_executor` | Master discovery, down detection, election and failover. |
+| [`redis/stream.hpp`](../../include/crpc/redis/stream.hpp) | `stream`, `stream_id`, `stream_entry`, `stream_read` | Redis Streams and consumer groups. |
+| [`redis/transaction.hpp`](../../include/crpc/redis/transaction.hpp) | `transaction`, `transaction_exec_result` | `WATCH`/`MULTI`/`EXEC`/`DISCARD`. |
+| [`redis/types.hpp`](../../include/crpc/redis/types.hpp) | `value`, `*_type` builders, `decode_*`, iterators | Typed value model, command builders and reply projections. |
+| [`redis/client.hpp`](../../include/crpc/redis/client.hpp) | `client`, `client::options` | Pool + typed command facade. |
+| [`redis/cluster.hpp`](../../include/crpc/redis/cluster.hpp) | `cluster`, `cluster_topology`, `cluster_slot_executor` | Slot routing, `CLUSTER SHARDS`/`SLOTS`, `MOVED`/`ASK` and pinning. |
+| [`redis/rtti.hpp`](../../include/crpc/redis/rtti.hpp) | `encode_to_value`, `decode_from_value`, `hash_set_command`, `decode_hash_reply` | Reflection-driven DTO <-> value/hash binding. |
+
+The API map, quick start, async model, error handling and known limitations are
+in [Redis client](../redis-client.md).
+
 ## C ABI
 
 | Header | Key types | What it is |
@@ -115,5 +134,7 @@ the authoritative declaration.
 - [Tutorial](../tutorial.md) — a step-by-step build of a call and a push subscription.
 - [Architecture overview](../architecture.md) — the subsystem map and status matrix.
 - [Wire protocol](../protocol.md) — the frame format and codecs.
+- [Redis client](../redis-client.md) — the Redis API map and recipes.
+- [Distributed testing and benchmarks](../distributed-testing.md) — multi-node tests and benchmark commands.
 - [ABI policy](../abi.md) — layout and export rules.
 - [Build and test](../building.md) — CMake options and the one-click scripts.

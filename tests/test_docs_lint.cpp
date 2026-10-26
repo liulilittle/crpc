@@ -1,0 +1,583 @@
+// CRPC -- machine checks for the documentation set.
+//
+// docs/ holds the normative policy and user-facing guides, but until now only
+// docs/abi.md had an automated gate (tests/test_abi_docs.cpp). The rest could
+// drift silently: a guide could be added without its Chinese pair, a file could
+// be saved with the wrong encoding, or a "this is still being worked on" phrase
+// could be left behind long after the work landed.
+//
+// This test is deliberately generic. It walks docs/ and asserts four properties:
+//
+//   1. every Markdown file exists, is non-empty and is strict UTF-8 (no BOM, no
+//      U+FFFD, no overlong/surrogate/truncated sequence);
+//   2. every non-historical English document has a Chinese sibling, and every
+//      paired document links to its sibling;
+//   3. no non-historical document carries a known stale phrase;
+//   4. every qualified API name used in a fenced C++ block resolves against the
+//      public headers.
+//
+// The checks are text scans, not a Markdown parser. That keeps them stable when
+// prose is rewrapped while still failing when a fact changes. The historical
+// exemption (docs/superpowers/** and docs/CHANGELOG*) is explicit: those are
+// dated records and plans, not living documents, so a stale phrase there is the
+// point rather than a defect.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "test_framework.hpp"
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Resolve the repository root from this source file. CMake compiles tests with
+// absolute paths, so `__FILE__` already points at <root>/tests/test_docs_lint.cpp
+// in every supported generator. The fallback walks up from the working
+// directory so a manual compile still finds docs/.
+fs::path repo_root() {
+    fs::path from_source = fs::path(__FILE__).parent_path().parent_path();
+    if (fs::exists(from_source / "docs" / "README.md")) {
+        return from_source;
+    }
+    fs::path probe = fs::current_path();
+    for (int depth = 0; depth < 8 && !probe.empty(); ++depth) {
+        if (fs::exists(probe / "docs" / "README.md")) {
+            return probe;
+        }
+        if (!probe.has_parent_path() || probe.parent_path() == probe) {
+            break;
+        }
+        probe = probe.parent_path();
+    }
+    return {};
+}
+
+std::string read_text(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+        return {};
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+// --- Strict UTF-8 -----------------------------------------------------------
+//
+// A byte string is accepted only if it decodes as UTF-8 with no overlong form,
+// no UTF-16 surrogate, no code point above U+10FFFF, no truncated sequence, no
+// leading BOM and no U+FFFD. A BOM is rejected explicitly because the source
+// tree is UTF-8 without BOM; a stray BOM makes some tools see an invisible
+// character at the start of the first heading.
+bool utf8_strict(const std::string& text) {
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        return false;
+    }
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        if (lead < 0x80) {
+            ++i;
+            continue;
+        }
+        int len = 0;
+        std::uint32_t cp = 0;
+        if ((lead & 0xE0) == 0xC0) {
+            len = 2;
+            cp = lead & 0x1Fu;
+        } else if ((lead & 0xF0) == 0xE0) {
+            len = 3;
+            cp = lead & 0x0Fu;
+        } else if ((lead & 0xF8) == 0xF0) {
+            len = 4;
+            cp = lead & 0x07u;
+        } else {
+            return false;
+        }
+        if (i + static_cast<std::size_t>(len) > text.size()) {
+            return false;
+        }
+        for (int k = 1; k < len; ++k) {
+            const unsigned char cont =
+                static_cast<unsigned char>(text[i + static_cast<std::size_t>(k)]);
+            if ((cont & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (cont & 0x3Fu);
+        }
+        if (len == 2 && cp < 0x80) {
+            return false;
+        }
+        if (len == 3 && cp < 0x800) {
+            return false;
+        }
+        if (len == 4 && cp < 0x10000) {
+            return false;
+        }
+        if (cp > 0x10FFFF) {
+            return false;
+        }
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            return false;
+        }
+        if (cp == 0xFFFD) {
+            return false;
+        }
+        i += static_cast<std::size_t>(len);
+    }
+    return true;
+}
+
+// --- Document inventory -----------------------------------------------------
+
+struct DocFile {
+    std::string rel;
+    fs::path path;
+};
+
+std::vector<DocFile> collect_docs(const fs::path& root) {
+    std::vector<DocFile> out;
+    const fs::path docs_dir = root / "docs";
+    std::error_code ec;
+    fs::recursive_directory_iterator it(
+        docs_dir, fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        return out;
+    }
+    for (const fs::directory_entry& entry : it) {
+        std::error_code type_ec;
+        if (!entry.is_regular_file(type_ec)) {
+            continue;
+        }
+        if (entry.path().extension() != ".md") {
+            continue;
+        }
+        DocFile doc;
+        doc.rel = fs::relative(entry.path(), docs_dir).generic_string();
+        doc.path = entry.path();
+        out.push_back(std::move(doc));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const DocFile& a, const DocFile& b) { return a.rel < b.rel; });
+    return out;
+}
+
+bool has_doc(const std::vector<DocFile>& docs, const std::string& rel) {
+    for (const DocFile& doc : docs) {
+        if (doc.rel == rel) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_chinese(const std::string& rel) {
+    return rel.size() >= 9 && rel.compare(rel.size() - 9, 9, ".zh-CN.md") == 0;
+}
+
+std::string english_of(const std::string& zh_rel) {
+    return zh_rel.substr(0, zh_rel.size() - 9) + ".md";
+}
+
+std::string chinese_of(const std::string& en_rel) {
+    return en_rel.substr(0, en_rel.size() - 3) + ".zh-CN.md";
+}
+
+// Dated records and working plans are not living documents. A "being finalised"
+// note in a plan from last month is history, not a defect.
+bool is_historical(const std::string& rel) {
+    return rel.rfind("superpowers/", 0) == 0 ||
+           rel.rfind("CHANGELOG", 0) == 0;
+}
+
+// --- Stale-phrase matching --------------------------------------------------
+//
+// Prose is wrapped at 80 columns, so a phrase can be split across a line break.
+// Both the document and the needle are normalised to single spaces before the
+// substring test, so "being\nfinalised" still matches "being finalised" while a
+// phrase inside a longer word ("finalised" inside "finalised-ish") is not
+// silently missed. The needle list is the known-stale set; extending it is a
+// one-line change here.
+
+std::string normalize_ws(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool pending_space = false;
+    for (char raw : text) {
+        const unsigned char c = static_cast<unsigned char>(raw);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+            c == '\v') {
+            pending_space = !out.empty();
+            continue;
+        }
+        if (pending_space) {
+            out.push_back(' ');
+            pending_space = false;
+        }
+        out.push_back(raw);
+    }
+    return out;
+}
+
+// --- API-name resolution ----------------------------------------------------
+
+bool ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+struct HeaderIndex {
+    std::set<std::string> ids;
+    std::set<std::string> quals;
+};
+
+// Collect every identifier and every `a::b::...` spelling that appears in the
+// public headers. A qualified name is only kept when it is well formed (it never
+// ends in `::`), so a doc reference can be matched exactly.
+void scan_quals(const std::string& text, std::set<std::string>& out) {
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (!ident_char(text[i])) {
+            ++i;
+            continue;
+        }
+        const std::size_t start = i;
+        std::size_t j = i;
+        for (;;) {
+            while (j < text.size() && ident_char(text[j])) {
+                ++j;
+            }
+            if (j + 2 < text.size() && text[j] == ':' && text[j + 1] == ':' &&
+                ident_char(text[j + 2])) {
+                j += 2;
+                continue;
+            }
+            break;
+        }
+        if (j > start) {
+            const std::string qual = text.substr(start, j - start);
+            if (qual.find("::") != std::string::npos) {
+                out.insert(qual);
+            }
+            i = j;
+        } else {
+            ++i;
+        }
+    }
+}
+
+HeaderIndex scan_headers(const fs::path& root) {
+    HeaderIndex index;
+    const fs::path include_dir = root / "include" / "crpc";
+    std::error_code ec;
+    fs::recursive_directory_iterator it(
+        include_dir, fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        return index;
+    }
+    for (const fs::directory_entry& entry : it) {
+        std::error_code type_ec;
+        if (!entry.is_regular_file(type_ec) ||
+            entry.path().extension() != ".hpp") {
+            continue;
+        }
+        const std::string text = read_text(entry.path());
+        std::size_t i = 0;
+        while (i < text.size()) {
+            if (ident_char(text[i])) {
+                const std::size_t start = i;
+                while (i < text.size() && ident_char(text[i])) {
+                    ++i;
+                }
+                index.ids.insert(text.substr(start, i - start));
+            } else {
+                ++i;
+            }
+        }
+        scan_quals(text, index.quals);
+    }
+    return index;
+}
+
+std::vector<std::string> split_qual(const std::string& qual) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t pos = qual.find("::", start);
+        if (pos == std::string::npos) {
+            parts.push_back(qual.substr(start));
+            break;
+        }
+        parts.push_back(qual.substr(start, pos - start));
+        start = pos + 2;
+    }
+    return parts;
+}
+
+// Type names a document declares itself (a tutorial's `class greeter`, a
+// recipe's `struct profile`). A qualified name rooted at one of these is user
+// code, not a CRPC API, and must not be checked against the headers.
+std::set<std::string> declared_types(const std::string& text) {
+    std::set<std::string> out;
+    static const char* const keywords[] = {"class", "struct", "namespace",
+                                           "using"};
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (!ident_char(text[i])) {
+            ++i;
+            continue;
+        }
+        const std::size_t start = i;
+        while (i < text.size() && ident_char(text[i])) {
+            ++i;
+        }
+        const std::string word = text.substr(start, i - start);
+        bool is_keyword = false;
+        for (const char* kw : keywords) {
+            if (word == kw) {
+                is_keyword = true;
+                break;
+            }
+        }
+        if (!is_keyword) {
+            continue;
+        }
+        std::size_t k = i;
+        while (k < text.size() && (text[k] == ' ' || text[k] == '\t' ||
+                                   text[k] == '\n' || text[k] == '\r')) {
+            ++k;
+        }
+        const std::size_t name_start = k;
+        while (k < text.size() && ident_char(text[k])) {
+            ++k;
+        }
+        if (k > name_start) {
+            out.insert(text.substr(name_start, k - name_start));
+        }
+    }
+    return out;
+}
+
+// Fenced ```cpp blocks only. A doc that shows an API in a ```text diagram is
+// not making a compilable claim, and shell/powershell blocks are not C++.
+std::vector<std::string> cpp_blocks(const std::string& text) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    for (;;) {
+        const std::size_t open = text.find("```cpp", pos);
+        if (open == std::string::npos) {
+            break;
+        }
+        const std::size_t line_end = text.find('\n', open + 6);
+        if (line_end == std::string::npos) {
+            break;
+        }
+        const std::size_t close = text.find("```", line_end + 1);
+        if (close == std::string::npos) {
+            break;
+        }
+        out.push_back(text.substr(line_end + 1, close - (line_end + 1)));
+        pos = close + 3;
+    }
+    return out;
+}
+
+} // namespace
+
+// --- 1. Presence, size and encoding -----------------------------------------
+
+CRPC_TEST(docs_lint_all_markdown_present_nonempty_and_strict_utf8) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::vector<DocFile> docs = collect_docs(root);
+    CRPC_CHECK(!docs.empty());
+
+    // Meta-assertion: without this, an emptied or moved docs/ tree would leave
+    // every loop below vacuous and the test would pass on nothing.
+    CRPC_CHECK(has_doc(docs, "README.md"));
+    CRPC_CHECK(has_doc(docs, "abi.md"));
+    CRPC_CHECK(has_doc(docs, "protocol.md"));
+    CRPC_CHECK(has_doc(docs, "redis-client.md"));
+
+    for (const DocFile& doc : docs) {
+        const std::string text = read_text(doc.path);
+        if (text.empty()) {
+            std::printf("  empty document: %s\n", doc.rel.c_str());
+        }
+        CRPC_CHECK_FALSE(text.empty());
+        if (!utf8_strict(text)) {
+            std::printf("  not strict UTF-8 (BOM/U+FFFD/bad sequence): %s\n",
+                        doc.rel.c_str());
+        }
+        CRPC_CHECK(utf8_strict(text));
+    }
+}
+
+// --- 2. Cross-language index ------------------------------------------------
+
+CRPC_TEST(docs_lint_every_english_doc_has_a_chinese_pair) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::vector<DocFile> docs = collect_docs(root);
+    std::size_t checked = 0;
+    for (const DocFile& doc : docs) {
+        if (is_chinese(doc.rel) || is_historical(doc.rel)) {
+            continue;
+        }
+        const std::string zh = chinese_of(doc.rel);
+        if (!has_doc(docs, zh)) {
+            std::printf("  missing Chinese pair: %s (expected %s)\n",
+                        doc.rel.c_str(), zh.c_str());
+        }
+        CRPC_CHECK(has_doc(docs, zh));
+        ++checked;
+    }
+    CRPC_CHECK(checked > 0);
+}
+
+CRPC_TEST(docs_lint_pairs_link_to_each_other) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::vector<DocFile> docs = collect_docs(root);
+    std::size_t checked = 0;
+    for (const DocFile& doc : docs) {
+        const std::string peer =
+            is_chinese(doc.rel) ? english_of(doc.rel) : chinese_of(doc.rel);
+        if (!has_doc(docs, peer)) {
+            continue;
+        }
+        const std::string self = fs::path(doc.rel).filename().generic_string();
+        const std::string peer_name =
+            fs::path(peer).filename().generic_string();
+        const std::string text = read_text(doc.path);
+        const std::string peer_text = read_text(root / "docs" / peer);
+        if (text.find(peer_name) == std::string::npos) {
+            std::printf("  %s does not link to %s\n", doc.rel.c_str(),
+                        peer_name.c_str());
+        }
+        CRPC_CHECK(text.find(peer_name) != std::string::npos);
+        if (peer_text.find(self) == std::string::npos) {
+            std::printf("  %s does not link back to %s\n", peer.c_str(),
+                        self.c_str());
+        }
+        CRPC_CHECK(peer_text.find(self) != std::string::npos);
+        ++checked;
+    }
+    CRPC_CHECK(checked > 0);
+}
+
+// --- 3. Known stale phrases -------------------------------------------------
+
+CRPC_TEST(docs_lint_no_stale_phrases) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    static const char* const kStale[] = {
+        "being finalised",
+        "being finalized",
+        "正在定案",
+        "待复核",
+        "正在补齐",
+        "CF-1 completion race",
+    };
+    const std::vector<DocFile> docs = collect_docs(root);
+    std::size_t checked = 0;
+    for (const DocFile& doc : docs) {
+        if (is_historical(doc.rel)) {
+            continue;
+        }
+        const std::string normalized = normalize_ws(read_text(doc.path));
+        for (const char* phrase : kStale) {
+            if (normalized.find(normalize_ws(phrase)) == std::string::npos) {
+                continue;
+            }
+            std::printf("  stale phrase \"%s\" in %s\n", phrase,
+                        doc.rel.c_str());
+            CRPC_CHECK(false);
+        }
+        ++checked;
+    }
+    CRPC_CHECK(checked > 0);
+}
+
+// --- 4. API names in fenced C++ blocks --------------------------------------
+
+CRPC_TEST(docs_lint_api_names_exist_in_public_headers) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const HeaderIndex index = scan_headers(root);
+    CRPC_CHECK(!index.ids.empty());
+    CRPC_CHECK(!index.quals.empty());
+
+    const std::vector<DocFile> docs = collect_docs(root);
+    std::size_t candidates = 0;
+    bool bad = false;
+    for (const DocFile& doc : docs) {
+        if (is_historical(doc.rel)) {
+            continue;
+        }
+        const std::string text = read_text(doc.path);
+        const std::set<std::string> declared = declared_types(text);
+        for (const std::string& block : cpp_blocks(text)) {
+            std::set<std::string> quals;
+            scan_quals(block, quals);
+            for (const std::string& qual : quals) {
+                const std::vector<std::string> parts = split_qual(qual);
+                const std::string& ns = parts.front();
+                if (ns == "std") {
+                    continue;
+                }
+                if (declared.count(ns) != 0) {
+                    continue;
+                }
+                ++candidates;
+                if (index.quals.count(qual) != 0) {
+                    continue;
+                }
+                if (index.ids.count(ns) != 0 &&
+                    index.ids.count(parts.back()) != 0) {
+                    continue;
+                }
+                std::printf("  unknown API name \"%s\" in %s\n", qual.c_str(),
+                            doc.rel.c_str());
+                bad = true;
+            }
+        }
+    }
+    // Meta-assertion: redis-client.md must contribute candidates, so a broken
+    // extractor cannot make this test vacuous.
+    CRPC_CHECK(candidates > 0);
+    CRPC_CHECK_FALSE(bad);
+}
+
+CRPC_TEST_MAIN()

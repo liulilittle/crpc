@@ -125,12 +125,17 @@ inline constexpr u8 frame_flag_unreliable = 0x10;
 inline constexpr u8 frame_flag_algo_mask = 0xE0;
 inline constexpr u8 frame_flag_algo_shift = 5;
 
-// Compression algorithms carried in flags bits 5-7. Values 4-7 are reserved.
+// Compression algorithms carried in flags bits 5-7. Values are appended at
+// the end of the list: existing ids are stable wire values, so a new codec
+// must never reuse or renumber an id. `zstd` stays reserved (fail closed).
 enum class compression_algorithm : u8 {
     none = 0,
     lz4 = 1,
     zstd = 2,
-    gzip = 3
+    gzip = 3,
+    deflate = 4,
+    lz77 = 5,
+    zip = 6
 };
 
 // --- Header and frame --------------------------------------------------------

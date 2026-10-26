@@ -21,6 +21,8 @@ languages; the pairs are linked at the top of each file.
 | 10 | [Tutorial](tutorial.md) | [教程](tutorial.zh-CN.md) |
 | 11 | [Examples](../examples/README.md) | [示例](../examples/README.zh-CN.md) |
 | 12 | [Release notes](CHANGELOG.md) | [发布说明](CHANGELOG.zh-CN.md) |
+| 13 | [Distributed testing and benchmarks](distributed-testing.md) | [分布式测试与基准](distributed-testing.zh-CN.md) |
+| 14 | [Redis client](redis-client.md) | [Redis 客户端](redis-client.zh-CN.md) |
 
 All documents in the index are present. Their per-module status is recorded in
 the status matrix of document 3 and in the design specification's chapter 21; a
@@ -29,7 +31,10 @@ missing entry or a broken link is a documentation defect, not an oversight.
 ## Reading order
 
 - **Using the library**: 10 (tutorial) → 9 (API reference) → 3 (architecture) → 4
-  (protocol) → the design specification's service API chapter.
+  (protocol) → the design specification's service API chapter. Add 14 (Redis
+  client) when the program talks to Redis.
+- **Measuring and reproducing**: 7 (performance) → 13 (distributed testing and
+  benchmarks).
 - **Contributing**: 6 (principles) → 1 (design specification) → 5 (build and
   test).
 - **Integrating at the binary level**: 2 (ABI policy).

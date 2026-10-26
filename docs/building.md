@@ -96,7 +96,7 @@ stated so a build without corocc is not mistaken for a broken build.
 |---|---|---|
 | `CRPC_BUILD_TESTS` | `ON` | build `tests/` and register CTest entries |
 | `CRPC_BUILD_BENCH` | `OFF` | build `bench/`; benchmarks are not registered in CTest, and in a shared build the benchmark executables sit in the build root next to `crpc.dll` |
-| `CRPC_BUILD_EXAMPLES` | `OFF` | build `examples/`; `examples/CMakeLists.txt` builds `crpc_example_quickstart` and registers it in CTest |
+| `CRPC_BUILD_EXAMPLES` | `OFF` | build `examples/`; every `quickstart*.cpp` becomes `crpc_example_<file-stem>` and is registered in CTest (quickstart, microservice, MVC, game) |
 | `CRPC_WARNINGS_AS_ERRORS` | `ON` | `/W4 /WX` or `-Werror` |
 | `CRPC_ENABLE_LTO` | `ON` | IPO/LTO for Release when supported and no sanitizer is active |
 | `CRPC_BUILD_SHARED` | `OFF` | build a shared library instead of a static archive |
@@ -316,7 +316,7 @@ green on x64 Debug and x86 Debug; rerun the scripts to confirm the current tree.
 |---|---|
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | point it at the checkout root, not `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | point it at the root containing `include/corocc/coro.h` |
-| examples are not built | examples are now available: set `CRPC_BUILD_EXAMPLES=ON`; `examples/CMakeLists.txt` builds `crpc_example_quickstart` and registers it in CTest |
+| examples are not built | examples are now available: set `CRPC_BUILD_EXAMPLES=ON`; every `quickstart*.cpp` is built as `crpc_example_<file-stem>` and registered in CTest |
 | a sanitizer is requested on MSVC | TSan is unavailable; use Linux/Clang for the TSan job |
 | `cmake` or `ninja` not found | the scripts search `PATH`, Program Files and the VS bundle; install CMake/Ninja or add them to `PATH` |
 | a test hangs on Windows | inspect `.opencode/tmp/out/dumps`, the test log, and the 300 s CTest timeout |

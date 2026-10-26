@@ -102,6 +102,25 @@
 | [`codec.hpp`](../../include/crpc/codec.hpp) | `codec_registry`、`encode_into`、`decode_from` | 编解码注册表与类型化序列化接口。 |
 | [`codec_id.hpp`](../../include/crpc/codec_id.hpp) | `codec_id` | 编解码标识。 |
 
+## Redis 客户端
+
+| 头文件 | 关键类型 | 说明 |
+|---|---|---|
+| [`redis/resp.hpp`](../../include/crpc/redis/resp.hpp) | `resp_value`、`resp_parser`、`resp_encoder`、`resp_protocol` | RESP2/RESP3 值模型、增量解析器与编码器。 |
+| [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp) | `connection`、`connection_pool`、`connection_config`、`pool_config` | 基于 `io::source`/`io::sink` 的字节传输、重连/退避与连接池。 |
+| [`redis/pipeline.hpp`](../../include/crpc/redis/pipeline.hpp) | `command`、`command_executor`、`message_channel`、`command_channel`、`pipeline` | 单条命令流、批量与面向传输的 RESP 通道。 |
+| [`redis/pubsub.hpp`](../../include/crpc/redis/pubsub.hpp) | `pubsub`、`pubsub_message`、`pubsub_kind` | Pub/Sub 订阅/退订、消息解码与 `PUBLISH`/`PUBSUB`。 |
+| [`redis/sentinel.hpp`](../../include/crpc/redis/sentinel.hpp) | `sentinel`、`sentinel_options`、`sentinel_status`、`sentinel_connection_executor` | 主节点发现、下线判定、选举与故障转移。 |
+| [`redis/stream.hpp`](../../include/crpc/redis/stream.hpp) | `stream`、`stream_id`、`stream_entry`、`stream_read` | Redis Streams 与消费者组。 |
+| [`redis/transaction.hpp`](../../include/crpc/redis/transaction.hpp) | `transaction`、`transaction_exec_result` | `WATCH`/`MULTI`/`EXEC`/`DISCARD`。 |
+| [`redis/types.hpp`](../../include/crpc/redis/types.hpp) | `value`、`*_type` 构造器、`decode_*`、迭代器 | 类型化值模型、命令构造器与回复投影。 |
+| [`redis/client.hpp`](../../include/crpc/redis/client.hpp) | `client`、`client::options` | 连接池 + 类型化命令门面。 |
+| [`redis/cluster.hpp`](../../include/crpc/redis/cluster.hpp) | `cluster`、`cluster_topology`、`cluster_slot_executor` | 槽路由、`CLUSTER SHARDS`/`SLOTS`、`MOVED`/`ASK` 与 pin。 |
+| [`redis/rtti.hpp`](../../include/crpc/redis/rtti.hpp) | `encode_to_value`、`decode_from_value`、`hash_set_command`、`decode_hash_reply` | 反射驱动的 DTO <-> value/hash 绑定。 |
+
+API 地图、快速开始、异步模型、错误处理与已知限制见
+[Redis 客户端](../redis-client.zh-CN.md)。
+
 ## C ABI
 
 | 头文件 | 关键类型 | 说明 |
@@ -113,5 +132,7 @@
 - [教程](../tutorial.zh-CN.md) —— 一步步构建一次调用与一个推送订阅。
 - [架构概览](../architecture.zh-CN.md) —— 子系统地图与状态矩阵。
 - [线上协议](../protocol.zh-CN.md) —— 帧格式与编解码。
+- [Redis 客户端](../redis-client.zh-CN.md) —— Redis API 地图与配方。
+- [分布式测试与基准](../distributed-testing.zh-CN.md) —— 多节点测试与基准命令。
 - [ABI 策略](../abi.zh-CN.md) —— 布局与导出规则。
 - [构建与测试](../building.zh-CN.md) —— CMake 选项与一键脚本。
