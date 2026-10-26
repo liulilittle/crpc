@@ -750,8 +750,10 @@ private:
     mutable std::mutex map_mutex_;
     // Terminal completion vs. handle detach/recycle. Held across the callback.
     mutable std::recursive_mutex completion_mutex_;
-    // Depth of the current thread's `completion_mutex_` nesting. Only touched
-    // while that lock is held, so a plain int is enough.
+    // Nesting depth of `completion_mutex_`. Every read and write happens while
+    // that mutex is held -- including the decrement in `completion_guard`'s
+    // destructor, which computes "outermost" before unlocking. A plain int is
+    // therefore enough, and reading it after the unlock would be a data race.
     int completion_depth_ = 0;
     // Stream ids whose RST could not be written while a completion lock was
     // held (a `then` callback that destroys a written sibling cancels it, and

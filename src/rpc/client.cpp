@@ -527,9 +527,12 @@ client::completion_guard::completion_guard(client& owner) noexcept : owner_(owne
 }
 
 client::completion_guard::~completion_guard() {
-    --owner_.completion_depth_;
+    // Decide "outermost" while the lock is still held. Reading the depth after
+    // the unlock would race with another thread's `++` under the lock (the
+    // counter is only written while the mutex is held).
+    const bool outermost = (--owner_.completion_depth_ == 0);
     owner_.completion_mutex_.unlock();
-    if (owner_.completion_depth_ == 0) {
+    if (outermost) {
         owner_.flush_pending_rst();
     }
 }
