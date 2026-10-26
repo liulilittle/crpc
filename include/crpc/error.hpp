@@ -304,6 +304,9 @@ class [[nodiscard]] status {
 public:
     status() noexcept = default;
     status(rpc_code code) noexcept : error_(code) {}
+    // A code plus a diagnostic message. The message is for humans and logs; it
+    // never changes the retryability, which stays a function of the code.
+    status(rpc_code code, std::string message) : error_(code, std::move(message)) {}
     status(rpc_error error) noexcept : error_(std::move(error)) {}
 
     bool ok() const noexcept { return error_.ok(); }
