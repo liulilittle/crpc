@@ -191,4 +191,152 @@ CRPC_TEST(facade_destroy_client_inside_deadline_callback) {
     held.reset();
 }
 
+CRPC_TEST(facade_close_marks_liveness_dead) {
+    stalled_backend backend;
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5000ms);
+
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        cli.reset();
+        return;
+    }
+    auto handle =
+        std::make_unique<crpc::client::call<int>>(std::move(started).value());
+    auto& state = call_state_of(*handle);
+    CRPC_CHECK(state != nullptr);
+    if (!state) {
+        handle.reset();
+        cli.reset();
+        return;
+    }
+    // Hold the liveness token strongly, exactly like a `get()` frame that keeps
+    // the implementation alive while it waits. With only the weak reference in
+    // `call_core`, the token would expire with the client and the first gate in
+    // `live_owner()` would never be exercised.
+    std::shared_ptr<crpc::client_detail::client_liveness> token =
+        state->core.owner_liveness.lock();
+    CRPC_CHECK(token != nullptr);
+    if (!token) {
+        handle.reset();
+        cli.reset();
+        return;
+    }
+    CRPC_CHECK(token->alive.load(std::memory_order_acquire));
+
+    // cancel() finalizes and unregisters the attempt, so close() no longer sees
+    // this core and leaves `owner` pointing at the client. That is the
+    // abandoned-call shape the liveness gate exists for.
+    handle->cancel();
+    CRPC_CHECK(state->core.owner.load(std::memory_order_acquire) != nullptr);
+
+    cli.reset();
+
+    // Before the fix `alive` was never written: it stayed true, the token was
+    // still alive through this frame, and `live_owner()` returned the pointer
+    // `~client` had just freed.
+    const bool dead = crpc::client_detail::live_owner(state->core) == nullptr;
+    CRPC_CHECK_FALSE(token->alive.load(std::memory_order_acquire));
+    CRPC_CHECK(dead);
+    if (dead) {
+        handle.reset();
+    } else {
+        // Pre-fix only: destroying the handle would call release() and use the
+        // freed owner. Leak it so the failure stays a clean assertion instead
+        // of an access violation inside the test harness.
+        (void)handle.release();
+    }
+}
+
+// Concurrent `close()` vs `live_owner()`: the reader takes the same lease the
+// real call sites take, dereferences the owner, then releases it. `close()`
+// publishes `alive=false` under the liveness gate and waits for the readers to
+// drain before `~client` frees the object, so the reader can never observe a
+// dangling `client*`. Before the reader gate, `close()` could free the client
+// between the reader's `alive` read and its use of `owner`.
+CRPC_TEST(facade_live_owner_concurrent_close_is_safe) {
+    stalled_backend backend;
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc("stalled"), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5000ms);
+
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        return;
+    }
+
+    auto stub = cli->service<int, int>(1, 1);
+    auto started = stub.call(1);
+    CRPC_CHECK(started.ok());
+    if (!started.ok()) {
+        cli.reset();
+        return;
+    }
+    auto handle = std::make_unique<crpc::client::call<int>>(std::move(started).value());
+    auto& state = call_state_of(*handle);
+    CRPC_CHECK(state != nullptr);
+    if (!state) {
+        handle.reset();
+        cli.reset();
+        return;
+    }
+    // Hold the token strongly, exactly like a live reader frame does. With only
+    // the weak reference in `call_core` the token would expire with the client
+    // and the first gate in `live_owner()` would never be exercised.
+    std::shared_ptr<crpc::client_detail::client_liveness> token =
+        state->core.owner_liveness.lock();
+    CRPC_CHECK(token != nullptr);
+    if (!token) {
+        handle.reset();
+        cli.reset();
+        return;
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> nonnull{0};
+    std::atomic<long> nulls{0};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            crpc::client* const owner =
+                crpc::client_detail::live_owner(state->core);
+            if (owner != nullptr) {
+                // Widen the window between taking the lease and dereferencing
+                // the owner so the race is reproducible. `close()` must wait
+                // for this lease; without the wait the client is freed here.
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                nonnull.fetch_add(owner->closed() ? 1 : 1,
+                                  std::memory_order_relaxed);
+                crpc::client_detail::live_owner_release(state->core);
+            } else {
+                nulls.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    // Let the reader spin up before destroying the client.
+    std::this_thread::sleep_for(2ms);
+    cli.reset();
+    stop.store(true, std::memory_order_release);
+    reader.join();
+
+    CRPC_CHECK_FALSE(token->alive.load(std::memory_order_acquire));
+    // The reader must have observed at least one live owner before the close.
+    CRPC_CHECK(nonnull.load(std::memory_order_relaxed) > 0);
+    // After the client is gone the gate must report dead.
+    CRPC_CHECK(crpc::client_detail::live_owner(state->core) == nullptr);
+    handle.reset();
+}
+
 CRPC_TEST_MAIN()

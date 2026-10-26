@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <thread>
@@ -45,6 +46,60 @@
 #include <crpc/server.hpp>
 
 using namespace std::chrono_literals;
+
+// Allocation-failure injection for the `send_error` regression test. The
+// interceptor arms a one-shot flag on the shard thread that is about to build
+// the refusal; the next allocation on that thread throws `std::bad_alloc`.
+// `send_error` is noexcept, so before the fix the exception escaped it and
+// called `std::terminate`. The flag is thread-local, so only the shard thread
+// is affected and no other test's allocations are disturbed.
+namespace {
+std::atomic<bool> g_arm_alloc_failure{false};
+std::atomic<int> g_armed_requests{0};
+std::atomic<int> g_injected_alloc_failures{0};
+thread_local bool g_fail_next_alloc = false;
+} // namespace
+
+void* operator new(std::size_t size) {
+    // The debug CRT allocates a 16-byte `_Container_proxy` even for an empty
+    // `std::string`, and `decode_call_envelope` returns a `status` (which owns
+    // an empty string) on every call. Failing that allocation would abort in
+    // the `noexcept` decoder before `send_error` runs, so only fail the
+    // allocations that belong to the error body (message buffer, metadata
+    // vector, response buffer), all of which are larger.
+    if (g_fail_next_alloc && size > 16) {
+        g_fail_next_alloc = false;
+        g_injected_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc();
+    }
+    if (void* pointer = std::malloc(size == 0 ? 1 : size)) {
+        return pointer;
+    }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size) { return ::operator new(size); }
+
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return ::operator new(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete[](void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
 
 namespace {
 
@@ -171,6 +226,20 @@ struct service_state {
     }
 };
 
+// Arms the one-shot allocation failure on the shard thread that processes the
+// next request. Resetting from `g_arm_alloc_failure` on every request also
+// clears a flag that was armed but never consumed, so a later request cannot
+// inherit it.
+struct alloc_arming_interceptor final : crpc::server_interceptor {
+    void on_request(const crpc::frame&) noexcept override {
+        const bool arm = g_arm_alloc_failure.load(std::memory_order_acquire);
+        g_fail_next_alloc = arm;
+        if (arm) {
+            g_armed_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
 struct setup {
     std::size_t shards = 1;
     std::size_t per_service = 65536;
@@ -186,6 +255,7 @@ struct setup {
     std::optional<crpc::resilience::rate_limit_config> service_rate;
     std::optional<crpc::resilience::bulkhead_config> service_bulkhead;
     std::optional<crpc::resilience::breaker_config> breaker;
+    crpc::server_interceptor* interceptor = nullptr;
 };
 
 struct server_under_test {
@@ -241,6 +311,9 @@ bool start(server_under_test& f, const setup& cfg) {
     }
     if (cfg.frozen_clock) {
         sb.clock(f.server_clock.source());
+    }
+    if (cfg.interceptor != nullptr) {
+        sb.add_interceptor(*cfg.interceptor);
     }
     f.srv = sb.build();
     return f.srv != nullptr && f.srv->start().ok();
@@ -1509,6 +1582,85 @@ CRPC_TEST(degradable_rate_bucket_follows_the_injected_clock) {
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
                   static_cast<int>(admitted.error.code));
     CRPC_CHECK_EQ(2, f.service.echo_calls.load());
+}
+
+// `send_error` is noexcept and runs on the shard. Building the error allocates
+// the message string, the metadata vector and the response buffer. Before the
+// fix a `bad_alloc` escaped the noexcept function and called `std::terminate`.
+// This case arms exactly one allocation failure on the shard that builds the
+// refusal and proves the frame is dropped instead of the process aborting.
+CRPC_TEST(send_error_drops_frame_instead_of_terminating_on_allocation_failure) {
+#if defined(CRPC_SHARED)
+    crpc_test::skip("operator new replacement cannot intercept crpc.dll");
+#else
+    g_arm_alloc_failure.store(false, std::memory_order_release);
+    g_armed_requests.store(0, std::memory_order_relaxed);
+    g_injected_alloc_failures.store(0, std::memory_order_relaxed);
+
+    server_under_test f;
+    setup cfg;
+    cfg.shards = 2;
+    cfg.per_service = 1;
+    cfg.overload_retry = 10ms;
+    alloc_arming_interceptor interceptor;
+    cfg.interceptor = &interceptor;
+    CRPC_CHECK(start(f, cfg));
+
+    tee_client first = make_client(f);
+    tee_client second = make_client(f);
+    CRPC_CHECK(first.client != nullptr);
+    CRPC_CHECK(second.client != nullptr);
+    if (!first.client || !second.client) {
+        return;
+    }
+
+    f.service.blocking_gate.store(0, std::memory_order_release);
+    crpc::buffer first_body;
+    crpc::buffer second_body;
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(1, first_body).ok());
+    CRPC_CHECK(crpc::rpc::call_codec<int>::encode(2, second_body).ok());
+    auto first_started = first.client->start_call<int>(kService, kBlocking,
+                                                       first_body.readable());
+    CRPC_CHECK(first_started.ok());
+    if (!first_started.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first_started).value();
+    CRPC_CHECK(crpc_test::wait_for(
+        [&f] { return f.service.blocking_calls.load() >= 1; }, 2000));
+
+    // The first request holds the only cap slot, so the second is refused
+    // before dispatch. Arm the one-shot on the shard that processes it.
+    // `get()` on this low-level client waits for a response or for a poller to
+    // expire the deadline; the frame is dropped, so a poller is required to
+    // observe the timeout instead of blocking the test forever.
+    std::atomic<bool> poll_stop{false};
+    std::thread poller([&second, &poll_stop] {
+        while (!poll_stop.load(std::memory_order_acquire)) {
+            second.client->poll();
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    g_arm_alloc_failure.store(true, std::memory_order_release);
+    const call_outcome refused = call_int(second, kBlocking, 2, 300ms);
+    g_arm_alloc_failure.store(false, std::memory_order_release);
+    poll_stop.store(true, std::memory_order_release);
+    poller.join();
+
+    f.service.blocking_gate.store(1, std::memory_order_release);
+    (void)first_handle.get();
+
+    // The interceptor must have armed; otherwise the second request took a
+    // different path (for example it queued behind the first handler) and the
+    // allocation failure was never exercised.
+    CRPC_CHECK(g_armed_requests.load(std::memory_order_relaxed) >= 1);
+    CRPC_CHECK(g_injected_alloc_failures.load(std::memory_order_relaxed) >= 1);
+    // The error frame was dropped, so the client observes its own deadline
+    // rather than a response. The process is still alive to make this check.
+    CRPC_CHECK(refused.started);
+    CRPC_CHECK_FALSE(refused.error.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::deadline_exceeded, refused.error.code);
+#endif
 }
 
 CRPC_TEST_MAIN()

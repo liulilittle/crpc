@@ -28,14 +28,17 @@ u16 clamp_u16(std::size_t value) {
 }
 
 // Produces an error response unless the request was a fire-and-forget ONE_WAY.
-status respond_error(buffer& out, bool& has_response, bool wants_response, rpc_code code,
-                     std::string message) {
+// The whole `rpc_error` is preserved, not just its code and message: a handler
+// may attach metadata, a retry hint or a retryable flag, and dropping them here
+// made every server-side marker (other than the one `send_error` builds itself)
+// unreachable.
+status respond_error(buffer& out, bool& has_response, bool wants_response,
+                     const rpc_error& error) {
     if (!wants_response) {
         return status{};
     }
     has_response = true;
-    const rpc_error error(code, std::move(message));
-    return encode_response(code, error, span<const std::byte>(), out);
+    return encode_response(error.code, error, span<const std::byte>(), out);
 }
 
 // Rebuilds the per-call context a handler sees from the decoded envelope.
@@ -122,69 +125,82 @@ status encode_response(rpc_code code, const rpc_error& error, span<const std::by
 
 status decode_response(span<const std::byte> in, rpc_code& code, rpc_error& error,
                        span<const std::byte>& body) noexcept {
-    byte_reader reader(in);
-    u8 status_byte = 0;
-    if (!reader.get_u8(status_byte)) {
-        return status{rpc_code::decode_error};
-    }
-    if (status_byte == 0) {
-        code = rpc_code::ok;
-        error = rpc_error{};
-        body = reader.remaining_bytes();
-        return status{};
-    }
-    if (status_byte != 1) {
-        return status{rpc_code::protocol_error};
-    }
-
-    u64 raw_code = 0;
-    if (!reader.get_varint(raw_code)) {
-        return status{rpc_code::decode_error};
-    }
-    rpc_error decoded;
-    if (raw_code > static_cast<u64>(rpc_code::application)) {
-        decoded.metadata.set("crpc.raw_code", std::to_string(raw_code));
-        decoded.code = rpc_code::internal;
-    } else {
-        decoded.code = static_cast<rpc_code>(raw_code);
-    }
-
-    u8 retryable = 0;
-    u64 retry_after = 0;
-    u16 message_length = 0;
-    if (!reader.get_u8(retryable) || !reader.get_varint(retry_after) ||
-        !reader.get_u16(message_length)) {
-        return status{rpc_code::decode_error};
-    }
-    span<const std::byte> message;
-    if (!reader.get_bytes(message_length, message)) {
-        return status{rpc_code::decode_error};
-    }
-    decoded.message.assign(reinterpret_cast<const char*>(message.data()), message.size());
-
-    u16 meta_count = 0;
-    if (!reader.get_u16(meta_count)) {
-        return status{rpc_code::decode_error};
-    }
-    for (u16 i = 0; i < meta_count; ++i) {
-        u16 key_length = 0;
-        u16 value_length = 0;
-        span<const std::byte> key;
-        span<const std::byte> value;
-        if (!reader.get_u16(key_length) || !reader.get_bytes(key_length, key) ||
-            !reader.get_u16(value_length) || !reader.get_bytes(value_length, value)) {
+    // Decoding a response allocates (the message string and every metadata
+    // entry), and this function is `noexcept` -- the low-level client's reader
+    // calls it. An allocation failure would reach `std::terminate`. Report it
+    // as a decode error instead; `error` and `body` are left unchanged because
+    // `decoded` is only published at the end.
+    try {
+        byte_reader reader(in);
+        u8 status_byte = 0;
+        if (!reader.get_u8(status_byte)) {
             return status{rpc_code::decode_error};
         }
-        decoded.metadata.set(std::string(reinterpret_cast<const char*>(key.data()), key.size()),
-                             std::string(reinterpret_cast<const char*>(value.data()), value.size()));
-    }
-    decoded.retryable = retryable != 0;
-    decoded.retry_after = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(retry_after));
+        if (status_byte == 0) {
+            code = rpc_code::ok;
+            error = rpc_error{};
+            body = reader.remaining_bytes();
+            return status{};
+        }
+        if (status_byte != 1) {
+            return status{rpc_code::protocol_error};
+        }
 
-    code = decoded.code;
-    error = std::move(decoded);
-    body = span<const std::byte>();
-    return status{};
+        u64 raw_code = 0;
+        if (!reader.get_varint(raw_code)) {
+            return status{rpc_code::decode_error};
+        }
+        rpc_error decoded;
+        if (raw_code > static_cast<u64>(rpc_code::application)) {
+            decoded.metadata.set("crpc.raw_code", std::to_string(raw_code));
+            decoded.code = rpc_code::internal;
+        } else {
+            decoded.code = static_cast<rpc_code>(raw_code);
+        }
+
+        u8 retryable = 0;
+        u64 retry_after = 0;
+        u16 message_length = 0;
+        if (!reader.get_u8(retryable) || !reader.get_varint(retry_after) ||
+            !reader.get_u16(message_length)) {
+            return status{rpc_code::decode_error};
+        }
+        span<const std::byte> message;
+        if (!reader.get_bytes(message_length, message)) {
+            return status{rpc_code::decode_error};
+        }
+        decoded.message.assign(reinterpret_cast<const char*>(message.data()), message.size());
+
+        u16 meta_count = 0;
+        if (!reader.get_u16(meta_count)) {
+            return status{rpc_code::decode_error};
+        }
+        for (u16 i = 0; i < meta_count; ++i) {
+            u16 key_length = 0;
+            u16 value_length = 0;
+            span<const std::byte> key;
+            span<const std::byte> value;
+            if (!reader.get_u16(key_length) || !reader.get_bytes(key_length, key) ||
+                !reader.get_u16(value_length) || !reader.get_bytes(value_length, value)) {
+                return status{rpc_code::decode_error};
+            }
+            decoded.metadata.set(
+                std::string(reinterpret_cast<const char*>(key.data()), key.size()),
+                std::string(reinterpret_cast<const char*>(value.data()), value.size()));
+        }
+        decoded.retryable = retryable != 0;
+        decoded.retry_after =
+            std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(retry_after));
+
+        code = decoded.code;
+        error = std::move(decoded);
+        body = span<const std::byte>();
+        return status{};
+    } catch (...) {
+        // Allocation failure while decoding. Report it as a decode error; the
+        // catch body performs no allocation.
+        return status{rpc_code::decode_error};
+    }
 }
 
 // --- method_slot -------------------------------------------------------------
@@ -314,76 +330,100 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
 status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
                             std::chrono::steady_clock::time_point now,
                             bool& handler_ran) noexcept {
+    // Building the decode-failure message, the refusal errors and the success
+    // response all allocate, and this function is `noexcept` (the server's
+    // shard calls it). An allocation failure would reach `std::terminate`.
+    // Report it as an internal error instead. The concurrency counters taken
+    // below are released on every exit, including the catch path.
     has_response = false;
     response_out.clear();
     handler_ran = false;
 
-    const bool one_way = request.header.type == frame_type::one_way;
-    if (request.header.type != frame_type::request && !one_way) {
-        return status{rpc_code::protocol_error};
-    }
-    const bool wants_response = !one_way;
-
-    call_envelope envelope;
-    const status decoded = decode_call_envelope(request.payload, envelope);
-    if (!decoded.ok()) {
-        const std::string message =
-            decoded.message().empty() ? "request decode failed" : decoded.message();
-        return respond_error(response_out, has_response, wants_response, rpc_code::decode_error,
-                             message);
-    }
-
-    const service_slot* service = registry_->find_service(envelope.service_id);
-    if (service == nullptr) {
-        return respond_error(response_out, has_response, wants_response, rpc_code::not_found,
-                             "unknown service");
-    }
-    const method_slot* method = service->find_method(envelope.method_id);
-    if (method == nullptr) {
-        return respond_error(response_out, has_response, wants_response, rpc_code::no_such_method,
-                             "unknown method");
-    }
-
-    if (envelope.extensions.has(trace_extension::has_deadline)) {
-        // Relative deadline (design section 8.5): refuse to start work that
-        // cannot finish. The floor is shared with the server's admission
-        // refusals so the two cannot drift (resilience::min_remaining_ns).
-        if (envelope.extensions.deadline_ns < resilience::min_remaining_ns) {
-            return respond_error(response_out, has_response, wants_response,
-                                 rpc_code::deadline_exceeded, "deadline already passed");
-        }
-    }
-
-    if (!method->enter()) {
-        return respond_error(response_out, has_response, wants_response, rpc_code::overload,
-                             "method concurrency limit reached");
-    }
-    service->enter();
-
-    call_context ctx = build_context(envelope, now);
-    buffer body_out;
-    status handler_status;
-    handler_ran = true;
+    const service_slot* service = nullptr;
+    const method_slot* method = nullptr;
+    bool entered = false;
     try {
-        handler_status = method->invoke(envelope, envelope.body, body_out, ctx);
-    } catch (const std::exception& ex) {
-        handler_status = status{rpc_error(rpc_code::internal, std::string("handler threw: ") + ex.what())};
+        const bool one_way = request.header.type == frame_type::one_way;
+        if (request.header.type != frame_type::request && !one_way) {
+            return status{rpc_code::protocol_error};
+        }
+        const bool wants_response = !one_way;
+
+        call_envelope envelope;
+        const status decoded = decode_call_envelope(request.payload, envelope);
+        if (!decoded.ok()) {
+            const std::string message =
+                decoded.message().empty() ? "request decode failed" : decoded.message();
+            return respond_error(response_out, has_response, wants_response,
+                                 rpc_error(rpc_code::decode_error, message));
+        }
+
+        service = registry_->find_service(envelope.service_id);
+        if (service == nullptr) {
+            return respond_error(response_out, has_response, wants_response,
+                                 rpc_error(rpc_code::not_found, "unknown service"));
+        }
+        method = service->find_method(envelope.method_id);
+        if (method == nullptr) {
+            return respond_error(response_out, has_response, wants_response,
+                                 rpc_error(rpc_code::no_such_method, "unknown method"));
+        }
+
+        if (envelope.extensions.has(trace_extension::has_deadline)) {
+            // Relative deadline (design section 8.5): refuse to start work that
+            // cannot finish. The floor is shared with the server's admission
+            // refusals so the two cannot drift (resilience::min_remaining_ns).
+            if (envelope.extensions.deadline_ns < resilience::min_remaining_ns) {
+                return respond_error(response_out, has_response, wants_response,
+                                     rpc_error(rpc_code::deadline_exceeded,
+                                               "deadline already passed"));
+            }
+        }
+
+        if (!method->enter()) {
+            return respond_error(response_out, has_response, wants_response,
+                                 rpc_error(rpc_code::overload,
+                                           "method concurrency limit reached"));
+        }
+        service->enter();
+        entered = true;
+
+        call_context ctx = build_context(envelope, now);
+        buffer body_out;
+        status handler_status;
+        handler_ran = true;
+        try {
+            handler_status = method->invoke(envelope, envelope.body, body_out, ctx);
+        } catch (const std::exception& ex) {
+            handler_status =
+                status{rpc_error(rpc_code::internal, std::string("handler threw: ") + ex.what())};
+        } catch (...) {
+            handler_status = status{rpc_error(rpc_code::internal, "handler threw an exception")};
+        }
+
+        service->leave();
+        method->leave();
+        entered = false;
+
+        if (!handler_status.ok()) {
+            return respond_error(response_out, has_response, wants_response,
+                                 handler_status.error());
+        }
+        if (!wants_response) {
+            return status{};
+        }
+        has_response = true;
+        return encode_response(rpc_code::ok, rpc_error{}, body_out.readable(), response_out);
     } catch (...) {
-        handler_status = status{rpc_error(rpc_code::internal, "handler threw an exception")};
+        // Allocation failure. Release the concurrency counters if they were
+        // taken, then report an internal error. The catch body performs no
+        // allocation.
+        if (entered) {
+            service->leave();
+            method->leave();
+        }
+        return status{rpc_code::internal};
     }
-
-    service->leave();
-    method->leave();
-
-    if (!handler_status.ok()) {
-        return respond_error(response_out, has_response, wants_response, handler_status.code(),
-                             handler_status.message());
-    }
-    if (!wants_response) {
-        return status{};
-    }
-    has_response = true;
-    return encode_response(rpc_code::ok, rpc_error{}, body_out.readable(), response_out);
 }
 
 } // namespace crpc::rpc

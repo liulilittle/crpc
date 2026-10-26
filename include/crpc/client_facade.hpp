@@ -227,6 +227,26 @@ public:
         size_ = 0;
     }
 
+    // Moves up to `max` used values out of the table and clears their slots.
+    // Allocation-free and noexcept: `close()` uses it to take ownership of the
+    // registered calls in bounded batches, so the `noexcept` destructor path
+    // never reaches the allocator and cannot terminate on `bad_alloc`.
+    template <typename OutputIt>
+    std::size_t take_used(std::size_t max, OutputIt out) noexcept {
+        std::size_t taken = 0;
+        for (std::size_t i = 0; i < capacity_ && taken < max; ++i) {
+            if (!entries_[i].used) {
+                continue;
+            }
+            *out++ = std::move(entries_[i].second);
+            entries_[i].second = Value{};
+            entries_[i].used = false;
+            --size_;
+            ++taken;
+        }
+        return taken;
+    }
+
     [[nodiscard]] iterator begin() { return iterator(this, next_used(0)); }
     [[nodiscard]] iterator end() { return iterator(this, capacity_); }
 
@@ -391,6 +411,14 @@ struct connection_slot {
 // member function on a freed client.
 struct client_liveness {
     std::atomic<bool> alive{true};
+    // Appended after `alive` so the offset of `alive` -- baked into consumer
+    // translation units by the header-inline `live_owner` -- is unchanged.
+    // Reader gate: `close()` publishes `alive=false` under `gate_mutex` and
+    // then waits for `readers` to drain, so the client object cannot be freed
+    // while a `live_owner()` reader is still holding its pointer.
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    std::uint64_t readers{0};
 };
 
 // How a finished attempt feeds the endpoint breaker. A logical call records
@@ -526,7 +554,7 @@ struct CRPC_API call_core {
     // this, which becomes true only when a consumer (`get()`/`try_get()`)
     // processes the attempt. `signal()` sets `done` before the terminal
     // snapshot exists, so `ready()` alone does not imply the accessors are
-    // readable — use `terminal_ready()` for that.
+    // readable --use `terminal_ready()` for that.
     std::atomic<bool> terminal_recorded{false};
     // Set by `call::cancel()`, with or without an in-flight low-level call.
     // The retry wait polls it so a backoff can be interrupted.
@@ -845,13 +873,27 @@ struct call_state_allocator {
 // enough: an abandoned call leaves the registry, so a destroyed client never
 // nulls that pointer, and a handle released afterwards would call a member
 // function on freed memory.
-[[nodiscard]] inline client* live_owner(const call_core& core) noexcept {
-    const std::shared_ptr<client_liveness> live = core.owner_liveness.lock();
-    if (!live || !live->alive.load(std::memory_order_acquire)) {
-        return nullptr;
+//
+// The read of `alive` and `owner` happens under the liveness gate, and the
+// reader count is held until `live_owner_release()` is called. `close()`
+// publishes `alive=false` under the same gate and waits for the readers to
+// drain, so a concurrent `close()`/`~client` cannot free the client object
+// while the caller is still using the pointer. The reader count is a lease,
+// not ownership: the caller must pair every non-null `live_owner()` with a
+// `live_owner_release()`.
+[[nodiscard]] client* live_owner(const call_core& core) noexcept;
+inline void live_owner_release(const call_core& core) noexcept;
+
+// RAII lease for a `live_owner()` reader. Releases the reader count on scope
+// exit so an early return cannot leave `close()` waiting forever.
+struct live_owner_lease {
+    const call_core* core = nullptr;
+    ~live_owner_lease() {
+        if (core != nullptr) {
+            live_owner_release(*core);
+        }
     }
-    return core.owner.load(std::memory_order_acquire);
-}
+};
 
 template <typename Resp>
 struct wake_functor {
@@ -1082,7 +1124,8 @@ public:
             if (state_->terminal_result.has_value()) {
                 return *state_->terminal_result;
             }
-            if (client_detail::live_owner(state_->core) == nullptr) {
+            client* const pre_owner = client_detail::live_owner(state_->core);
+            if (pre_owner == nullptr) {
                 state_->core.record_terminal(
                     rpc_code::failed_precondition,
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"),
@@ -1091,6 +1134,7 @@ public:
                     rpc_error(rpc_code::failed_precondition, "invalid call handle"));
                 return *state_->terminal_result;
             }
+            client_detail::live_owner_release(state_->core);
             std::shared_ptr<client_detail::call_state<Resp>> st = state_;
             // Every return below is terminal. The guard runs the `then` callback
             // exactly once on the thread that observes the terminal result, so a
@@ -1155,6 +1199,7 @@ public:
                     return finish(rpc::rpc_result<Resp>(
                         rpc_error(rpc_code::shutting_down, "client is closed")));
                 }
+                client_detail::live_owner_lease owner_lease{&st->core};
                 // Presence is read under `inner_mutex` so a concurrent cancel()
                 // (which takes the same lock to reach the low-level handle) has
                 // a happens-before edge on the pointer. The lock is released
@@ -1180,6 +1225,7 @@ public:
                         return finish(rpc::rpc_result<Resp>(
                             rpc_error(rpc_code::shutting_down, "client is closed")));
                     }
+                    client_detail::live_owner_lease current_lease{&st->core};
                     if (!waited.ok()) {
                         rpc_error failure(rpc_code::deadline_exceeded,
                                           "call did not complete in time");
@@ -1369,6 +1415,7 @@ public:
                         st->core, code, terminal_error, origin,
                         client_detail::breaker_record_for(origin, code));
                 }
+                client_detail::live_owner_release(st->core);
                 // The call is terminal: run the `then` callback exactly once.
                 st->core.invoke_callback();
             }
@@ -1413,6 +1460,7 @@ public:
                 owner->abandon_attempt(state_->core);
                 owner->notify_waiter();
             }
+            client_detail::live_owner_release(state_->core);
             {
                 std::lock_guard<std::mutex> lk(state_->core.mutex);
             }
@@ -1507,6 +1555,7 @@ public:
             if (owner != nullptr) {
                 owner->abandon_attempt(st->core);
             }
+            client_detail::live_owner_release(st->core);
         }
 
         std::shared_ptr<client_detail::call_state<Resp>> state_;
@@ -1747,8 +1796,11 @@ private:
         client_detail::call_core& core,
         const std::shared_ptr<client_detail::call_state_base>& keep) noexcept;
     void unregister_core(client_detail::call_core& core) noexcept;
-    void finalize_active(
-        std::vector<std::shared_ptr<client_detail::call_state_base>>& active) noexcept;
+    // Finalizes one registered call. `close()` drains the registry in
+    // allocation-free batches (see `flat_pool_map::take_used`) and calls this
+    // for each entry; the entry is already owned by the caller, so a concurrent
+    // `unregister_core()` cannot drop it.
+    void finalize_one(const std::shared_ptr<client_detail::call_state_base>& keep) noexcept;
     [[nodiscard]] bool should_retry(client_detail::call_core& core,
                                     const rpc_error& error,
                                     client_detail::failure_origin origin,
@@ -1800,6 +1852,48 @@ private:
     std::atomic<std::size_t> probe_admitted_{0};
     std::atomic<std::size_t> retries_delayed_by_hint_{0};
 };
+
+namespace client_detail {
+
+// Returns the owner only while the client is alive, holding a reader lease on
+// the liveness gate. `close()` publishes `alive=false` under the same gate and
+// waits for the readers to drain before the client object is freed, so the
+// pointer cannot dangle while the caller uses it. The caller must release the
+// lease with `live_owner_release()` once it is done with the pointer.
+[[nodiscard]] inline client* live_owner(const call_core& core) noexcept {
+    const std::shared_ptr<client_liveness> live = core.owner_liveness.lock();
+    if (!live) {
+        return nullptr;
+    }
+    client* owner;
+    {
+        std::lock_guard<std::mutex> lk(live->gate_mutex);
+        if (!live->alive.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        owner = core.owner.load(std::memory_order_acquire);
+        if (owner != nullptr) {
+            ++live->readers;
+        }
+    }
+    return owner;
+}
+
+inline void live_owner_release(const call_core& core) noexcept {
+    const std::shared_ptr<client_liveness> live = core.owner_liveness.lock();
+    if (!live) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(live->gate_mutex);
+        if (live->readers > 0) {
+            --live->readers;
+        }
+    }
+    live->gate_cv.notify_all();
+}
+
+} // namespace client_detail
 
 // RAII scoped fallback installer.
 //
@@ -1901,35 +1995,43 @@ status client::issue(
         core.slot = slot;
     }
 
-    std::lock_guard<std::recursive_mutex> lk(slot->mutex);
-    if (!slot->healthy.load(std::memory_order_acquire) || !slot->conn ||
-        !slot->conn->is_open()) {
-        core.origin = client_detail::failure_origin::endpoint_pre_send;
-        rpc_error unavailable(rpc_code::unavailable, "connection is not usable");
-        failure = unavailable;
-        return status{failure};
-    }
-    rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
-        core.service_id, core.method_id, core.request.readable(), core.ctx);
-    if (!started.ok()) {
-        core.origin = started.error().code == rpc_code::resource_exhausted
-                          ? client_detail::failure_origin::local_capacity
-                          : client_detail::failure_origin::endpoint_pre_send;
-        failure = started.error();
-        return status{failure};
-    }
     {
-        // Publish the handle and arm its completion callback under the same lock
-        // that cancel() takes to reach it. `rpc::call` documents single-owner
-        // use: `then()` writes callback_storage/invoke/owner while a concurrent
-        // cancel() -> invoke_callback() reads them, so both sides must be
-        // serialized. `then()` may run the callback synchronously when the call
-        // already terminated; the wake functor only touches the call core and
-        // never re-enters `inner_mutex`, so holding the lock here is safe.
-        std::lock_guard<std::mutex> inner_lk(st->inner_mutex);
-        st->inner.emplace(std::move(started).value());
-        st->inner->then(client_detail::wake_functor<Resp>{&core});
+        std::lock_guard<std::recursive_mutex> lk(slot->mutex);
+        if (!slot->healthy.load(std::memory_order_acquire) || !slot->conn ||
+            !slot->conn->is_open()) {
+            core.origin = client_detail::failure_origin::endpoint_pre_send;
+            rpc_error unavailable(rpc_code::unavailable, "connection is not usable");
+            failure = unavailable;
+            return status{failure};
+        }
+        rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
+            core.service_id, core.method_id, core.request.readable(), core.ctx, false);
+        if (!started.ok()) {
+            core.origin = started.error().code == rpc_code::resource_exhausted
+                              ? client_detail::failure_origin::local_capacity
+                              : client_detail::failure_origin::endpoint_pre_send;
+            failure = started.error();
+            return status{failure};
+        }
+        {
+            // Publish the handle and arm its completion callback under the same lock
+            // that cancel() takes to reach it. `rpc::call` documents single-owner
+            // use: `then()` writes callback_storage/invoke/owner while a concurrent
+            // cancel() -> invoke_callback() reads them, so both sides must be
+            // serialized. `then()` may run the callback synchronously when the call
+            // already terminated; the wake functor only touches the call core and
+            // never re-enters `inner_mutex`, so holding the lock here is safe.
+            std::lock_guard<std::mutex> inner_lk(st->inner_mutex);
+            st->inner.emplace(std::move(started).value());
+            st->inner->then(client_detail::wake_functor<Resp>{&core});
+        }
     }
+    // Flush outside `slot->mutex`: the synchronous in-process drain triggered by
+    // the flush re-enters the client's reader, whose completion path takes
+    // `completion_mutex_`. Holding the facade slot lock across that would invert
+    // against a handle destructor that holds `completion_mutex_` and waits on the
+    // slot lock (cycle 2 in `.opencode/sdd/lock-order-analysis.md`).
+    slot->conn->flush_pending();
     return status{};
 }
 

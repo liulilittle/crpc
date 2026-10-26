@@ -281,7 +281,7 @@ The client path passes through the same stages per endpoint: load balancing with
 
 `obs::trace_context` carries a 16-byte trace id, an 8-byte span id, an 8-byte parent and W3C flags; `parse_traceparent`/`format_traceparent` implement the W3C header, and `baggage` is ordered and bounded. `obs::deadline` is relative (`after(duration)`), as required for cross-machine propagation.
 
-`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:1127-1131` for `on_request`, `:1164-1168` and `:1387-1391` for `on_response`), but it is not the observability chain.
+`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:1140-1144` for `on_request`, `:1176-1180` and `:1400-1404` for `on_response`), but it is not the observability chain.
 
 **Exception contract.** The HTTP and RPC paths cross two different boundaries, and they do not behave alike. A header-inline boundary is compiled into the consumer and follows the consumer's exception flags; a library translation unit is prebuilt and keeps the library's flags.
 

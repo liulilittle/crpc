@@ -4,6 +4,31 @@
 
 ## Unreleased
 
+### Reliability: the reliable pipelined path no longer deadlocks
+
+- `rpc::client` had two mutually inverted lock orders on `completion_mutex_` and
+  `map_mutex_`: the completion path took completion then map, while
+  `release_slot_under_lock` (the handle-destruction path) took map then
+  completion. A pipelined workload on the in-process backend (concurrency > 1,
+  batch > 1) hit it in roughly a third of runs. There is now one order
+  everywhere: `completion_mutex_` outer, `map_mutex_` inner.
+- `poll()` and `fail_all()` no longer snapshot raw `call_slot*` pointers. A
+  `then` callback runs under the completion lock and may legally destroy a
+  *sibling* handle, which returns that sibling's slot to the pool; a
+  pre-collected snapshot could therefore finish a slot that was already
+  recycled, writing a bogus `timed_out` into it (and, after a re-acquire, into a
+  fresh never-sent call). Both functions now pick one still-live victim per
+  round and finish it immediately.
+- `rpc::client::start_call` gained a trailing `bool flush = true` parameter. The
+  default keeps the documented "start_call sends" behaviour; `client_facade`
+  passes `false` and flushes through the new `flush_pending()` outside its
+  connection-slot lock, which is what makes the synchronous in-process drain
+  safe. Source compatible; templates are instantiated in the consumer, so no
+  library symbol changed.
+- Impact: MINOR. New regression `tests/test_poll_recycle.cpp` (2 cases) covers
+  both recycle windows; it fails 200/200 checks against the old shape.
+
+
 ### Error diagnostics
 
 - `rpc_error` now carries where a terminal failure originated and how many

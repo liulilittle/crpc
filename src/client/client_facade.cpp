@@ -507,18 +507,27 @@ void client::close() noexcept {
     // attempt is either inserted before this snapshot (and is finalized below)
     // or observes `closed_` and never arms a timer (R1). The snapshot owns each
     // state, so a handle destroyed on another thread cannot free a core that
-    // finalize_active() is about to write.
-    std::vector<std::shared_ptr<client_detail::call_state_base>> active;
+    // finalize_one() is about to write.
     {
         std::lock_guard<std::mutex> lk(impl->calls_mutex);
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
-        active.reserve(impl->active_calls.size());
-        for (auto& entry : impl->active_calls) {
-            active.push_back(std::move(entry.second));
+        // Publish the client's death to every handle that still holds a strong
+        // reference to the liveness token. Without this write `alive` stayed
+        // true forever, so `live_owner()`'s first gate never fired: a frame
+        // that keeps `impl` alive (and therefore keeps the token alive) would
+        // still be handed `core.owner`, a pointer `~client` already freed.
+        // The store is under `calls_mutex`, the same lock that orders
+        // `register_core_if_open()`, so a new attempt either observes
+        // `closed_` or its liveness write. It is also under the liveness gate,
+        // the same lock `live_owner()` takes to read `alive` and to take its
+        // reader lease, so a reader either sees the death before taking the
+        // lease or is counted and waited for below.
+        {
+            std::lock_guard<std::mutex> gate(impl->liveness->gate_mutex);
+            impl->liveness->alive.store(false, std::memory_order_release);
         }
-        impl->active_calls.clear();
     }
     for (std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
         std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
@@ -537,7 +546,38 @@ void client::close() noexcept {
     // Cancel the deadline timer and release the slot for every attempt that is
     // still active; detach its owner so a handle that outlives the client can
     // never call back into it.
-    finalize_active(active);
+    //
+    // The old code copied the whole registry into a `std::vector` here, which
+    // allocates. This path is also reached from `~client()` (implicitly
+    // `noexcept`), so an allocation failure would terminate the process. Instead
+    // the registry is drained in allocation-free batches: each batch is removed
+    // from the registry under `calls_mutex` before it is finalized, so a
+    // concurrent `unregister_core()` cannot drop an entry before its turn, and
+    // the `keep` reference in the batch keeps the state alive for `finalize_one`.
+    for (;;) {
+        std::array<std::shared_ptr<client_detail::call_state_base>, 64> batch{};
+        std::size_t taken;
+        {
+            std::lock_guard<std::mutex> lk(impl->calls_mutex);
+            taken = impl->active_calls.take_used(batch.size(), batch.begin());
+        }
+        if (taken == 0) {
+            break;
+        }
+        for (std::size_t i = 0; i < taken; ++i) {
+            finalize_one(batch[i]);
+        }
+    }
+    // Wait for every `live_owner()` reader to release its lease before the
+    // client object is freed by `~client`. A reader that observed `alive == true`
+    // under the gate cannot still be holding `core.owner` when the object dies,
+    // because `close()` is the last thing that touches the client. `finalize_one`
+    // woke any blocked waiter, so the readers drain.
+    {
+        std::unique_lock<std::mutex> gate(impl->liveness->gate_mutex);
+        impl->liveness->gate_cv.wait(
+            gate, [&impl] { return impl->liveness->readers == 0; });
+    }
 }
 
 std::shared_ptr<client_detail::client_liveness>
@@ -570,15 +610,18 @@ void client::unregister_core(client_detail::call_core& core) noexcept {
     impl_->active_calls.erase(&core);
 }
 
-void client::finalize_active(
-    std::vector<std::shared_ptr<client_detail::call_state_base>>& active) noexcept {
-    for (const std::shared_ptr<client_detail::call_state_base>& keep : active) {
-        client_detail::call_core* core = &keep->core_ref();
-        // A concurrent finish_attempt/abandon_attempt must win exactly once;
-        // only the winner releases the timer and slot.
-        if (core->finalized.exchange(true, std::memory_order_acq_rel)) {
-            continue;
-        }
+void client::finalize_one(const std::shared_ptr<client_detail::call_state_base>& keep) noexcept {
+    client_detail::call_core* core = &keep->core_ref();
+    // A concurrent finish_attempt/abandon_attempt must win exactly once;
+    // only the winner releases the timer and slot.
+    if (core->finalized.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Building the shutdown `rpc_error` allocates (its message exceeds SSO), and
+    // this function is `noexcept`. Degrade by dropping the rest of this entry's
+    // finalization: the core is already marked `finalized`, so no other path
+    // will touch it, and the client is closing anyway.
+    try {
         if (options_.shard != nullptr) {
             (void)options_.shard->cancel_timer(core);
         }
@@ -631,6 +674,9 @@ void client::finalize_active(
             who->notify_waiter();
         }
         core->owner.store(nullptr, std::memory_order_release);
+    } catch (...) {
+        // Allocation failure while building the shutdown error. The core is
+        // already marked `finalized`; the client is closing.
     }
 }
 
@@ -1592,65 +1638,82 @@ void client::deadline_tick(const std::shared_ptr<impl>& impl,
     // A user callback below may destroy the client. `impl` keeps the
     // implementation alive and every scalar is already copied, so nothing here
     // dereferences the client.
-    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
-        std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
-        {
-            std::lock_guard<std::mutex> lk(pool->mutex);
-            snapshot = pool->slots;
-        }
-        for (const std::shared_ptr<client_detail::connection_slot>& slot : snapshot) {
-            std::lock_guard<std::recursive_mutex> lk(slot->mutex);
-            if (!slot->conn) {
-                continue;
+    //
+    // Snapshotting `pool->slots` allocates, and this function is noexcept (it
+    // runs on the shard timer thread). An allocation failure would reach
+    // `std::terminate`. Dropping this tick is safe: the next tick re-snapshots
+    // and re-polls, so the only cost of a skipped tick is a delayed deadline.
+    try {
+        for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
+            std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
+            {
+                std::lock_guard<std::mutex> lk(pool->mutex);
+                snapshot = pool->slots;
             }
-            slot->conn->poll();
+            for (const std::shared_ptr<client_detail::connection_slot>& slot : snapshot) {
+                std::lock_guard<std::recursive_mutex> lk(slot->mutex);
+                if (!slot->conn) {
+                    continue;
+                }
+                slot->conn->poll();
+            }
         }
-    }
-    if (idle_eviction.count() > 0) {
-        evict_idle(impl, idle_eviction);
+        if (idle_eviction.count() > 0) {
+            evict_idle(impl, idle_eviction);
+        }
+    } catch (...) {
+        // Allocation failure while snapshotting. Skip this tick; the catch body
+        // performs no allocation.
     }
 }
 
 void client::evict_idle(const std::shared_ptr<impl>& impl,
                         std::chrono::nanoseconds idle_eviction) noexcept {
-    const auto now = steady_now();
-    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
-        std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
-        std::size_t count = 0;
-        {
-            std::lock_guard<std::mutex> lk(pool->mutex);
-            snapshot = pool->slots;
-            count = pool->slots.size();
-        }
-        for (const std::shared_ptr<client_detail::connection_slot>& slot : snapshot) {
-            if (count <= 1) {
-                break;
-            }
-            if (slot->in_flight.load(std::memory_order_acquire) != 0) {
-                continue;
-            }
-            if (now - slot->idle_since < idle_eviction) {
-                continue;
-            }
-            bool closed_now = false;
+    // Same allocation-safety contract as `deadline_tick`: the snapshot copy can
+    // throw `bad_alloc` and this function is noexcept, so the body is guarded and
+    // a failure degrades to "evict nothing this tick".
+    try {
+        const auto now = steady_now();
+        for (const std::unique_ptr<impl::endpoint_pool>& pool : impl->pools) {
+            std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
+            std::size_t count = 0;
             {
-                std::lock_guard<std::recursive_mutex> lk(slot->mutex);
-                if (slot->conn && slot->conn->in_flight() == 0) {
-                    slot->conn->close();
-                    slot->healthy.store(false, std::memory_order_release);
-                    closed_now = true;
+                std::lock_guard<std::mutex> lk(pool->mutex);
+                snapshot = pool->slots;
+                count = pool->slots.size();
+            }
+            for (const std::shared_ptr<client_detail::connection_slot>& slot : snapshot) {
+                if (count <= 1) {
+                    break;
+                }
+                if (slot->in_flight.load(std::memory_order_acquire) != 0) {
+                    continue;
+                }
+                if (now - slot->idle_since < idle_eviction) {
+                    continue;
+                }
+                bool closed_now = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lk(slot->mutex);
+                    if (slot->conn && slot->conn->in_flight() == 0) {
+                        slot->conn->close();
+                        slot->healthy.store(false, std::memory_order_release);
+                        closed_now = true;
+                    }
+                }
+                if (!closed_now) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> lk(pool->mutex);
+                const auto it = std::find(pool->slots.begin(), pool->slots.end(), slot);
+                if (it != pool->slots.end()) {
+                    pool->slots.erase(it);
+                    --count;
                 }
             }
-            if (!closed_now) {
-                continue;
-            }
-            std::lock_guard<std::mutex> lk(pool->mutex);
-            const auto it = std::find(pool->slots.begin(), pool->slots.end(), slot);
-            if (it != pool->slots.end()) {
-                pool->slots.erase(it);
-                --count;
-            }
         }
+    } catch (...) {
+        // Allocation failure while snapshotting. Evict nothing this tick.
     }
 }
 

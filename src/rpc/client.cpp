@@ -127,40 +127,75 @@ void client::close() noexcept {
 // --- Reader ------------------------------------------------------------------
 
 std::size_t client::on_data(span<const std::byte> data) noexcept {
-    std::lock_guard<std::recursive_mutex> lk(read_mutex_);
-    if (in_process_) {
-        // Re-entered from a synchronous push: the outer loop will drain these
-        // bytes after the current frame is handled. The chunk does not outlive
-        // this call, so it must go through the copying path (which also drains
-        // any external chunk the outer loop still holds).
-        decoder_.feed(data);
-        return data.size();
-    }
-    // Parse directly out of the transport's chunk: handle_frame() consumes the
-    // payload before next() is called again, so the zero-copy window is this
-    // loop. Only a trailing partial frame is copied into the decoder.
-    decoder_.feed_external(data);
-    in_process_ = true;
-    frame value;
+    // Extract every ready frame under the reader lock, then handle them with the
+    // lock released. A frame's payload span points into the decoder's buffer (or
+    // the caller's chunk), so it is copied into `pending_frame::payload` here.
+    // Handling after the unlock is what keeps `completion_mutex_` out of the
+    // reader-lock scope: the synchronous in-process drain re-enters `on_data`
+    // from the writer, and a completion taken under the reader lock would invert
+    // against the completion/detach path.
+    std::vector<pending_frame> frames;
     frame_decoder::result result = frame_decoder::result::need_more;
-    // A dropped frame consumes its bytes and leaves the decoder usable, so it
-    // is not a terminal outcome: keep parsing the rest of this chunk, matching
-    // server_connection::on_data. Borrowing mode has no payload buffer, so a
-    // compressed frame fails hard instead and frame_dropped is unreachable
-    // here today; the branch is kept so a future payload buffer cannot
-    // silently truncate the chunk.
-    for (;;) {
-        result = decoder_.next(value);
-        if (result == frame_decoder::result::frame_dropped) {
-            continue;
+    {
+        std::lock_guard<std::recursive_mutex> lk(read_mutex_);
+        if (in_process_) {
+            // Re-entered from a synchronous push: the outer loop will drain these
+            // bytes after the current frame is handled. The chunk does not outlive
+            // this call, so it must go through the copying path (which also drains
+            // any external chunk the outer loop still holds).
+            decoder_.feed(data);
+            return data.size();
         }
-        if (result != frame_decoder::result::frame_ready) {
-            break;
+        // Parse directly out of the transport's chunk: handle_frame() consumes the
+        // payload before next() is called again, so the zero-copy window is this
+        // loop. Only a trailing partial frame is copied into the decoder.
+        decoder_.feed_external(data);
+        in_process_ = true;
+        frame value;
+        // A dropped frame consumes its bytes and leaves the decoder usable, so it
+        // is not a terminal outcome: keep parsing the rest of this chunk, matching
+        // server_connection::on_data. Borrowing mode has no payload buffer, so a
+        // compressed frame fails hard instead and frame_dropped is unreachable
+        // here today; the branch is kept so a future payload buffer cannot
+        // silently truncate the chunk.
+        for (;;) {
+            result = decoder_.next(value);
+            if (result == frame_decoder::result::frame_dropped) {
+                continue;
+            }
+            if (result != frame_decoder::result::frame_ready) {
+                break;
+            }
+            pending_frame copy;
+            copy.header = value.header;
+            copy.ordered = value.ordered;
+            if (!copy.payload.append(value.payload)) {
+                // Allocation failure while staging the frame: drop it and keep
+                // parsing the rest of the chunk rather than losing the stream.
+                continue;
+            }
+            // `on_data` is `noexcept` (the backend calls it through a virtual
+            // source), so a growth failure here must not reach
+            // `std::terminate`. Dropping the staged frame degrades to "this
+            // response is lost"; the caller's deadline reports it.
+            try {
+                frames.push_back(std::move(copy));
+            } catch (...) {
+                continue;
+            }
         }
+        in_process_ = false;
+        decoder_.drain_external();
+    }
+    // Reader lock released. `handle_frame` runs without it, so a completion it
+    // takes cannot wait on a thread that holds `read_mutex_`.
+    for (pending_frame& pending : frames) {
+        frame value;
+        value.header = pending.header;
+        value.ordered = pending.ordered;
+        value.payload = pending.payload.readable();
         handle_frame(value);
     }
-    in_process_ = false;
-    decoder_.drain_external();
     if (result == frame_decoder::result::error) {
         protocol_failure();
     }
@@ -211,9 +246,13 @@ void client::handle_response(const frame& value) {
     span<const std::byte> body;
     const status decoded = decode_response(value.payload, code, error, body);
 
-    // Hold the completion lock across the lookup: a handle destructor could
-    // otherwise detach and recycle the slot between the lookup and the claim.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    // `completion_mutex_` is the outer lock: it keeps the slot from being
+    // recycled between the lookup and the terminal claim (CF-1). `map_mutex_`
+    // is innermost, taken only for the lookup and the in-flight removal, so
+    // the completion callback never runs under `map_mutex_` -- a callback that
+    // destroys its handle re-enters `map_mutex_` through
+    // `release_slot_under_lock`, and a non-recursive `map_mutex_` would throw.
+    completion_guard lk(*this);
     call_slot* slot = nullptr;
     {
         std::lock_guard<std::mutex> map(map_mutex_);
@@ -322,6 +361,8 @@ rpc_result<push::push_subscription> client::subscribe_push(std::string_view topi
     if (!started.ok()) {
         return rpc_result<push::push_subscription>(started.error());
     }
+    // `start_call` only stages the frame; flush it before waiting for the reply.
+    flush_pending();
 
     rpc_result<std::vector<std::byte>> reply = started.value().get();
     if (!reply.ok()) {
@@ -441,6 +482,15 @@ void client::flush_write() {
     }
 }
 
+void client::flush_pending() {
+    // The caller has released every other lock. Taking `write_mutex_` here means
+    // the synchronous in-process drain triggered by `flush_write` reaches
+    // `on_data` (which no longer takes `completion_mutex_` under the reader lock)
+    // without any facade or client lock held on this stack.
+    write_lock w(*this);
+    flush_write();
+}
+
 void client::enqueue_raw(span<const std::byte> bytes) {
     (void)out_.append(bytes);
 }
@@ -467,6 +517,48 @@ void client::send_rst(u32 stream_id, rpc_code code) {
     }
     enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
     flush_write();
+}
+
+// --- Completion scope and deferred RST ---------------------------------------
+
+client::completion_guard::completion_guard(client& owner) noexcept : owner_(owner) {
+    owner_.completion_mutex_.lock();
+    ++owner_.completion_depth_;
+}
+
+client::completion_guard::~completion_guard() {
+    --owner_.completion_depth_;
+    owner_.completion_mutex_.unlock();
+    if (owner_.completion_depth_ == 0) {
+        owner_.flush_pending_rst();
+    }
+}
+
+void client::queue_rst(u32 stream_id) noexcept {
+    // Called with `completion_mutex_` held. The vector may allocate, and every
+    // caller is `noexcept`; a failure drops the RST, which is best-effort (the
+    // peer also learns about the cancel from the deadline or the close).
+    try {
+        rst_pending_.push_back(stream_id);
+    } catch (...) {
+    }
+}
+
+void client::flush_pending_rst() noexcept {
+    // No completion lock is held here, so taking `write_mutex_` is safe even
+    // though the write path may re-enter the reader and take the completion
+    // lock. Swap the queue out under the lock, then write outside it.
+    std::vector<u32> pending;
+    {
+        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        if (rst_pending_.empty()) {
+            return;
+        }
+        pending.swap(rst_pending_);
+    }
+    for (const u32 stream_id : pending) {
+        send_rst(stream_id, rpc_code::canceled);
+    }
 }
 
 void client::send_push_ack(u32 stream_id, u64 seq) {
@@ -645,13 +737,19 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
             }
         }
         set_state(slot, call_state::sent);
-        flush_write();
     }
 
     // Complete a ONE_WAY outside the write lock: finish takes the completion
-    // lock, and no path may hold the write lock while taking it.
+    // lock, and no path may hold the write lock while taking it. The staged
+    // bytes are flushed by the caller's `flush_pending()` (outside every lock
+    // this path can reach `completion_mutex_` under), so a synchronous drain
+    // cannot invert against a completion.
     if (slot.one_way) {
-        finish(slot, call_state::completed, rpc_code::ok, rpc_error{}, span<const std::byte>());
+        // `finish` takes `completion_mutex_` then `map_mutex_` (the single order
+        // used in this file), claims the terminal state, removes the in-flight
+        // entry and runs the callback with the map lock released (CF-1).
+        finish(slot, call_state::completed, rpc_code::ok, rpc_error{},
+               span<const std::byte>());
     }
     return status{};
 }
@@ -660,9 +758,13 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
                     span<const std::byte> body) {
     // Hold the completion lock from before the claim until after the callback
     // returns, so a handle destructor cannot detach and recycle the slot while
-    // this path still touches it. `map_mutex_` is released before the callback
-    // runs, so a slow callback never blocks a writer.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    // this path still touches it (CF-1). `completion_mutex_` is the outer lock
+    // and `map_mutex_` the inner one; the in-flight removal happens between the
+    // claim and the callback, so a callback that destroys its handle finds the
+    // entry already gone and cannot hand the slot back to the pool while the
+    // removal below still reads it. The callback itself runs with the map lock
+    // released, so it may re-enter the map.
+    completion_guard lk(*this);
     if (!finish_slot(slot, terminal, code, std::move(error), body)) {
         return;
     }
@@ -679,12 +781,15 @@ void client::cancel_slot(call_slot& slot) noexcept {
     bool won = false;
     bool written = false;
     {
-        std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+        // `completion_mutex_` is the outer lock and `map_mutex_` the inner one.
+        // Holding both across the claim and the in-flight removal keeps the slot
+        // from being recycled in between (CF-1).
+        completion_guard lk(*this);
+        std::lock_guard<std::mutex> map(map_mutex_);
         won = finish_slot(slot, call_state::canceled, rpc_code::canceled,
                           rpc_error(rpc_code::canceled, "call canceled"),
                           span<const std::byte>());
         if (won) {
-            std::lock_guard<std::mutex> map(map_mutex_);
             written = slot.written;
             remove_in_flight(slot);
         }
@@ -692,32 +797,64 @@ void client::cancel_slot(call_slot& slot) noexcept {
     if (!won) {
         return;
     }
-    // The RST is a write: send it with the completion lock released, so the
-    // write lock is never taken under the completion lock.
+    // The RST is a write, and writing takes `write_mutex_` whose path re-enters
+    // the reader and therefore `completion_mutex_`. A cancel that runs inside a
+    // `then` callback (a callback destroying a written sibling) is nested inside
+    // an outer completion scope, so writing here would invert the two locks.
+    // Queue it instead: the outermost completion scope writes it after the lock
+    // is released.
     if (written) {
-        send_rst(slot.stream_id, rpc_code::canceled);
+        completion_guard lk(*this);
+        queue_rst(slot.stream_id);
     }
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     slot.invoke_callback();
 }
 
-bool client::fail_all(rpc_code code, std::string message) {
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
-    std::vector<call_slot*> slots;
+bool client::fail_all(rpc_code code, std::string_view message) {
+    // `completion_mutex_` is the outer lock and is taken BEFORE the map, and it
+    // is held across the whole drain. The map is only held to pick the next
+    // victim, never across `finish`.
+    //
+    // Same hazard as `poll`: a `then` callback runs under the completion lock
+    // and may legally destroy a *sibling* handle, which detaches/cancels that
+    // sibling and returns its slot to the pool. A snapshot of raw `call_slot*`
+    // taken before the loop can therefore point at an already-recycled slot.
+    // Re-reading `in_flight_` each round only ever hands `finish` a slot that
+    // was observed live under the lock, and holding the completion lock keeps
+    // it alive until its claim is done.
+    completion_guard lk(*this);
     {
         std::lock_guard<std::mutex> map(map_mutex_);
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return false;
         }
-        slots.reserve(in_flight_.size());
-        for (const auto& entry : in_flight_) {
-            slots.push_back(entry.second);
-        }
-        in_flight_.clear();
-        deadlines_.clear();
     }
-    for (call_slot* slot : slots) {
-        finish(*slot, call_state::failed, code, rpc_error(code, message), span<const std::byte>());
+    for (;;) {
+        call_slot* victim = nullptr;
+        {
+            std::lock_guard<std::mutex> map(map_mutex_);
+            if (in_flight_.empty()) {
+                deadlines_.clear();
+                break;
+            }
+            victim = in_flight_.begin()->second;
+        }
+        if (victim != nullptr) {
+            try {
+                finish(*victim, call_state::failed, code,
+                       rpc_error(code, std::string(message)), span<const std::byte>());
+            } catch (...) {
+                // Allocation failure while building the failure error. The
+                // client is closed; drop this slot's completion.
+            }
+        }
+        // Guarantee progress even when `finish` lost the claim or threw: drop
+        // the entry that was picked if it is still the head of the map.
+        std::lock_guard<std::mutex> map(map_mutex_);
+        if (!in_flight_.empty() && in_flight_.begin()->second == victim) {
+            in_flight_.erase(in_flight_.begin());
+        }
     }
     return true;
 }
@@ -744,37 +881,70 @@ void client::remove_deadline(call_slot& slot) {
 }
 
 void client::poll() noexcept {
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
-    if (closed_.load(std::memory_order_acquire)) {
-        return;
-    }
-    std::vector<call_slot*> expired;
-    {
-        std::lock_guard<std::mutex> map(map_mutex_);
-        if (deadlines_.empty()) {
-            return;
-        }
-        const auto now = options_.clock(options_.clock_ctx);
-        auto it = deadlines_.begin();
-        while (it != deadlines_.end() && it->first <= now) {
-            call_slot* slot = it->second;
-            it = deadlines_.erase(it);
-            if (slot == nullptr || result_ready(*slot)) {
-                continue;
+    // Collecting expired slots and building each `rpc_error` allocates, and this
+    // function is `noexcept` (the facade's timer thread calls it). An allocation
+    // failure must not terminate; every call whose deadline entry was not
+    // consumed stays armed, so a failed poll is retried on the next tick.
+    //
+    // Shape: take `completion_mutex_`, then repeatedly (a) pick ONE expired,
+    // still-live slot under `map_mutex_`, (b) drop the map lock, (c) finish that
+    // slot, and (d) loop. A snapshot of raw `call_slot*` collected up front is
+    // NOT safe here: `finish` runs the user `then` callback under the
+    // (recursive) completion lock, and that callback may legally destroy a
+    // *sibling* handle. Destroying a sibling detaches it, cancels it and
+    // returns its slot to the pool, so a pre-collected list can hold a pointer
+    // to a slot that is already recycled and possibly re-published. Re-reading
+    // the map each round means a slot is only ever touched after it was observed
+    // live under the lock, and `completion_mutex_` (held throughout) prevents
+    // any concurrent detach/release in between.
+    try {
+        completion_guard lk(*this);
+        for (;;) {
+            call_slot* victim = nullptr;
+            {
+                std::lock_guard<std::mutex> map(map_mutex_);
+                if (closed_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                if (deadlines_.empty()) {
+                    return;
+                }
+                const auto now = options_.clock(options_.clock_ctx);
+                auto it = deadlines_.begin();
+                while (it != deadlines_.end() && it->first <= now) {
+                    call_slot* slot = it->second;
+                    if (slot == nullptr || result_ready(*slot)) {
+                        // Stale duplicate or already finished: consume it so the
+                        // loop makes progress.
+                        it = deadlines_.erase(it);
+                        continue;
+                    }
+                    victim = slot;
+                    // The deadline entry is NOT erased here. `finish` removes it
+                    // through `remove_in_flight`, and building the error below
+                    // allocates: if that throws, the entry must still be armed so
+                    // the next poll retries the call instead of leaving it in
+                    // flight with no deadline at all.
+                    break;
+                }
+                if (victim == nullptr) {
+                    return;
+                }
             }
-            expired.push_back(slot);
+            rpc_error error(rpc_code::deadline_exceeded, "deadline exceeded");
+            // Local-only marker: the facade distinguishes this from a
+            // server-produced deadline (which must not open the breaker).
+            error.metadata.set("crpc.local_timeout", "1");
+            if (victim->written && !victim->idempotent) {
+                error.metadata.set("unknown_side_effect", "1");
+            }
+            finish(*victim, call_state::timed_out, rpc_code::deadline_exceeded,
+                   std::move(error), span<const std::byte>());
         }
-    }
-    for (call_slot* slot : expired) {
-        rpc_error error(rpc_code::deadline_exceeded, "deadline exceeded");
-        // Local-only marker: the facade distinguishes this from a
-        // server-produced deadline (which must not open the breaker).
-        error.metadata.set("crpc.local_timeout", "1");
-        if (slot->written && !slot->idempotent) {
-            error.metadata.set("unknown_side_effect", "1");
-        }
-        finish(*slot, call_state::timed_out, rpc_code::deadline_exceeded, std::move(error),
-               span<const std::byte>());
+    } catch (...) {
+        // Allocation failure while building a deadline error. The client stays
+        // usable and the call's deadline entry is still armed, so the next poll
+        // retries it. The catch body performs no allocation.
     }
 }
 
@@ -791,7 +961,7 @@ void client::detach_slot(call_slot& slot) noexcept {
     // Every completion callback invocation runs under `completion_mutex_`, so
     // holding it here guarantees that once this returns no callback is running
     // and none can start for this slot.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
+    completion_guard lk(*this);
     slot.callback_armed.store(false, std::memory_order_release);
     slot.callback_invoke = nullptr;
     slot.callback_owner = nullptr;
@@ -809,15 +979,20 @@ void client::release_slot_under_lock(call_slot* slot) noexcept {
     if (slot == nullptr) {
         return;
     }
-    // A response thread reads slot.stream_id/has_deadline under `map_mutex_`
-    // (handle_response -> finish -> remove_in_flight). The completion lock is
-    // taken first so no completion is still touching the slot, and the reset in
-    // `pool_.release` cannot race the response thread.
-    std::lock_guard<std::recursive_mutex> lk(completion_mutex_);
-    {
-        std::lock_guard<std::mutex> map(map_mutex_);
-        remove_in_flight(*slot);
-    }
+    // Lock order: `completion_mutex_` outer, `map_mutex_` inner -- the single
+    // order used by every other path in this file (`handle_response`,
+    // `cancel_slot`, `start_request`'s one-way completion, `fail_all`, `poll`).
+    // Taking the map lock first here was the second half of an ABBA cycle with
+    // `handle_response`: a response thread held `completion_mutex_` and wanted
+    // `map_mutex_`, while a handle destructor held `map_mutex_` and wanted
+    // `completion_mutex_` (live hang, `.opencode/tmp/pd-live-stack.txt`).
+    // Taking `completion_mutex_` here also synchronizes with any callback still
+    // running for this slot (CF-1), and the in-flight removal happens under the
+    // map lock so a response thread's claim cannot race the reset in
+    // `pool_.release`.
+    completion_guard lk(*this);
+    std::lock_guard<std::mutex> map(map_mutex_);
+    remove_in_flight(*slot);
     pool_.release(slot);
 }
 

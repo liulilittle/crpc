@@ -538,84 +538,99 @@ status encode_call_envelope(span<std::byte> out, const call_envelope& value, std
 }
 
 status decode_call_envelope(span<const std::byte> in, call_envelope& value) noexcept {
-    byte_reader reader(in);
-    call_envelope decoded;
+    // The decode itself allocates nothing, but every return value constructs a
+    // `status`, whose `rpc_error` owns a `std::string` (the Debug CRT allocates
+    // a 16-byte container proxy even for an empty string). This function is
+    // noexcept, so an allocation failure would reach `std::terminate`. Report
+    // it as an internal error instead: the caller treats any non-ok status as
+    // a decode failure and `value` is left unchanged. `result` is built before
+    // `value` is published, so a failure on the success path leaves `value`
+    // untouched.
+    try {
+        status result;
+        byte_reader reader(in);
+        call_envelope decoded;
 
-    u16 codec = 0;
-    if (!reader.get_u64(decoded.service_id) || !reader.get_u64(decoded.method_id) ||
-        !reader.get_u8(decoded.call_flags) || !reader.get_u16(codec)) {
-        return rpc_code::protocol_error;
-    }
-    if (!is_known_codec(static_cast<codec_id>(codec))) {
-        return rpc_code::protocol_error;
-    }
-    decoded.codec = static_cast<codec_id>(codec);
-
-    if ((decoded.call_flags & static_cast<u8>(~call_flag_known_mask)) != 0) {
-        return rpc_code::protocol_error;
-    }
-
-    if ((decoded.call_flags & call_flag_has_extensions) != 0) {
-        trace_extension ext;
-        if (!reader.get_u8(ext.flags)) {
+        u16 codec = 0;
+        if (!reader.get_u64(decoded.service_id) || !reader.get_u64(decoded.method_id) ||
+            !reader.get_u8(decoded.call_flags) || !reader.get_u16(codec)) {
             return rpc_code::protocol_error;
         }
-        if ((ext.flags & static_cast<u8>(~trace_extension::known_mask)) != 0) {
+        if (!is_known_codec(static_cast<codec_id>(codec))) {
             return rpc_code::protocol_error;
         }
-        if (ext.has(trace_extension::has_span_id) && !ext.has(trace_extension::has_trace_id)) {
-            return rpc_code::protocol_error;
-        }
-        if (ext.has(trace_extension::has_parent_span_id) && !ext.has(trace_extension::has_span_id)) {
+        decoded.codec = static_cast<codec_id>(codec);
+
+        if ((decoded.call_flags & static_cast<u8>(~call_flag_known_mask)) != 0) {
             return rpc_code::protocol_error;
         }
 
-        if (ext.has(trace_extension::has_trace_id)) {
-            span<const std::byte> bytes;
-            if (!reader.get_bytes(ext.trace_id.size(), bytes)) {
+        if ((decoded.call_flags & call_flag_has_extensions) != 0) {
+            trace_extension ext;
+            if (!reader.get_u8(ext.flags)) {
                 return rpc_code::protocol_error;
             }
-            std::copy(bytes.begin(), bytes.end(), ext.trace_id.begin());
-        }
-        if (ext.has(trace_extension::has_span_id)) {
-            span<const std::byte> bytes;
-            if (!reader.get_bytes(ext.span_id.size(), bytes)) {
+            if ((ext.flags & static_cast<u8>(~trace_extension::known_mask)) != 0) {
                 return rpc_code::protocol_error;
             }
-            std::copy(bytes.begin(), bytes.end(), ext.span_id.begin());
-        }
-        if (ext.has(trace_extension::has_parent_span_id)) {
-            span<const std::byte> bytes;
-            if (!reader.get_bytes(ext.parent_span_id.size(), bytes)) {
+            if (ext.has(trace_extension::has_span_id) && !ext.has(trace_extension::has_trace_id)) {
                 return rpc_code::protocol_error;
             }
-            std::copy(bytes.begin(), bytes.end(), ext.parent_span_id.begin());
-        }
-        if (ext.has(trace_extension::has_deadline)) {
-            if (!reader.get_u64(ext.deadline_ns)) {
+            if (ext.has(trace_extension::has_parent_span_id) &&
+                !ext.has(trace_extension::has_span_id)) {
                 return rpc_code::protocol_error;
             }
-        }
-        if (ext.has(trace_extension::has_idempotency_key)) {
-            u8 length = 0;
-            if (!reader.get_u8(length)) {
-                return rpc_code::protocol_error;
-            }
-            if (static_cast<std::size_t>(length) > max_idempotency_key) {
-                return rpc_code::protocol_error;
-            }
-            span<const std::byte> key;
-            if (!reader.get_bytes(static_cast<std::size_t>(length), key)) {
-                return rpc_code::protocol_error;
-            }
-            ext.idempotency_key = key;
-        }
-        decoded.extensions = ext;
-    }
 
-    decoded.body = reader.remaining_bytes();
-    value = decoded;
-    return status();
+            if (ext.has(trace_extension::has_trace_id)) {
+                span<const std::byte> bytes;
+                if (!reader.get_bytes(ext.trace_id.size(), bytes)) {
+                    return rpc_code::protocol_error;
+                }
+                std::copy(bytes.begin(), bytes.end(), ext.trace_id.begin());
+            }
+            if (ext.has(trace_extension::has_span_id)) {
+                span<const std::byte> bytes;
+                if (!reader.get_bytes(ext.span_id.size(), bytes)) {
+                    return rpc_code::protocol_error;
+                }
+                std::copy(bytes.begin(), bytes.end(), ext.span_id.begin());
+            }
+            if (ext.has(trace_extension::has_parent_span_id)) {
+                span<const std::byte> bytes;
+                if (!reader.get_bytes(ext.parent_span_id.size(), bytes)) {
+                    return rpc_code::protocol_error;
+                }
+                std::copy(bytes.begin(), bytes.end(), ext.parent_span_id.begin());
+            }
+            if (ext.has(trace_extension::has_deadline)) {
+                if (!reader.get_u64(ext.deadline_ns)) {
+                    return rpc_code::protocol_error;
+                }
+            }
+            if (ext.has(trace_extension::has_idempotency_key)) {
+                u8 length = 0;
+                if (!reader.get_u8(length)) {
+                    return rpc_code::protocol_error;
+                }
+                if (static_cast<std::size_t>(length) > max_idempotency_key) {
+                    return rpc_code::protocol_error;
+                }
+                span<const std::byte> key;
+                if (!reader.get_bytes(static_cast<std::size_t>(length), key)) {
+                    return rpc_code::protocol_error;
+                }
+                ext.idempotency_key = key;
+            }
+            decoded.extensions = ext;
+        }
+
+        decoded.body = reader.remaining_bytes();
+        value = decoded;
+        return result;
+    } catch (...) {
+        // Allocation failure while building a `status`. `value` is unchanged.
+        return status{rpc_code::internal};
+    }
 }
 
 // --- Incremental decoder -----------------------------------------------------
