@@ -157,7 +157,11 @@ namespace detail {
 
     const u8 algorithm = static_cast<u8>((header.flags & frame_flag_algo_mask) >> frame_flag_algo_shift);
     const bool compressed = (header.flags & frame_flag_compressed) != 0;
-    if (algorithm > static_cast<u8>(compression_algorithm::gzip)) {
+    // ALGO is a 3-bit field: ids 0..6 are defined (none, lz4, zstd, gzip,
+    // deflate, lz77, zip), id 7 is reserved. The validator accepts every
+    // defined id and leaves the "can this build decode it" decision to the
+    // whole-frame paths (zstd is a defined id that fails closed at decode).
+    if (algorithm > static_cast<u8>(compression_algorithm::zip)) {
         return rpc_code::protocol_error;
     }
     if (!compressed && algorithm != static_cast<u8>(compression_algorithm::none)) {

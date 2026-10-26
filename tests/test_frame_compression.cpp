@@ -1270,8 +1270,11 @@ CRPC_TEST(golden_maximum_offset_65535) {
 CRPC_TEST(compression_bound_and_support_queries) {
     CRPC_CHECK(is_supported_compression(compression_algorithm::none));
     CRPC_CHECK(is_supported_compression(compression_algorithm::lz4));
+    CRPC_CHECK(is_supported_compression(compression_algorithm::gzip));
+    CRPC_CHECK(is_supported_compression(compression_algorithm::deflate));
+    CRPC_CHECK(is_supported_compression(compression_algorithm::lz77));
+    CRPC_CHECK(is_supported_compression(compression_algorithm::zip));
     CRPC_CHECK_FALSE(is_supported_compression(compression_algorithm::zstd));
-    CRPC_CHECK_FALSE(is_supported_compression(compression_algorithm::gzip));
 
     // The bound covers the worst case: a fully literal block plus its token and
     // length extension.
@@ -1288,6 +1291,25 @@ CRPC_TEST(compression_bound_and_support_queries) {
                        .ok());
         CRPC_CHECK(written <= bound);
     }
+
+    // Every implemented codec has a bound that really holds for an all-literal
+    // worst case (random bytes never compress).
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    for (const compression_algorithm codec : codecs) {
+        for (std::size_t size : {std::size_t{1}, std::size_t{255}, std::size_t{1024}}) {
+            const std::size_t bound = compressed_payload_bound(codec, size);
+            CRPC_CHECK(bound >= size + compressed_payload_prefix_size);
+            const std::vector<std::byte> plain = random_bytes(size, static_cast<u32>(size));
+            std::vector<std::byte> out(bound);
+            std::size_t written = 0;
+            CRPC_CHECK(compress_payload(codec, as_span(plain), as_writable_span(out), written)
+                           .ok());
+            CRPC_CHECK(written <= bound);
+        }
+    }
+
     // An unusable algorithm has no container, so the bound is the plain size.
     CRPC_CHECK_EQ(compressed_payload_bound(compression_algorithm::zstd, 100), std::size_t{100});
     CRPC_CHECK_EQ(compressed_payload_bound(compression_algorithm::none, 100), std::size_t{100});
@@ -1297,21 +1319,17 @@ CRPC_TEST(unsupported_algorithms_fail_closed_everywhere) {
     const std::vector<std::byte> plain = text_bytes(1024);
     const std::vector<std::byte> zstd_wire = raw_frame(
         static_cast<u32>(plain.size()), static_cast<u8>(frame_type::data), zstd_flags(), 1, plain);
-    const std::vector<std::byte> gzip_wire = raw_frame(
-        static_cast<u32>(plain.size()), static_cast<u8>(frame_type::data), gzip_flags(), 1, plain);
 
     std::vector<std::byte> out(plain.size());
     frame decoded;
-    for (const std::vector<std::byte>* wire : {&zstd_wire, &gzip_wire}) {
-        CRPC_CHECK_EQ(static_cast<int>(decode_frame_compressed(as_span(*wire), decoded,
-                                                               as_writable_span(out),
-                                                               max_frame_default)
-                                           .code()),
-                      static_cast<int>(rpc_code::protocol_error));
-    }
+    CRPC_CHECK_EQ(static_cast<int>(decode_frame_compressed(as_span(zstd_wire), decoded,
+                                                           as_writable_span(out),
+                                                           max_frame_default)
+                                       .code()),
+                  static_cast<int>(rpc_code::protocol_error));
 
     // An unusable preference is a configuration error, not a hint: falling back
-    // to lz4 (or to identity) would mean "configured gzip, sent something else".
+    // to lz4 (or to identity) would mean "configured zstd, sent something else".
     // `none` is the explicit identity request and stays legal.
     frame value;
     value.header.type = frame_type::data;
@@ -1320,8 +1338,7 @@ CRPC_TEST(unsupported_algorithms_fail_closed_everywhere) {
     std::vector<std::byte> buffer(encoded_frame_size(value));
     std::size_t written = 7;
     compression_algorithm chosen = compression_algorithm::lz4;
-    for (const compression_algorithm unsupported :
-         {compression_algorithm::zstd, compression_algorithm::gzip}) {
+    for (const compression_algorithm unsupported : {compression_algorithm::zstd}) {
         CRPC_CHECK_EQ(static_cast<int>(encode_frame_compressed(as_writable_span(buffer), value,
                                                               unsupported, compression_limits{},
                                                               written, &chosen)
@@ -2080,6 +2097,583 @@ CRPC_TEST(tc34_control_frames_rejected_with_a_valid_codec_stream) {
         CRPC_CHECK_EQ(static_cast<int>(decode_frame(as_span(wire), decoded).code()),
                       static_cast<int>(rpc_code::protocol_error));
     }
+}
+
+// --- New codecs: gzip / deflate / lz77 / zip -------------------------------
+//
+// G29b adds four frame payload codecs and the shared DEFLATE core. These cases
+// pin the round trip, the boundary behaviour, the integrity checks, the
+// fail-closed paths and the frame-level algorithm selection for all of them.
+
+namespace {
+
+// codec flags byte: COMPRESSED | (ALGO << 5).
+u8 codec_flags(compression_algorithm algorithm) {
+    return static_cast<u8>(frame_flag_compressed |
+                            (static_cast<u8>(algorithm) << frame_flag_algo_shift));
+}
+
+// Encodes a frame with a chosen codec and asserts the codec was used.
+std::vector<std::byte> encode_compressed_with(compression_algorithm algorithm, frame_type type,
+                                              u32 stream_id, u8 extra_flags,
+                                              const std::vector<std::byte>& plain,
+                                              const compression_limits& limits = {}) {
+    frame value;
+    value.header.type = type;
+    value.header.stream_id = stream_id;
+    value.header.flags = extra_flags;
+    value.payload = as_span(plain);
+    std::vector<std::byte> out(encoded_frame_size_compressed(value, algorithm, limits));
+    std::size_t written = 0;
+    compression_algorithm chosen = compression_algorithm::none;
+    const status result = encode_frame_compressed(as_writable_span(out), value, algorithm, limits,
+                                                  written, &chosen);
+    CRPC_CHECK(result.ok());
+    CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(algorithm));
+    out.resize(written);
+    return out;
+}
+
+// A small CRC32 (IEEE) for verifying the gzip/zip/lz77 trailers independently of
+// the library's own CRC32C frame checksum.
+std::uint32_t test_crc32_ieee(const std::vector<std::byte>& data) {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (const std::byte byte : data) {
+        crc ^= static_cast<std::uint32_t>(static_cast<unsigned>(byte));
+        for (int bit = 0; bit < 8; ++bit) {
+            const std::uint32_t mask = (crc & 1u) != 0 ? 0xEDB88320u : 0u;
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+std::uint32_t load_le32_at(const std::vector<std::byte>& bytes, std::size_t offset) {
+    return static_cast<std::uint32_t>(static_cast<unsigned>(bytes[offset])) |
+           (static_cast<std::uint32_t>(static_cast<unsigned>(bytes[offset + 1])) << 8) |
+           (static_cast<std::uint32_t>(static_cast<unsigned>(bytes[offset + 2])) << 16) |
+           (static_cast<std::uint32_t>(static_cast<unsigned>(bytes[offset + 3])) << 24);
+}
+
+// Compressed frame payload (u32 LE logical length + codec stream) for a codec.
+std::vector<std::byte> make_compressed_payload_for(compression_algorithm codec,
+                                                   const std::vector<std::byte>& plain,
+                                                   const compression_limits& limits = {}) {
+    const std::size_t bound = compressed_payload_bound(codec, plain.size());
+    std::vector<std::byte> stream(bound);
+    std::size_t written = 0;
+    const status result =
+        compress_payload(codec, as_span(plain), as_writable_span(stream), written, limits);
+    CRPC_CHECK(result.ok());
+    stream.resize(written);
+
+    std::vector<std::byte> payload(compressed_payload_prefix_size + stream.size());
+    byte_writer writer(as_writable_span(payload));
+    writer.put_u32(static_cast<u32>(plain.size()));
+    writer.put_bytes(as_span(stream));
+    CRPC_CHECK(writer.ok());
+    return payload;
+}
+
+} // namespace
+
+CRPC_TEST(tc35_all_new_codecs_round_trip) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    const std::size_t sizes[] = {1, 2, 3, 4, 5, 127, 128, 255, 256, 1024, 65535};
+
+    for (const compression_algorithm codec : codecs) {
+        for (const std::size_t size : sizes) {
+            // Repetitive prose: every codec must find matches.
+            const std::vector<std::byte> plain = text_bytes(size);
+            const std::size_t bound = compressed_payload_bound(codec, plain.size());
+            std::vector<std::byte> stream(bound);
+            std::size_t written = 0;
+            CRPC_CHECK(compress_payload(codec, as_span(plain), as_writable_span(stream), written)
+                           .ok());
+            CRPC_CHECK(written <= bound);
+            // A bound must not be absurd: at most 2x the input plus a fixed cap.
+            CRPC_CHECK(bound <= plain.size() * 2 + 2048);
+            stream.resize(written);
+            std::vector<std::byte> decoded(plain.size(), std::byte{0xCD});
+            std::size_t decoded_size = 0;
+            CRPC_CHECK(decompress_payload(codec, as_span(stream), plain.size(),
+                                          as_writable_span(decoded), decoded_size)
+                           .ok());
+            CRPC_CHECK_EQ(decoded_size, plain.size());
+            CRPC_CHECK(bytes_equal(as_span(decoded), plain));
+
+            // Random (incompressible) data exercises the stored/literal path
+            // and the no-expansion bound.
+            const std::vector<std::byte> noise = random_bytes(size, static_cast<u32>(size) ^ 0x5555u);
+            std::vector<std::byte> noise_stream(compressed_payload_bound(codec, noise.size()));
+            std::size_t noise_written = 0;
+            CRPC_CHECK(compress_payload(codec, as_span(noise), as_writable_span(noise_stream),
+                                        noise_written)
+                           .ok());
+            noise_stream.resize(noise_written);
+            std::vector<std::byte> noise_decoded(noise.size(), std::byte{0x3C});
+            std::size_t noise_size = 0;
+            CRPC_CHECK(decompress_payload(codec, as_span(noise_stream), noise.size(),
+                                          as_writable_span(noise_decoded), noise_size)
+                           .ok());
+            CRPC_CHECK_EQ(noise_size, noise.size());
+            CRPC_CHECK(bytes_equal(as_span(noise_decoded), noise));
+        }
+    }
+}
+
+CRPC_TEST(tc36_new_codecs_compress_repetitive_input) {
+    const std::vector<std::byte> plain = text_bytes(8192);
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    for (const compression_algorithm codec : codecs) {
+        std::vector<std::byte> stream(compressed_payload_bound(codec, plain.size()));
+        std::size_t written = 0;
+        CRPC_CHECK(compress_payload(codec, as_span(plain), as_writable_span(stream), written)
+                       .ok());
+        // Every codec must be a net win on repetitive prose, otherwise the frame
+        // sender would silently fall back to identity (TC-12 covers the policy).
+        CRPC_CHECK(written < plain.size());
+    }
+}
+
+CRPC_TEST(tc37_gzip_container_layout) {
+    // The gzip member is 10 header bytes + DEFLATE + 8 trailer bytes. The trailer
+    // carries the CRC32 and the input size; the header carries the magic and CM=8.
+    const std::vector<std::byte> plain = text_bytes(2048);
+    std::vector<std::byte> stream(compressed_payload_bound(compression_algorithm::gzip,
+                                                           plain.size()));
+    std::size_t written = 0;
+    CRPC_CHECK(compress_payload(compression_algorithm::gzip, as_span(plain),
+                                as_writable_span(stream), written)
+                   .ok());
+    stream.resize(written);
+
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[0]), 0x1Fu);
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[1]), 0x8Bu);
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[2]), 8u); // CM = deflate
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[3]), 0u); // no optional fields
+    // ISIZE is the last 4 bytes: the uncompressed size.
+    CRPC_CHECK_EQ(load_le32_at(stream, stream.size() - 4), static_cast<std::uint32_t>(plain.size()));
+    // CRC32 is the 4 bytes before it.
+    CRPC_CHECK_EQ(load_le32_at(stream, stream.size() - 8), test_crc32_ieee(plain));
+}
+
+CRPC_TEST(tc38_zip_container_layout) {
+    // The ZIP local header starts with PK\x03\x04 and stores the CRC32 and both
+    // sizes in the header (general-purpose flag bit 3 clear).
+    const std::vector<std::byte> plain = text_bytes(2048);
+    std::vector<std::byte> stream(compressed_payload_bound(compression_algorithm::zip,
+                                                           plain.size()));
+    std::size_t written = 0;
+    CRPC_CHECK(compress_payload(compression_algorithm::zip, as_span(plain),
+                                as_writable_span(stream), written)
+                   .ok());
+    stream.resize(written);
+
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[0]), 0x50u);
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[1]), 0x4Bu);
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[2]), 0x03u);
+    CRPC_CHECK_EQ(static_cast<unsigned>(stream[3]), 0x04u);
+    // method = 8 (deflate) at offset 8.
+    const u16 method = static_cast<u16>(static_cast<unsigned>(stream[8]) |
+                                        (static_cast<unsigned>(stream[9]) << 8));
+    CRPC_CHECK_EQ(static_cast<unsigned>(method), 8u);
+    // CRC32 at offset 14, compressed size at 18, uncompressed size at 22.
+    CRPC_CHECK_EQ(load_le32_at(stream, 14), test_crc32_ieee(plain));
+    CRPC_CHECK_EQ(load_le32_at(stream, 22), static_cast<std::uint32_t>(plain.size()));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(load_le32_at(stream, 18)), written - 30);
+}
+
+CRPC_TEST(tc39_new_codecs_malformed_streams_are_rejected) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    const std::vector<std::byte> plain = text_bytes(1024);
+
+    for (const compression_algorithm codec : codecs) {
+        // Empty stream: protocol_error.
+        std::vector<std::byte> scratch(plain.size());
+        std::size_t written = 99;
+        CRPC_CHECK_EQ(static_cast<int>(decompress_payload(codec, span<const std::byte>(), 16,
+                                                          as_writable_span(scratch), written)
+                                           .code()),
+                      static_cast<int>(rpc_code::protocol_error));
+        CRPC_CHECK_EQ(written, std::size_t{0});
+
+        // All-zero garbage: protocol_error, nothing written. Zero bytes are a
+        // stored block with LEN == NLEN == 0, which fails the LEN/NLEN check for
+        // every codec (and the magic for the container codecs).
+        const std::vector<std::byte> garbage(64, std::byte{0x00});
+        std::vector<std::byte> out(plain.size(), std::byte{0x5A});
+        std::size_t decoded_size = 123;
+        CRPC_CHECK_EQ(static_cast<int>(decompress_payload(codec, as_span(garbage), 16,
+                                                          as_writable_span(out), decoded_size)
+                                           .code()),
+                      static_cast<int>(rpc_code::protocol_error));
+        CRPC_CHECK_EQ(decoded_size, std::size_t{0});
+        CRPC_CHECK_EQ(static_cast<unsigned>(out.front()), 0x5Au);
+    }
+
+    // Only the container codecs carry their own checksum; for deflate a single
+    // flipped byte can decode to a valid-length but different stream, which is
+    // the frame layer's CRC32C job to catch (TC-15).
+    const compression_algorithm checksummed[] = {
+        compression_algorithm::gzip, compression_algorithm::zip,
+        compression_algorithm::lz77};
+    for (const compression_algorithm codec : checksummed) {
+        const std::vector<std::byte> source = text_bytes(1024);
+        std::vector<std::byte> stream(compressed_payload_bound(codec, source.size()));
+        std::size_t encoded_size = 0;
+        CRPC_CHECK(compress_payload(codec, as_span(source), as_writable_span(stream),
+                                    encoded_size)
+                       .ok());
+        stream.resize(encoded_size);
+        const std::size_t corrupt = stream.size() / 2;
+        stream[corrupt] = static_cast<std::byte>(static_cast<unsigned>(stream[corrupt]) ^ 0xFFu);
+
+        std::vector<std::byte> mutated_out(source.size(), std::byte{0x7E});
+        std::size_t mutated_size = 0;
+        const status mutated =
+            decompress_payload(codec, as_span(stream), source.size(),
+                               as_writable_span(mutated_out), mutated_size);
+        CRPC_CHECK_FALSE(mutated.ok());
+        CRPC_CHECK_EQ(static_cast<int>(mutated.code()),
+                      static_cast<int>(rpc_code::protocol_error));
+    }
+}
+
+CRPC_TEST(tc40_new_codecs_crc_and_size_are_verified) {
+    const compression_algorithm crc_codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::zip,
+        compression_algorithm::lz77};
+    const std::vector<std::byte> plain = text_bytes(1024);
+
+    for (const compression_algorithm codec : crc_codecs) {
+        std::vector<std::byte> stream(compressed_payload_bound(codec, plain.size()));
+        std::size_t written = 0;
+        CRPC_CHECK(compress_payload(codec, as_span(plain), as_writable_span(stream), written)
+                       .ok());
+        stream.resize(written);
+
+        // A wrong declared length is rejected before any checksum. The buffer is
+        // one byte larger than the declared length so the size check (not the
+        // buffer check) is what fires.
+        std::vector<std::byte> out(plain.size() + 16, std::byte{0x11});
+        std::size_t decoded_size = 0;
+        CRPC_CHECK_EQ(static_cast<int>(decompress_payload(codec, as_span(stream), plain.size() + 1,
+                                                          as_writable_span(out), decoded_size)
+                                           .code()),
+                      static_cast<int>(rpc_code::protocol_error));
+        CRPC_CHECK_EQ(decoded_size, std::size_t{0});
+        // A guard byte after the declared length must never be touched: the
+        // codec may write the decoded prefix before it notices the length
+        // mismatch, but it must not write past the declared length.
+        CRPC_CHECK_EQ(static_cast<unsigned>(out[plain.size()]), 0x11u);
+
+        // A buffer one byte too small is resource_exhausted, not protocol_error.
+        std::vector<std::byte> small(plain.size() - 1, std::byte{0x22});
+        decoded_size = 0;
+        CRPC_CHECK_EQ(static_cast<int>(decompress_payload(codec, as_span(stream), plain.size(),
+                                                          as_writable_span(small), decoded_size)
+                                           .code()),
+                      static_cast<int>(rpc_code::resource_exhausted));
+
+        // The ratio guard applies to the new codecs exactly as it does to lz4.
+        compression_limits limits;
+        limits.max_payload = 8192; // above the bomb so the ratio guard is what fires
+        limits.max_compression_ratio = 1;
+        const std::vector<std::byte> bomb = text_bytes(4096);
+        std::vector<std::byte> bomb_stream(compressed_payload_bound(codec, bomb.size()));
+        std::size_t bomb_written = 0;
+        CRPC_CHECK(compress_payload(codec, as_span(bomb), as_writable_span(bomb_stream),
+                                    bomb_written)
+                       .ok());
+        bomb_stream.resize(bomb_written);
+        std::vector<std::byte> bomb_out(bomb.size(), std::byte{0x00});
+        compression_statistics stats;
+        CRPC_CHECK_EQ(static_cast<int>(decompress_payload(codec, as_span(bomb_stream),
+                                                          bomb.size(),
+                                                          as_writable_span(bomb_out),
+                                                          decoded_size, limits, &stats)
+                                           .code()),
+                      static_cast<int>(rpc_code::resource_exhausted));
+        CRPC_CHECK_EQ(stats.rejected_ratio, std::uint64_t{1});
+    }
+}
+
+CRPC_TEST(tc41_new_codecs_frame_round_trip_and_selection) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+
+    for (const compression_algorithm codec : codecs) {
+        const std::vector<std::byte> plain = text_bytes(4096);
+        const std::vector<std::byte> wire =
+            encode_compressed_with(codec, frame_type::data, 77, 0, plain);
+        CRPC_CHECK(wire.size() < encoded_frame_size([&] {
+            frame value;
+            value.header.type = frame_type::data;
+            value.header.stream_id = 77;
+            value.payload = as_span(plain);
+            return value;
+        }()));
+
+        frame_header wire_header;
+        CRPC_CHECK(decode_frame_header(as_span(wire), wire_header).ok());
+        CRPC_CHECK_EQ(static_cast<unsigned>(wire_header.flags & frame_flag_compressed),
+                      static_cast<unsigned>(frame_flag_compressed));
+        CRPC_CHECK_EQ(static_cast<int>(frame_compression(wire_header)),
+                      static_cast<int>(codec));
+
+        std::vector<std::byte> out(plain.size(), std::byte{0x00});
+        frame decoded;
+        compression_algorithm wire_algorithm = compression_algorithm::none;
+        compression_statistics stats;
+        CRPC_CHECK(decode_frame_compressed(as_span(wire), decoded, as_writable_span(out),
+                                           max_frame_default, compression_limits{},
+                                           &wire_algorithm, &stats)
+                       .ok());
+        CRPC_CHECK_EQ(static_cast<int>(wire_algorithm), static_cast<int>(codec));
+        CRPC_CHECK_EQ(decoded.header.payload_len, static_cast<u32>(plain.size()));
+        CRPC_CHECK_EQ(static_cast<int>(decoded.header.flags & frame_flag_compressed), 0);
+        CRPC_CHECK(bytes_equal(decoded.payload, plain));
+        CRPC_CHECK_EQ(stats.frames_decompressed, std::uint64_t{1});
+
+        // An unsupported preference (zstd) is still a configuration error.
+        frame value;
+        value.header.type = frame_type::data;
+        value.header.stream_id = 78;
+        value.payload = as_span(plain);
+        std::vector<std::byte> buffer(encoded_frame_size(value));
+        std::size_t written = 7;
+        compression_algorithm chosen = compression_algorithm::lz4;
+        CRPC_CHECK_EQ(static_cast<int>(encode_frame_compressed(as_writable_span(buffer), value,
+                                                              compression_algorithm::zstd,
+                                                              compression_limits{}, written, &chosen)
+                                           .code()),
+                      static_cast<int>(rpc_code::invalid_argument));
+    }
+}
+
+CRPC_TEST(tc42_new_codecs_never_inflate_or_compress_below_min) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+
+    // Incompressible payload: the sender falls back to identity.
+    for (const compression_algorithm codec : codecs) {
+        const std::vector<std::byte> noise = random_bytes(1024);
+        frame value;
+        value.header.type = frame_type::request;
+        value.header.stream_id = 5;
+        value.payload = as_span(noise);
+        std::vector<std::byte> buffer(encoded_frame_size_compressed(value, codec));
+        std::size_t written = 0;
+        compression_algorithm chosen = codec;
+        compression_statistics stats;
+        CRPC_CHECK(encode_frame_compressed(as_writable_span(buffer), value, codec,
+                                           compression_limits{}, written, &chosen, &stats)
+                       .ok());
+        CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::none));
+        CRPC_CHECK_EQ(stats.fallbacks_not_smaller, std::uint64_t{1});
+    }
+
+    // Payload below min_payload: identity, counted as skipped.
+    for (const compression_algorithm codec : codecs) {
+        const std::vector<std::byte> small(100, std::byte{'z'});
+        frame value;
+        value.header.type = frame_type::data;
+        value.header.stream_id = 6;
+        value.payload = as_span(small);
+        compression_limits limits;
+        limits.min_payload = 512;
+        std::vector<std::byte> buffer(encoded_frame_size_compressed(value, codec, limits));
+        std::size_t written = 0;
+        compression_algorithm chosen = codec;
+        compression_statistics stats;
+        CRPC_CHECK(encode_frame_compressed(as_writable_span(buffer), value, codec, limits,
+                                           written, &chosen, &stats)
+                       .ok());
+        CRPC_CHECK_EQ(static_cast<int>(chosen), static_cast<int>(compression_algorithm::none));
+        CRPC_CHECK_EQ(stats.skipped_below_min, std::uint64_t{1});
+        CRPC_CHECK_EQ(written, encoded_frame_size(value));
+    }
+}
+
+CRPC_TEST(tc43_new_codecs_empty_input_is_invalid_argument) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    std::vector<std::byte> out(64);
+    for (const compression_algorithm codec : codecs) {
+        std::size_t written = 99;
+        CRPC_CHECK_EQ(static_cast<int>(compress_payload(codec, span<const std::byte>(),
+                                                        as_writable_span(out), written)
+                                           .code()),
+                      static_cast<int>(rpc_code::invalid_argument));
+        CRPC_CHECK_EQ(written, std::size_t{0});
+    }
+}
+
+CRPC_TEST(tc44_new_codecs_mutation_fuzz_never_crashes) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+
+    u32 state = 0x1234ABCDu;
+    std::vector<std::byte> out(4096);
+    for (const compression_algorithm codec : codecs) {
+        const std::vector<std::byte> plain = text_bytes(2048);
+        const std::vector<std::byte> payload = make_compressed_payload_for(codec, plain);
+        const std::vector<std::byte> wire = raw_frame(
+            static_cast<u32>(payload.size()), static_cast<u8>(frame_type::data),
+            codec_flags(codec), 9, payload);
+
+        for (int iteration = 0; iteration < 2000; ++iteration) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            std::vector<std::byte> mutated = wire;
+            const std::size_t target = static_cast<std::size_t>(state % mutated.size());
+            mutated[target] = static_cast<std::byte>(state & 0xFFu);
+
+            frame decoded;
+            const status result = decode_frame_compressed(as_span(mutated), decoded,
+                                                          as_writable_span(out),
+                                                          max_frame_default);
+            const bool acceptable = result.ok() ||
+                                    result.code() == rpc_code::protocol_error ||
+                                    result.code() == rpc_code::resource_exhausted;
+            CRPC_CHECK(acceptable);
+
+            std::vector<std::byte> storage(4096);
+            frame_decoder decoder(as_writable_span(storage));
+            decoder.feed(as_span(mutated));
+            frame streamed;
+            for (int guard = 0; guard < 4; ++guard) {
+                const frame_decoder::result step = decoder.next(streamed);
+                if (step != frame_decoder::result::frame_ready &&
+                    step != frame_decoder::result::frame_dropped) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+CRPC_TEST(tc45_new_codecs_large_round_trip) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+    const std::vector<std::byte> plain = text_bytes(1024 * 1024);
+
+    for (const compression_algorithm codec : codecs) {
+        const std::size_t bound = compressed_payload_bound(codec, plain.size());
+        std::vector<std::byte> stream(bound);
+        std::size_t written = 0;
+        CRPC_CHECK(compress_payload(codec, as_span(plain), as_writable_span(stream), written)
+                       .ok());
+        CRPC_CHECK(written < plain.size() / 2);
+        stream.resize(written);
+
+        std::vector<std::byte> decoded(plain.size(), std::byte{0x00});
+        std::size_t decoded_size = 0;
+        CRPC_CHECK(decompress_payload(codec, as_span(stream), plain.size(),
+                                      as_writable_span(decoded), decoded_size)
+                       .ok());
+        CRPC_CHECK_EQ(decoded_size, plain.size());
+        CRPC_CHECK(bytes_equal(as_span(decoded), plain));
+    }
+}
+
+CRPC_TEST(tc46_new_codecs_unreliable_one_way_drop) {
+    const compression_algorithm codecs[] = {
+        compression_algorithm::gzip, compression_algorithm::deflate,
+        compression_algorithm::lz77, compression_algorithm::zip};
+
+    for (const compression_algorithm codec : codecs) {
+        const std::vector<std::byte> plain = text_bytes(2048);
+        std::vector<std::byte> payload = make_compressed_payload_for(codec, plain);
+        // Corrupt the codec stream: the ONE_WAY frame must be dropped, not fatal.
+        payload.back() = static_cast<std::byte>(static_cast<unsigned>(payload.back()) ^ 0xFFu);
+        const std::vector<std::byte> bad = raw_frame(
+            static_cast<u32>(payload.size()), static_cast<u8>(frame_type::one_way),
+            static_cast<u8>(codec_flags(codec) | frame_flag_unreliable), 42, payload);
+
+        std::vector<std::byte> ping_payload = hex_bytes("0102030405060708");
+        const std::vector<std::byte> ping =
+            raw_frame(static_cast<u32>(ping_payload.size()), static_cast<u8>(frame_type::ping), 0,
+                      0, ping_payload);
+        std::vector<std::byte> stream = bad;
+        stream.insert(stream.end(), ping.begin(), ping.end());
+
+        std::vector<std::byte> storage(4096);
+        frame_decoder decoder(as_writable_span(storage));
+        decoder.feed(as_span(stream));
+        frame first;
+        frame_compression_info info;
+        CRPC_CHECK_EQ(static_cast<int>(decoder.next(first, &info)),
+                      static_cast<int>(frame_decoder::result::frame_dropped));
+        CRPC_CHECK(info.dropped);
+        CRPC_CHECK_EQ(static_cast<int>(decoder.error()), static_cast<int>(rpc_code::ok));
+
+        frame second;
+        CRPC_CHECK_EQ(static_cast<int>(decoder.next(second)),
+                      static_cast<int>(frame_decoder::result::frame_ready));
+        CRPC_CHECK(bytes_equal(second.payload, ping_payload));
+    }
+}
+
+CRPC_TEST(tc47_gzip_and_deflate_interop_golden_vectors) {
+    // The 200-byte input and the 56-byte gzip member below were produced by a
+    // reference implementation (.NET System.IO.Compression.GZipStream) and are
+    // embedded so a third-party writer is decoded byte for byte.
+    const char* seed = "CRPC gzip interop golden vector. ";
+    const std::size_t seed_size = std::strlen(seed);
+    std::vector<std::byte> plain(200);
+    for (std::size_t i = 0; i < plain.size(); ++i) {
+        plain[i] = static_cast<std::byte>(static_cast<unsigned char>(seed[i % seed_size]));
+    }
+
+    const std::vector<std::byte> gzip_member = hex_bytes(
+        "1f8b0800000000000400730e0a705648afca2c50c8cc2b492dca2f5048cfcf4949cd53284b4d2ec92fd"
+        "253701e1a0a00e993dd57c8000000");
+    CRPC_CHECK_EQ(gzip_member.size(), std::size_t{56});
+
+    std::vector<std::byte> decoded(plain.size(), std::byte{0x00});
+    std::size_t decoded_size = 0;
+    CRPC_CHECK(decompress_payload(compression_algorithm::gzip, as_span(gzip_member),
+                                  plain.size(), as_writable_span(decoded), decoded_size)
+                   .ok());
+    CRPC_CHECK_EQ(decoded_size, plain.size());
+    CRPC_CHECK(bytes_equal(as_span(decoded), plain));
+
+    // The same member with a corrupted CRC32 must be refused.
+    std::vector<std::byte> bad_crc = gzip_member;
+    bad_crc[bad_crc.size() - 5] =
+        static_cast<std::byte>(static_cast<unsigned>(bad_crc[bad_crc.size() - 5]) ^ 0x10u);
+    decoded_size = 0;
+    CRPC_CHECK_EQ(static_cast<int>(decompress_payload(compression_algorithm::gzip,
+                                                      as_span(bad_crc), plain.size(),
+                                                      as_writable_span(decoded), decoded_size)
+                                           .code()),
+                  static_cast<int>(rpc_code::protocol_error));
+
+    // The raw DEFLATE payload of the same member is 38 bytes (56 - 10 - 8).
+    const std::vector<std::byte> deflate_stream = hex_bytes(
+        "730e0a705648afca2c50c8cc2b492dca2f5048cfcf4949cd53284b4d2ec92fd253701e1a0a00");
+    CRPC_CHECK_EQ(deflate_stream.size(), std::size_t{38});
+    std::vector<std::byte> deflate_decoded(plain.size(), std::byte{0x00});
+    decoded_size = 0;
+    CRPC_CHECK(decompress_payload(compression_algorithm::deflate, as_span(deflate_stream),
+                                  plain.size(), as_writable_span(deflate_decoded), decoded_size)
+                   .ok());
+    CRPC_CHECK_EQ(decoded_size, plain.size());
+    CRPC_CHECK(bytes_equal(as_span(deflate_decoded), plain));
 }
 
 CRPC_TEST_MAIN()

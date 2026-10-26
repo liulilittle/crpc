@@ -20,13 +20,17 @@
 | 10 | [教程](tutorial.zh-CN.md) | [Tutorial](tutorial.md) |
 | 11 | [示例](../examples/README.zh-CN.md) | [Examples](../examples/README.md) |
 | 12 | [发布说明](CHANGELOG.zh-CN.md) | [Release notes](CHANGELOG.md) |
+| 13 | [分布式测试与基准](distributed-testing.zh-CN.md) | [Distributed testing and benchmarks](distributed-testing.md) |
+| 14 | [Redis 客户端](redis-client.zh-CN.md) | [Redis client](redis-client.md) |
 
 索引中的文档均已存在。各模块状态见第 3 份文档的状态矩阵与设计规格第 21 章；
 索引缺项或链接失效视为文档缺陷，不是疏漏。
 
 ## 阅读顺序
 
-- **使用这个库**：10（教程）→ 9（API 参考）→ 3（架构）→ 4（协议）→ 设计规格中的服务 API 章节。
+- **使用这个库**：10（教程）→ 9（API 参考）→ 3（架构）→ 4（协议）→ 设计规格中的服务 API 章节；
+  程序要访问 Redis 时加读 14（Redis 客户端）。
+- **测量与复现**：7（性能）→ 13（分布式测试与基准）。
 - **参与开发**：6（工程原则）→ 1（设计规格）→ 5（构建与测试）。
 - **二进制层集成**：2（ABI 策略）。
 

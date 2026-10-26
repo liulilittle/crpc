@@ -200,6 +200,33 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::push::push_envelope`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`
+- `::crpc::redis::bitmap_type`
+- `::crpc::redis::geo_type`
+- `::crpc::redis::hash_type`
+- `::crpc::redis::hyperloglog_type`
+- `::crpc::redis::list_type`
+- `::crpc::redis::redis_stream_entry`
+- `::crpc::redis::resp_array_value`
+- `::crpc::redis::resp_big_number`
+- `::crpc::redis::resp_blob_error`
+- `::crpc::redis::resp_boolean`
+- `::crpc::redis::resp_bulk_string`
+- `::crpc::redis::resp_double`
+- `::crpc::redis::resp_error`
+- `::crpc::redis::resp_integer`
+- `::crpc::redis::resp_map_value`
+- `::crpc::redis::resp_null`
+- `::crpc::redis::resp_push_value`
+- `::crpc::redis::resp_set_value`
+- `::crpc::redis::resp_simple_string`
+- `::crpc::redis::resp_verbatim_string`
+- `::crpc::redis::scored_member`
+- `::crpc::redis::sentinel_reply`
+- `::crpc::redis::set_type`
+- `::crpc::redis::stream_type`
+- `::crpc::redis::string_type`
+- `::crpc::redis::value`
+- `::crpc::redis::zset_type`
 - `::crpc::resilience::instance`
 
 这些记录只受第 7 节政策约束（任何公开结构体布局变更都属 MAJOR），没有构建期检查。

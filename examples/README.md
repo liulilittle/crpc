@@ -54,6 +54,117 @@ quickstart OK
 The process exits non-zero on the first failure, so it is usable as a smoke
 check.
 
+## Microservice
+
+`quickstart_microservice.cpp` builds a deterministic service mesh in one
+process:
+
+- two provider servers register in `crpc::cluster::registry`;
+- `crpc::cluster::health_monitor` aggregates a healthy and a sick probe;
+- the consumer queries the registry with `passing_only = true` and
+  load-balances the discovered instances with
+  `crpc::resilience::load_balancer` (`round_robin`);
+- every call runs through `crpc::resilience::circuit_breaker` and a
+  `retry_policy`;
+- a call to a missing provider opens the breaker, proving the failure path.
+
+Key API: `cluster::registry`, `cluster::service_instance`,
+`cluster::health_monitor`, `resilience::load_balancer`,
+`resilience::circuit_breaker`, `resilience::retry_sequence`, `server::builder`,
+`rpc::client::start_call`.
+
+Build and run (same build tree as the quickstart; the existing
+`quickstart*.cpp` glob creates one `crpc_example_<file-stem>` target per file):
+
+```powershell
+cmake --build .opencode/tmp/p20b
+.\.opencode\tmp\p20b\crpc_example_quickstart_microservice.exe
+```
+
+Expected output:
+
+```text
+microservice: registry has 2 passing instance(s) of 'greeter'
+microservice: health aggregate is passing
+microservice: round-robin picked 1 2 1 2
+microservice: greeter-1 -> Hello, CRPC from greeter-1
+microservice: greeter-2 -> Hello, CRPC from greeter-2
+microservice: breaker opened after failures
+microservice OK
+```
+
+## MVC
+
+`quickstart_mvc.cpp` drives the RTTI-attributed MVC router and then serves the
+same router through a real `crpc::http::http_server`:
+
+- reflected DTOs use `CRPC_FROM_ROUTE` for a path parameter and
+  `CRPC_FROM_QUERY` for query parameters;
+- `CRPC_HTTP_GET`/`CRPC_HTTP_POST` declare the routes;
+- `crpc::mvc::dispatch` handles GET/POST, a path parameter, a query parameter,
+  a JSON body, a `result<T>` error (404) and a binding failure (400);
+- the HTTP facade starts on an in-process endpoint and stops cleanly.
+
+Key API: `mvc::default_router`, `mvc::dispatch`, `mvc::with_status`,
+`crpc::mvc::status_body<T>`, `CRPC_ROUTE`, `CRPC_HTTP_GET`, `CRPC_HTTP_POST`,
+`http::http_server::builder`.
+
+Run:
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_quickstart_mvc.exe
+```
+
+Expected output:
+
+```text
+mvc: GET /users/42 -> 200 { "id": 42, "name": "alice" }
+mvc: GET /users?page=2&limit=5 -> 200 { "id": 10, "name": "page" }
+mvc: POST /users -> 201 { "id": 1, "name": "carol" }
+mvc: GET /users/-1/maybe -> 404
+mvc: GET /users/abc -> 400
+mvc: GET /nope -> 404
+mvc: http_server listening on inproc:mvc-example
+mvc OK
+```
+
+## Game gateway
+
+`quickstart_game.cpp` is a two-tier game backend in one process:
+
+- the gateway server accepts the client and forwards `join`/`action` calls to
+  the logic tier over a cross-node `rpc::client` call;
+- the logic server owns the authoritative, stateful player sessions;
+- after the logic tier answers, the gateway publishes a reliable event to
+  `game.events`, and the client's push sink receives it.
+
+Key API: `server::builder::add_method`, `rpc::client::start_call`,
+`rpc::client::set_push_sink`, `rpc::client::subscribe_push`,
+`server::publish`, `push::delivery_mode::reliable`,
+`push::push_message_view`.
+
+Run:
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_quickstart_game.exe
+```
+
+Expected output:
+
+```text
+game: subscribed to 'game.events' on stream 1
+game: join -> session alice
+game: push: player alice joined at (0,0)
+game: action -> (3,4)
+game: push: player moved to (3,4)
+game OK
+```
+
+The gateway emits the event after the forward call returns. A logic-to-gateway
+callback would deadlock on the synchronous in-process transport, because the
+gateway shard thread is blocked in the forward call; over TCP (separate
+processes/threads) that callback shape is possible.
+
 ## Why one process
 
 The quickstart uses `crpc::inproc_backend`, which connects two endpoints inside

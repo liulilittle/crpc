@@ -26,6 +26,8 @@ server push over one connection, one frame format and one coroutine model.
 | Tutorial | [docs/tutorial.md](docs/tutorial.md) | [教程](docs/tutorial.zh-CN.md) |
 | Examples | [examples/README.md](examples/README.md) | [示例](examples/README.zh-CN.md) |
 | Release notes | [docs/CHANGELOG.md](docs/CHANGELOG.md) | [发布说明](docs/CHANGELOG.zh-CN.md) |
+| Distributed testing and benchmarks | [docs/distributed-testing.md](docs/distributed-testing.md) | [分布式测试与基准](docs/distributed-testing.zh-CN.md) |
+| Redis client | [docs/redis-client.md](docs/redis-client.md) | [Redis 客户端](docs/redis-client.zh-CN.md) |
 
 ## What this is
 

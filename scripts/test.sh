@@ -137,6 +137,37 @@ for san in "${SAN_LIST[@]}"; do
         else
           log WARN "export gate skipped: python3 not on PATH"
         fi
+
+        # The gate is only as good as its parser, and every historical
+        # blindness bug in that parser made it print OK. Pin the parser's three
+        # real shapes (ILT suffix, annotation suffix, a name wrapped across two
+        # lines) so a regression in `read_exports` fails here rather than
+        # silently disabling the export check.
+        #
+        # Interpreter lookup is deliberately lenient: `python` on Windows,
+        # `python3` on Linux/macOS. A missing interpreter skips the self-test
+        # with a WARN, never a failure -- the same policy the gate itself uses,
+        # so one missing interpreter cannot make two checks fail differently.
+        SELFTEST="$SOURCE_DIR/scripts/export_gate_selftest.py"
+        SELFTEST_PY=""
+        if command -v python3 >/dev/null 2>&1; then
+          SELFTEST_PY="python3"
+        elif command -v python >/dev/null 2>&1; then
+          SELFTEST_PY="python"
+        fi
+        if [[ ! -f "$SELFTEST" ]]; then
+          log ERROR "export gate selftest missing: $SELFTEST"
+          FAILURES=$((FAILURES + 1))
+        elif [[ -n "$SELFTEST_PY" ]]; then
+          if ! "$SELFTEST_PY" "$SELFTEST" 2>&1 | tee -a "$LOG"; then
+            log ERROR "export gate selftest FAILED"
+            FAILURES=$((FAILURES + 1))
+          else
+            log INFO "export gate selftest OK"
+          fi
+        else
+          log WARN "export gate selftest skipped: no python interpreter on PATH"
+        fi
       fi
       if grep -qE 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)' "$LOG"; then
         log ERROR "sanitizer report detected"

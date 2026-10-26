@@ -535,7 +535,7 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 | 偏移 | 宽度 | 字段 | 说明 |
 |---|---|---|---|
 | 0 | 4 | `uncompressed_len` | `u32` 小端，`1..max_frame`；逻辑 payload 长度 |
-| 4 | N | `codec_stream` | `lz4` block 或单个 `gzip` member |
+| 4 | N | `codec_stream` | 由 `ALGO` 指定的编解码流（LZ4 block、gzip member、raw DEFLATE、LZ77 block、ZIP entry） |
 
 `payload_len = 4 + N <= max_frame`。置位 `CRC32C` 时，校验和覆盖**含前缀**的整个 payload，
 接收方在消耗解压 CPU 之前先验证完整性。payload 短于 5 字节、`uncompressed_len` 为零、或
@@ -551,12 +551,56 @@ HTTP/2 下命中下载路由的请求返回完整 `501`（fail-closed），不�
 | 0 | none | 必需 |
 | 1 | LZ4 **block** 格式（无 frame magic、无 frame 校验和；容器已提供两者） | 已实现 |
 | 2 | zstd | 保留，**未实现**：一律 `protocol_error` |
-| 3 | gzip member（RFC 1952：deflate + CRC32 + ISIZE） | 留待下一阶段；本构建一律 `protocol_error` |
-| 4-7 | 保留 | `protocol_error` |
+| 3 | gzip member（RFC 1952：raw DEFLATE + CRC32 + ISIZE） | 已实现 |
+| 4 | raw DEFLATE（RFC 1951：stored / fixed / dynamic block） | 已实现 |
+| 5 | LZ77 block（CRPC 专用容器：`LZ77` magic、长度、CRC32、token 流） | 已实现 |
+| 6 | ZIP local file entry（`PK\x03\x04` + raw DEFLATE + header 中的 CRC32/长度） | 已实现 |
+| 7 | 保留 | `protocol_error` |
 
 `ALGO = 1` 是 LZ4 block 格式，不是 LZ4 frame 格式。`tests/test_frame_compression.cpp` 的
 golden 向量钉死字节布局，供第三方实现对照；它们由参考实现 LZ4 v1.10.0 产出，
 与本实现在相同输入下的输出逐字节相同。
+
+`ALGO = 3, 4, 6` 共享同一个 DEFLATE 核心（`src/compression/deflate_core.cpp`），因此 gzip
+member、raw DEFLATE 流与 ZIP entry 与第三方 DEFLATE 实现字节兼容：互操作测试会解码参考
+DEFLATE 编码器产出的 gzip member，且本编码器的 gzip 输出可被参考 gzip reader 读取。
+`ALGO = 5` 是 CRPC 专用格式：不能与任何外部工具互操作，其 20 字节 header 携带 CRC32，
+使码流自校验。
+
+gzip member 为 `1f 8b`、`CM = 8`、`FLG = 0`、`MTIME = 0`、`XFL = 0`、`OS = 255`，随后是
+raw DEFLATE 流，最后是小端 CRC32 与 ISIZE。ZIP entry 是 30 字节 local file header
+（method 8，无 data descriptor）后接 raw DEFLATE 流。LZ77 流为 `4c 5a 37 37`、版本 1、
+未压缩大小、压缩大小与 CRC32（均为 `u32` 小端），随后是以 `0x00` 终止的字面量段与匹配 token。
+
+#### 24.2.1 算法选择
+
+容器与编解码器解耦，因此选择是策略决定，不是线缆决定。`ALGO` 始终命名实际产出
+`codec_stream` 的编解码器；发送方绝不会用别的编解码器替代请求的算法。
+
+| 选择 | 适用场景 | 代价 |
+|---|---|---|
+| `none` | payload 低于 `min_payload`、数据本身已压缩、或对端无能力 | 无 CPU；帧不置 `COMPRESSED` |
+| `lz4` | 延迟敏感的 RPC/push；对端宣告时的默认选择 | 压缩选项中 CPU 最低；block 格式需要 4 字节长度前缀 |
+| `gzip` | 需要外部 gzip reader 互操作，或 payload 本身就是 HTTP gzip 形状 | RFC 1952 header/trailer（18 字节）与 CRC32；比 LZ4 慢 |
+| `deflate` | 需要 raw RFC 1951 流互操作；容器开销最小 | 自身无 magic/校验和；帧 `CRC32C`（若置位）承担完整性校验 |
+| `zip` | payload 还需能被当作 ZIP local entry 读取 | 30 字节 local header；不生成 central directory |
+| `lz77` | 仅 CRPC 链路，想要自校验码流且不需要外部格式 | CRPC 专用；不能与外部工具互操作 |
+| `zstd` | 保留 | 未实现；一律 `protocol_error`，绝不回退 |
+
+各选择之间的关系：
+
+- `gzip`、`deflate` 与 `zip` 共享 DEFLATE 核心：它们在同一压缩载荷外使用不同容器，是可互操作
+  的一族。
+- `lz4` 是另一种算法（LZ4 block），为速度而选。`zstd` 也是另一种算法，但在本实现中保留、
+  不可用。
+- `lz77` 是 LZ77 token 流的 CRPC 专用容器；它自校验，但不是交换格式。
+- 这里的压缩是帧压缩（本节），不是 HTTP 内容编码（第 21 节）。同一批字节无论 HTTP 层是否
+  做 gzip/deflate，都可以独立做帧压缩；两层不共享码流或字典。
+
+`encode_frame_compressed` 还执行永不放大规则：若所选编解码器的输出（含 4 字节前缀）不是严格
+更小，则发送未压缩帧且 `chosen` 报告 `none`。因此需要在线上使用特定算法的调用方必须检查
+`chosen`，而不只是请求参数。所有选择的 Debug 实测压缩率与吞吐见
+[performance §2.5](performance.zh-CN.md#s2-5)。
 
 压缩仅定义于承载应用数据的帧：`REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH`。
 控制帧（`RST_STREAM`、`SETTINGS`、`SETTINGS_ACK`、`PING`、`PONG`、`GOAWAY`、`WINDOW_UPDATE`、
@@ -571,7 +615,7 @@ golden 向量钉死字节布局，供第三方实现对照；它们由参考实�
 
 | 条件 | 结果 |
 |---|---|
-| 不支持的 `ALGO`（zstd、本构建的 gzip、保留值） | `protocol_error` |
+| 不支持的 `ALGO`（zstd、保留 id 7） | `protocol_error` |
 | `payload_len < 5`、`uncompressed_len == 0` | `protocol_error` |
 | `uncompressed_len > max_frame` | `protocol_error` |
 | 码流畸形或截断 | `protocol_error`（可靠）/ 显式丢弃（不可靠 `ONE_WAY`） |
@@ -599,7 +643,7 @@ golden 向量钉死字节布局，供第三方实现对照；它们由参考实�
 （默认 512）、且编码后**含 4 字节前缀**严格小于原始 payload 时才压缩；否则发送未压缩帧并保持
 `COMPRESSED` 清零：发送方绝不放大帧，因此启用压缩不会破坏任何帧大小预算。
 
-算法是传给 `encode_frame_compressed` 的运行时选择（`none` 表示要求不压缩）。不支持的取值（zstd、本构建的 gzip、保留 id）返回 `invalid_argument`，绝不静默回退到别的算法：「配置了 gzip 却发 lz4」正是本节要消除的标志与载荷不符。
+算法是传给 `encode_frame_compressed` 的运行时选择（`none` 表示要求不压缩）。不支持的取值（zstd、保留 id）返回 `invalid_argument`，绝不静默回退到别的算法：「配置了 gzip 却发 lz4」正是本节要消除的标志与载荷不符。
 
 `encode_frame_compressed` 在写出任何字节之前，按与 `encode_frame` 完全相同的规则校验帧头
 （已知类型、stream 作用域、`stream_id` bit 31 为 0、`ONE_WAY` 需 `UNRELIABLE`、非零 `ext` 需 `CRC32C`、
@@ -616,7 +660,7 @@ golden 向量钉死字节布局，供第三方实现对照；它们由参考实�
 | 0 | 1 | `version` = 1 |
 | 1 | 1 | `flags` = 0（保留） |
 | 2 | 2 | `reserved` = 0 |
-| 4 | 4 | `compress_bitmap`：bit0 lz4、bit1 zstd、bit2 gzip；bits 3-31 必须为 0 |
+| 4 | 4 | `compress_bitmap`：bit0 lz4、bit1 zstd、bit2 gzip、bit3 deflate、bit4 lz77、bit5 zip；bits 6-31 必须为 0 |
 | 8 | 4 | `compress_min`：小于该值的 payload 不压缩；0 = 512 |
 | 12 | 4 | `max_decompressed_frame`：可接受的解压后单帧上限；0 = 16 MiB |
 
@@ -639,6 +683,14 @@ golden 向量钉死字节布局，供第三方实现对照；它们由参考实�
 
 ### 24.7 验证
 
-`tests/test_frame_compression.cpp` 覆盖容器、编解码、fail-closed 表、不可靠丢弃路径、
+`tests/test_frame_compression.cpp` 覆盖容器、每种编解码器、fail-closed 表、不可靠丢弃路径、
 比值与大小上限、永不放大策略、golden 向量与变异 fuzz 循环。LZ4 block 编解码在 golden 向量上
-另与参考实现做了逐字节一致性对拍。
+另与参考实现做了逐字节一致性对拍；gzip 与 raw DEFLATE 编解码器对照参考 DEFLATE 编码器
+（gzip member 与其 raw DEFLATE payload 都还原为输入），且本编码器的 gzip 输出可被参考
+gzip reader 读取。gzip、ZIP、LZ77 容器校验 magic、CRC32 与长度字段，损坏字节会被拒绝。
+记录运行结果为 61 case / 95 229 check / 0 failure。
+
+`bench/bench_compression.cpp` 对 `none`、`lz4`、`deflate`、`lz77`、`zip`、`gzip` 在文本与
+不可压缩二进制、4 KiB 与 64 KiB 下测量同一帧路径，报告实际选择的算法、wire/plain 比值与
+编解码吞吐；见 [performance §2.5](performance.zh-CN.md#s2-5) 与
+[分布式测试 §6.4](distributed-testing.zh-CN.md#s6)。

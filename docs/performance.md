@@ -15,6 +15,7 @@ absent rather than estimated.
 |---|---|
 | [1](#s1) | Measurement method |
 | [2](#s2) | Recorded evidence |
+| [2.5](#s2-5) | Compression, RPC matrix and Redis benchmarks (2026-10-26) |
 | [3](#s3) | Budgets and targets |
 | [4](#s4) | Benchmark plan |
 | [5](#s5) | Anti-patterns the design rejects |
@@ -197,6 +198,128 @@ not a timing: a `feed()` payload points into the decoder while a
 `frame_decoder_external_matches_feed` checks that the same frame stream is
 produced at every split point, including a split inside a frame.
 
+### 2.5 Compression, RPC matrix and Redis benchmarks (2026-10-26) <a id="s2-5"></a>
+
+Sources: `bench/bench_compression.cpp`, `bench/bench_rpc_matrix.cpp` and
+`bench/bench_redis.cpp` (targets `crpc_bench_compression`,
+`crpc_bench_rpc_matrix`, `crpc_bench_redis`). Toolchain: MSVC x64 **Debug**
+(`/W4 /WX`), AMD Ryzen 9 7945HX (16 cores / 32 threads), single-process
+`inproc_backend`, no network, no sanitizer. Every case warms up, runs several
+times and reports the median. Debug numbers are for same-environment regression
+comparison only; they are not Release or production capacity. Run method,
+scenarios and the full scenario evidence are in
+[distributed-testing.md](distributed-testing.md).
+
+**Frame compression (text payload, wire/plain).** The benchmark uses the real
+frame path (header + 4-byte logical-length prefix + codec stream), not a bare
+codec call.
+
+| Algorithm | 4 KiB | 64 KiB |
+|---|---:|---:|
+| none | 1.004 | 1.000 |
+| lz4 | 0.026 | 0.005 |
+| deflate | 0.027 | 0.004 |
+| lz77 | 0.048 | 0.025 |
+| zip | 0.034 | 0.005 |
+| gzip | 0.031 | 0.005 |
+
+**Frame compression throughput (text, Debug).**
+
+| Case | Encode | Decode |
+|---|---:|---:|
+| text 4 KiB lz4 | 307.9 MiB/s | 316.3 MiB/s |
+| text 64 KiB lz4 | 343.0 MiB/s | 474.3 MiB/s |
+| text 4 KiB deflate | 5.57 MiB/s | 90.75 MiB/s |
+| text 4 KiB gzip | 5.51 MiB/s | 66.95 MiB/s |
+
+Incompressible binary: every algorithm falls back to `none` by design, so the
+ratio is 1.0. For example, lz4 attempts to encode 4 KiB at 84.0 MiB/s and the
+final `chosen` is `none`. The run recorded 120 cases
+(`.opencode/tmp/distbench-compression.log`).
+
+**Reliable RPC latency (closed loop, depth 1; 5 x 2000 samples, median).**
+
+| Payload | p50 | p99 |
+|---|---:|---:|
+| 16 B | 64.0 µs | 177.1 µs |
+| 256 B | 59.3 µs | 174.8 µs |
+| 4 KiB | 67.1 µs | 194.8 µs |
+
+**Reliable RPC throughput (closed loop, payload x concurrency, 0 errors).**
+
+| Payload | c=1 | c=4 |
+|---|---:|---:|
+| 16 B | 83.1 µs/call (~12.0k/s) | 96.9 µs/call (~10.3k/s) |
+| 256 B | 113.9 µs/call (~8.8k/s) | 85.8 µs/call (~11.7k/s) |
+| 4 KiB | 123.9 µs/call (~8.1k/s) | 99.1 µs/call (~10.1k/s) |
+| 64 KiB | 265.1 µs/call (~3.8k/s) | 272.5 µs/call (~3.7k/s) |
+
+**Unreliable `ONE_WAY` issue/delivery (0 errors, drained = yes).**
+
+| Payload | c=1 issued/delivered | c=4 issued/delivered |
+|---|---:|---:|
+| 16 B | 10000 / 10000, 0.4894 s (~20.4k/s) | 10000 / 10000, 0.5816 s (~17.2k/s) |
+| 4 KiB | 4000 / 4000, 0.2004 s (~20.0k/s) | 4000 / 4000, 0.2665 s (~15.0k/s) |
+
+**Pipelined batch throughput (Debug, 2026-10-26).** The closed-loop cases above
+issue one call and wait for it; the pipelined cases issue a batch of 1/16/64
+calls before waiting for any of them, which is the issue shape a throughput
+caller uses. Every case warms up, runs three timed iterations and reports the
+median, p99 and spread. `batch=1` is the same issue shape as the closed loop and
+is the harness sanity check.
+
+Reliable, median ns/call (payload x batch x concurrency; `hang` means the
+pipelined case deadlocked and the watchdog recorded the closed-loop fallback,
+see [distributed-testing.md §7](distributed-testing.md#s7)):
+
+| Payload | batch | c=1 | c=2 | c=4 |
+|---|---:|---:|---:|---:|
+| 16 B | 1 | 88.1 µs | 75.0 µs | 80.4 µs |
+| 16 B | 16 | 54.9 µs | 51.9 µs | hang (~0.009 M/s) |
+| 16 B | 64 | 46.7 µs | 82.1 µs | hang (~0.010 M/s) |
+| 256 B | 1 | 74.6 µs | 82.1 µs | 71.5 µs |
+| 256 B | 16 | 45.2 µs | 72.7 µs | hang (~0.009 M/s) |
+| 256 B | 64 | hang (~0.008 M/s) | hang (~0.009 M/s) | hang (~0.009 M/s) |
+
+Unreliable `ONE_WAY`, median delivered M calls/s (16 B; all drained, 0 errors):
+
+| batch | c=1 | c=2 | c=4 |
+|---:|---:|---:|---:|
+| 1 | 0.029 | 0.025 | 0.024 |
+| 16 | 0.028 | 0.019 | 0.020 |
+| 64 | 0.025 | 0.018 | 0.019 |
+
+The reliable pipelined path is not usable at high batch x concurrency in this
+Debug build: the concurrent issue path and the in-process backend's synchronous
+completion path deadlock, so the watchdog kills the case and records the
+closed-loop fallback instead of a pipelined number. The ONE_WAY path does not
+deadlock (its issue path does not wait), so its pipelined numbers are complete.
+The deadlock is a library finding, not a benchmark artefact; it is reproduced
+with a stack trace in `.superpowers/sdd/bench-pipeline-report.md` and recorded
+as a limitation in [distributed-testing.md §8](distributed-testing.md#s8).
+The hang is timing-dependent, so the exact set of hanging cases varies between
+runs; the fallback is always recorded explicitly.
+
+**Redis client (isolated layers).** The pool case uses a null transport; the
+pipeline case uses a wire-shaped executor (RESP encode + parse), so neither
+includes a real server or a network.
+
+| Case | Result |
+|---|---:|
+| connection_pool acquire/release | 792.4 ns/op, 0 idle, 0 error |
+| RESP encode command (1 argument, 1 B wire) | 3275.4 ns/op |
+| RESP parse bulk reply | 4085.4 ns/op |
+| pipeline batch=1 | 15157.7 ns/batch, ~0.07 M cmds/s |
+| pipeline batch=16 | 194894.4 ns/batch, ~0.08 M cmds/s |
+| pipeline batch=64 | 763389.9 ns/batch, ~0.08 M cmds/s |
+
+Log: `.opencode/tmp/distbench-redis.log`.
+
+The distributed correctness suite is not a benchmark. It is recorded here only
+so the numbers and their environment can be found together: two executables,
+5 + 3 cases, 150 + 64 checks, 0 failures, each run five times with zero
+failures. See [distributed-testing.md §3](distributed-testing.md#s3).
+
 ## 3. Budgets and targets <a id="s3"></a>
 
 Memory budgets are from design §17.1; status is assessed against the code.
@@ -238,15 +361,28 @@ not prove the target.
 
 The RPC benchmark now lands as `bench/bench_rpc.cpp` (§2.3). Its current cases
 are 64 B sync latency, pipeline depth 1/16/64 and 1/2/4 shards over inproc, plus
-IOCP loopback on Windows; the wider matrix below is still pending:
+IOCP loopback on Windows. The wider matrix is being filled in:
 
-- `bench/bench_rpc.cpp` — extend to 16 B/256 B/1 KiB, 1/8/64/512 connections,
+- `bench/bench_rpc_matrix.cpp` — implemented: 16 B/256 B/4 KiB/64 KiB payloads,
+  1/2/4 caller threads, reliable closed-loop latency/throughput, unreliable
+  `ONE_WAY` issue/delivery, and pipelined batch throughput (batch 1/16/64 x
+  concurrency 1/2/4) with a child-process watchdog that falls back to the closed
+  loop when the pipelined path deadlocks (§2.5).
+- `bench/bench_compression.cpp` — implemented: none/lz4/deflate/lz77/zip/gzip
+  over text and incompressible binary at 4 KiB/64 KiB (§2.5).
+- `bench/bench_redis.cpp` — implemented: pool acquire/release, RESP encode/parse
+  and pipeline batch throughput (§2.5).
+- `bench/bench_rpc.cpp` — still to extend to 1 KiB, 1/8/64/512 connections,
   epoll loopback, and separate reliable/unreliable/ordered-lane runs.
 - `bench/bench_http.cpp` — HTTP/1.1 and HTTP/2 request/response, keep-alive,
   header sizes, upload/download streaming.
 - `bench/bench_codec.cpp` — crpc-binary, JSON, XML, INI, TOML and the schema
   formats at 64 B, 256 B and 1 KiB, with a warm cache and no allocation on the
   measured path.
+
+The run commands, substring filters and scenario interpretation for the three
+implemented benchmarks are in
+[distributed-testing.md §5](distributed-testing.md#s5).
 
 Every run reports the fields in §1. The counter is incremented by the client
 after a response is decoded, never by the server after it writes bytes. CPU
@@ -284,8 +420,9 @@ states the measured value and the gap; it does not replace a missing measurement
 with a projection.
 
 Current status: the library has functional test coverage, an HTTP server facade,
-an in-process and IOCP end-to-end RPC benchmark (§2.3) and a wire/codec
-microbenchmark. The 5M RPC/s and IOCP p99 targets are **not met** (measured
+an in-process and IOCP end-to-end RPC benchmark (§2.3), a wire/codec
+microbenchmark, and the compression/RPC-matrix/Redis benchmarks in §2.5. The 5M
+RPC/s and IOCP p99 targets are **not met** (measured
 0.275M RPC/s inproc single-client, 0.773M RPC/s multi-thread, and 170 µs p99
 over IOCP); the in-process p99 target is met
 at 22.6 µs on MSVC. The 128-byte call-slot budget remains **unmet** at 440 bytes

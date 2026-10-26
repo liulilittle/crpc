@@ -22,10 +22,13 @@
 // so a returned frame always describes the payload it carries.
 //
 // Algorithms:
-//   none  -- identity, never flagged COMPRESSED
-//   lz4   -- LZ4 *block* format (no frame magic, no frame checksums)
-//   zstd  -- reserved, always fail-closed (protocol_error)
-//   gzip  -- reserved for G29b, fail-closed in this slice
+//   none    -- identity, never flagged COMPRESSED
+//   lz4     -- LZ4 *block* format (no frame magic, no frame checksums)
+//   zstd    -- reserved, always fail-closed (protocol_error)
+//   gzip    -- gzip member (RFC 1952): raw DEFLATE + CRC32 + ISIZE
+//   deflate -- raw DEFLATE (RFC 1951): stored / fixed / dynamic blocks
+//   lz77    -- CRPC-specific LZ77 block container (magic + sizes + CRC32)
+//   zip     -- ZIP local file entry (PK\x03\x04 + raw DEFLATE + CRC32/sizes)
 //
 // Dynamic configuration: `compression_limits` is a plain value type passed by
 // the caller to every entry point. It carries the logical payload ceiling, the
@@ -161,8 +164,8 @@ struct frame_compression_info {
     rpc_code drop_reason = rpc_code::ok;
 };
 
-// none and lz4 are usable in this slice. zstd and gzip are recognised ids that
-// fail closed (gzip is opened in G29b when the DEFLATE core is shared).
+// Every codec this build can decode returns true (none, lz4, gzip, deflate,
+// lz77, zip). zstd stays a recognised id that fails closed at decode.
 [[nodiscard]] CRPC_API bool is_supported_compression(compression_algorithm algorithm) noexcept;
 
 // Upper bound on the encoded payload for `plain_size` input bytes, including
@@ -222,10 +225,9 @@ struct frame_compression_info {
 // value.header.flags must not carry COMPRESSED or ALGO (invalid_argument); a
 // COMPRESSED frame is produced only here. `preferred` is the runtime algorithm
 // choice: `none` means "send this frame uncompressed", `lz4` asks for LZ4, and
-// any unsupported value (zstd, gzip in this build, reserved) is
-// invalid_argument - never a silent fallback to a different codec, because a
-// caller that configured gzip and got lz4 would be back to "the flag does not
-// describe the payload".
+// any unsupported value (zstd, reserved ids) is invalid_argument - never a
+// silent fallback to a different codec, because a caller that configured zstd
+// and got lz4 would be back to "the flag does not describe the payload".
 //
 // With a usable algorithm, compression is used only when the payload is at
 // least limits.min_payload bytes, the type carries application data, and the

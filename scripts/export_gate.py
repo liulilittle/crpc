@@ -52,9 +52,9 @@ any exported name mentions the class. That is the only use of the binaries; the
 "must" side is purely static, which is what makes the gate work on Linux and in
 review as well as on a Windows build.
 
-Exit codes: 0 = clean, 1 = violation, 2 = the gate could not run (no DLL, no
-dumpbin, unparsable export table). 2 is never treated as success: a gate that
-cannot run must not report green.
+Exit codes: 0 = clean, 1 = violation, 2 = the gate could not run (no shared
+object, no usable symbol reader, unparsable export table). 2 is never treated as
+success: a gate that cannot run must not report green.
 """
 import argparse
 import io
@@ -63,7 +63,25 @@ import re
 import subprocess
 import sys
 
-_EXPORT_ROW = re.compile(r'^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$')
+# An export row starts with the ordinal, hint and RVA columns; everything after
+# them is the symbol name. Two things make a single line insufficient to recover
+# the name, both measured on this machine's `dumpbin`:
+#
+#   * the name is followed by a ` = ` suffix -- either an ILT reference such as
+#     ` = @ILT+1234(name)` or an annotation such as ` = name (comment)`;
+#   * a long name is wrapped across several lines, so one logical entry spans
+#     multiple physical lines until the next entry starts.
+#
+# `read_exports` therefore accumulates the lines of one logical entry and takes
+# the text before the first ` = `. The old line regex
+# `^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$` matched neither shape:
+# it rejected every row carrying a ` = ` suffix, so a build with `--build-dir`
+# parsed zero symbols and the gate exited 2 (could not run) instead of checking
+# anything.
+_EXPORT_ROW = re.compile(r'^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(.*)$')
+# The export table ends at the `Summary` section. Its rows (`1000 .00cfg`) are
+# not entries, and a continuation line would otherwise absorb them.
+_EXPORT_SECTION = re.compile(r'^\s*[0-9A-Fa-f]+\s+\.\w')
 
 # ---------------------------------------------------------------------------
 # Source text handling
@@ -351,26 +369,148 @@ def _record(statement, stack, index, path, line):
 # Export table
 # ---------------------------------------------------------------------------
 
+def _export_name(block):
+    """The symbol name from one logical export entry.
+
+    `block` is the entry's first line (without the ordinal/hint/RVA columns)
+    followed by any wrapped continuation lines. The name ends at the first
+    ` = `; everything after it is an ILT reference or a comment and is dropped.
+    Continuation lines carry no separator of their own, so they are joined
+    directly -- MSVC mangled names contain no spaces, so a space would corrupt a
+    wrapped name rather than reconstruct it.
+    """
+    text = block[0] + ''.join(line.strip() for line in block[1:])
+    return text.split(' = ', 1)[0].strip()
+
+
 def read_exports(dumpbin, dll):
     out = subprocess.run([dumpbin, '/exports', dll],
                          capture_output=True).stdout.decode('utf-8', 'replace')
-    names, started = set(), False
-    for line in out.split('\n'):
-        if 'ordinal hint' in line:
-            started = True
-            continue
-        if not started:
-            continue
+    lines = [line.rstrip('\r') for line in out.split('\n')]
+    try:
+        start = next(i for i, line in enumerate(lines)
+                     if 'ordinal hint' in line) + 1
+    except StopIteration:
+        raise RuntimeError('no export table header in %s' % dll)
+    names = set()
+    block = None
+    for line in lines[start:]:
+        if line.strip() == 'Summary' or _EXPORT_SECTION.match(line):
+            break
         m = _EXPORT_ROW.match(line)
         if m:
-            names.add(m.group(1))
+            if block is not None:
+                names.add(_export_name(block))
+            block = [m.group(1)]
+        elif block is not None and line.strip():
+            # A wrapped continuation of the current entry's name.
+            block.append(line)
+    if block is not None:
+        names.add(_export_name(block))
     if not names:
         raise RuntimeError('no exports parsed from %s' % dll)
     return names
 
 
-def read_exports_elf(shared_object):
-    """Dynamic symbols of a Linux/macOS shared object, via `nm`.
+def _run_tool(argv):
+    """Run `argv` and return its decoded stdout.
+
+    A missing executable raises `FileNotFoundError`; the caller turns that into
+    a skip rather than a crash, because the gate must fall through to the next
+    available reader instead of dying on the first absent tool.
+    """
+    proc = subprocess.run(argv, capture_output=True)
+    return proc.stdout.decode('utf-8', 'replace')
+
+
+def _nm_argv(tool, demangle):
+    """`nm` arguments for the dynamic, defined-only table.
+
+    GNU `nm` spells it `-D --defined-only`; macOS spells it `-gU` and does not
+    accept GNU's long form, so the whole flag list is chosen per platform.
+    """
+    flags = ['-gU'] if sys.platform == 'darwin' else ['-D', '--defined-only']
+    if demangle:
+        flags.append('-C')
+    return [tool] + flags
+
+
+def _parse_nm(text):
+    """Dynamic symbols from `nm -D --defined-only` / `... -C`.
+
+    Columns are `address type name`. The demangled name can contain spaces
+    (`crpc::http2::plain_free(int)`), so everything after the two leading
+    columns is rejoined rather than taking the last token.
+    """
+    names = set()
+    for line in text.split('\n'):
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1]:
+            names.add(' '.join(parts[2:]))
+    return names
+
+
+_READELF_TABLE = re.compile(r"Symbol table '([^']+)'")
+_READELF_ROW = re.compile(r'^\s*\d+:\s')
+
+
+def _parse_readelf(text):
+    """Dynamic symbols from `readelf -Ws` / `readelf -WsC`.
+
+    Only the `.dynsym` table is collected: `-Ws` also prints `.symtab`, whose
+    local symbols (`deregister_tm_clones`, `crtstuff.c`, ...) are not exports
+    and would let rule B see a class name that is never actually exported.
+    Undefined entries (`Ndx UND`) are dropped for the same reason.
+    """
+    names = set()
+    table = None
+    for line in text.split('\n'):
+        header = _READELF_TABLE.search(line)
+        if header:
+            table = header.group(1)
+            continue
+        if not _READELF_ROW.match(line):
+            continue
+        if table is not None and table != '.dynsym':
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        if parts[6] in ('UND', '*UND*'):
+            continue
+        name = ' '.join(parts[7:])
+        if name and not name.startswith('*'):
+            names.add(name)
+    return names
+
+
+_OBJDUMP_ROW = re.compile(
+    r'^\s*[0-9a-fA-F]+\s+(?:\S+\s+)?\S+\s+(\*UND\*|\.\S+)\s+'
+    r'[0-9a-fA-F]+\s+(.+?)\s*$')
+
+
+def _parse_objdump(text):
+    """Dynamic symbols from `objdump -T` / `objdump -TC`.
+
+    Columns are `address [flags] type section<TAB>size name`; the section is
+    `.text`/`.data`/`*UND*` and the name is the remainder of the line, so a
+    demangled name with spaces (`crpc::operator new(unsigned long)`) survives.
+    `*UND*` entries are imports, not exports, and are dropped.
+    """
+    names = set()
+    for line in text.split('\n'):
+        m = _OBJDUMP_ROW.match(line)
+        if not m:
+            continue
+        section, name = m.group(1), m.group(2)
+        if section == '*UND*' or not name:
+            continue
+        names.add(name)
+    return names
+
+
+def read_exports_elf(shared_object, nm='nm', readelf='readelf', objdump='objdump'):
+    """Dynamic symbols of a Linux/macOS shared object.
 
     Both the mangled and the demangled spelling are collected, because neither
     alone is enough. The mangled form (`_ZN4crpc5http213strip_paddingEv`) needs
@@ -381,59 +521,56 @@ def read_exports_elf(shared_object):
     on Linux. Merging both means a symbol the demangler could not handle still
     contributes its raw text, and a symbol it handled contributes segments.
 
-    Measured on a two-symbol probe: mangled-only yields
-    `{'_ZN4crpc10plain_freeEv', ...}` and zero segments; with `-C` it yields
-    `{'crpc', 'http2', 'plain_free', 'strip_padding'}`.
+    `nm` is the preferred reader, but it is not always installed (a minimal
+    container, a Windows checkout opened from WSL). Rather than depend on it,
+    the gate walks a chain -- `nm`, then `readelf -Ws`, then `objdump -T` -- and
+    uses the first reader that yields a usable table. A reader that is missing,
+    that returns no symbols, or that cannot demangle is skipped, and the reason
+    is recorded. Only when *every* reader is unusable does the gate raise, which
+    `main` turns into exit 2 ("could not run"). A gate that cannot read the table
+    must never report green, so there is no silent fallback to an empty set.
 
-    A failed `-C` is fatal, not tolerated. If only the mangled table is available
-    every Itanium name stays a single segment, so `exported_classes()` finds no
-    class name at all and rule B reports *every* decorated class as unexported.
-    That is a false red pointing at 100+ innocent classes, and a false red is
-    worse than no check: it teaches people to reach for a baseline entry or to
-    ignore the gate. Raising turns it into exit 2 ("could not run"), which the
-    exit-code contract already reserves for exactly this.
+    A demangler that is absent is detected behaviourally rather than by a flag
+    check: if the demangled run returns exactly the same symbols as the plain
+    run *and* those symbols are Itanium-mangled (`_Z...`), nothing was
+    demangled. Comparing the two runs is what makes this robust -- a reader that
+    silently ignores the demangle flag (measured on `nm`: exit 0, mangled
+    output, which a returncode check alone would accept) is caught, while a
+    genuinely C-only library, whose symbols have no `_Z` prefix, is not.
 
     `nm -D` is the GNU spelling for the dynamic table; macOS spells it `-gU`
     (external, defined-only). The flag is chosen per platform and the result is
-    validated rather than assumed -- an `nm` that silently ignores `-D` returns
-    an empty table, which the "no dynamic symbols" check below catches.
+    validated rather than assumed -- a reader that silently ignores the flags
+    returns an empty table, which is skipped.
     """
-    # `nm -D` is the GNU spelling for the dynamic table; macOS spells it `-gU`
-    # (external, defined-only) and does not accept GNU's long `--defined-only`,
-    # so the whole flag list is chosen per platform rather than just the short
-    # flag. The result is validated below instead of assumed: an `nm` that
-    # silently ignores the flags returns an empty table, which raises.
-    flags = ['-gU'] if sys.platform == 'darwin' else ['-D', '--defined-only']
-
-    def collect(extra):
-        proc = subprocess.run(['nm'] + flags + extra + [shared_object],
-                              capture_output=True)
-        names = set()
-        for line in proc.stdout.decode('utf-8', 'replace').split('\n'):
-            parts = line.split()
-            if len(parts) >= 3 and parts[-1]:
-                names.add(parts[-1])
-        return names
-
-    mangled = collect([])
-    demangled = collect(['-C'])
-    names = mangled | demangled
-    if not names:
-        raise RuntimeError('no dynamic symbols parsed from %s' % shared_object)
-
-    # Detect a demangler that is absent rather than a library that needs none.
-    # The test is behavioural, not a flag check: if `-C` returned exactly the
-    # same symbols as no `-C` *and* those symbols are Itanium-mangled (`_Z...`),
-    # nothing was demangled. Comparing the two runs is what makes this robust --
-    # an `nm` that silently ignores `-C` (measured: exit 0, mangled output,
-    # which a returncode check alone would accept) is caught, while a genuinely
-    # C-only library, whose symbols have no `_Z` prefix, is not.
-    if mangled == demangled and any(s.startswith('_Z') for s in mangled):
-        raise RuntimeError(
-            'nm -C did not demangle %s; rule B cannot be evaluated without '
-            'demangled names, and reporting every decorated class as unexported '
-            'would be a false red' % shared_object)
-    return names
+    readers = (
+        ('nm', _nm_argv(nm, False), _nm_argv(nm, True), _parse_nm),
+        ('readelf', [readelf, '-Ws'], [readelf, '-WsC'], _parse_readelf),
+        ('objdump', [objdump, '-T'], [objdump, '-TC'], _parse_objdump),
+    )
+    errors = []
+    for label, mangled_argv, demangled_argv, parse in readers:
+        try:
+            mangled = parse(_run_tool(mangled_argv + [shared_object]))
+            demangled = parse(_run_tool(demangled_argv + [shared_object]))
+        except FileNotFoundError:
+            errors.append('%s: not found' % label)
+            continue
+        except OSError as exc:
+            errors.append('%s: %s' % (label, exc))
+            continue
+        if not mangled and not demangled:
+            errors.append('%s: no dynamic symbols parsed' % label)
+            continue
+        if mangled == demangled and any(s.startswith('_Z') for s in mangled):
+            errors.append(
+                '%s: demangler did not demangle (rule B cannot be evaluated '
+                'without demangled names)' % label)
+            continue
+        return mangled | demangled
+    raise RuntimeError(
+        'no dynamic symbols parsed from %s; tried: %s'
+        % (shared_object, '; '.join(errors)))
 
 
 def _qualified(key):
@@ -634,6 +771,12 @@ def main(argv=None):
     parser.add_argument('--build-dir', default=None,
                         help='shared build dir; required for rules B and D')
     parser.add_argument('--dumpbin', default=os.environ.get('CRPC_DUMPBIN', 'dumpbin'))
+    parser.add_argument('--nm', default=os.environ.get('CRPC_NM', 'nm'),
+                        help='ELF dynamic-symbol reader (nm)')
+    parser.add_argument('--readelf', default=os.environ.get('CRPC_READELF', 'readelf'),
+                        help='ELF dynamic-symbol reader fallback (readelf -Ws)')
+    parser.add_argument('--objdump', default=os.environ.get('CRPC_OBJDUMP', 'objdump'),
+                        help='ELF dynamic-symbol reader fallback (objdump -T)')
     parser.add_argument('--baseline', default=None)
     parser.add_argument('--update-baseline', action='store_true')
     args = parser.parse_args(argv)
@@ -664,7 +807,9 @@ def main(argv=None):
             if found[0].endswith('.dll'):
                 exported = read_exports(args.dumpbin, found[0])
             else:
-                exported = read_exports_elf(found[0])
+                exported = read_exports_elf(
+                    found[0], nm=args.nm, readelf=args.readelf,
+                    objdump=args.objdump)
         except (OSError, RuntimeError) as exc:
             sys.stderr.write('export_gate: %s\n' % exc)
             return 2
