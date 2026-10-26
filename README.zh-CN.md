@@ -24,6 +24,8 @@
 | 教程 | [docs/tutorial.zh-CN.md](docs/tutorial.zh-CN.md) | [Tutorial](docs/tutorial.md) |
 | 示例 | [examples/README.zh-CN.md](examples/README.zh-CN.md) | [Examples](examples/README.md) |
 | 发布说明 | [docs/CHANGELOG.zh-CN.md](docs/CHANGELOG.zh-CN.md) | [Release notes](docs/CHANGELOG.md) |
+| 分布式测试与基准 | [docs/distributed-testing.zh-CN.md](docs/distributed-testing.zh-CN.md) | [Distributed testing and benchmarks](docs/distributed-testing.md) |
+| Redis 客户端 | [docs/redis-client.zh-CN.md](docs/redis-client.zh-CN.md) | [Redis client](docs/redis-client.md) |
 
 ## 这是什么
 

@@ -247,7 +247,7 @@ The decoders return `rpc_code::protocol_error` for every condition below. `rpc::
 | extension fields without `has_extensions` | `protocol_error` |
 | response status other than 0/1 | `protocol_error` |
 | `ONE_WAY` without `UNRELIABLE` | `protocol_error` |
-| unsupported `ALGO` (zstd, gzip in this build, reserved) | `protocol_error` |
+| unsupported `ALGO` (zstd, reserved id 7) | `protocol_error` |
 | compressed payload shorter than 5 bytes | `protocol_error` |
 | `uncompressed_len` zero or above `max_frame` | `protocol_error` |
 | malformed codec stream or decoded length mismatch | `protocol_error` |
@@ -796,7 +796,7 @@ A frame with `COMPRESSED` set carries:
 | Offset | Width | Field | Notes |
 |---|---|---|---|
 | 0 | 4 | `uncompressed_len` | `u32` LE, `1..max_frame`; logical payload size |
-| 4 | N | `codec_stream` | `lz4` block or one `gzip` member |
+| 4 | N | `codec_stream` | the codec named by `ALGO` (LZ4 block, gzip member, raw DEFLATE, LZ77 block, ZIP entry) |
 
 `payload_len = 4 + N <= max_frame`. `CRC32C`, when set, covers the whole payload including the
 prefix, so a receiver verifies integrity before spending CPU on decompression. A payload shorter
@@ -813,13 +813,63 @@ straight to `LZ4_decompress_safe`.
 | 0 | none | required |
 | 1 | LZ4 **block** format (no frame magic, no frame checksums; the container above supplies both) | implemented |
 | 2 | zstd | reserved, **not implemented**: always `protocol_error` |
-| 3 | gzip member (RFC 1952: deflate + CRC32 + ISIZE) | reserved for the next slice; `protocol_error` in this build |
-| 4-7 | reserved | `protocol_error` |
+| 3 | gzip member (RFC 1952: raw DEFLATE + CRC32 + ISIZE) | implemented |
+| 4 | raw DEFLATE (RFC 1951; stored / fixed / dynamic blocks) | implemented |
+| 5 | LZ77 block (CRPC-specific container: `LZ77` magic, sizes, CRC32, token stream) | implemented |
+| 6 | ZIP local file entry (`PK\x03\x04` + raw DEFLATE + CRC32/sizes in the header) | implemented |
+| 7 | reserved | `protocol_error` |
 
 `ALGO = 1` is the LZ4 block format, not the LZ4 frame format. Golden vectors in
 `tests/test_frame_compression.cpp` pin the byte layout for third-party implementers; they were
 produced by the reference LZ4 v1.10.0 encoder and are byte-identical to this implementation's
 output for the same inputs.
+
+`ALGO = 3, 4, 6` share one DEFLATE core (`src/compression/deflate_core.cpp`), so a gzip
+member, a raw DEFLATE stream and a ZIP entry are byte-compatible with a third-party DEFLATE
+implementation: the interop test decodes a gzip member produced by a reference DEFLATE
+encoder, and the same encoder's output is decodable by a reference gzip reader. `ALGO = 5`
+is CRPC-specific: it is not interoperable with any external tool, and its 20-byte header
+carries the CRC32 that makes the stream self-verifying.
+
+A gzip member is `1f 8b`, `CM = 8`, `FLG = 0`, `MTIME = 0`, `XFL = 0`, `OS = 255`, then the raw
+DEFLATE stream, then the little-endian CRC32 and ISIZE. A ZIP entry is the 30-byte local file
+header (method 8, no data descriptor) followed by the raw DEFLATE stream. An LZ77 stream is
+`4c 5a 37 37`, version 1, the uncompressed size, the compressed size and the CRC32 (all `u32`
+LE), then literal-run and match tokens terminated by `0x00`.
+
+#### 24.2.1 Choosing an algorithm
+
+The container is independent of the codec, so the choice is a policy decision, not a wire
+decision. `ALGO` always names the codec that actually produced `codec_stream`; a sender never
+substitutes a different codec for the requested one.
+
+| Choice | When it fits | Trade-off |
+|---|---|---|
+| `none` | Payload below `min_payload`, already compressed data, or no peer capability | No CPU; the frame is not flagged `COMPRESSED` |
+| `lz4` | Latency-sensitive RPC/push, the default when the peer advertises it | Lowest CPU of the compressing choices; block format needs the 4-byte length prefix |
+| `gzip` | Interop with an external gzip reader, or an HTTP-style payload that is already gzip-shaped | RFC 1952 header/trailer (18 bytes) and a CRC32; slower than LZ4 |
+| `deflate` | Interop with a raw RFC 1951 stream; smallest container overhead | No magic or checksum of its own; the frame `CRC32C` (when set) is the integrity check |
+| `zip` | Payload that must also be readable as a ZIP local entry | 30-byte local header; no central directory is produced |
+| `lz77` | CRPC-only links that want a self-verifying stream without an external format | CRPC-specific; not interoperable with any external tool |
+| `zstd` | Reserved | Not implemented; always `protocol_error`, never a fallback |
+
+The relationship between the choices is:
+
+- `gzip`, `deflate` and `zip` share the DEFLATE core, so they produce different containers around
+  the same compressed payload. They are the interoperable family.
+- `lz4` is a different algorithm (LZ4 block), chosen for speed. `zstd` is a different algorithm
+  that is reserved but not available in this implementation.
+- `lz77` is a CRPC-specific container around an LZ77 token stream; it is self-verifying but not
+  an interchange format.
+- Compression here is frame compression (this section), not HTTP content coding (section 21).
+  A frame can be compressed regardless of whether the same bytes would be gzip/deflate-encoded
+  by the HTTP layer; the two layers do not share a stream or a dictionary.
+
+`encode_frame_compressed` also applies the never-inflate rule: if the chosen codec's output
+including the 4-byte prefix is not strictly smaller, the frame is sent uncompressed and
+`chosen` reports `none`. A caller that needs a specific algorithm on the wire must therefore
+check `chosen`, not just the request. Measured Debug ratios and throughput for every choice are
+recorded in [performance §2.5](performance.md#s2-5).
 
 Compression is only defined for frames that carry application data: `REQUEST`, `RESPONSE`,
 `DATA`, `ONE_WAY` and `PUSH`. A `COMPRESSED` bit on a control frame (`RST_STREAM`, `SETTINGS`,
@@ -836,7 +886,7 @@ the codec runs, so a control frame carrying a perfectly valid LZ4 stream is stil
 
 | Condition | Result |
 |---|---|
-| unsupported `ALGO` (zstd, gzip in this build, reserved) | `protocol_error` |
+| unsupported `ALGO` (zstd, reserved id 7) | `protocol_error` |
 | `payload_len < 5`, `uncompressed_len == 0` | `protocol_error` |
 | `uncompressed_len > max_frame` | `protocol_error` |
 | malformed or truncated codec stream | `protocol_error` (reliable) / explicit drop (unreliable `ONE_WAY`) |
@@ -875,9 +925,9 @@ Otherwise the frame is sent uncompressed and `COMPRESSED` stays clear: a sender 
 frame, so enabling compression can never break a frame-size budget.
 
 The algorithm is a runtime choice passed to `encode_frame_compressed` (`none` requests identity).
-An unsupported choice (zstd, gzip in this build, reserved ids) is `invalid_argument`, never a
-silent fallback to a different codec: "configured gzip, sent lz4" would be the same
-flag-versus-payload mismatch this section removes.
+An unsupported choice (zstd, reserved ids) is `invalid_argument`, never a silent fallback to a
+different codec: "configured zstd, sent lz4" would be the same flag-versus-payload mismatch this
+section removes.
 
 `encode_frame_compressed` validates the header with exactly the same rules as `encode_frame`
 (known type, stream scope, `stream_id` bit 31 clear, `ONE_WAY` requires `UNRELIABLE`, non-zero
@@ -897,7 +947,7 @@ which predates this section and was previously unparsed:
 | 0 | 1 | `version` = 1 |
 | 1 | 1 | `flags` = 0 (reserved) |
 | 2 | 2 | `reserved` = 0 |
-| 4 | 4 | `compress_bitmap`: bit0 lz4, bit1 zstd, bit2 gzip; bits 3-31 must be 0 |
+| 4 | 4 | `compress_bitmap`: bit0 lz4, bit1 zstd, bit2 gzip, bit3 deflate, bit4 lz77, bit5 zip; bits 6-31 must be 0 |
 | 8 | 4 | `compress_min`: payload bytes below this are never compressed; 0 = 512 |
 | 12 | 4 | `max_decompressed_frame`: accepted logical frame size; 0 = 16 MiB |
 
@@ -927,7 +977,17 @@ frame.
 
 ### 24.7 Verification
 
-`tests/test_frame_compression.cpp` covers the container, the codec, the fail-closed table, the
+`tests/test_frame_compression.cpp` covers the container, every codec, the fail-closed table, the
 unreliable drop path, the ratio and size limits, the never-inflate policy, golden vectors and a
 mutation fuzz loop. The LZ4 block codec is additionally checked for byte-identical output against
-the reference implementation on the golden vectors.
+the reference implementation on the golden vectors; the gzip and raw DEFLATE codecs are checked
+against a reference DEFLATE encoder (a gzip member and its raw DEFLATE payload decode to the
+input), and the encoder's gzip output is decodable by a reference gzip reader. The gzip, ZIP and
+LZ77 containers are checked for their magic bytes, CRC32 and size fields, and a corrupted byte is
+refused. The suite reports 61 cases / 95 229 checks / 0 failures in the recorded run.
+
+`bench/bench_compression.cpp` measures the same frame path for `none`, `lz4`, `deflate`, `lz77`,
+`zip` and `gzip` over text and incompressible binary payloads at 4 KiB and 64 KiB. It reports the
+chosen algorithm, wire/plain ratio, and encode/decode throughput; see
+[performance §2.5](performance.md#s2-5) and
+[distributed testing §6.4](distributed-testing.md#s6).

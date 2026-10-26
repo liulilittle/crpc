@@ -12,18 +12,9 @@
 #include <crpc/wire.hpp>
 
 #include "../frame/frame_internal.hpp"
+#include "codecs.hpp"
 
 namespace crpc {
-namespace detail {
-
-// Defined in lz4_block.cpp. Both work on bare codec streams (no prefix).
-[[nodiscard]] status lz4_block_compress(span<const std::byte> in, span<std::byte> out,
-                                        std::size_t& written) noexcept;
-[[nodiscard]] status lz4_block_decompress(span<const std::byte> in, std::size_t expected_size,
-                                          span<std::byte> out, std::size_t& written) noexcept;
-
-} // namespace detail
-
 namespace {
 
 // Exact "plain / wire > ratio" test without overflowing a size_t product.
@@ -61,7 +52,20 @@ namespace {
 } // namespace
 
 bool is_supported_compression(compression_algorithm algorithm) noexcept {
-    return algorithm == compression_algorithm::none || algorithm == compression_algorithm::lz4;
+    switch (algorithm) {
+    case compression_algorithm::none:
+    case compression_algorithm::lz4:
+    case compression_algorithm::gzip:
+    case compression_algorithm::deflate:
+    case compression_algorithm::lz77:
+    case compression_algorithm::zip:
+        return true;
+    // zstd stays reserved and fail-closed. Listed explicitly so a future
+    // algorithm is classified here rather than silently defaulting.
+    case compression_algorithm::zstd:
+        return false;
+    }
+    return false;
 }
 
 std::size_t compressed_payload_bound(compression_algorithm algorithm,
@@ -71,9 +75,16 @@ std::size_t compressed_payload_bound(compression_algorithm algorithm,
         // Worst case of the block encoder: every 255 literal bytes cost one
         // extra length byte, plus the token and the trailing sequence.
         return compressed_payload_prefix_size + plain_size + plain_size / 255 + 16;
+    case compression_algorithm::gzip:
+        return compressed_payload_prefix_size + detail::gzip_stream_bound(plain_size);
+    case compression_algorithm::zip:
+        return compressed_payload_prefix_size + detail::zip_stream_bound(plain_size);
+    case compression_algorithm::deflate:
+        return compressed_payload_prefix_size + detail::deflate_stream_bound(plain_size);
+    case compression_algorithm::lz77:
+        return compressed_payload_prefix_size + detail::lz77_stream_bound(plain_size);
     case compression_algorithm::none:
     case compression_algorithm::zstd:
-    case compression_algorithm::gzip:
         break;
     }
     // An unusable algorithm ends up as an uncompressed payload, which carries
@@ -85,13 +96,28 @@ status compress_payload(compression_algorithm algorithm, span<const std::byte> i
                         span<std::byte> out, std::size_t& written,
                         const compression_limits& limits) noexcept {
     written = 0;
-    if (algorithm != compression_algorithm::lz4) {
+    if (algorithm == compression_algorithm::none || !is_supported_compression(algorithm)) {
         return rpc_code::invalid_argument;
     }
     if (in.empty() || in.size() > limits.max_payload) {
         return rpc_code::invalid_argument;
     }
-    return detail::lz4_block_compress(in, out, written);
+    switch (algorithm) {
+    case compression_algorithm::lz4:
+        return detail::lz4_block_compress(in, out, written);
+    case compression_algorithm::gzip:
+        return detail::gzip_compress(in, out, written);
+    case compression_algorithm::zip:
+        return detail::zip_compress(in, out, written);
+    case compression_algorithm::deflate:
+        return detail::deflate_compress(in, out, written);
+    case compression_algorithm::lz77:
+        return detail::lz77_compress(in, out, written);
+    case compression_algorithm::none:
+    case compression_algorithm::zstd:
+        return rpc_code::invalid_argument;
+    }
+    return rpc_code::invalid_argument;
 }
 
 status decompress_payload(compression_algorithm algorithm, span<const std::byte> in,
@@ -99,7 +125,7 @@ status decompress_payload(compression_algorithm algorithm, span<const std::byte>
                           const compression_limits& limits,
                           compression_statistics* stats) noexcept {
     written = 0;
-    if (algorithm != compression_algorithm::lz4) {
+    if (algorithm == compression_algorithm::none || !is_supported_compression(algorithm)) {
         if (stats != nullptr) {
             ++stats->rejected_algorithm;
         }
@@ -124,7 +150,28 @@ status decompress_payload(compression_algorithm algorithm, span<const std::byte>
         return rpc_code::resource_exhausted;
     }
 
-    const status result = detail::lz4_block_decompress(in, expected_size, out, written);
+    status result;
+    switch (algorithm) {
+    case compression_algorithm::lz4:
+        result = detail::lz4_block_decompress(in, expected_size, out, written);
+        break;
+    case compression_algorithm::gzip:
+        result = detail::gzip_decompress(in, expected_size, out, written);
+        break;
+    case compression_algorithm::zip:
+        result = detail::zip_decompress(in, expected_size, out, written);
+        break;
+    case compression_algorithm::deflate:
+        result = detail::deflate_decompress(in, expected_size, out, written);
+        break;
+    case compression_algorithm::lz77:
+        result = detail::lz77_decompress(in, expected_size, out, written);
+        break;
+    case compression_algorithm::none:
+    case compression_algorithm::zstd:
+        result = status(rpc_code::protocol_error);
+        break;
+    }
     if (!result.ok()) {
         if (stats != nullptr) {
             ++stats->decode_failures;

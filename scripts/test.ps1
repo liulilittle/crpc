@@ -245,6 +245,42 @@ foreach ($san in $sanList) {
                     Write-Log "export gate missing: $gate" 'ERROR'
                     $script:Failures++
                 }
+
+                # The gate above is only as good as its parser, and every
+                # historical blindness bug in that parser made it print OK.
+                # Pin the parser's three real shapes (ILT suffix, annotation
+                # suffix, a name wrapped across two lines) so a regression in
+                # `read_exports` fails here rather than silently disabling the
+                # export check. Same skip/WARN policy as the gate itself.
+                $selftest = Join-Path $SourceDir 'scripts\export_gate_selftest.py'
+                if (Test-Path -LiteralPath $selftest) {
+                    # `python` on Windows, `python3` on Linux/macOS. A missing
+                    # interpreter skips the self-test with a WARN, never a
+                    # failure -- the same policy the gate itself uses, so one
+                    # missing interpreter cannot make two checks fail
+                    # differently.
+                    $selftestPython = Get-Command python -ErrorAction SilentlyContinue
+                    if (-not $selftestPython) {
+                        $selftestPython = Get-Command python3 -ErrorAction SilentlyContinue
+                    }
+                    if (-not $selftestPython) {
+                        Write-Log "export gate selftest skipped: no python interpreter on PATH" 'WARN'
+                    } else {
+                        $selftestOut = & $selftestPython.Source $selftest 2>&1
+                        $selftestExit = $LASTEXITCODE
+                        $selftestOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
+                        $selftestOut | ForEach-Object { Write-Host $_ }
+                        if ($selftestExit -ne 0) {
+                            Write-Log "export gate selftest FAILED (exit $selftestExit)" 'ERROR'
+                            $script:Failures++
+                        } else {
+                            Write-Log "export gate selftest OK"
+                        }
+                    }
+                } else {
+                    Write-Log "export gate selftest missing: $selftest" 'ERROR'
+                    $script:Failures++
+                }
             }
 
             $sanPattern = 'ERROR: (AddressSanitizer|LeakSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer)|runtime error:|SUMMARY: (AddressSanitizer|ThreadSanitizer|LeakSanitizer)'
