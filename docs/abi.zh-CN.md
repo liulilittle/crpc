@@ -190,6 +190,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::http::sse::event_id`
 - `::crpc::inproc_pair`
 - `::crpc::io::io_result`
+- `::crpc::memcached::binary_header`
+- `::crpc::memcached::text_reply`
 - `::crpc::mvc::binding_limits`
 - `::crpc::mvc::file_part`
 - `::crpc::mvc::route_entry`

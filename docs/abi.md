@@ -293,6 +293,8 @@ is guarded.
 - `::crpc::http::sse::event_id`
 - `::crpc::inproc_pair`
 - `::crpc::io::io_result`
+- `::crpc::memcached::binary_header`
+- `::crpc::memcached::text_reply`
 - `::crpc::mvc::binding_limits`
 - `::crpc::mvc::file_part`
 - `::crpc::mvc::route_entry`

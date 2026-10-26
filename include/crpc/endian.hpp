@@ -1,8 +1,12 @@
-// CRPC -- explicit little-endian primitives.
+// CRPC -- explicit integer endianness primitives.
 //
-// The wire format is little-endian on every platform. These helpers are the
-// only sanctioned way to move a multi-byte integer between memory and a wire
-// buffer:
+// The CRPC wire format is little-endian on every platform. Some external
+// protocols (the memcached binary protocol, TDS, the MySQL packet header) are
+// big-endian, so the same validated helpers are provided for both orders; a
+// caller names the order it needs and never assumes the host order.
+//
+// These helpers are the only sanctioned way to move a multi-byte integer
+// between memory and a wire buffer:
 //
 //   * no `memcpy` of a whole struct (padding and member order are not wire
 //     format),
@@ -115,6 +119,54 @@ inline u64 load_le64(const void* src) noexcept { return load_le<u64>(src); }
 inline void store_le16(void* dst, u16 value) noexcept { store_le<u16>(dst, value); }
 inline void store_le32(void* dst, u32 value) noexcept { store_le<u32>(dst, value); }
 inline void store_le64(void* dst, u64 value) noexcept { store_le<u64>(dst, value); }
+
+// Big-endian counterparts. Same contract: the caller guarantees the width.
+template <typename T>
+inline T load_be(const void* src) noexcept {
+    static_assert(std::is_integral<T>::value, "load_be requires an integer type");
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+                  "load_be supports 1, 2, 4 and 8 byte integers");
+    using unsigned_t = std::make_unsigned_t<T>;
+    unsigned_t raw = 0;
+    std::memcpy(&raw, src, sizeof(raw));
+#if !defined(CRPC_HOST_BIG_ENDIAN)
+    if constexpr (sizeof(T) == 2) {
+        raw = byteswap16(raw);
+    } else if constexpr (sizeof(T) == 4) {
+        raw = byteswap32(raw);
+    } else if constexpr (sizeof(T) == 8) {
+        raw = byteswap64(raw);
+    }
+#endif
+    return static_cast<T>(raw);
+}
+
+template <typename T>
+inline void store_be(void* dst, T value) noexcept {
+    static_assert(std::is_integral<T>::value, "store_be requires an integer type");
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+                  "store_be supports 1, 2, 4 and 8 byte integers");
+    using unsigned_t = std::make_unsigned_t<T>;
+    unsigned_t raw = static_cast<unsigned_t>(value);
+#if !defined(CRPC_HOST_BIG_ENDIAN)
+    if constexpr (sizeof(T) == 2) {
+        raw = byteswap16(raw);
+    } else if constexpr (sizeof(T) == 4) {
+        raw = byteswap32(raw);
+    } else if constexpr (sizeof(T) == 8) {
+        raw = byteswap64(raw);
+    }
+#endif
+    std::memcpy(dst, &raw, sizeof(raw));
+}
+
+inline u16 load_be16(const void* src) noexcept { return load_be<u16>(src); }
+inline u32 load_be32(const void* src) noexcept { return load_be<u32>(src); }
+inline u64 load_be64(const void* src) noexcept { return load_be<u64>(src); }
+
+inline void store_be16(void* dst, u16 value) noexcept { store_be<u16>(dst, value); }
+inline void store_be32(void* dst, u32 value) noexcept { store_be<u32>(dst, value); }
+inline void store_be64(void* dst, u64 value) noexcept { store_be<u64>(dst, value); }
 
 } // namespace endian
 } // namespace crpc
