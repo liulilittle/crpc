@@ -289,7 +289,9 @@ is guarded.
 - `::crpc::http::request`
 - `::crpc::http::request_encoding_plan`
 - `::crpc::http::response`
+- `::crpc::http::forwarded_client`
 - `::crpc::http::serialize_options`
+- `::crpc::http::trusted_proxies`
 - `::crpc::http::sse::event_id`
 - `::crpc::inproc_pair`
 - `::crpc::io::io_result`

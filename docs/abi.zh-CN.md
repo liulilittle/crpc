@@ -186,7 +186,9 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::http::request`
 - `::crpc::http::request_encoding_plan`
 - `::crpc::http::response`
+- `::crpc::http::forwarded_client`
 - `::crpc::http::serialize_options`
+- `::crpc::http::trusted_proxies`
 - `::crpc::http::sse::event_id`
 - `::crpc::inproc_pair`
 - `::crpc::io::io_result`
