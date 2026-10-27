@@ -308,6 +308,11 @@ struct binary_row {
                                                span<const column_type> types,
                                                binary_row& out);
 
+// Maps a wire column definition to the abstract metadata a caller (and an ORM) uses
+// to bind a struct field to a column: alias, original name, owning schema/table,
+// abstract type, precision/scale, nullability and the raw provider flags.
+[[nodiscard]] CRPC_API column_info to_column_info(const column_definition& definition);
+
 // Maps a wire error code to the library code. The server's own code is never lost:
 // it stays in `err_packet::code`, and this only classifies it.
 [[nodiscard]] CRPC_API rpc_code map_error_code(std::uint16_t code) noexcept;

@@ -4,6 +4,18 @@
 
 ## 未发布
 
+### ABI 破坏：ADO 式参数方向与 ORM 列元数据
+
+- `db::parameter` 新增 `std::string name` 与 `parameter_direction direction`
+  （`input`、`output`、`input_output`、`return_value`），以及 `is_output()`、
+  `sends_value()` 与 `parameter::out()` 工厂。存储过程通过 OUT/INOUT 写回结果，
+  而 MySQL 用会话变量绑定它们，因此方向必须是参数的一部分，不能按调用点猜。
+- `db::column_info` 新增 `schema`、`table`、`original_name` 与 `flags`。ORM 要把
+  结构体字段绑定到列，必须知道原始列名（用别名会绑错字段）与所属表，而不只是别名
+  和抽象类型。
+- 两者都是公开聚合布局，因此属 MAJOR（[abi.md](abi.md) §1）：消费者必须重新编译。
+  按位置初始化前几个字段仍可编译；新成员追加在末尾。
+
 ### ABI 破坏：Redis 传输层迁移到 `crpc::net`
 
 - 字节级的 `connection`、`connection_config`、`connection_pool` 与

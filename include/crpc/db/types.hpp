@@ -91,6 +91,21 @@ struct column_info {
     // True when the column may be null. A driver that cannot tell reports false
     // and the caller must still check `is_null`.
     bool nullable = true;
+
+    // ORM mapping metadata. A struct field is matched to a column, so the caller
+    // needs to know where the column came from and what it is allowed to be.
+    //
+    // `original_name` is the column name before any alias (`SELECT id AS user_id`);
+    // mapping on `name` alone would bind the alias and silently lose the field when
+    // the query changes.
+    std::string schema;
+    std::string table;
+    std::string original_name;
+    // Provider column flags. The concrete meaning is the backend's, exposed rather
+    // than reinterpreted: an ORM that needs "auto increment" or "unsigned" asks the
+    // adapter, and a generic layer that guessed would be wrong for at least one
+    // backend.
+    std::uint16_t flags = 0;
 };
 
 // A value detached from its cursor. Copyable and owning, so it outlives the
@@ -176,11 +191,24 @@ private:
     std::vector<std::byte> blob_;
 };
 
+// Which way a parameter flows. ADO-style commands expose all four because a stored
+// procedure can write back through OUT and INOUT parameters, and some providers
+// surface a RETURN_VALUE slot.
+enum class parameter_direction : std::uint8_t {
+    input,
+    output,
+    input_output,
+    return_value
+};
+
 // A bound parameter. Kept as a separate type from `db_value` because binding is
 // directional: the caller supplies it, and a null parameter is written as SQL
 // NULL rather than as an empty value.
 struct parameter {
     db_type type = db_type::unknown;
+    // For an input or input-output parameter, "the caller supplied NULL". For an
+    // output or return-value parameter this is simply true until the server fills
+    // it in, so it must not be sent as data.
     bool is_null = true;
     std::int64_t int_value = 0;
     std::uint64_t uint_value = 0;
@@ -188,7 +216,35 @@ struct parameter {
     std::string text;
     std::vector<std::byte> blob;
 
+    // Positional parameters may leave this empty; a named provider may require it.
+    // Stored procedures are usually addressed by name, so the name is carried even
+    // when the wire protocol is positional.
+    std::string name;
+    parameter_direction direction = parameter_direction::input;
+
+    [[nodiscard]] bool is_output() const noexcept {
+        return direction == parameter_direction::output ||
+               direction == parameter_direction::input_output ||
+               direction == parameter_direction::return_value;
+    }
+    [[nodiscard]] bool sends_value() const noexcept {
+        return direction == parameter_direction::input ||
+               direction == parameter_direction::input_output;
+    }
+
     static parameter null() { return parameter{}; }
+
+    // An output slot: it carries a type (so the caller knows what to read back) and
+    // no value.
+    static parameter out(std::string name, db_type type, parameter_direction direction =
+                                                             parameter_direction::output) {
+        parameter result;
+        result.name = std::move(name);
+        result.type = type;
+        result.direction = direction;
+        result.is_null = true;
+        return result;
+    }
 
     static parameter from_int64(std::int64_t value) {
         parameter out;

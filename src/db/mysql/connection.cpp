@@ -228,16 +228,6 @@ private:
     bool closed_ = false;
 };
 
-[[nodiscard]] column_info to_column_info(const column_definition& definition) {
-    column_info info;
-    info.name = definition.name;
-    info.type = map_column_type(definition.type, definition.flags);
-    info.precision = definition.length;
-    info.scale = definition.decimals;
-    info.nullable = (definition.flags & static_cast<std::uint16_t>(column_flag::not_null)) == 0;
-    return info;
-}
-
 } // namespace
 
 // --- channel -----------------------------------------------------------------
@@ -735,7 +725,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
             return decoded;
         }
         names.push_back(definition.name);
-        columns.push_back(to_column_info(definition));
+        columns.push_back(mysql::to_column_info(definition));
     }
     const std::int64_t affected = -1;
     std::unique_ptr<memory_result_set> set(

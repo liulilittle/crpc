@@ -570,9 +570,24 @@ status decode_prepare_ok(span<const std::byte> payload, prepare_ok& out) {
 
 status encode_stmt_execute(std::vector<std::byte>& out, std::uint32_t statement_id,
                            span<const parameter> params) {
+    // Validate everything before writing a byte: a rejected call must leave `out`
+    // empty, or a caller that ignores the status would send a half-built command.
     if (statement_id == 0) {
         return status{rpc_code::invalid_argument, "mysql statement id 0 is not valid"};
     }
+    // A parameter that only receives a value has no bytes on the wire. MySQL binds
+    // OUT/INOUT through session variables referenced in the SQL text, so the caller
+    // rewrites those placeholders and must not include them here. Rejecting it keeps
+    // a mismatch between placeholder count and parameter count from becoming a
+    // silent value shift.
+    for (const parameter& param : params) {
+        if (!param.sends_value()) {
+            return status{rpc_code::invalid_argument,
+                          "mysql execute cannot bind an output-only parameter; rewrite it to a "
+                          "session variable"};
+        }
+    }
+
     out.clear();
     out.reserve(16 + params.size() * 12);
     out.push_back(byte_of(com_stmt_execute));
@@ -929,6 +944,24 @@ const std::size_t bitmap_bytes = (types.size() + 7 + 2) / 8;
         }
     }
     return status{};
+}
+
+column_info to_column_info(const column_definition& definition) {
+    column_info info;
+    // `name` is what the query produced (possibly an alias); `original_name` is the
+    // column as declared. An ORM must map on the original name, or an alias silently
+    // changes which field binds.
+    info.name = definition.name;
+    info.original_name = definition.org_name;
+    info.schema = definition.schema;
+    info.table = definition.org_table.empty() ? definition.table : definition.org_table;
+    info.type = map_column_type(definition.type, definition.flags);
+    info.precision = definition.length;
+    info.scale = definition.decimals;
+    info.nullable =
+        (definition.flags & static_cast<std::uint16_t>(column_flag::not_null)) == 0;
+    info.flags = definition.flags;
+    return info;
 }
 
 rpc_code map_error_code(std::uint16_t code) noexcept {

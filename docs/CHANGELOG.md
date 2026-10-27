@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+### ABI breaking: ADO-style parameter direction and ORM column metadata
+
+- `db::parameter` gained `std::string name` and `parameter_direction direction`
+  (`input`, `output`, `input_output`, `return_value`), plus `is_output()`,
+  `sends_value()` and a `parameter::out()` factory. A stored procedure writes
+  back through OUT/INOUT, and MySQL binds those through session variables, so
+  the direction must be part of the parameter rather than inferred per call.
+- `db::column_info` gained `schema`, `table`, `original_name` and `flags`. An ORM
+  binds a struct field to a column, which needs the original column name (an
+  alias would bind the wrong field) and the owning table, not just the alias and
+  the abstract type.
+- Both are public aggregate layouts, so this is MAJOR ([abi.md](abi.md) §1): a
+  consumer must be rebuilt. Positional initialisation of the first fields keeps
+  compiling; the new members are appended.
+
 ### ABI breaking: the Redis transport moved to `crpc::net`
 
 - The byte-level `connection`, `connection_config`, `connection_pool` and
