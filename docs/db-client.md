@@ -216,10 +216,12 @@ Limits, stated rather than hidden:
   mismatch is refused before anything is sent.
 * A NULL input parameter needs a type: `parameter::null()` has `db_type::unknown`, so
   it is refused with `invalid_argument` rather than being declared as some guess.
-* **No TLS.** A server that answers PRELOGIN with ENCRYPT_ON or ENCRYPT_REQ is
-  refused with `failed_precondition`, and `require_encryption = true` is refused at
-  construction before a byte is written. Half a handshake would look like an
-  authentication failure and hide the cause.
+* **No TLS yet.** `require_encryption` and `encrypt_login_only` are refused with
+  `failed_precondition` before a byte is written, and a server that demands encryption
+  is refused too. A TLS channel exists in the source tree and completes a handshake
+  against SQL Server 2022, but its post-handshake framing does not match what the
+  server expects, so it is not wired in: shipping encryption that is unproven is worse
+  than refusing it. `tests/test_db_tds_it.cpp` pins the refusal.
 * Cancellation uses `ATTENTION`: `cancel()` is safe to call from another thread while a
   query is blocked, and the blocked query then returns `rpc_code::canceled`. The
   acknowledgement arrives as its own message, so the reply loop waits for the DONE that
@@ -229,5 +231,11 @@ Limits, stated rather than hidden:
   and the session stays usable.
 * No MARS, and no bulk-load protocol (`bulk_insert` is a MySQL-side interface today).
 * Types decoded today: INT1/2/4/8, BIT, FLT4/8, INTN/BITN/FLTN, DECIMAL/NUMERIC,
-  DATE, TIME, DATETIME2, VARCHAR/NVARCHAR/CHAR/NCHAR, VARBINARY/BINARY, GUID. Any
-  other wire type fails the read with `no_such_method` instead of misreading bytes.
+  MONEY/SMALLMONEY (and their nullable MONEYN form), DATE, TIME, DATETIME2,
+  DATETIMEOFFSET, the legacy DATETIME/SMALLDATETIME pair (and DATETIMEN),
+  VARCHAR/NVARCHAR/CHAR/NCHAR, VARBINARY/BINARY, GUID. Any other wire type fails the
+  read with `no_such_method` naming the type byte, instead of misreading bytes.
+* A nullable column arrives as the `N` variant of its type (`money` is 0x6E, not
+  0x3C), so both forms are decoded. `money` is two 32-bit halves with the high half
+  first; the legacy DATETIME pair counts days from 1900-01-01, not from 0001-01-01;
+  `datetimeoffset` carries UTC plus an offset and is printed as local time.

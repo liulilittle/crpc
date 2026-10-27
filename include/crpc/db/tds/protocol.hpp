@@ -417,6 +417,10 @@ public:
 
     [[nodiscard]] rpc_code error() const noexcept { return error_; }
 
+    // Why the last decode failed, in words. A bare code cannot distinguish "unknown
+    // column type" from "truncated value", and both surface the same way to a caller.
+    [[nodiscard]] const std::string& error_message() const noexcept { return error_message_; }
+
 private:
     [[nodiscard]] bool need(std::size_t count) const noexcept {
         return offset_ <= payload_.size() && payload_.size() - offset_ >= count;
@@ -450,6 +454,7 @@ private:
     span<const std::byte> payload_;
     std::size_t offset_ = 0;
     rpc_code error_ = rpc_code::ok;
+    std::string error_message_;
     // The most recent COLMETADATA. A ROW carries values only, so this is the only
     // way to know how wide each one is.
     std::vector<column_meta> columns_;

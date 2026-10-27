@@ -187,14 +187,19 @@ DECIMAL 符号字节 1 表示正数，`ENVCHANGE(begin_transaction)` 的事务�
   （`last_return_status()`）。占位符与参数个数不符时在发送前就拒绝。
 * NULL 输入参数必须带类型：`parameter::null()` 的类型是 `db_type::unknown`，会被
   `invalid_argument` 拒绝，而不是猜一个类型去声明。
-* **没有 TLS。** 服务端在 PRELOGIN 应答 ENCRYPT_ON 或 ENCRYPT_REQ 时以 `failed_precondition`
-  拒绝；构造时设置 `require_encryption = true` 会在写入任何字节之前失败。半截握手会被误判成
-  认证失败，把真正原因藏起来。
+* **暂无 TLS。** `require_encryption` 与 `encrypt_login_only` 在写入任何字节之前以
+  `failed_precondition` 拒绝，要求加密的服务端同样被拒绝。源码里有一条 TLS 通道，能对
+  SQL Server 2022 完成握手，但握手之后的分帧与服务端期望不符，因此没有接入：交付未经证实的
+  加密比拒绝更糟。`tests/test_db_tds_it.cpp` 固化了这个拒绝行为。
 * 取消走 `ATTENTION`：`cancel()` 可以在查询阻塞时从另一线程调用，被阻塞的查询随后返回
   `rpc_code::canceled`。确认是**单独一条消息**，所以应答循环必须等到带 attention 位的 DONE ——
   在第一个终止 DONE 就停下会把确认留在流里，下一次查询会把它当成自己的应答。
   已在真机验证：`WAITFOR DELAY '00:00:03'` 约 160 ms 返回，会话仍可继续使用。
 * 不支持 MARS 与 bulk-load 协议（`bulk_insert` 目前是 MySQL 侧接口）。
-* 目前已解码类型：INT1/2/4/8、BIT、FLT4/8、INTN/BITN/FLTN、DECIMAL/NUMERIC、DATE、TIME、
-  DATETIME2、VARCHAR/NVARCHAR/CHAR/NCHAR、VARBINARY/BINARY、GUID。其他线类型以
-  `no_such_method` 失败，而不是误读字节。
+* 目前已解码类型：INT1/2/4/8、BIT、FLT4/8、INTN/BITN/FLTN、DECIMAL/NUMERIC、
+  MONEY/SMALLMONEY（以及可空的 MONEYN 形式）、DATE、TIME、DATETIME2、DATETIMEOFFSET、
+  旧版 DATETIME/SMALLDATETIME 对（以及 DATETIMEN）、VARCHAR/NVARCHAR/CHAR/NCHAR、
+  VARBINARY/BINARY、GUID。其他线类型以 `no_such_method` 失败并报出类型字节，而不是误读字节。
+* 可空列收到的是类型的 `N` 变体（`money` 是 0x6E 而不是 0x3C），两种形式都解码。
+  `money` 是高位在前的高低两个 32 位半字；旧版 DATETIME 对的日期从 1900-01-01 起算，
+  不是 0001-01-01；`datetimeoffset` 携带 UTC 加偏移，按本地时间打印。

@@ -36,6 +36,25 @@ public:
     // `connection_reset`; both are terminal for this channel.
     [[nodiscard]] virtual result<std::vector<std::byte>> read_exact(std::size_t count) = 0;
 
+    // Reads at least one byte and at most `buffer.size()`, blocking until some arrive.
+    //
+    // A TLS record layer needs this: it cannot know in advance how many bytes the peer
+    // will send, so it must be able to consume whatever is there. Protocol layers that
+    // always know their next length (MySQL, TDS framing) keep using `read_exact`.
+    [[nodiscard]] virtual result<std::size_t> read_some(span<std::byte> buffer) {
+        // A default in terms of read_exact keeps every existing channel usable; a
+        // channel that can do better overrides it.
+        if (buffer.empty()) {
+            return std::size_t{0};
+        }
+        result<std::vector<std::byte>> one = read_exact(1);
+        if (!one) {
+            return one.error();
+        }
+        buffer[0] = one.value()[0];
+        return std::size_t{1};
+    }
+
     // Writes every byte. `ok` means the kernel accepted them, not that the server
     // processed them.
     [[nodiscard]] virtual status write(span<const std::byte> data) = 0;
@@ -64,6 +83,7 @@ public:
     socket_channel& operator=(const socket_channel&) = delete;
 
     [[nodiscard]] result<std::vector<std::byte>> read_exact(std::size_t count) override;
+    [[nodiscard]] result<std::size_t> read_some(span<std::byte> buffer) override;
     [[nodiscard]] status write(span<const std::byte> data) override;
     void close() noexcept override;
 

@@ -1,3 +1,6 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <cstdio>
+#include <cstdlib>
 // CRPC -- TDS connection implementation.
 #include <crpc/db/tds/connection.hpp>
 
@@ -176,18 +179,19 @@ status connection::send_message(packet_type type, span<const std::byte> payload)
         if (prefix.size() != header_size) {
             return status{rpc_code::protocol_error, "the TDS header did not encode"};
         }
-        const status head = link_->write(span<const std::byte>(prefix.data(), prefix.size()));
-        if (!head) {
-            fail(head);
-            return head;
-        }
+        // Header and body go out as one write. Over TLS that matters: two writes become
+        // two records, and SQL Server's reader expects a record to carry a whole packet.
+        std::vector<std::byte> packet;
+        packet.reserve(prefix.size() + chunk);
+        packet.insert(packet.end(), prefix.begin(), prefix.end());
         if (chunk != 0) {
-            const status body = link_->write(
-                span<const std::byte>(payload.data() + offset, chunk));
-            if (!body) {
-                fail(body);
-                return body;
-            }
+            packet.insert(packet.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                          payload.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
+        }
+        const status sent = link_->write(span<const std::byte>(packet.data(), packet.size()));
+        if (!sent) {
+            fail(sent);
+            return sent;
         }
         offset += chunk;
         packet_id_ = static_cast<std::uint8_t>(packet_id_ + 1);
@@ -252,16 +256,17 @@ status connection::perform_handshake() {
     if (!link_) {
         return status{rpc_code::failed_precondition, "the connection has no channel"};
     }
-    if (options_.require_encryption) {
-        // Refusing beats encrypting nothing: a plaintext login that the caller
-        // believes is encrypted is worse than a clear error.
-        return status{rpc_code::failed_precondition,
-                      "TLS is not implemented for TDS; drop require_encryption or use a "
-                      "tunnel"};
-    }
     packet_size_ = options_.packet_size;
 
     prelogin greeting;
+    // Encryption is offered only when it is demanded, and the handshake below is not
+    // yet verified against a real server, so both encryption options are refused before
+    // a byte is written. Sending ENCRYPT_NOT_SUPPORTED keeps the plaintext path exact.
+    if (options_.require_encryption || options_.encrypt_login_only) {
+        return status{rpc_code::failed_precondition,
+                      "TDS encryption is not verified yet; drop require_encryption and "
+                      "encrypt_login_only, or use a tunnel"};
+    }
     greeting.encryption = encryption_mode::not_supported;
     greeting.thread_id = 0;
     greeting.mars = 0;
@@ -269,6 +274,13 @@ status connection::perform_handshake() {
     const status encoded = encode_prelogin(payload, greeting);
     if (!encoded) {
         return encoded;
+    }
+    if (std::getenv("CRPC_TDS_DEBUG") != nullptr) {
+        std::fprintf(stderr, "prelogin out offer=%d bytes:", static_cast<int>(greeting.encryption));
+        for (const std::byte b : payload) {
+            std::fprintf(stderr, " %02x", static_cast<unsigned>(static_cast<std::uint8_t>(b)));
+        }
+        std::fprintf(stderr, "\n");
     }
     const status sent = send_message(packet_type::prelogin, span<const std::byte>(
                                                                 payload.data(), payload.size()));
@@ -286,12 +298,21 @@ status connection::perform_handshake() {
     if (!decoded) {
         return decoded;
     }
+    if (std::getenv("CRPC_TDS_DEBUG") != nullptr) {
+        std::fprintf(stderr, "prelogin answer encryption=%d reply=%zu:", 
+                     static_cast<int>(answer.encryption), reply.size());
+        for (const std::byte b : reply) {
+            std::fprintf(stderr, " %02x", static_cast<unsigned>(static_cast<std::uint8_t>(b)));
+        }
+        std::fprintf(stderr, "\n");
+    }
     if (answer.encryption == encryption_mode::required ||
         answer.encryption == encryption_mode::on) {
         return status{rpc_code::failed_precondition,
-                      "the server requires TDS encryption and this client has no TLS"};
+                      "the server requires TDS encryption and this client has not verified TLS"};
     }
     encrypted_ = false;
+    login_only_encryption_ = false;
 
     // LOGIN7. ServerName defaults to the endpoint host when the caller has none,
     // because the server records it and a mismatch shows up in audits.
@@ -438,7 +459,12 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 break;
             }
             if (step == token_reader::result::error) {
-                const status broken{reader.error(), "a TDS result token could not be decoded"};
+                // Carry the reader's own message: "could not be decoded" alone cannot
+                // distinguish an unknown column type from a truncated value.
+                const status broken{reader.error(),
+                                    reader.error_message().empty()
+                                        ? std::string("a TDS result token could not be decoded")
+                                        : reader.error_message()};
                 fail(broken);
                 return broken;
             }

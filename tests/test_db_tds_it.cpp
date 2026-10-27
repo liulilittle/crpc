@@ -60,8 +60,14 @@ struct it_session {
     std::unique_ptr<crpc::db::tds::connection_factory> factory;
     std::unique_ptr<crpc::db::tds::connection> session;
 
-    explicit it_session(const char* database = nullptr) {
+    explicit it_session(const char* database = nullptr, bool require_encryption = false,
+                        bool login_only = false) {
         crpc::db::tds::connection_options options;
+        options.require_encryption = require_encryption;
+        options.encrypt_login_only = login_only;
+        // The test server uses a self-signed certificate; verification is what a
+        // production deployment turns on, and the case that exercises it is separate.
+        options.verify_server_certificate = false;
         options.user = env_or("CRPC_TDS_USER", "sa");
         options.password = env_or("CRPC_TDS_PASSWORD", "Crpc#It2026");
         options.database = database != nullptr ? database : env_or("CRPC_TDS_DB", "master");
@@ -506,6 +512,69 @@ CRPC_TEST(tds_it_attention_cancels_a_running_batch) {
         CRPC_CHECK(after->next());
         CRPC_CHECK_EQ(std::int64_t{123}, after->get_int64(0).value());
     }
+}
+
+CRPC_TEST(tds_it_encryption_is_refused_until_verified) {
+    (void)require_server();
+    // The TLS path completes a handshake but its post-handshake framing is not yet
+    // correct against a real server, so the adapter refuses to encrypt rather than
+    // produce a session that looks protected and is not. This case pins that refusal so
+    // it cannot silently become "encryption attempted" again.
+    it_session it(nullptr, true);
+    CRPC_CHECK_FALSE(it.ok());
+    const crpc::rpc_error& why = it.session->connect_error();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                  static_cast<int>(why.code));
+    CRPC_CHECK(why.message.find("encryption") != std::string::npos);
+
+    // A plaintext session against the same server still works, which is what proves the
+    // refusal is about TLS and not about the endpoint.
+    it_session plain;
+    CRPC_CHECK(plain.ok());
+    if (plain.ok()) {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status ran = plain.session->query("SELECT 1 AS n", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        CRPC_CHECK(static_cast<bool>(ran));
+    }
+}
+
+CRPC_TEST(tds_it_legacy_types) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // The types a real schema still contains: money, the pre-2008 datetime pair, and
+    // datetimeoffset. Each has its own encoding, and the epoch for the legacy pair is
+    // 1900-01-01 rather than 0001-01-01.
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query(
+        "SELECT CAST(12.3456 AS money) AS m, CAST(-0.5 AS smallmoney) AS sm, "
+        "CAST('2024-04-25T12:34:56.123' AS datetime) AS dt, "
+        "CAST('2024-04-25T12:34:00' AS smalldatetime) AS sdt, "
+        "CAST('2024-04-25T12:34:56.1234567+02:30' AS datetimeoffset(7)) AS dto",
+        {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("legacy types", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(raw != nullptr);
+    if (raw == nullptr) {
+        return;
+    }
+    CRPC_CHECK(raw->next());
+    CRPC_CHECK_EQ(std::string("12.3456"), raw->get_text(0).value());
+    CRPC_CHECK_EQ(std::string("-0.5000"), raw->get_text(1).value());
+    // datetime is exact to 3.33 ms, so the stored value is what the server rounded to.
+    CRPC_CHECK_EQ(std::string("2024-04-25 12:34:56.123"), raw->get_text(2).value());
+    CRPC_CHECK_EQ(std::string("2024-04-25 12:34"), raw->get_text(3).value());
+    CRPC_CHECK_EQ(std::string("2024-04-25 12:34:56.1234567 +02:30"),
+                  raw->get_text(4).value());
 }
 
 CRPC_TEST_MAIN()

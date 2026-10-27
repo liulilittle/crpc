@@ -1038,10 +1038,15 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
         case 0xAD: // BIGBINARY
             column.max_length = le16();
             break;
-        default:
+        default: {
             fail(rpc_code::no_such_method);
-            return status{rpc_code::no_such_method,
-                          "this TDS column type is not decoded yet"};
+            char message[64];
+            std::snprintf(message, sizeof(message),
+                          "TDS column type 0x%02x is not decoded yet",
+                          static_cast<unsigned>(column.type));
+            error_message_ = message;
+            return status{rpc_code::no_such_method, message};
+        }
         }
         column.name = b_varchar();
         if (error_ != rpc_code::ok) {
@@ -1140,10 +1145,14 @@ status token_reader::read_type_info(column_meta& column) noexcept {
     case 0xAD: // BIGBINARY
         column.max_length = le16();
         break;
-    default:
+    default: {
         fail(rpc_code::no_such_method);
-        return status{rpc_code::no_such_method,
-                      "this TDS parameter type is not encoded yet"};
+        char message[64];
+        std::snprintf(message, sizeof(message), "TDS parameter type 0x%02x is not decoded yet",
+                      static_cast<unsigned>(column.type));
+        error_message_ = message;
+        return status{rpc_code::no_such_method, message};
+    }
     }
     return status{};
 }
@@ -1314,6 +1323,140 @@ status token_reader::read_one(const column_meta& column, std::string& text,
         text = format_date(days) + " " + format_time(ticks, column.scale);
         return status{};
     }
+    case 0x6E:   // MONEYN
+    case 0x6F: { // DATETIMEN: the nullable forms of MONEY/DATETIME and SMALLMONEY/SMALLDATETIME
+        // A single length byte picks the width: 4 for the small variant, 8 for the large
+        // one, 0 for NULL. A schema column is always nullable, so the server sends these
+        // rather than the fixed-width types -- which is why `CAST(x AS money)` arrives as
+        // 0x6E and not 0x3C.
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (column.type == 0x6E) {
+            if (length == 4) {
+                const std::uint32_t raw = le32();
+                const bool negative = (raw & 0x80000000u) != 0;
+                const std::uint32_t magnitude = negative ? (~raw + 1u) : raw;
+                char buffer[32];
+                std::snprintf(buffer, sizeof(buffer), "%s%u.%04u", negative ? "-" : "",
+                              static_cast<unsigned>(magnitude / 10000u),
+                              static_cast<unsigned>(magnitude % 10000u));
+                text.assign(buffer);
+                return status{};
+            }
+            // Two 32-bit halves, high first: the 64-bit money value is not stored as one
+            // little-endian number.
+            const std::uint64_t high = le32();
+            const std::uint64_t low = le32();
+            const std::uint64_t raw = (high << 32) | low;
+            const bool negative = (raw & 0x8000000000000000ull) != 0;
+            const std::uint64_t magnitude = negative ? (~raw + 1ull) : raw;
+            char buffer[40];
+            std::snprintf(buffer, sizeof(buffer), "%s%llu.%04llu", negative ? "-" : "",
+                          static_cast<unsigned long long>(magnitude / 10000ull),
+                          static_cast<unsigned long long>(magnitude % 10000ull));
+            text.assign(buffer);
+            return status{};
+        }
+        if (length == 4) {
+            const std::uint16_t days = static_cast<std::uint16_t>(u8() | (u8() << 8));
+            const std::uint16_t minutes = static_cast<std::uint16_t>(u8() | (u8() << 8));
+            text = format_date(static_cast<std::uint32_t>(days) + 693595u) + " " +
+                   format_time(static_cast<std::uint64_t>(minutes) * 600000000ull, 0).substr(0, 5);
+            return status{};
+        }
+        const std::uint32_t days = le32();
+        const std::uint32_t ticks = le32();
+        // 300 ticks per second, and one tick is 10,000,000/300 hundred-nanoseconds.
+        const std::uint64_t hundred_ns =
+            (static_cast<std::uint64_t>(ticks) * 10000000ull) / 300ull;
+        text = format_date(days + 693595u) + " " + format_time(hundred_ns, 3);
+        return status{};
+    }
+    case 0x3C: { // MONEY: two 32-bit halves (high, low), scaled by 10000
+        const std::uint64_t high = le32();
+        const std::uint64_t low = le32();
+        const std::uint64_t raw = (high << 32) | low;
+        const bool negative = (raw & 0x8000000000000000ull) != 0;
+        const std::uint64_t magnitude = negative ? (~raw + 1ull) : raw;
+        char buffer[40];
+        std::snprintf(buffer, sizeof(buffer), "%s%llu.%04llu", negative ? "-" : "",
+                      static_cast<unsigned long long>(magnitude / 10000ull),
+                      static_cast<unsigned long long>(magnitude % 10000ull));
+        text.assign(buffer);
+        return status{};
+    }
+    case 0x7A: { // SMALLMONEY: same scale, fixed 4 bytes
+        const std::uint32_t raw = le32();
+        const bool negative = (raw & 0x80000000u) != 0;
+        const std::uint32_t magnitude = negative ? (~raw + 1u) : raw;
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%s%u.%04u", negative ? "-" : "",
+                      static_cast<unsigned>(magnitude / 10000u),
+                      static_cast<unsigned>(magnitude % 10000u));
+        text.assign(buffer);
+        return status{};
+    }
+    case 0x3A: { // SMALLDATETIME: days since 1900-01-01 and minutes since midnight
+        const std::uint16_t days = static_cast<std::uint16_t>(u8() | (u8() << 8));
+        const std::uint16_t minutes = static_cast<std::uint16_t>(u8() | (u8() << 8));
+        // 1900-01-01 is 693595 days after the 0001-01-01 epoch TDS uses elsewhere.
+        text = format_date(static_cast<std::uint32_t>(days) + 693595u) + " " +
+               format_time(static_cast<std::uint64_t>(minutes) * 600000000ull, 0).substr(0, 5);
+        return status{};
+    }
+    case 0x3D: { // DATETIME: days since 1900-01-01 and 1/300 s ticks
+        const std::uint32_t days = le32();
+        const std::uint32_t ticks = le32();
+        // 300 ticks per second. Rounding to milliseconds matches what the type can
+        // represent (it is exact at 3.33 ms).
+        // 300 ticks per second, and one tick is 10,000,000/300 hundred-nanoseconds.
+        const std::uint64_t hundred_ns =
+            (static_cast<std::uint64_t>(ticks) * 10000000ull) / 300ull;
+        text = format_date(days + 693595u) + " " + format_time(hundred_ns, 3);
+        return status{};
+    }
+    case 0x2B: { // DATETIMEOFFSET: a length, then time, date and the offset in minutes
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        const std::uint8_t time_bytes =
+            column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+        std::uint64_t ticks = 0;
+        for (std::uint8_t i = 0; i < time_bytes && i < length; ++i) {
+            ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
+        }
+        std::uint32_t days = static_cast<std::uint32_t>(u8());
+        days |= static_cast<std::uint32_t>(u8()) << 8;
+        days |= static_cast<std::uint32_t>(u8()) << 16;
+        const std::int16_t minutes = static_cast<std::int16_t>(le16());
+        // The value is UTC plus an offset; the text form is the local time with the
+        // offset appended, so the offset is added back here.
+        std::int64_t local_ticks = static_cast<std::int64_t>(ticks) +
+                                   (static_cast<std::int64_t>(minutes) * 60ll * 10000000ll);
+        std::int64_t local_days = static_cast<std::int64_t>(days);
+        const std::int64_t ticks_per_day = 86400ll * 10000000ll;
+        while (local_ticks < 0) {
+            local_ticks += ticks_per_day;
+            --local_days;
+        }
+        while (local_ticks >= ticks_per_day) {
+            local_ticks -= ticks_per_day;
+            ++local_days;
+        }
+        const bool west = minutes < 0;
+        const int magnitude = west ? -static_cast<int>(minutes) : static_cast<int>(minutes);
+        char offset[8];
+        std::snprintf(offset, sizeof(offset), "%c%02d:%02d", west ? '-' : '+', magnitude / 60,
+                      magnitude % 60);
+        text = format_date(static_cast<std::uint32_t>(local_days)) + " " +
+               format_time(static_cast<std::uint64_t>(local_ticks), column.scale) + " " + offset;
+        return status{};
+    }
     case 0xE7:   // NVARCHAR
     case 0xEF: { // NCHAR
         const std::uint16_t bytes = le16();
@@ -1375,9 +1518,14 @@ status token_reader::read_one(const column_meta& column, std::string& text,
         offset_ += length;
         return status{};
     }
-    default:
+    default: {
         fail(rpc_code::no_such_method);
-        return status{rpc_code::no_such_method, "this TDS column type is not decoded yet"};
+        char message[64];
+        std::snprintf(message, sizeof(message), "TDS column type 0x%02x is not decoded yet",
+                      static_cast<unsigned>(column.type));
+        error_message_ = message;
+        return status{rpc_code::no_such_method, message};
+    }
     }
 }
 

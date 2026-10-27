@@ -68,10 +68,19 @@ struct connection_options {
     std::size_t max_result_rows = 1'000'000;
     std::size_t max_result_bytes = 256u * 1024u * 1024u;
 
-    // Require the link to be encrypted. This slice has no TLS, so setting it is
-    // refused at construction with a clear message rather than silently sending a
-    // login in the clear.
+    // Demand an encrypted session. PRELOGIN then offers ENCRYPT_ON, so a server that
+    // refuses TLS fails the connection instead of receiving a plaintext login.
     bool require_encryption = false;
+
+    // Encrypt only the login packet, then continue in the clear. Refused until the TLS
+    // path is verified; see `require_encryption`.
+    bool encrypt_login_only = false;
+
+    // Used when TLS is negotiated. A production deployment should leave this on; the
+    // integration suite turns it off for a self-signed test server, and says so.
+    bool verify_server_certificate = true;
+    // Trust anchors for verification. Empty uses the system store.
+    std::string ca_bundle;
 };
 
 // One authenticated TDS session.
@@ -133,6 +142,8 @@ public:
     }
     [[nodiscard]] const std::string& server_name() const noexcept { return server_name_; }
     [[nodiscard]] bool encryption_negotiated() const noexcept { return encrypted_; }
+    // True when only the login packet was encrypted and the session runs in the clear.
+    [[nodiscard]] bool login_only_encryption() const noexcept { return login_only_encryption_; }
     [[nodiscard]] const rpc_error& connect_error() const noexcept { return connect_error_; }
 
 private:
@@ -168,6 +179,7 @@ private:
     bool open_ = false;
     bool in_transaction_ = false;
     bool encrypted_ = false;
+    bool login_only_encryption_ = false;
     std::size_t received_bytes_ = 0;
     // Echoed from ENVCHANGE(begin_transaction); cleared on commit and rollback.
     std::array<std::uint8_t, transaction_descriptor_size> descriptor_{};
