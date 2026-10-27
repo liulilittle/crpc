@@ -1318,6 +1318,64 @@ status connection::call(std::string_view call_sql, span<parameter> params, resul
     return status{};
 }
 
+status connection::bulk_insert(const db::insert_target& target,
+                                 span<const std::vector<parameter>> rows,
+                                 const db::bulk_options& options, std::uint64_t& affected) {
+    affected = 0;
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    if (rows.empty()) {
+        return status{};
+    }
+    for (const std::vector<parameter>& row : rows) {
+        if (row.size() != target.columns.size()) {
+            return status{rpc_code::invalid_argument,
+                          "a bulk row does not match the column count"};
+        }
+    }
+
+    result<std::vector<std::size_t>> plan =
+        db::plan_insert_batches(target, rows.size(), options);
+    if (!plan) {
+        return plan.error();
+    }
+
+    std::size_t offset = 0;
+    for (const std::size_t batch : plan.value()) {
+        result<std::string> sql = db::make_insert_sql(target, batch);
+        if (!sql) {
+            return sql.error();
+        }
+        result<prepared_statement> prepared = prepare(sql.value());
+        if (!prepared) {
+            return prepared.error();
+        }
+        prepared_statement statement = std::move(prepared.value());
+
+        std::vector<parameter> bound;
+        bound.reserve(batch * target.columns.size());
+        for (std::size_t row = 0; row < batch; ++row) {
+            for (const parameter& value : rows[offset + row]) {
+                bound.push_back(value);
+            }
+        }
+
+        result<result_set*> executed =
+            statement.execute(span<const parameter>(bound.data(), bound.size()));
+        statement.close();
+        if (!executed) {
+            return executed.error();
+        }
+        std::unique_ptr<result_set> guard(executed.value());
+        if (guard != nullptr && guard->affected_rows() > 0) {
+            affected += static_cast<std::uint64_t>(guard->affected_rows());
+        }
+        offset += batch;
+    }
+    return status{};
+}
+
 result<prepared_statement> connection::prepare(std::string_view sql) {
     if (!open_) {
         return rpc_error{rpc_code::shutting_down, "mysql connection is closed"};

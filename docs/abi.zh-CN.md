@@ -170,7 +170,9 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::cluster::vote_result`
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
+- `::crpc::db::bulk_options`
 - `::crpc::db::column_info`
+- `::crpc::db::insert_target`
 - `::crpc::db::parameter`
 - `::crpc::db::mysql::column_definition`
 - `::crpc::db::mysql::eof_packet`

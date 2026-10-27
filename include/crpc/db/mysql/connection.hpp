@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <crpc/config.hpp>
+#include <crpc/db/bulk.hpp>
 #include <crpc/db/connection.hpp>
 #include <crpc/db/mysql/channel.hpp>
 #include <crpc/db/mysql/protocol.hpp>
@@ -91,6 +92,14 @@ public:
     // OUT parameter directly.
     [[nodiscard]] status call(std::string_view call_sql, span<parameter> params,
                               result_set** out);
+
+    // Inserts ows with the prepared-statement protocol, one statement per batch
+    // planned by plan_insert_batches. Every value is bound; identifiers are
+    // validated because they cannot be. ffected accumulates the server's count.
+    [[nodiscard]] status bulk_insert(const db::insert_target& target,
+                                     span<const std::vector<parameter>> rows,
+                                     const db::bulk_options& options,
+                                     std::uint64_t& affected);
 
     void close() noexcept override;
     [[nodiscard]] bool is_open() const noexcept override;
