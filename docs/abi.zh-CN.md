@@ -171,6 +171,13 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
 - `::crpc::db::column_info`
+- `::crpc::db::mysql::column_definition`
+- `::crpc::db::mysql::eof_packet`
+- `::crpc::db::mysql::err_packet`
+- `::crpc::db::mysql::handshake`
+- `::crpc::db::mysql::handshake_response_options`
+- `::crpc::db::mysql::ok_packet`
+- `::crpc::db::mysql::text_row`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
