@@ -343,4 +343,89 @@ CRPC_TEST(tds_decodes_a_real_transaction_descriptor_change) {
     CRPC_CHECK_EQ(static_cast<int>(token::kind::done), static_cast<int>(done.type));
 }
 
+CRPC_TEST(tds_decodes_a_real_sp_executesql_reply) {
+    // Captured from SQL Server 2022 answering
+    //   sp_executesql N'SELECT @P1 a, @P2 b, @P3 c', N'@P1 bigint,@P2 nvarchar(5),@P3 float',
+    //                 42, N'héllo', 3.5
+    // The tail is the part a batch never has: DONE_IN_PROC, RETURNSTATUS and
+    // DONE_PROC. Stopping at the first DONE would leave those three tokens in the
+    // stream and desynchronise the next request.
+    static const unsigned char raw[] = {
+        0x81, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x00, 0x26, 0x08, 0x01, 0x61, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x21, 0x00, 0xe7, 0x0a, 0x00, 0x09, 0x04, 0xd0, 0x00, 0x34, 0x01, 0x62,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x00, 0x6d, 0x08, 0x01, 0x63, 0x00, 0xd1, 0x08, 0x2a,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x68, 0x00, 0xe9, 0x00, 0x6c, 0x00,
+        0x6c, 0x00, 0x6f, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x40, 0xff, 0x11,
+        0x00, 0xc1, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0x00, 0x00, 0x00,
+        0x00, 0xfe, 0x00, 0x00, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    std::vector<std::byte> payload(sizeof raw);
+    for (std::size_t i = 0; i < sizeof raw; ++i) {
+        payload[i] = static_cast<std::byte>(raw[i]);
+    }
+
+    token_reader reader(crpc::span<const std::byte>(payload.data(), payload.size()));
+    token meta;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(meta)));
+    CRPC_CHECK_EQ(std::size_t{3}, meta.columns.size());
+
+    token row;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(row)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::row), static_cast<int>(row.type));
+    CRPC_CHECK_EQ(std::string("42"), row.values[0]);
+    CRPC_CHECK_EQ(std::string("héllo"), row.values[1]);
+    CRPC_CHECK_EQ(std::string("3.5"), row.values[2]);
+
+    // DONE_IN_PROC says more results follow, so the reader must continue.
+    token inner_done;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(inner_done)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::done), static_cast<int>(inner_done.type));
+    CRPC_CHECK(inner_done.done.more_results());
+
+    token status;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(status)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::return_status), static_cast<int>(status.type));
+    CRPC_CHECK_EQ(std::uint32_t{0}, status.ret_status);
+
+    token final_done;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(final_done)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::done), static_cast<int>(final_done.type));
+    CRPC_CHECK_FALSE(final_done.done.more_results());
+
+    token end;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::end),
+                  static_cast<int>(reader.next(end)));
+}
+
+CRPC_TEST(tds_decodes_a_real_return_value) {
+    // The tail of a procedure call with an OUTPUT parameter, captured from SQL Server
+    // 2022: RETURNVALUE (0xAC), ordinal 2 (zero-based, for the third parameter), name
+    // "@sum", status 1, a user type and a flags word, then INTN(8) and the value 42.
+    static const unsigned char raw[] = {
+        0xac, 0x02, 0x00, 0x04, 0x40, 0x00, 0x73, 0x00, 0x75, 0x00, 0x6d, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x08, 0x08, 0x2a, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    std::vector<std::byte> payload(sizeof raw);
+    for (std::size_t i = 0; i < sizeof raw; ++i) {
+        payload[i] = static_cast<std::byte>(raw[i]);
+    }
+    token_reader reader(crpc::span<const std::byte>(payload.data(), payload.size()));
+    token value;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(value)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::return_value), static_cast<int>(value.type));
+    CRPC_CHECK_EQ(std::uint16_t{2}, value.ret.ordinal);
+    CRPC_CHECK_EQ(std::string("@sum"), value.ret.name);
+    CRPC_CHECK_EQ(std::uint8_t{1}, value.ret.status);
+    CRPC_CHECK_EQ(static_cast<int>(0x26), static_cast<int>(value.ret.meta.type));
+    CRPC_CHECK_FALSE(value.ret.is_null);
+    CRPC_CHECK_EQ(std::string("42"), value.ret.value);
+}
+
 CRPC_TEST_MAIN()

@@ -291,6 +291,8 @@ is guarded.
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`
+- `::crpc::db::tds::rpc_parameter`
+- `::crpc::db::tds::rpc_request`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`

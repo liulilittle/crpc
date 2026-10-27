@@ -7,7 +7,10 @@
 // about the server's mood.
 #include "test_framework.hpp"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -171,11 +174,32 @@ void put_colmetadata(bytes& out, const std::vector<column_spec>& columns) {
         put_u32_le(out, 0); // user type
         put_u16_le(out, 1); // flags
         put_u8(out, column.type);
-        if (column.type == 0xE7 || column.type == 0xA7) {
+        switch (column.type) {
+        case 0xE7: // NVARCHAR
+        case 0xA7:
+        case 0xA5:
             put_u16_le(out, column.max_length);
-            for (int i = 0; i < 5; ++i) {
-                put_u8(out, 0); // collation
+            if (column.type != 0xA5) {
+                for (int i = 0; i < 5; ++i) {
+                    put_u8(out, 0); // collation
+                }
             }
+            break;
+        case 0x26: // INTN
+        case 0x68: // BITN
+        case 0x6D: // FLTN
+        case 0x24: // GUID
+        case 0x28: // DATE
+        case 0x29: // TIME
+        case 0x2A: // DATETIME2
+            // These carry a type-specific byte count (or, for DATE, nothing) that the
+            // decoder reads: omitting it shifts the name and every later column.
+            if (column.type != 0x28) {
+                put_u8(out, static_cast<std::uint8_t>(column.max_length));
+            }
+            break;
+        default:
+            break;
         }
         put_b_varchar(out, column.name);
     }
@@ -625,6 +649,204 @@ CRPC_TEST(tds_connection_factory_reports_the_login_failure) {
     CRPC_CHECK_FALSE(static_cast<bool>(opened));
     CRPC_CHECK_EQ(std::string("Login failed for user 'sa'."), opened.error().message);
     CRPC_CHECK_EQ(std::string_view("tds-injected"), factory.name());
+}
+
+// --- RPC ---------------------------------------------------------------------
+
+namespace {
+
+// True when `haystack` contains `needle` as UTF-16LE text. The RPC body is UTF-16
+// throughout, so an ASCII search would never match.
+[[nodiscard]] bool contains_utf16(const std::vector<std::byte>& haystack, std::string_view needle) {
+    std::vector<std::byte> encoded;
+    encoded.reserve(needle.size() * 2);
+    for (const char c : needle) {
+        encoded.push_back(static_cast<std::byte>(c));
+        encoded.push_back(std::byte{0});
+    }
+    return std::search(haystack.begin(), haystack.end(), encoded.begin(), encoded.end()) !=
+           haystack.end();
+}
+
+// The 22-byte AllHeaders block that must precede every post-login message.
+[[nodiscard]] bool has_all_headers(const std::vector<std::byte>& message) {
+    if (message.size() < 22) {
+        return false;
+    }
+    static const unsigned char expected[22] = {0x16, 0x00, 0x00, 0x00, 0x12, 0x00,
+                                               0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+                                               0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                               0x01, 0x00, 0x00, 0x00};
+    for (std::size_t i = 0; i < 22; ++i) {
+        if (static_cast<std::uint8_t>(message[i]) != expected[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+CRPC_TEST(tds_rpc_binds_parameters_through_sp_executesql) {
+    bytes sent;
+    auto respond = login_server();
+    auto session = open_with([respond, &sent](packet_type type,
+                                             crpc::span<const std::byte> payload) {
+        if (type != packet_type::rpc) {
+            return respond(type, payload);
+        }
+        sent.assign(payload.begin(), payload.end());
+        bytes reply;
+        put_colmetadata(reply, {{0x26, 8, "a"}});
+        put_u8(reply, static_cast<std::uint8_t>(token_type::row));
+        put_u8(reply, 8);
+        put_u32_le(reply, 42);
+        put_u32_le(reply, 0);
+        put_done(reply, 0, 1);
+        return reply;
+    });
+
+    crpc::db::parameter params[2] = {
+        crpc::db::parameter::from_int64(42),
+        crpc::db::parameter::from_text("hi"),
+    };
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = session->query(
+        "SELECT ? AS a, ? AS b",
+        crpc::span<const crpc::db::parameter>(params, 2), &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(ran));
+    CRPC_CHECK(raw != nullptr);
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{42}, raw->get_int64(0).value());
+    }
+
+    // The request must be an sp_executesql call whose statement uses @P1/@P2 and whose
+    // declaration matches, or the server binds nothing.
+    CRPC_CHECK(!sent.empty());
+    CRPC_CHECK(has_all_headers(sent));
+    CRPC_CHECK(contains_utf16(sent, "sp_executesql"));
+    CRPC_CHECK(contains_utf16(sent, "SELECT @P1 AS a, @P2 AS b"));
+    CRPC_CHECK(contains_utf16(sent, "@P1 bigint,@P2 nvarchar(2)"));
+    CRPC_CHECK_FALSE(contains_utf16(sent, "SELECT ? AS a"));
+}
+
+CRPC_TEST(tds_rpc_refuses_a_placeholder_count_mismatch) {
+    bytes sent;
+    auto respond = login_server();
+    auto session = open_with([respond, &sent](packet_type type,
+                                             crpc::span<const std::byte> payload) {
+        if (type == packet_type::rpc) {
+            sent.assign(payload.begin(), payload.end());
+            return bytes{};
+        }
+        return respond(type, payload);
+    });
+    crpc::db::parameter one = crpc::db::parameter::from_int64(1);
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = session->query(
+        "SELECT ?, ?", crpc::span<const crpc::db::parameter>(&one, 1), &raw);
+    CRPC_CHECK_FALSE(static_cast<bool>(ran));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                  static_cast<int>(ran.error().code));
+    // Nothing may reach the server: a mismatched binding is the caller's bug, and
+    // sending it would bind values to the wrong markers.
+    CRPC_CHECK(sent.empty());
+    CRPC_CHECK(session->is_open());
+}
+
+CRPC_TEST(tds_rpc_placeholder_scanner_ignores_literals_and_comments) {
+    bytes sent;
+    auto respond = login_server();
+    auto session = open_with([respond, &sent](packet_type type,
+                                             crpc::span<const std::byte> payload) {
+        if (type != packet_type::rpc) {
+            return respond(type, payload);
+        }
+        sent.assign(payload.begin(), payload.end());
+        bytes reply;
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    crpc::db::parameter params[1] = {crpc::db::parameter::from_int64(5)};
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = session->query(
+        "SELECT 'a?b' AS s -- ? in a comment\n, ? AS n /* ? too */",
+        crpc::span<const crpc::db::parameter>(params, 1), &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(ran));
+    CRPC_CHECK(!sent.empty());
+    CRPC_CHECK(has_all_headers(sent));
+    // The literal and both comments survive untouched; only the real marker moved.
+    CRPC_CHECK(contains_utf16(sent, "'a?b'"));
+    CRPC_CHECK(contains_utf16(sent, "-- ? in a comment"));
+    CRPC_CHECK(contains_utf16(sent, "/* ? too */"));
+    CRPC_CHECK(contains_utf16(sent, "@P1"));
+}
+
+CRPC_TEST(tds_rpc_procedure_call_writes_output_parameters) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::rpc) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        // The shape SQL Server sends for a procedure with an OUT parameter: the inner
+        // DONE, RETURNSTATUS, RETURNVALUE, then DONE_PROC.
+        put_done(reply, 0x0011, 1);
+        put_u8(reply, static_cast<std::uint8_t>(token_type::return_status));
+        put_u32_le(reply, 7);
+        put_u8(reply, static_cast<std::uint8_t>(token_type::return_value));
+        put_u16_le(reply, 2);
+        put_u8(reply, 4);
+        put_utf16(reply, "@sum");
+        put_u8(reply, 1);
+        put_u32_le(reply, 0); // user type
+        put_u16_le(reply, 0); // flags
+        put_u8(reply, 0x26);  // INTN
+        put_u8(reply, 8);
+        put_u8(reply, 8);
+        put_u32_le(reply, 42);
+        put_u32_le(reply, 0);
+        put_u8(reply, static_cast<std::uint8_t>(token_type::done_proc));
+        put_u16_le(reply, 0xE000);
+        put_u16_le(reply, 0);
+        put_u32_le(reply, 0);
+        put_u32_le(reply, 0);
+        return reply;
+    });
+
+    crpc::db::parameter params[3] = {
+        crpc::db::parameter::from_int64(2),
+        crpc::db::parameter::from_int64(40),
+        crpc::db::parameter::out("sum", crpc::db::db_type::int64),
+    };
+    params[0].name = "a";
+    params[1].name = "b";
+
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = session->call("crpc_add", params, &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(ran));
+    CRPC_CHECK_FALSE(params[2].is_null);
+    CRPC_CHECK_EQ(std::int64_t{42}, params[2].int_value);
+    CRPC_CHECK(session->has_return_status());
+    CRPC_CHECK_EQ(std::uint32_t{7}, session->last_return_status());
+}
+
+CRPC_TEST(tds_rpc_query_refuses_an_output_parameter) {
+    auto session = open_with(login_server());
+    crpc::db::parameter params[1] = {
+        crpc::db::parameter::out("sum", crpc::db::db_type::int64),
+    };
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = session->query(
+        "SELECT ?", crpc::span<const crpc::db::parameter>(params, 1), &raw);
+    CRPC_CHECK_FALSE(static_cast<bool>(ran));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                  static_cast<int>(ran.error().code));
+    CRPC_CHECK(raw == nullptr);
 }
 
 CRPC_TEST_MAIN()

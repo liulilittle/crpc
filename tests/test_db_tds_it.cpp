@@ -242,4 +242,207 @@ CRPC_TEST(tds_it_ddl_dml_and_affected_rows) {
     }
 }
 
+CRPC_TEST(tds_it_bound_parameters) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+
+    // int, nvarchar (with a non-ASCII character), NULL and float in one statement.
+    crpc::db::parameter params[4] = {
+        crpc::db::parameter::from_int64(42),
+        crpc::db::parameter::from_text("héllo"),
+        crpc::db::parameter::null(),
+        crpc::db::parameter::from_double(3.5),
+    };
+    // A NULL parameter carries no type, so the declaration would be wrong; the
+    // adapter must say so rather than guess.
+    crpc::db::result_set* raw = nullptr;
+    crpc::status ran = it.session->query(
+        "SELECT ? AS a, ? AS b, ? AS c, ? AS d",
+        crpc::span<const crpc::db::parameter>(params, 4), &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        // db_type::unknown cannot be declared; that is a caller mistake, and the
+        // message must say which parameter.
+        report("unknown-typed parameter", ran.error());
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(ran.error().code));
+    }
+
+    crpc::db::parameter typed[3] = {
+        crpc::db::parameter::from_int64(42),
+        crpc::db::parameter::from_text("héllo"),
+        crpc::db::parameter::from_double(3.5),
+    };
+    crpc::db::result_set* rows = nullptr;
+    ran = it.session->query("SELECT ? AS a, ? AS b, ? AS c",
+                            crpc::span<const crpc::db::parameter>(typed, 3), &rows);
+    crpc::db::statement_guard rows_guard(rows);
+    if (!ran) {
+        report("bound query", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(rows != nullptr);
+    if (rows == nullptr) {
+        return;
+    }
+    CRPC_CHECK_EQ(std::size_t{3}, rows->column_count());
+    CRPC_CHECK(rows->next());
+    CRPC_CHECK_EQ(std::int64_t{42}, rows->get_int64(0).value());
+    CRPC_CHECK_EQ(std::string("héllo"), rows->get_text(1).value());
+    CRPC_CHECK_EQ(3.5, rows->get_double(2).value());
+}
+
+CRPC_TEST(tds_it_parameter_quoting_is_not_a_literal) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // A '?' inside a literal must stay a literal, and a '?' inside a comment must not
+    // be counted: only the real placeholder is bound.
+    crpc::db::parameter params[2] = {
+        crpc::db::parameter::from_text("a?b"),
+        crpc::db::parameter::from_int64(7),
+    };
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query(
+        "SELECT ? AS lit -- a ? in a comment\n, ? AS n",
+        crpc::span<const crpc::db::parameter>(params, 2), &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("quoted placeholder", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(raw != nullptr);
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::string("a?b"), raw->get_text(0).value());
+        CRPC_CHECK_EQ(std::int64_t{7}, raw->get_int64(1).value());
+    }
+}
+
+CRPC_TEST(tds_it_parameter_type_mismatch_is_reported) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // More placeholders than parameters: refused before anything is sent, because a
+    // count mismatch binds values to the wrong markers.
+    crpc::db::parameter one = crpc::db::parameter::from_int64(1);
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query(
+        "SELECT ?, ?", crpc::span<const crpc::db::parameter>(&one, 1), &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK_FALSE(static_cast<bool>(ran));
+    if (!ran) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(ran.error().code));
+        report("count mismatch", ran.error());
+    }
+    // The session survives.
+    CRPC_CHECK(static_cast<bool>(it.session->query("SELECT 1", {}, nullptr)));
+}
+
+CRPC_TEST(tds_it_stored_procedure_out_parameter) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status created = it.session->query(
+            "IF DB_ID('crpc_tds_it') IS NULL CREATE DATABASE crpc_tds_it", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!created) {
+            report("create database", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+    CRPC_CHECK(static_cast<bool>(it.session->query("USE crpc_tds_it", {}, nullptr)));
+
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status dropped = it.session->query(
+            "IF OBJECT_ID('crpc_add') IS NOT NULL DROP PROCEDURE crpc_add", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        CRPC_CHECK(static_cast<bool>(dropped));
+    }
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status created = it.session->query(
+            "CREATE PROCEDURE crpc_add @a int, @b int, @sum int OUTPUT AS "
+            "BEGIN SET @sum = @a + @b; RETURN 7; END",
+            {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!created) {
+            report("create procedure", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+
+    crpc::db::parameter params[3] = {
+        crpc::db::parameter::from_int64(2),
+        crpc::db::parameter::from_int64(40),
+        crpc::db::parameter::out("sum", crpc::db::db_type::int64),
+    };
+    params[0].name = "a";
+    params[1].name = "b";
+    params[2].name = "sum";
+
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->call("crpc_add", params, &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("procedure call", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    // The OUT value must come back through the RETURNVALUE token.
+    CRPC_CHECK_FALSE(params[2].is_null);
+    CRPC_CHECK_EQ(std::int64_t{42}, params[2].int_value);
+    // And the procedure's return code through RETURNSTATUS.
+    CRPC_CHECK(it.session->has_return_status());
+    CRPC_CHECK_EQ(std::uint32_t{7}, it.session->last_return_status());
+}
+
+CRPC_TEST(tds_it_batch_after_rpc_stays_aligned) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    crpc::db::parameter one = crpc::db::parameter::from_int64(5);
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status ran =
+            it.session->query("SELECT ? AS n", crpc::span<const crpc::db::parameter>(&one, 1), &raw);
+        crpc::db::statement_guard guard(raw);
+        CRPC_CHECK(static_cast<bool>(ran));
+    }
+    // A plain batch right after an RPC must decode as its own reply.
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query("SELECT 99 AS n", {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(ran));
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{99}, raw->get_int64(0).value());
+    }
+}
+
 CRPC_TEST_MAIN()

@@ -87,15 +87,30 @@ public:
     [[nodiscard]] status commit() override;
     [[nodiscard]] status rollback() override;
 
-    // Runs one SQL batch. Parameters are refused: TDS binds them through an RPC
-    // call (sp_executesql), which this slice does not encode yet, and splicing them
-    // into the text is never acceptable.
+    // Runs one SQL batch, or a parameterised statement through `sp_executesql` when
+    // `params` is not empty.
+    //
+    // Parameters are bound by RPC, never spliced into the text: the statement goes as
+    // the first argument, the parameter declarations as the second, and the values
+    // follow as typed parameters. A `?` in `sql` is replaced by `@P<n>` in order,
+    // because TDS addresses parameters by name.
     //
     // `*out` receives the first result set, or a cursor with an affected-row count
     // and no columns. Further result sets are drained and discarded — a reply that
     // is not drained desynchronises the stream.
     [[nodiscard]] status query(std::string_view sql, span<const parameter> params,
                                result_set** out) override;
+
+    // Calls a stored procedure by name with RPC, writing OUT/INOUT values back into
+    // `params`. The procedure's return code is available from `last_return_status()`.
+    [[nodiscard]] status call(std::string_view procedure, span<parameter> params,
+                              result_set** out) override;
+
+    // The RETURNSTATUS of the last RPC call, when the procedure returned one.
+    [[nodiscard]] std::uint32_t last_return_status() const noexcept {
+        return last_return_status_;
+    }
+    [[nodiscard]] bool has_return_status() const noexcept { return has_return_status_; }
 
     void close() noexcept override;
     [[nodiscard]] bool is_open() const noexcept override;
@@ -120,6 +135,17 @@ private:
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
     // Sends one batch and decodes the whole reply, returning the first result set.
     [[nodiscard]] status run_batch(std::string_view sql, result_set** out);
+    // Sends one RPC and decodes the whole reply. `results` is the first result set;
+    // `written` receives the OUT/INOUT values, addressed by parameter name.
+    [[nodiscard]] status run_rpc(const rpc_request& request, result_set** out,
+                                 std::vector<return_value>* written);
+    // The shared token loop for batch and RPC replies.
+    [[nodiscard]] status read_reply(result_set** out, std::vector<return_value>* written);
+    // For a query, ? placeholders become @P<n> in an sp_executesql call; for a
+    // procedure call the parameters are sent to the procedure itself.
+    [[nodiscard]] status call_impl(std::string_view sql, span<const parameter> params,
+                                   result_set** out, bool procedure,
+                                   std::vector<return_value>& written);
     void fail(const status& error) noexcept;
 
     connection_options options_;
@@ -135,6 +161,8 @@ private:
     // Echoed from ENVCHANGE(begin_transaction); cleared on commit and rollback.
     std::array<std::uint8_t, transaction_descriptor_size> descriptor_{};
     bool has_descriptor_ = false;
+    std::uint32_t last_return_status_ = 0;
+    bool has_return_status_ = false;
     rpc_error connect_error_;
 };
 

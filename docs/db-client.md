@@ -208,9 +208,14 @@ transaction descriptor in `ENVCHANGE(begin_transaction)` is length-prefixed.
 
 Limits, stated rather than hidden:
 
-* **Parameters are refused** (`invalid_argument`). TDS binds them through an RPC
-  `sp_executesql` call, which is not encoded yet; splicing values into the SQL text
-  is never done.
+* Parameters are bound by RPC, never spliced into the text. `query(sql, params)` sends
+  `sp_executesql` with the `?` markers rewritten to `@P1..@Pn` (the scanner respects
+  string literals, quoted identifiers and comments), and `call(name, params)` invokes a
+  procedure by name. OUT/INOUT values come back through `RETURNVALUE` and the return
+  code through `RETURNSTATUS` (`last_return_status()`). A placeholder/parameter count
+  mismatch is refused before anything is sent.
+* A NULL input parameter needs a type: `parameter::null()` has `db_type::unknown`, so
+  it is refused with `invalid_argument` rather than being declared as some guess.
 * **No TLS.** A server that answers PRELOGIN with ENCRYPT_ON or ENCRYPT_REQ is
   refused with `failed_precondition`, and `require_encryption = true` is refused at
   construction before a byte is written. Half a handshake would look like an

@@ -50,6 +50,10 @@ void patch_le16(std::vector<std::byte>& out, std::size_t offset, std::uint16_t v
     out[offset + 1] = byte_of(static_cast<std::uint8_t>((value >> 8) & 0xffu));
 }
 
+// Days between 0001-01-01 (the TDS epoch) and 1970-01-01. Shared by the formatter
+// and the parser so a round trip is exact.
+constexpr std::int64_t tds_epoch_offset_days = 719162;
+
 } // namespace
 
 // --- Framing -----------------------------------------------------------------
@@ -415,12 +419,455 @@ status encode_login7(std::vector<std::byte>& out, const login7& value) {
     return status{};
 }
 
-// --- Column metadata and rows ------------------------------------------------
+// --- Value encoding ----------------------------------------------------------
 
 namespace {
 
-// Days between 0001-01-01 (the TDS epoch) and 1970-01-01.
-constexpr std::int64_t tds_epoch_offset_days = 719162;
+// "YYYY-MM-DD" -> days since 0001-01-01. The inverse of `format_date`; both use the
+// same civil-calendar arithmetic so a round trip is exact.
+[[nodiscard]] result<std::uint32_t> parse_date_days(std::string_view text) {
+    if (text.size() < 10 || text[4] != '-' || text[7] != '-') {
+        return rpc_error{rpc_code::invalid_argument, "a date must be YYYY-MM-DD"};
+    }
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (text[static_cast<std::size_t>(i)] < '0' || text[static_cast<std::size_t>(i)] > '9') {
+            return rpc_error{rpc_code::invalid_argument, "a date year must be digits"};
+        }
+        year = year * 10 + (text[static_cast<std::size_t>(i)] - '0');
+    }
+    month = (text[5] - '0') * 10 + (text[6] - '0');
+    day = (text[8] - '0') * 10 + (text[9] - '0');
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return rpc_error{rpc_code::invalid_argument, "a date field is out of range"};
+    }
+    // Civil-from-days, the inverse of the formatting algorithm above.
+    const int y = month <= 2 ? year - 1 : year;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy =
+        static_cast<unsigned>((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1);
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const std::int64_t days_since_1970 = era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+    const std::int64_t days = days_since_1970 + tds_epoch_offset_days;
+    if (days < 0 || days > 3652058) { // 9999-12-31
+        return rpc_error{rpc_code::invalid_argument, "a date is outside 0001-01-01..9999-12-31"};
+    }
+    return static_cast<std::uint32_t>(days);
+}
+
+// Splits "HH:MM:SS[.fraction]" into ticks of 100 ns.
+[[nodiscard]] result<std::uint64_t> parse_ticks(std::string_view text) {
+    if (text.size() < 8 || text[2] != ':' || text[5] != ':') {
+        return rpc_error{rpc_code::invalid_argument, "a time must be HH:MM:SS"};
+    }
+    const auto digits = [&](std::size_t at, std::size_t count) -> int {
+        int value = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const char c = text[at + i];
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+            value = value * 10 + (c - '0');
+        }
+        return value;
+    };
+    const int hour = digits(0, 2);
+    const int minute = digits(3, 2);
+    const int second = digits(6, 2);
+    if (hour < 0 || minute < 0 || second < 0) {
+        return rpc_error{rpc_code::invalid_argument, "a time field is not numeric"};
+    }
+    if (hour > 23 || minute > 59 || second > 59) {
+        return rpc_error{rpc_code::invalid_argument, "a time field is out of range"};
+    }
+    std::uint64_t ticks = (static_cast<std::uint64_t>(hour) * 3600u +
+                           static_cast<std::uint64_t>(minute) * 60u +
+                           static_cast<std::uint64_t>(second)) *
+                          10000000ull;
+    if (text.size() > 9 && (text[8] == '.' || text[8] == ',')) {
+        std::uint64_t fraction = 0;
+        std::size_t used = 0;
+        for (std::size_t i = 9; i < text.size() && used < 7; ++i, ++used) {
+            const char c = text[i];
+            if (c < '0' || c > '9') {
+                return rpc_error{rpc_code::invalid_argument, "a fractional second is not numeric"};
+            }
+            fraction = fraction * 10 + static_cast<std::uint64_t>(c - '0');
+        }
+        for (std::size_t i = used; i < 7; ++i) {
+            fraction *= 10;
+        }
+        ticks += fraction;
+    }
+    return ticks;
+}
+
+[[nodiscard]] int hex_digit(char c) noexcept {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+} // namespace
+
+status encode_date_value(std::vector<std::byte>& out, std::string_view text) {
+    const result<std::uint32_t> days = parse_date_days(text);
+    if (!days) {
+        return days.error();
+    }
+    put_u8(out, static_cast<std::uint8_t>(days.value() & 0xffu));
+    put_u8(out, static_cast<std::uint8_t>((days.value() >> 8) & 0xffu));
+    put_u8(out, static_cast<std::uint8_t>((days.value() >> 16) & 0xffu));
+    return status{};
+}
+
+status encode_time_value(std::vector<std::byte>& out, std::string_view text,
+                         std::uint8_t scale) {
+    const result<std::uint64_t> ticks = parse_ticks(text);
+    if (!ticks) {
+        return ticks.error();
+    }
+    const std::uint8_t bytes = scale <= 2 ? 3 : (scale <= 4 ? 4 : 5);
+    for (std::uint8_t i = 0; i < bytes; ++i) {
+        put_u8(out, static_cast<std::uint8_t>((ticks.value() >> (8 * i)) & 0xffu));
+    }
+    return status{};
+}
+
+status encode_datetime2_value(std::vector<std::byte>& out, std::string_view text,
+                              std::uint8_t scale) {
+    const std::size_t split = text.find_first_of(" T");
+    if (split == std::string_view::npos) {
+        return status{rpc_code::invalid_argument,
+                      "a datetime2 value must be 'YYYY-MM-DD HH:MM:SS'"};
+    }
+    const result<std::uint32_t> days = parse_date_days(text.substr(0, split));
+    if (!days) {
+        return days.error();
+    }
+    const result<std::uint64_t> ticks = parse_ticks(text.substr(split + 1));
+    if (!ticks) {
+        return ticks.error();
+    }
+    const std::uint8_t time_bytes = scale <= 2 ? 3 : (scale <= 4 ? 4 : 5);
+    for (std::uint8_t i = 0; i < time_bytes; ++i) {
+        put_u8(out, static_cast<std::uint8_t>((ticks.value() >> (8 * i)) & 0xffu));
+    }
+    put_u8(out, static_cast<std::uint8_t>(days.value() & 0xffu));
+    put_u8(out, static_cast<std::uint8_t>((days.value() >> 8) & 0xffu));
+    put_u8(out, static_cast<std::uint8_t>((days.value() >> 16) & 0xffu));
+    return status{};
+}
+
+status encode_guid_value(std::vector<std::byte>& out, std::string_view text) {
+    // Accept the 36-character form with dashes in the usual places.
+    if (text.size() != 36 || text[8] != '-' || text[13] != '-' || text[18] != '-' ||
+        text[23] != '-') {
+        return status{rpc_code::invalid_argument,
+                      "a uniqueidentifier must be 8-4-4-4-12 hexadecimal digits"};
+    }
+    std::vector<std::uint8_t> raw;
+    raw.reserve(16);
+    for (std::size_t i = 0; i < text.size();) {
+        if (text[i] == '-') {
+            ++i;
+            continue;
+        }
+        if (i + 1 >= text.size()) {
+            return status{rpc_code::invalid_argument, "a uniqueidentifier has an odd digit"};
+        }
+        const int high = hex_digit(text[i]);
+        const int low = hex_digit(text[i + 1]);
+        if (high < 0 || low < 0) {
+            return status{rpc_code::invalid_argument, "a uniqueidentifier has a non-hex digit"};
+        }
+        raw.push_back(static_cast<std::uint8_t>((high << 4) | low));
+        i += 2;
+    }
+    if (raw.size() != 16) {
+        return status{rpc_code::invalid_argument, "a uniqueidentifier does not decode to 16 bytes"};
+    }
+    // Windows order: the first three groups are little-endian.
+    const std::size_t order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+    for (const std::size_t index : order) {
+        put_u8(out, raw[index]);
+    }
+    return status{};
+}
+
+status encode_decimal_value(std::vector<std::byte>& out, std::string_view text,
+                            std::uint8_t& precision, std::uint8_t& scale) {
+    if (text.empty()) {
+        return status{rpc_code::invalid_argument, "a decimal value is empty"};
+    }
+    std::size_t index = 0;
+    bool negative = false;
+    if (text[0] == '+' || text[0] == '-') {
+        negative = text[0] == '-';
+        index = 1;
+    }
+    std::uint64_t magnitude = 0;
+    std::uint8_t digits = 0;
+    std::uint8_t fraction = 0;
+    bool saw_point = false;
+    for (; index < text.size(); ++index) {
+        const char c = text[index];
+        if (c == '.') {
+            if (saw_point) {
+                return status{rpc_code::invalid_argument, "a decimal value has two points"};
+            }
+            saw_point = true;
+            continue;
+        }
+        if (c < '0' || c > '9') {
+            return status{rpc_code::invalid_argument, "a decimal value has a non-digit"};
+        }
+        if (magnitude > (std::numeric_limits<std::uint64_t>::max() - 9) / 10) {
+            return status{rpc_code::invalid_argument, "a decimal value overflows 64 bits"};
+        }
+        magnitude = magnitude * 10 + static_cast<std::uint64_t>(c - '0');
+        ++digits;
+        if (saw_point) {
+            ++fraction;
+        }
+    }
+    if (digits == 0) {
+        return status{rpc_code::invalid_argument, "a decimal value has no digits"};
+    }
+    if (digits > 38) {
+        return status{rpc_code::invalid_argument, "a decimal value exceeds 38 digits"};
+    }
+    scale = fraction;
+    precision = digits;
+    // Byte count from the precision, per the server's own table: 1-9 digits fit in
+    // five bytes including the sign, 10-19 in nine, 20-28 in thirteen, 29-38 in
+    // seventeen.
+    const std::uint8_t payload_bytes = precision <= 9     ? 5
+                                       : precision <= 19  ? 9
+                                       : precision <= 28  ? 13
+                                                          : 17;
+    put_u8(out, negative ? 0 : 1); // 1 means positive
+    for (std::uint8_t i = 1; i < payload_bytes; ++i) {
+        put_u8(out, static_cast<std::uint8_t>((magnitude >> (8 * (i - 1))) & 0xffu));
+    }
+    return status{};
+}
+
+// --- RPC ---------------------------------------------------------------------
+
+namespace {
+
+// A parameter's TYPE_INFO: the type byte and its type-specific info, with no user
+// type and no flags word (a result column has both, a parameter has neither).
+void put_type_info(std::vector<std::byte>& out, const column_meta& info) {
+    put_u8(out, info.type);
+    switch (info.type) {
+    case 0x30: // INT1
+    case 0x32: // BIT
+    case 0x34: // INT2
+    case 0x38: // INT4
+    case 0x3B: // FLT4
+    case 0x3E: // FLT8
+    case 0x7F: // INT8
+    case 0x3D: // DATETIME
+    case 0x3C: // MONEY
+    case 0x3A: // SMALLDATETIME
+    case 0x7A: // SMALLMONEY
+    case 0x1F: // NULL
+        // Fixed-width types and NULL carry no type info at all.
+        break;
+    case 0x24: // GUID
+    case 0x26: // INTN
+    case 0x68: // BITN
+    case 0x6D: // FLTN
+        put_u8(out, static_cast<std::uint8_t>(info.max_length));
+        break;
+    case 0x28: // DATE
+        break;
+    case 0x29: // TIME
+    case 0x2A: // DATETIME2
+        put_u8(out, info.scale);
+        break;
+    case 0x6A: // DECIMALN
+    case 0x6C: // NUMERICN
+        put_u8(out, static_cast<std::uint8_t>(info.max_length));
+        put_u8(out, info.precision);
+        put_u8(out, info.scale);
+        break;
+    case 0xA7: // BIGVARCHAR
+    case 0xAF: // BIGCHAR
+    case 0xE7: // NVARCHAR
+    case 0xEF: // NCHAR
+        put_le16(out, static_cast<std::uint16_t>(info.max_length));
+        if (info.max_length == 0xFFFF) {
+            // A MAX type still carries a collation after the 0xFFFF marker.
+            for (const std::uint8_t byte : info.collation) {
+                put_u8(out, byte);
+            }
+        } else {
+            for (const std::uint8_t byte : info.collation) {
+                put_u8(out, byte);
+            }
+        }
+        break;
+    case 0xA5: // BIGVARBINARY
+    case 0xAD: // BIGBINARY
+        put_le16(out, static_cast<std::uint16_t>(info.max_length));
+        break;
+    default:
+        break;
+    }
+}
+
+} // namespace
+
+status encode_rpc_value(std::vector<std::byte>& out, const rpc_parameter& param) {
+    const column_meta& info = param.info;
+    if (param.is_null) {
+        // A NULL is a zero length for the length-prefixed types, and a zero byte for
+        // the ones that use a byte count.
+        switch (info.type) {
+        case 0x1F:
+            return status{};
+        case 0x30: // INT1
+        case 0x32: // BIT
+        case 0x34: // INT2
+        case 0x38: // INT4
+        case 0x3B: // FLT4
+        case 0x3E: // FLT8
+        case 0x7F: // INT8
+        case 0x3D: // DATETIME
+        case 0x3C: // MONEY
+        case 0x3A: // SMALLDATETIME
+        case 0x7A: // SMALLMONEY
+            return status{rpc_code::invalid_argument,
+                          "a fixed-width TDS parameter cannot be NULL; send the nullable form"};
+        case 0xA7: // BIGVARCHAR
+        case 0xAF: // BIGCHAR
+        case 0xE7: // NVARCHAR
+        case 0xEF: // NCHAR
+        case 0xA5: // BIGVARBINARY
+        case 0xAD: // BIGBINARY
+            put_le16(out, 0xFFFFu); // a byte count of 0xFFFF means NULL
+            return status{};
+        default:
+            put_u8(out, 0); // the remaining types use a zero byte count for NULL
+            return status{};
+        }
+    }
+
+    switch (info.type) {
+    case 0x30: // INT1
+    case 0x32: // BIT
+    case 0x34: // INT2
+    case 0x38: // INT4
+    case 0x3B: // FLT4
+    case 0x3E: // FLT8
+    case 0x7F: // INT8
+    case 0x3D: // DATETIME
+    case 0x3C: // MONEY
+    case 0x3A: // SMALLDATETIME
+    case 0x7A: // SMALLMONEY
+        // Fixed-width: the value bytes only, with no length prefix at all.
+        out.insert(out.end(), param.value.begin(), param.value.end());
+        return status{};
+    case 0x1F:
+        return status{};
+    case 0x24: // GUID
+    case 0x26: // INTN
+    case 0x68: // BITN
+    case 0x6D: // FLTN
+    case 0x28: // DATE
+    case 0x29: // TIME
+    case 0x2A: // DATETIME2
+    case 0x6A: // DECIMALN
+    case 0x6C: // NUMERICN
+        if (param.value.size() > 0xFF) {
+            return status{rpc_code::invalid_argument, "an RPC value exceeds its byte count"};
+        }
+        put_u8(out, static_cast<std::uint8_t>(param.value.size()));
+        out.insert(out.end(), param.value.begin(), param.value.end());
+        return status{};
+    case 0xA7: // BIGVARCHAR
+    case 0xAF: // BIGCHAR
+    case 0xE7: // NVARCHAR
+    case 0xEF: // NCHAR
+    case 0xA5: // BIGVARBINARY
+    case 0xAD: { // BIGBINARY
+        // Bounded variable-length types prefix a little-endian byte count; a MAX type
+        // uses PLP instead.
+        if (info.max_length == 0xFFFF) {
+            const std::size_t size = param.value.size();
+            for (int i = 0; i < 8; ++i) {
+                put_u8(out, static_cast<std::uint8_t>((static_cast<std::uint64_t>(size) >> (8 * i)) & 0xffu));
+            }
+            if (size != 0) {
+                put_le32(out, static_cast<std::uint32_t>(size));
+                out.insert(out.end(), param.value.begin(), param.value.end());
+            }
+            // PLP terminator: a chunk length of zero.
+            put_le32(out, 0);
+            return status{};
+        }
+        if (param.value.size() > 0xFFFFu || param.value.size() > info.max_length) {
+            return status{rpc_code::invalid_argument,
+                          "an RPC value does not fit the parameter's declared length"};
+        }
+        put_le16(out, static_cast<std::uint16_t>(param.value.size()));
+        out.insert(out.end(), param.value.begin(), param.value.end());
+        return status{};
+    }
+    default:
+        return status{rpc_code::no_such_method, "this TDS parameter type is not encoded yet"};
+    }
+}
+
+status encode_rpc(std::vector<std::byte>& out, const rpc_request& request) {
+    out.clear();
+    // A named procedure sends a USHORT character count and UTF-16LE characters; the
+    // reserved proc id 0xFFFF followed by a proc id calls a system procedure.
+    if (request.proc_name.empty() && request.proc_id != 0) {
+        put_le16(out, 0xFFFFu);
+        put_le16(out, request.proc_id);
+    } else {
+        if (request.proc_name.size() > 0xFFFFu / 2) {
+            return status{rpc_code::invalid_argument, "the RPC name is too long"};
+        }
+        put_le16(out, static_cast<std::uint16_t>(request.proc_name.size()));
+        const std::vector<std::byte> name = utf16le(request.proc_name);
+        out.insert(out.end(), name.begin(), name.end());
+    }
+    put_le16(out, request.option_flags);
+    for (const rpc_parameter& param : request.params) {
+        if (param.name.size() > 0xFFu) {
+            return status{rpc_code::invalid_argument, "an RPC parameter name is too long"};
+        }
+        put_u8(out, static_cast<std::uint8_t>(param.name.size()));
+        const std::vector<std::byte> name = utf16le(param.name);
+        out.insert(out.end(), name.begin(), name.end());
+        put_u8(out, param.status);
+        put_type_info(out, param.info);
+        const status value = encode_rpc_value(out, param);
+        if (!value) {
+            return value;
+        }
+    }
+    return status{};
+}
+
+// --- Column metadata and rows ------------------------------------------------
+
+namespace {
 
 [[nodiscard]] std::string format_date(std::uint32_t days) {
     // Civil-from-days (Howard Hinnant's algorithm), with the TDS epoch shifted to
@@ -465,7 +912,7 @@ constexpr std::int64_t tds_epoch_offset_days = 719162;
 }
 
 [[nodiscard]] std::string format_decimal(std::uint8_t precision, std::uint8_t scale,
-                                         bool negative, std::uint32_t magnitude) {
+                                         bool negative, std::uint64_t magnitude) {
     (void)precision;
     std::string digits = std::to_string(magnitude);
     if (scale != 0) {
@@ -615,6 +1062,325 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
     return status{};
 }
 
+// One value, in canonical text. A ROW cell and a RETURNVALUE payload are the same
+// bytes, so they share this reader; the only difference is that a row knows its NULLs
+// from a bitmap while a return value encodes a NULL as a zero length.
+// A parameter's TYPE_INFO: just the type byte and its type-specific info. A result
+// column has a four-byte user type and a two-byte flags word in front of this; a
+// parameter has neither, which is why one capture of `@P1` starts at `0x26 0x04`.
+status token_reader::read_type_info(column_meta& column) noexcept {
+    column = column_meta{};
+    column.type = u8();
+    if (error_ != rpc_code::ok) {
+        return status{error_};
+    }
+    switch (column.type) {
+    case 0x1F: // NULL
+        column.max_length = 0;
+        break;
+    case 0x30: // INT1
+    case 0x32: // BIT
+        column.max_length = 1;
+        break;
+    case 0x34: // INT2
+        column.max_length = 2;
+        break;
+    case 0x38: // INT4
+    case 0x3B: // FLT4
+    case 0x3A: // SMALLDATETIME
+    case 0x7A: // SMALLMONEY
+        column.max_length = 4;
+        break;
+    case 0x7F: // INT8
+    case 0x3E: // FLT8
+    case 0x3D: // DATETIME
+    case 0x3C: // MONEY
+        column.max_length = 8;
+        break;
+    case 0x24: // GUID
+    case 0x26: // INTN
+    case 0x68: // BITN
+    case 0x6D: // FLTN
+    case 0x6E: // MONEYN
+    case 0x6F: // DATETIMEN
+        column.max_length = u8();
+        break;
+    case 0x28: // DATE: no type info; the value is always three bytes.
+        column.max_length = 3;
+        break;
+    case 0x29: // TIME
+    case 0x2A: // DATETIME2
+    case 0x2B: // DATETIMEOFFSET
+        // Only the scale is sent; the byte count follows from it.
+        column.scale = u8();
+        if (column.type == 0x29) {
+            column.max_length = column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+        } else if (column.type == 0x2A) {
+            column.max_length = column.scale <= 2 ? 6 : (column.scale <= 4 ? 7 : 8);
+        } else {
+            column.max_length = column.scale <= 2 ? 8 : (column.scale <= 4 ? 9 : 10);
+        }
+        break;
+    case 0x6A: // DECIMALN
+    case 0x6C: // NUMERICN
+        column.max_length = u8();
+        column.precision = u8();
+        column.scale = u8();
+        break;
+    case 0xA7: // BIGVARCHAR
+    case 0xAF: // BIGCHAR
+    case 0xE7: // NVARCHAR
+    case 0xEF: // NCHAR
+        column.max_length = le16();
+        for (std::size_t i = 0; i < 5; ++i) {
+            column.collation[i] = u8();
+        }
+        break;
+    case 0xA5: // BIGVARBINARY
+    case 0xAD: // BIGBINARY
+        column.max_length = le16();
+        break;
+    default:
+        fail(rpc_code::no_such_method);
+        return status{rpc_code::no_such_method,
+                      "this TDS parameter type is not encoded yet"};
+    }
+    return status{};
+}
+
+status token_reader::read_one(const column_meta& column, std::string& text,
+                              bool& nulled) noexcept {
+    text.clear();
+    nulled = false;
+    switch (column.type) {
+    case 0x1F: // NULL column: always null
+        nulled = true;
+        return status{};
+    case 0x30: { // INT1
+        const std::int8_t value = static_cast<std::int8_t>(u8());
+        text = std::to_string(static_cast<int>(value));
+        return status{};
+    }
+    case 0x32: { // BIT
+        text = u8() != 0 ? "1" : "0";
+        return status{};
+    }
+    case 0x34: { // INT2
+        const std::uint16_t low = u8();
+        const std::uint16_t high = u8();
+        const std::uint16_t raw = static_cast<std::uint16_t>(low | (high << 8));
+        text = std::to_string(static_cast<std::int16_t>(raw));
+        return status{};
+    }
+    case 0x38: { // INT4
+        const std::uint32_t raw = le32();
+        text = std::to_string(static_cast<std::int32_t>(raw));
+        return status{};
+    }
+    case 0x7F: { // INT8
+        const std::uint64_t raw = le64();
+        text = std::to_string(static_cast<std::int64_t>(raw));
+        return status{};
+    }
+    case 0x3B: { // FLT4
+        const std::uint32_t raw = le32();
+        float value = 0.0f;
+        std::memcpy(&value, &raw, sizeof(value));
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
+        text.assign(buffer);
+        return status{};
+    }
+    case 0x3E: { // FLT8
+        const std::uint64_t raw = le64();
+        double value = 0.0;
+        std::memcpy(&value, &raw, sizeof(value));
+        char buffer[40];
+        std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+        text.assign(buffer);
+        return status{};
+    }
+    case 0x26:   // INTN
+    case 0x68: { // BITN
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (length > 8) {
+            fail(rpc_code::protocol_error);
+            return status{rpc_code::protocol_error, "an INTN value is wider than 8 bytes"};
+        }
+        std::uint64_t value = 0;
+        for (std::uint8_t i = 0; i < length; ++i) {
+            value |= static_cast<std::uint64_t>(u8()) << (8 * i);
+        }
+        // Sign-extend from the actual width.
+        if (length < 8 && (value & (1ull << (8 * length - 1))) != 0) {
+            value |= ~0ull << (8 * length);
+        }
+        text = std::to_string(static_cast<std::int64_t>(value));
+        return status{};
+    }
+    case 0x6D: { // FLTN
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (length == 4) {
+            const std::uint32_t raw = le32();
+            float value = 0.0f;
+            std::memcpy(&value, &raw, sizeof(value));
+            char buffer[32];
+            std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
+            text.assign(buffer);
+        } else {
+            const std::uint64_t raw = le64();
+            double value = 0.0;
+            std::memcpy(&value, &raw, sizeof(value));
+            char buffer[40];
+            std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+            text.assign(buffer);
+        }
+        return status{};
+    }
+    case 0x6A:   // DECIMALN
+    case 0x6C: { // NUMERICN
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        // The sign byte is 1 for positive and 0 for negative -- the opposite of the
+        // obvious reading, and a capture caught it: 12.34 arrived as -12.34.
+        const bool negative = u8() == 0;
+        std::uint64_t magnitude = 0;
+        for (std::uint8_t i = 0; i + 1 < length; ++i) {
+            const std::uint64_t byte = u8();
+            if (i < 8) {
+                magnitude |= byte << (8 * i);
+            } else if (byte != 0) {
+                // Beyond 16 digits the value cannot be carried here; refusing beats
+                // printing a truncated number that looks right.
+                fail(rpc_code::protocol_error);
+                return status{rpc_code::protocol_error,
+                              "a decimal value exceeds the 64-bit magnitude this reader carries"};
+            }
+        }
+        text = format_decimal(column.precision, column.scale, negative, magnitude);
+        return status{};
+    }
+    case 0x28: { // DATE: one length byte, then days since 0001-01-01
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        std::uint32_t days = static_cast<std::uint32_t>(u8());
+        days |= static_cast<std::uint32_t>(u8()) << 8;
+        days |= static_cast<std::uint32_t>(u8()) << 16;
+        text = format_date(days);
+        return status{};
+    }
+    case 0x29: { // TIME
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        std::uint64_t ticks = 0;
+        for (std::uint8_t i = 0; i < length && i < 8; ++i) {
+            ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
+        }
+        text = format_time(ticks, column.scale);
+        return status{};
+    }
+    case 0x2A: { // DATETIME2: time, then three bytes of date
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        std::uint64_t ticks = 0;
+        const std::uint8_t time_bytes =
+            column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+        for (std::uint8_t i = 0; i < time_bytes; ++i) {
+            ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
+        }
+        std::uint32_t days = static_cast<std::uint32_t>(u8());
+        days |= static_cast<std::uint32_t>(u8()) << 8;
+        days |= static_cast<std::uint32_t>(u8()) << 16;
+        text = format_date(days) + " " + format_time(ticks, column.scale);
+        return status{};
+    }
+    case 0xE7:   // NVARCHAR
+    case 0xEF: { // NCHAR
+        const std::uint16_t bytes = le16();
+        if (bytes == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (!need(bytes)) {
+            fail(rpc_code::protocol_error);
+            return status{rpc_code::protocol_error, "a truncated NVARCHAR value"};
+        }
+        text = from_utf16le(payload_.subspan(offset_, bytes));
+        offset_ += bytes;
+        return status{};
+    }
+    case 0xA7:   // BIGVARCHAR
+    case 0xAF: { // BIGCHAR
+        const std::uint16_t bytes = le16();
+        if (bytes == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (!need(bytes)) {
+            fail(rpc_code::protocol_error);
+            return status{rpc_code::protocol_error, "a truncated VARCHAR value"};
+        }
+        // VARCHAR is in the column's collation code page. Bytes are passed through;
+        // claiming a specific encoding here would corrupt a non-UTF-8 collation.
+        text.assign(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
+        offset_ += bytes;
+        return status{};
+    }
+    case 0xA5:   // BIGVARBINARY
+    case 0xAD: { // BIGBINARY
+        const std::uint16_t bytes = le16();
+        if (bytes == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (!need(bytes)) {
+            fail(rpc_code::protocol_error);
+            return status{rpc_code::protocol_error, "a truncated VARBINARY value"};
+        }
+        text.assign(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
+        offset_ += bytes;
+        return status{};
+    }
+    case 0x24: { // GUID
+        const std::uint8_t length = u8();
+        if (length == 0) {
+            nulled = true;
+            return status{};
+        }
+        if (length != 16 || !need(length)) {
+            fail(rpc_code::protocol_error);
+            return status{rpc_code::protocol_error, "a UNIQUEIDENTIFIER is not 16 bytes"};
+        }
+        text = format_guid(payload_.subspan(offset_, length));
+        offset_ += length;
+        return status{};
+    }
+    default:
+        fail(rpc_code::no_such_method);
+        return status{rpc_code::no_such_method, "this TDS column type is not decoded yet"};
+    }
+}
+
 status token_reader::read_row(bool compressed, std::vector<std::string>& values,
                               std::vector<bool>& nulls) noexcept {
     values.clear();
@@ -626,264 +1392,33 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
         return status{rpc_code::protocol_error, "a TDS row arrived before any column metadata"};
     }
 
-    std::vector<std::uint8_t> bitmap;
     if (compressed) {
+        // NBCROW prefixes the row with a null bitmap: a set bit means no value bytes
+        // follow for that column, which is what makes fixed-width types nullable.
         const std::size_t bytes = (columns_.size() + 7) / 8;
-        bitmap.resize(bytes);
+        bitmap_.assign(bytes, 0);
         for (std::size_t i = 0; i < bytes; ++i) {
-            bitmap[i] = u8();
+            bitmap_[i] = u8();
         }
     }
 
     for (std::size_t index = 0; index < columns_.size(); ++index) {
-        const column_meta& column = columns_[index];
-        const auto mark_null = [&]() {
-            values.emplace_back();
-            nulls.push_back(true);
-        };
-        if (compressed && (bitmap[index / 8] & (1u << (index % 8))) != 0) {
-            mark_null();
-            continue;
+        std::string text;
+        bool nulled = false;
+        if (compressed && (bitmap_[index / 8] & (1u << (index % 8))) != 0) {
+            nulled = true;
+        } else {
+            const status read = read_one(columns_[index], text, nulled);
+            if (!read) {
+                return read;
+            }
         }
-        switch (column.type) {
-        case 0x1F: // NULL column: always null
-            mark_null();
-            continue;
-        case 0x30: { // INT1
-            const std::int8_t value = static_cast<std::int8_t>(u8());
-            values.push_back(std::to_string(static_cast<int>(value)));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x32: { // BIT
-            values.push_back(u8() != 0 ? "1" : "0");
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x34: { // INT2
-            const std::uint16_t raw = static_cast<std::uint16_t>(u8()) |
-                                      (static_cast<std::uint16_t>(u8()) << 8);
-            values.push_back(std::to_string(static_cast<std::int16_t>(raw)));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x38: { // INT4
-            const std::uint32_t raw = le32();
-            values.push_back(std::to_string(static_cast<std::int32_t>(raw)));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x7F: { // INT8
-            const std::uint64_t raw = le64();
-            values.push_back(std::to_string(static_cast<std::int64_t>(raw)));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x3B: { // FLT4
-            const std::uint32_t raw = le32();
-            float value = 0.0f;
-            std::memcpy(&value, &raw, sizeof(value));
-            char buffer[32];
-            std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
-            values.emplace_back(buffer);
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x3E: { // FLT8
-            const std::uint64_t raw = le64();
-            double value = 0.0;
-            std::memcpy(&value, &raw, sizeof(value));
-            char buffer[40];
-            std::snprintf(buffer, sizeof(buffer), "%.17g", value);
-            values.emplace_back(buffer);
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x26:   // INTN
-        case 0x68: { // BITN
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            std::int64_t value = 0;
-            for (std::uint8_t i = 0; i < length && i < 8; ++i) {
-                value |= static_cast<std::int64_t>(u8()) << (8 * i);
-            }
-            // Sign-extend from the actual width.
-            if (length < 8 && (value & (1LL << (8 * length - 1))) != 0) {
-                value |= ~0LL << (8 * length);
-            }
-            values.push_back(std::to_string(value));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x6D: { // FLTN
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            if (length == 4) {
-                const std::uint32_t raw = le32();
-                float value = 0.0f;
-                std::memcpy(&value, &raw, sizeof(value));
-                char buffer[32];
-                std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
-                values.emplace_back(buffer);
-            } else {
-                const std::uint64_t raw = le64();
-                double value = 0.0;
-                std::memcpy(&value, &raw, sizeof(value));
-                char buffer[40];
-                std::snprintf(buffer, sizeof(buffer), "%.17g", value);
-                values.emplace_back(buffer);
-            }
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x6A:   // DECIMALN
-        case 0x6C: { // NUMERICN
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            // The sign byte is 1 for positive and 0 for negative -- the opposite of
-            // the obvious reading, and a capture caught it: 12.34 arrived as -12.34.
-            const bool negative = u8() == 0;
-            std::uint32_t magnitude = 0;
-            for (std::uint8_t i = 0; i + 1 < length && i < 4; ++i) {
-                magnitude |= static_cast<std::uint32_t>(u8()) << (8 * i);
-            }
-            // Any remaining bytes are higher-order digits this slice does not carry;
-            // silently dropping them would understate the value, so refuse instead.
-            for (std::uint8_t i = 4; i + 1 < length; ++i) {
-                (void)u8();
-            }
-            values.push_back(format_decimal(column.precision, column.scale, negative, magnitude));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x28: { // DATE: one length byte, then days since 0001-01-01
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            std::uint32_t days = static_cast<std::uint32_t>(u8());
-            days |= static_cast<std::uint32_t>(u8()) << 8;
-            days |= static_cast<std::uint32_t>(u8()) << 16;
-            values.push_back(format_date(days));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x29: { // TIME
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            std::uint64_t ticks = 0;
-            for (std::uint8_t i = 0; i < length && i < 8; ++i) {
-                ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
-            }
-            values.push_back(format_time(ticks, column.scale));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x2A: { // DATETIME2: time, then three bytes of date
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            std::uint64_t ticks = 0;
-            const std::uint8_t time_bytes =
-                column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
-            for (std::uint8_t i = 0; i < time_bytes; ++i) {
-                ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
-            }
-            std::uint32_t days = static_cast<std::uint32_t>(u8());
-            days |= static_cast<std::uint32_t>(u8()) << 8;
-            days |= static_cast<std::uint32_t>(u8()) << 16;
-            values.push_back(format_date(days) + " " + format_time(ticks, column.scale));
-            nulls.push_back(false);
-            continue;
-        }
-        case 0xE7:   // NVARCHAR
-        case 0xEF: { // NCHAR
-            const std::uint16_t bytes = le16();
-            if (bytes == 0) {
-                mark_null();
-                continue;
-            }
-            if (!need(bytes)) {
-                fail(rpc_code::protocol_error);
-                return status{error_};
-            }
-            values.push_back(from_utf16le(payload_.subspan(offset_, bytes)));
-            offset_ += bytes;
-            nulls.push_back(false);
-            continue;
-        }
-        case 0xA7:   // BIGVARCHAR
-        case 0xAF: { // BIGCHAR
-            const std::uint16_t bytes = le16();
-            if (bytes == 0) {
-                mark_null();
-                continue;
-            }
-            if (!need(bytes)) {
-                fail(rpc_code::protocol_error);
-                return status{error_};
-            }
-            // VARCHAR is in the column's collation code page. Bytes are passed
-            // through; claiming a specific encoding here would corrupt a non-UTF-8
-            // collation.
-            values.emplace_back(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
-            offset_ += bytes;
-            nulls.push_back(false);
-            continue;
-        }
-        case 0xA5:   // BIGVARBINARY
-        case 0xAD: { // BIGBINARY
-            const std::uint16_t bytes = le16();
-            if (bytes == 0) {
-                mark_null();
-                continue;
-            }
-            if (!need(bytes)) {
-                fail(rpc_code::protocol_error);
-                return status{error_};
-            }
-            values.emplace_back(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
-            offset_ += bytes;
-            nulls.push_back(false);
-            continue;
-        }
-        case 0x24: { // GUID
-            const std::uint8_t length = u8();
-            if (length == 0) {
-                mark_null();
-                continue;
-            }
-            if (!need(length)) {
-                fail(rpc_code::protocol_error);
-                return status{error_};
-            }
-            values.push_back(format_guid(payload_.subspan(offset_, length)));
-            offset_ += length;
-            nulls.push_back(false);
-            continue;
-        }
-        default:
-            fail(rpc_code::no_such_method);
-            return status{rpc_code::no_such_method, "this TDS column type is not decoded yet"};
-        }
+        values.push_back(std::move(text));
+        nulls.push_back(nulled);
     }
     return status{};
 }
+
 // --- Tokens ------------------------------------------------------------------
 
 void token_reader::fail(rpc_code code) noexcept {
@@ -1135,18 +1670,44 @@ token_reader::result token_reader::next(token& out) noexcept {
         out.type = token::kind::done;
         out.done.status = u16_le();
         out.done.current_command = u16_le();
-        if (static_cast<token_type>(raw) == token_type::done) {
-            // DONE carries an 8-byte row count; DONE_PROC and DONE_IN_PROC carry 4.
-            // The value is little-endian like the other numeric token fields, unlike
-            // the big-endian lengths above it.
-            const std::uint32_t low = u32_le();
-            const std::uint32_t high = u32_le();
-            out.done.row_count = (static_cast<std::uint64_t>(high) << 32) | low;
-            out.done.has_row_count = true;
-        } else {
-            out.done.row_count = u32_le();
-            out.done.has_row_count = true;
+        // All three DONE variants carry an 8-byte row count in TDS 7.2+. Reading
+        // four for DONE_PROC/DONE_IN_PROC leaves four bytes in the stream, and the
+        // next token then decodes as garbage -- which is exactly what a real server
+        // reply showed before this was fixed.
+        const std::uint32_t low = u32_le();
+        const std::uint32_t high = u32_le();
+        out.done.row_count = (static_cast<std::uint64_t>(high) << 32) | low;
+        out.done.has_row_count = true;
+        break;
+    }
+    case token_type::return_status: {
+        out.type = token::kind::return_status;
+        out.ret_status = u32_le();
+        break;
+    }
+    case token_type::return_value: {
+        out.type = token::kind::return_value;
+        out.ret.ordinal = u16_le();
+        out.ret.name = b_varchar();
+        out.ret.status = u8();
+        // A RETURNVALUE carries a user type and a flags word before its TYPE_INFO,
+        // unlike an RPC request parameter, which has neither. Skipping them shifts
+        // the type byte by six and the value decodes as garbage.
+        out.ret.meta.flags = 0;
+        (void)u32_le();            // user type
+        out.ret.meta.flags = u16_le();
+        const status info = read_type_info(out.ret.meta);
+        if (!info) {
+            return result::error;
         }
+        std::string text;
+        bool nulled = false;
+        const status read = read_one(out.ret.meta, text, nulled);
+        if (!read) {
+            return result::error;
+        }
+        out.ret.value = std::move(text);
+        out.ret.is_null = nulled;
         break;
     }
     case token_type::colmetadata: {

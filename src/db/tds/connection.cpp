@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -404,26 +406,18 @@ status connection::perform_handshake() {
 
 // --- batches -----------------------------------------------------------------
 
-status connection::run_batch(std::string_view sql, result_set** out) {
-    if (out != nullptr) {
-        *out = nullptr;
-    }
-    const std::vector<std::byte> encoded = utf16le(sql);
-    const status sent =
-        send_message(packet_type::sql_batch, span<const std::byte>(encoded.data(), encoded.size()));
-    if (!sent) {
-        return sent;
-    }
-
-    // The reply is one token stream that may span several messages. `current` is
-    // the result set being filled; `first` is the one the caller will get, recorded
-    // when a result set completes. Everything after it is decoded and discarded so
-    // the stream stays aligned for the next batch.
+// The reply loop shared by batches and RPCs. It reads until a DONE without the
+// "more results" bit, collecting the first result set and any values the server wrote
+// back. Anything after the first result set is decoded and discarded so the stream
+// stays aligned for the next request -- a reply that is not fully drained
+// desynchronises the session permanently.
+status connection::read_reply(result_set** out, std::vector<return_value>* written) {
     std::unique_ptr<memory_result_set> first;
     std::unique_ptr<memory_result_set> current;
     std::int64_t affected = -1;
     rpc_error server_error{rpc_code::ok, {}};
     std::size_t row_bytes = 0;
+    has_return_status_ = false;
 
     for (;;) {
         std::vector<std::byte> message;
@@ -457,8 +451,8 @@ status connection::run_batch(std::string_view sql, result_set** out) {
                     info.nullable = source.nullable;
                     columns.push_back(std::move(info));
                 }
-                // A COLMETADATA starts a new result set; the previous one ended at
-                // its DONE, so it is already complete.
+                // A COLMETADATA starts a new result set; the previous one ended at its
+                // DONE, so it is already complete.
                 current = std::unique_ptr<memory_result_set>(
                     new memory_result_set(std::move(columns), -1));
                 break;
@@ -487,12 +481,21 @@ status connection::run_batch(std::string_view sql, result_set** out) {
                 if (server_error.code == rpc_code::ok) {
                     server_error = rpc_error{map_error_number(item.error.number),
                                              item.error.message.empty()
-                                                 ? std::string("the server rejected the batch")
+                                                 ? std::string("the server rejected the request")
                                                  : item.error.message};
                 }
                 break;
             case token::kind::info:
                 // PRINT and informational messages are not errors.
+                break;
+            case token::kind::return_status:
+                last_return_status_ = item.ret_status;
+                has_return_status_ = true;
+                break;
+            case token::kind::return_value:
+                if (written != nullptr) {
+                    written->push_back(item.ret);
+                }
                 break;
             case token::kind::done: {
                 if (item.done.has_row_count) {
@@ -520,7 +523,7 @@ status connection::run_batch(std::string_view sql, result_set** out) {
                     packet_size_ = static_cast<std::uint16_t>(
                         std::min<std::uint32_t>(item.env.new_packet_size, 32767u));
                 }
-                // A transaction started by a batch hands out its descriptor in the
+                // A transaction started by a request hands out its descriptor in the
                 // reply. Every later message must echo it, or the server refuses the
                 // request with "should come with valid transaction descriptor".
                 if (item.env.type == env_change_type::begin_transaction) {
@@ -551,13 +554,44 @@ status connection::run_batch(std::string_view sql, result_set** out) {
         if (first) {
             *out = first.release();
         } else {
-            // A batch with no result set (INSERT, DDL, BEGIN) still reports how many
+            // A request with no result set (INSERT, DDL, BEGIN) still reports how many
             // rows it touched, so it gets a cursor with no columns.
             *out = new memory_result_set({}, affected);
         }
     }
     return status{};
 }
+
+status connection::run_batch(std::string_view sql, result_set** out) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    const std::vector<std::byte> encoded = utf16le(sql);
+    const status sent =
+        send_message(packet_type::sql_batch, span<const std::byte>(encoded.data(), encoded.size()));
+    if (!sent) {
+        return sent;
+    }
+    return read_reply(out, nullptr);
+}
+
+status connection::run_rpc(const rpc_request& request, result_set** out,
+                           std::vector<return_value>* written) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    std::vector<std::byte> body;
+    const status encoded = encode_rpc(body, request);
+    if (!encoded) {
+        return encoded;
+    }
+    const status sent = send_message(packet_type::rpc, span<const std::byte>(body.data(), body.size()));
+    if (!sent) {
+        return sent;
+    }
+    return read_reply(out, written);
+}
+
 
 // --- db::connection ----------------------------------------------------------
 
@@ -603,22 +637,458 @@ status connection::rollback() {
     return status{};
 }
 
+namespace {
+
+// What one parameter needs on the wire: the type info, the logical value bytes, and
+// the declaration text SQL Server wants in an sp_executesql call.
+struct encoded_parameter {
+    column_meta info;
+    std::vector<std::byte> value;
+    bool is_null = false;
+    std::string declaration;
+};
+
+void put_le64_bytes(std::vector<std::byte>& out, std::uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xffu));
+    }
+}
+
+// Maps one library parameter onto TDS. A value that cannot be represented is refused
+// rather than approximated: binding the wrong type makes the server convert or
+// truncate silently, which is worse than a clear error.
+[[nodiscard]] result<encoded_parameter> encode_parameter(const parameter& param) {
+    encoded_parameter out;
+    const bool sends = param.sends_value() && !param.is_null;
+    switch (param.type) {
+    case db_type::int64: {
+        out.info.type = 0x26; // INTN
+        out.info.max_length = 8;
+        out.declaration = "bigint";
+        if (sends) {
+            put_le64_bytes(out.value, static_cast<std::uint64_t>(param.int_value));
+        }
+        break;
+    }
+    case db_type::uint64: {
+        if (param.uint_value <=
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            out.info.type = 0x26;
+            out.info.max_length = 8;
+            out.declaration = "bigint";
+            if (sends) {
+                put_le64_bytes(out.value, param.uint_value);
+            }
+        } else {
+            // SQL Server has no unsigned 64-bit integer; a value above INT64_MAX is
+            // carried as DECIMAL(20,0), which holds every uint64 exactly.
+            out.info.type = 0x6A; // DECIMALN
+            out.info.precision = 20;
+            out.info.scale = 0;
+            out.info.max_length = 17;
+            out.declaration = "decimal(20,0)";
+            if (sends) {
+                std::vector<std::byte> encoded;
+                std::uint8_t precision = out.info.precision;
+                std::uint8_t scale = out.info.scale;
+                const status decimal =
+                    encode_decimal_value(encoded, std::to_string(param.uint_value), precision, scale);
+                if (!decimal) {
+                    return decimal.error();
+                }
+                out.value = std::move(encoded);
+            }
+        }
+        break;
+    }
+    case db_type::boolean: {
+        out.info.type = 0x68; // BITN
+        out.info.max_length = 1;
+        out.declaration = "bit";
+        if (sends) {
+            out.value.push_back(static_cast<std::byte>(param.int_value != 0 ? 1 : 0));
+        }
+        break;
+    }
+    case db_type::real: {
+        out.info.type = 0x6D; // FLTN
+        out.info.max_length = 8;
+        out.declaration = "float";
+        if (sends) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &param.real_value, sizeof(bits));
+            put_le64_bytes(out.value, bits);
+        }
+        break;
+    }
+    case db_type::text: {
+        const std::vector<std::byte> encoded = utf16le(param.text);
+        const std::size_t characters = encoded.size() / 2;
+        out.info.type = 0xE7; // NVARCHAR
+        out.info.collation = {0x09, 0x04, 0xD0, 0x00, 0x34};
+        if (characters <= 4000) {
+            out.info.max_length = static_cast<std::uint32_t>(characters * 2);
+            out.declaration = "nvarchar(" + std::to_string(characters == 0 ? 1 : characters) + ")";
+        } else {
+            out.info.max_length = 0xFFFF; // NVARCHAR(MAX)
+            out.declaration = "nvarchar(max)";
+        }
+        if (sends) {
+            out.value = encoded;
+        }
+        break;
+    }
+    case db_type::blob: {
+        out.info.type = 0xA5; // BIGVARBINARY
+        if (param.blob.size() <= 8000) {
+            out.info.max_length = static_cast<std::uint32_t>(param.blob.size());
+            out.declaration =
+                "varbinary(" + std::to_string(param.blob.empty() ? 1 : param.blob.size()) + ")";
+        } else {
+            out.info.max_length = 0xFFFF;
+            out.declaration = "varbinary(max)";
+        }
+        if (sends) {
+            out.value = param.blob;
+        }
+        break;
+    }
+    case db_type::decimal: {
+        out.info.type = 0x6A; // DECIMALN
+        if (sends) {
+            const status decimal =
+                encode_decimal_value(out.value, param.text, out.info.precision, out.info.scale);
+            if (!decimal) {
+                return decimal.error();
+            }
+        } else {
+            out.info.precision = 38;
+            out.info.scale = 0;
+        }
+        out.info.max_length = out.info.precision <= 9    ? 5
+                              : out.info.precision <= 19 ? 9
+                              : out.info.precision <= 28 ? 13
+                                                         : 17;
+        out.declaration = "decimal(" + std::to_string(out.info.precision) + "," +
+                          std::to_string(out.info.scale) + ")";
+        break;
+    }
+    case db_type::uuid: {
+        out.info.type = 0x24; // GUID
+        out.info.max_length = 16;
+        out.declaration = "uniqueidentifier";
+        if (sends) {
+            const status guid = encode_guid_value(out.value, param.text);
+            if (!guid) {
+                return guid.error();
+            }
+        }
+        break;
+    }
+    case db_type::date: {
+        out.info.type = 0x28; // DATE
+        out.info.max_length = 3;
+        out.declaration = "date";
+        if (sends) {
+            const status date = encode_date_value(out.value, param.text);
+            if (!date) {
+                return date.error();
+            }
+        }
+        break;
+    }
+    case db_type::time: {
+        out.info.type = 0x29; // TIME
+        out.info.scale = 7;
+        out.info.max_length = 5;
+        out.declaration = "time(7)";
+        if (sends) {
+            const status time = encode_time_value(out.value, param.text, out.info.scale);
+            if (!time) {
+                return time.error();
+            }
+        }
+        break;
+    }
+    case db_type::timestamp: {
+        out.info.type = 0x2A; // DATETIME2
+        out.info.scale = 7;
+        out.info.max_length = 8;
+        out.declaration = "datetime2(7)";
+        if (sends) {
+            const status stamp = encode_datetime2_value(out.value, param.text, out.info.scale);
+            if (!stamp) {
+                return stamp.error();
+            }
+        }
+        break;
+    }
+    default:
+        return rpc_error{rpc_code::invalid_argument,
+                         "this parameter type has no TDS representation"};
+    }
+    // A parameter the server writes, or one the caller left NULL, sends no value.
+    out.is_null = !sends;
+    return out;
+}
+
+// Rewrites each top-level `?` into @P1, @P2, ... so one statement can go to
+// sp_executesql. The scanner understands SQL quoting: replacing every '?' would
+// corrupt a literal like 'a?b', turning a bound statement into a data bug.
+[[nodiscard]] status bind_placeholders(std::string_view sql, std::size_t count,
+                                       std::string& out) {
+    out.clear();
+    out.reserve(sql.size() + 8 * count);
+    std::size_t index = 0;
+    for (std::size_t i = 0; i < sql.size(); ++i) {
+        const char c = sql[i];
+        if (c == '\'' || c == '"' || c == '[') {
+            const char closing = c == '[' ? ']' : c;
+            out.push_back(c);
+            ++i;
+            while (i < sql.size()) {
+                out.push_back(sql[i]);
+                if (c != '[' && sql[i] == '\\' && i + 1 < sql.size()) {
+                    ++i;
+                    out.push_back(sql[i]);
+                } else if (sql[i] == closing) {
+                    if (i + 1 < sql.size() && sql[i + 1] == closing) {
+                        ++i;
+                        out.push_back(sql[i]);
+                    } else {
+                        break;
+                    }
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            while (i < sql.size() && sql[i] != '\n') {
+                out.push_back(sql[i]);
+                ++i;
+            }
+            if (i < sql.size()) {
+                out.push_back(sql[i]);
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            out += "/*";
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                out.push_back(sql[i]);
+                ++i;
+            }
+            if (i + 1 < sql.size()) {
+                out += "*/";
+                ++i;
+            }
+            continue;
+        }
+        if (c == '?') {
+            if (index >= count) {
+                return status{rpc_code::invalid_argument,
+                              "the statement has more placeholders than parameters"};
+            }
+            out += "@P";
+            out += std::to_string(index + 1);
+            ++index;
+            continue;
+        }
+        out.push_back(c);
+    }
+    if (index != count) {
+        return status{rpc_code::invalid_argument,
+                      "the statement has fewer placeholders than parameters"};
+    }
+    return status{};
+}
+
+// Applies a value the server wrote back to the caller's parameter, in the type the
+// caller declared.
+void apply_return_value(const return_value& value, parameter& target) {
+    target.is_null = value.is_null;
+    if (value.is_null) {
+        return;
+    }
+    switch (target.type) {
+    case db_type::int64:
+    case db_type::uint64:
+    case db_type::boolean: {
+        char* end = nullptr;
+        const long long parsed = std::strtoll(value.value.c_str(), &end, 10);
+        target.int_value = parsed;
+        target.uint_value = static_cast<std::uint64_t>(parsed);
+        break;
+    }
+    case db_type::real: {
+        char* end = nullptr;
+        target.real_value = std::strtod(value.value.c_str(), &end);
+        break;
+    }
+    case db_type::blob:
+        target.blob.assign(reinterpret_cast<const std::byte*>(value.value.data()),
+                           reinterpret_cast<const std::byte*>(value.value.data()) +
+                               value.value.size());
+        break;
+    default:
+        target.text = value.value;
+        break;
+    }
+}
+
+} // namespace
+
+status connection::call_impl(std::string_view sql, span<const parameter> params,
+                             result_set** out, bool procedure,
+                             std::vector<return_value>& written) {
+    std::vector<encoded_parameter> encoded;
+    encoded.reserve(params.size());
+    for (const parameter& param : params) {
+        result<encoded_parameter> one = encode_parameter(param);
+        if (!one) {
+            return one.error();
+        }
+        encoded.push_back(std::move(one.value()));
+    }
+
+    rpc_request request;
+    if (procedure) {
+        request.proc_name = std::string(sql);
+        for (std::size_t i = 0; i < encoded.size(); ++i) {
+            rpc_parameter wire;
+            // TDS parameter names are @-prefixed, and the server matches on the name
+            // it declared: a caller writing "sum" means "@sum".
+            wire.name = params[i].name;
+            if (!wire.name.empty() && wire.name[0] != '@') {
+                wire.name.insert(wire.name.begin(), '@');
+            }
+            wire.status = params[i].is_output() ? 0x01 : 0x00;
+            wire.info = encoded[i].info;
+            wire.value = std::move(encoded[i].value);
+            wire.is_null = encoded[i].is_null;
+            request.params.push_back(std::move(wire));
+        }
+    } else {
+        // sp_executesql: @stmt, @params, then the bound values. The statement's `?`
+        // markers become @P1..@Pn so the text and the declaration agree.
+        std::string statement;
+        const status bound = bind_placeholders(sql, params.size(), statement);
+        if (!bound) {
+            return bound;
+        }
+        std::string declaration;
+        for (std::size_t i = 0; i < encoded.size(); ++i) {
+            if (i != 0) {
+                declaration.push_back(',');
+            }
+            declaration += "@P";
+            declaration += std::to_string(i + 1);
+            declaration.push_back(' ');
+            declaration += encoded[i].declaration;
+            if (params[i].is_output()) {
+                declaration += " OUTPUT";
+            }
+        }
+
+        request.proc_name = "sp_executesql";
+
+        rpc_parameter stmt;
+        stmt.info.type = 0xE7;
+        stmt.info.max_length = 0xFFFF;
+        stmt.info.collation = {0x09, 0x04, 0xD0, 0x00, 0x34};
+        stmt.value = utf16le(statement);
+        request.params.push_back(std::move(stmt));
+
+        rpc_parameter decl;
+        decl.info.type = 0xE7;
+        decl.info.max_length = 0xFFFF;
+        decl.info.collation = {0x09, 0x04, 0xD0, 0x00, 0x34};
+        decl.value = utf16le(declaration);
+        request.params.push_back(std::move(decl));
+
+        for (std::size_t i = 0; i < encoded.size(); ++i) {
+            rpc_parameter wire;
+            wire.name = "@P" + std::to_string(i + 1);
+            wire.status = params[i].is_output() ? 0x01 : 0x00;
+            wire.info = encoded[i].info;
+            wire.value = std::move(encoded[i].value);
+            wire.is_null = encoded[i].is_null;
+            request.params.push_back(std::move(wire));
+        }
+    }
+
+    return run_rpc(request, out, &written);
+}
+
 status connection::query(std::string_view sql, span<const parameter> params, result_set** out) {
     if (out != nullptr) {
         *out = nullptr;
     }
-    if (!params.empty()) {
-        // The alternative is splicing values into the SQL text, which is how
-        // injection happens. sp_executesql over RPC is the correct mechanism and
-        // is not encoded yet.
-        return status{rpc_code::invalid_argument,
-                      "the TDS adapter does not encode parameters yet; execute textual SQL "
-                      "or wait for the RPC slice"};
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (params.empty()) {
+        return run_batch(sql, out);
+    }
+    // A query's parameters are const by contract, so an OUTPUT marker is rejected
+    // instead of being silently treated as input.
+    for (const parameter& param : params) {
+        if (param.is_output()) {
+            return status{rpc_code::invalid_argument,
+                          "query() cannot return an output parameter; use call()"};
+        }
+    }
+    std::vector<return_value> ignored;
+    return call_impl(sql, params, out, false, ignored);
+}
+
+status connection::call(std::string_view procedure, span<parameter> params, result_set** out) {
+    if (out != nullptr) {
+        *out = nullptr;
     }
     if (!open_) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
-    return run_batch(sql, out);
+    std::vector<return_value> written;
+    const status ran = call_impl(procedure, span<const parameter>(params.data(), params.size()),
+                                out, true, written);
+    if (!ran || written.empty()) {
+        return ran;
+    }
+    // Match by name first: the server echoes the name it was given, and the wire
+    // ordinal is zero-based in practice (a three-parameter call returned 2 for the
+    // third parameter), so a fixed +-1 assumption is wrong either way.
+    const auto strip_at = [](std::string_view name) {
+        return !name.empty() && name.front() == '@' ? name.substr(1) : name;
+    };
+    for (const return_value& value : written) {
+        std::size_t match = params.size();
+        if (!value.name.empty()) {
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                if (!params[i].name.empty() &&
+                    strip_at(params[i].name) == strip_at(value.name)) {
+                    match = i;
+                    break;
+                }
+            }
+        }
+        if (match == params.size()) {
+            // Fall back to the ordinal, treating it as zero-based when that lands on
+            // a parameter and one-based otherwise.
+            if (value.ordinal < params.size()) {
+                match = value.ordinal;
+            } else if (value.ordinal >= 1 && value.ordinal <= params.size()) {
+                match = static_cast<std::size_t>(value.ordinal) - 1;
+            }
+        }
+        if (match >= params.size()) {
+            continue;
+        }
+        apply_return_value(value, params[match]);
+    }
+    return status{};
 }
 
 void connection::close() noexcept {

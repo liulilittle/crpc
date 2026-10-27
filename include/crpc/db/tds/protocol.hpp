@@ -295,9 +295,32 @@ struct column_meta {
     bool nullable = false;
 };
 
+// A RETURNVALUE token: a parameter an RPC wrote back (an OUT or INOUT argument).
+struct return_value {
+    std::uint16_t ordinal = 0;
+    std::string name;
+    // 0x01 marks a by-reference parameter; the rest are server flags.
+    std::uint8_t status = 0;
+    column_meta meta;
+    // Canonical text, exactly like a row cell, so the same parser reads both.
+    std::string value;
+    bool is_null = true;
+};
+
 // One decoded token. `kind` selects the meaningful member.
 struct token {
-    enum class kind : std::uint8_t { error, info, login_ack, env_change, done, colmetadata, row, unknown };
+    enum class kind : std::uint8_t {
+        error,
+        info,
+        login_ack,
+        env_change,
+        done,
+        colmetadata,
+        row,
+        return_status,
+        return_value,
+        unknown
+    };
     kind type = kind::unknown;
     error_token error;
     error_token info;
@@ -309,9 +332,75 @@ struct token {
     // Set for a ROW/NBCROW token: canonical text values and which were NULL.
     std::vector<std::string> values;
     std::vector<bool> nulls;
+    // Set for RETURNSTATUS: the procedure's return code.
+    std::uint32_t ret_status = 0;
+    // Set for RETURNVALUE.
+    return_value ret;
     // The raw token byte, so an unhandled token can be reported with its type.
     std::uint8_t raw_type = 0;
 };
+
+// --- RPC ---------------------------------------------------------------------
+
+// One RPC parameter. Unlike a result column, a parameter's TYPE_INFO carries no user
+// type and no flags: the type byte follows the status byte directly. A capture from
+// SQL Server 2022 shows it as `name length, name, status, 0x26, 0x04, value length,
+// value` for an int parameter.
+struct rpc_parameter {
+    // Empty for a positional parameter.
+    std::string name;
+    // 0x01 marks a value the callee writes back.
+    std::uint8_t status = 0;
+    column_meta info;
+    // The logical payload: little-endian for numbers, UTF-16LE for strings, raw for
+    // binary. `encode_rpc_value` adds the length prefix the type requires.
+    std::vector<std::byte> value;
+    bool is_null = false;
+};
+
+struct rpc_request {
+    // Non-empty calls the procedure by name; otherwise `proc_id` is used.
+    std::string proc_name;
+    std::uint16_t proc_id = 0;
+    std::uint16_t option_flags = 0;
+    std::vector<rpc_parameter> params;
+};
+
+// Encodes the RPC body (everything after the AllHeaders block).
+[[nodiscard]] CRPC_API status encode_rpc(std::vector<std::byte>& out,
+                                         const rpc_request& request);
+
+// Appends one parameter's value with the length prefix its type requires: one byte
+// for the fixed-width nullable types, a USHORT byte count for bounded variable-length
+// types, and PLP (a 64-bit total plus chunks) for MAX types.
+[[nodiscard]] CRPC_API status encode_rpc_value(std::vector<std::byte>& out,
+                                               const rpc_parameter& param);
+
+// --- Value encoding ----------------------------------------------------------
+//
+// These turn canonical text (the text the reader produces) into parameter payload
+// bytes, so a value read from one server can be written to another without a second
+// set of parsing rules.
+
+// "YYYY-MM-DD" -> three bytes of days since 0001-01-01.
+[[nodiscard]] CRPC_API status encode_date_value(std::vector<std::byte>& out,
+                                                std::string_view text);
+// "HH:MM:SS[.fffffff]" -> ticks, in the width the scale implies.
+[[nodiscard]] CRPC_API status encode_time_value(std::vector<std::byte>& out,
+                                                std::string_view text, std::uint8_t scale);
+// "YYYY-MM-DD[ T]HH:MM:SS[.fffffff]" -> ticks then days.
+[[nodiscard]] CRPC_API status encode_datetime2_value(std::vector<std::byte>& out,
+                                                     std::string_view text,
+                                                     std::uint8_t scale);
+// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -> the 16-byte Windows layout.
+[[nodiscard]] CRPC_API status encode_guid_value(std::vector<std::byte>& out,
+                                                std::string_view text);
+// A decimal string -> sign byte plus little-endian magnitude, and the precision and
+// scale its declaration needs.
+[[nodiscard]] CRPC_API status encode_decimal_value(std::vector<std::byte>& out,
+                                                   std::string_view text,
+                                                   std::uint8_t& precision,
+                                                   std::uint8_t& scale);
 
 // Reads tokens from one message payload, in order.
 class CRPC_API token_reader {
@@ -347,6 +436,12 @@ private:
     [[nodiscard]] status read_colmetadata(std::vector<column_meta>& out) noexcept;
     [[nodiscard]] status read_row(bool compressed, std::vector<std::string>& values,
                                   std::vector<bool>& nulls) noexcept;
+    // Reads one value of `column` into canonical text. `nulled` reports a NULL value,
+    // which is a value, not an error.
+    [[nodiscard]] status read_one(const column_meta& column, std::string& value,
+                                  bool& nulled) noexcept;
+    // Reads the TYPE_INFO that precedes a parameter value or a RETURNVALUE.
+    [[nodiscard]] status read_type_info(column_meta& column) noexcept;
     void fail(rpc_code code) noexcept;
 
     span<const std::byte> payload_;
@@ -355,6 +450,8 @@ private:
     // The most recent COLMETADATA. A ROW carries values only, so this is the only
     // way to know how wide each one is.
     std::vector<column_meta> columns_;
+    // Reused per row: the NBCROW null bitmap.
+    std::vector<std::uint8_t> bitmap_;
 };
 
 // Size of a transaction descriptor in an ENVCHANGE body and in AllHeaders.

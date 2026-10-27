@@ -181,8 +181,12 @@ DECIMAL 符号字节 1 表示正数，`ENVCHANGE(begin_transaction)` 的事务�
 
 限制（明说，不隐藏）：
 
-* **参数被拒绝**（`invalid_argument`）。TDS 通过 RPC `sp_executesql` 绑定参数，本片尚未编码；
-  绝不用拼接 SQL 文本替代。
+* 参数通过 RPC 绑定，绝不拼接进 SQL 文本。`query(sql, params)` 发送 `sp_executesql`，把 `?`
+  改写成 `@P1..@Pn`（扫描器识别字符串字面量、带引号标识符与注释），`call(name, params)` 按名
+  调用存储过程。OUT/INOUT 经 `RETURNVALUE` 回写，返回码经 `RETURNSTATUS`
+  （`last_return_status()`）。占位符与参数个数不符时在发送前就拒绝。
+* NULL 输入参数必须带类型：`parameter::null()` 的类型是 `db_type::unknown`，会被
+  `invalid_argument` 拒绝，而不是猜一个类型去声明。
 * **没有 TLS。** 服务端在 PRELOGIN 应答 ENCRYPT_ON 或 ENCRYPT_REQ 时以 `failed_precondition`
   拒绝；构造时设置 `require_encryption = true` 会在写入任何字节之前失败。半截握手会被误判成
   认证失败，把真正原因藏起来。
