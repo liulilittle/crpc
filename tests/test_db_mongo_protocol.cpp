@@ -205,12 +205,37 @@ CRPC_TEST(mongo_hello_names_the_client_and_the_database) {
     std::int64_t flag = 0;
     CRPC_CHECK(hello.get_int64("hello", flag));
     CRPC_CHECK_EQ(std::int64_t{1}, flag);
+    // The client metadata document has a fixed shape: `driver` and `os` are documents, and
+    // the server refuses a string in their place ("The 'driver' field is required to be a
+    // BSON document in the client metadata document").
     const bson_document* client = hello.get_document("client");
     CRPC_CHECK(client != nullptr);
     if (client != nullptr) {
-        std::string driver;
-        CRPC_CHECK(client->get_text("driver", driver));
-        CRPC_CHECK_EQ(std::string("crpc"), driver);
+        const bson_document* driver = client->get_document("driver");
+        CRPC_CHECK(driver != nullptr);
+        if (driver != nullptr) {
+            std::string name;
+            CRPC_CHECK(driver->get_text("name", name));
+            CRPC_CHECK_EQ(std::string("crpc"), name);
+            std::string version;
+            CRPC_CHECK(driver->get_text("version", version));
+            CRPC_CHECK_FALSE(version.empty());
+        }
+        // `os` is required too, with `type` mandatory.
+        const bson_document* os = client->get_document("os");
+        CRPC_CHECK(os != nullptr);
+        if (os != nullptr) {
+            std::string type;
+            CRPC_CHECK(os->get_text("type", type));
+            CRPC_CHECK_FALSE(type.empty());
+        }
+        const bson_document* application = client->get_document("application");
+        CRPC_CHECK(application != nullptr);
+        if (application != nullptr) {
+            std::string name;
+            CRPC_CHECK(application->get_text("name", name));
+            CRPC_CHECK_EQ(std::string("crpc-test"), name);
+        }
     }
     std::string database;
     CRPC_CHECK(hello.get_text("$db", database));

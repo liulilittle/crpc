@@ -141,8 +141,7 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 
 ## MongoDB
 
-这一片实现了线协议与文档格式，但**没有**连接对象：测试环境里没有可用的服务端，
-「已连接」的适配器只会是未经验证的声明。
+适配器实现 BSON、OP_MSG 与 SCRAM-SHA-256 认证，并已在真实 MongoDB 7.0 上验证。
 
 ```cpp
 #include <crpc/db/mongo/protocol.hpp>
@@ -168,8 +167,42 @@ auto message = crpc::db::mongo::encode_op_msg(doc, 1);
 * 命令：`hello`、`find`、`insert`、`delete`、`getMore`、`killCursors`，以及应答状态
   （`ok`、`errmsg`）与错误码映射（重复键、认证失败、命名空间不存在、超时、坏值）。
 
-未实现：SCRAM 认证、TLS、压缩、连接与查询层。`killCursors` 存在的原因很实际：
-被放弃的游标会占用服务端资源直到超时，懂游标的客户端必须发送它。
+连接层：
+
+```cpp
+crpc::db::mongo::connection_options options;
+options.user = "crpc";
+options.password = "...";
+options.auth_database = "admin";
+options.database = "app";
+
+auto factory = std::make_unique<crpc::db::mongo::connection_factory>(options, backend, endpoint);
+auto session = factory->open();
+
+crpc::db::mongo::find_request request;
+request.database = "app";
+request.collection = "people";
+request.filter.append("age", crpc::db::mongo::bson_value::make_int32(41));
+auto found = session->find(request);       // 首批结果 + 游标 id
+auto inserted = session->insert("people", docs);
+```
+
+下面这些线级事实每个都花了一次往返才查清，现已写进代码并有测试：
+
+* **客户端元数据文档形状是固定的。** `driver` 与 `os` 必须是**文档**；把 `driver` 写成字符串会被拒
+  （“The 'driver' field is required to be a BSON document in the client metadata document”），
+  缺少 `os` 则报 “Missing required sub-document 'os'”。
+* **`conversationId` 必须按服务端给出的类型原样回传。** 转成 int64 会被拒：
+  “is the wrong type 'long', expected type 'int'”。
+* **每个 OP_MSG 请求都需要 `$db`。** 连接层在缺失时补上，因此命令构造器不可能产出被服务端拒绝的请求。
+* **写命令把单个文档的失败放在 `writeErrors` 里，而 `ok` 仍为 1。** 只检查 `ok` 会把重复键当成插入成功
+  —— 这是调用方看不见的静默数据丢失。`insert()` 现在检查 `writeErrors` 与 `writeConcernError`，
+  返回服务端自己的错误码与原文。
+* **应答的 `responseTo` 必须匹配请求 id。** 没有多路复用时不可能出现别的应答，接受它就会把另一个
+  命令的结果记到这个命令上。
+
+未实现：TLS、压缩、会话与事务（`begin()` 明确报告不支持而不是假装支持）、聚合。
+`killCursors` 存在的原因很实际：被放弃的游标会占用服务端资源直到超时，懂游标的客户端必须发送它。
 
 ## SQL Server（TDS）
 

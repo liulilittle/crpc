@@ -2,6 +2,7 @@
 #include <crpc/crypto/hash.hpp>
 
 #include <cstring>
+#include <vector>
 
 namespace crpc {
 namespace crypto {
@@ -264,6 +265,115 @@ sha256_digest sha256(span<const std::byte> data) noexcept {
         digest[i * 4 + 3] = static_cast<std::uint8_t>(state.h[i] & 0xffu);
     }
     return digest;
+}
+
+namespace {
+
+// HMAC needs the key XORed with a repeated byte, padded to the 64-byte block. Built as a
+// small fixed buffer rather than a vector: every call would otherwise allocate twice.
+using sha256_pad = std::array<std::uint8_t, 64>;
+
+[[nodiscard]] sha256_digest sha256_of(const std::uint8_t* data, std::size_t size) noexcept {
+    sha_state state;
+    sha256_init(state);
+    absorb(state, sha256_block_fn, data, size);
+    finish(state, sha256_block_fn);
+    sha256_digest digest{};
+    for (std::size_t i = 0; i < 8; ++i) {
+        digest[i * 4] = static_cast<std::uint8_t>((state.h[i] >> 24) & 0xffu);
+        digest[i * 4 + 1] = static_cast<std::uint8_t>((state.h[i] >> 16) & 0xffu);
+        digest[i * 4 + 2] = static_cast<std::uint8_t>((state.h[i] >> 8) & 0xffu);
+        digest[i * 4 + 3] = static_cast<std::uint8_t>(state.h[i] & 0xffu);
+    }
+    return digest;
+}
+
+// Hashes two pieces without concatenating them into a buffer. HMAC always needs
+// ipad||message and opad||inner, and copying the message for the sake of a single call is
+// what makes an HMAC in a hot path slow.
+[[nodiscard]] sha256_digest sha256_two(const std::uint8_t* first, std::size_t first_size,
+                                       const std::uint8_t* second,
+                                       std::size_t second_size) noexcept {
+    sha_state state;
+    sha256_init(state);
+    absorb(state, sha256_block_fn, first, first_size);
+    absorb(state, sha256_block_fn, second, second_size);
+    finish(state, sha256_block_fn);
+    sha256_digest digest{};
+    for (std::size_t i = 0; i < 8; ++i) {
+        digest[i * 4] = static_cast<std::uint8_t>((state.h[i] >> 24) & 0xffu);
+        digest[i * 4 + 1] = static_cast<std::uint8_t>((state.h[i] >> 16) & 0xffu);
+        digest[i * 4 + 2] = static_cast<std::uint8_t>((state.h[i] >> 8) & 0xffu);
+        digest[i * 4 + 3] = static_cast<std::uint8_t>(state.h[i] & 0xffu);
+    }
+    return digest;
+}
+
+} // namespace
+
+sha256_digest hmac_sha256(span<const std::byte> key, span<const std::byte> message) {
+    sha256_pad ipad{};
+    sha256_pad opad{};
+    if (key.size() > ipad.size()) {
+        const sha256_digest hashed = sha256(key);
+        for (std::size_t i = 0; i < hashed.size(); ++i) {
+            ipad[i] = hashed[i];
+            opad[i] = hashed[i];
+        }
+    } else {
+        for (std::size_t i = 0; i < key.size(); ++i) {
+            ipad[i] = static_cast<std::uint8_t>(key[i]);
+            opad[i] = static_cast<std::uint8_t>(key[i]);
+        }
+    }
+    for (std::size_t i = 0; i < ipad.size(); ++i) {
+        ipad[i] = static_cast<std::uint8_t>(ipad[i] ^ 0x36u);
+        opad[i] = static_cast<std::uint8_t>(opad[i] ^ 0x5cu);
+    }
+
+    const sha256_digest inner = sha256_two(ipad.data(), ipad.size(),
+                                           reinterpret_cast<const std::uint8_t*>(message.data()),
+                                           message.size());
+    return sha256_two(opad.data(), opad.size(), inner.data(), inner.size());
+}
+
+sha256_digest pbkdf2_sha256(span<const std::byte> password, span<const std::byte> salt,
+                            std::uint32_t iterations) {
+    if (iterations == 0) {
+        return sha256_digest{};
+    }
+    // U1 = HMAC(password, salt || INT(1)), then Ui = HMAC(password, U(i-1)) and
+    // T = U1 xor U2 xor ... One block is enough because SHA-256's output is the whole
+    // value SCRAM asks for.
+    // U1 = HMAC(password, salt || INT(1)). The block index is appended to a copy of the
+    // salt because HMAC takes one contiguous message; the salt is a few bytes, so this is
+    // one small allocation per authentication, not per iteration.
+    static const std::uint8_t block_index[4] = {0, 0, 0, 1};
+    std::vector<std::uint8_t> joined;
+    joined.reserve(salt.size() + 4);
+    for (std::size_t i = 0; i < salt.size(); ++i) {
+        joined.push_back(static_cast<std::uint8_t>(salt[i]));
+    }
+    for (const std::uint8_t byte : block_index) {
+        joined.push_back(byte);
+    }
+    const sha256_digest first =
+        hmac_sha256(password,
+                    span<const std::byte>(reinterpret_cast<const std::byte*>(joined.data()),
+                                          joined.size()));
+
+    sha256_digest accumulated = first;
+    sha256_digest previous = first;
+    for (std::uint32_t round = 1; round < iterations; ++round) {
+        previous = hmac_sha256(password,
+                               span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(previous.data()),
+                                   previous.size()));
+        for (std::size_t i = 0; i < accumulated.size(); ++i) {
+            accumulated[i] = static_cast<std::uint8_t>(accumulated[i] ^ previous[i]);
+        }
+    }
+    return accumulated;
 }
 
 sha256_digest sha256(span<const std::byte> first, span<const std::byte> second) noexcept {

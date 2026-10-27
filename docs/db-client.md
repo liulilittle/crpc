@@ -161,9 +161,8 @@ returned.
 
 ## MongoDB
 
-This slice speaks the wire protocol and the document format, and stops short of a
-connection object: there is no server in the test environment, so a "connected" adapter
-would be unverified.
+The adapter speaks BSON, OP_MSG, and SCRAM-SHA-256 authentication, and is verified against
+a real MongoDB 7.0.
 
 ```cpp
 #include <crpc/db/mongo/protocol.hpp>
@@ -194,9 +193,47 @@ What is implemented:
   status (`ok`, `errmsg`) and error-code mapping (duplicate key, auth failure, namespace
   not found, deadline, bad value).
 
-Not implemented: SCRAM authentication, TLS, compression, and the connection/query layer.
-`killCursors` exists because an abandoned cursor holds server resources until it times
-out; a cursor-aware client must send it.
+Connection layer:
+
+```cpp
+crpc::db::mongo::connection_options options;
+options.user = "crpc";
+options.password = "...";
+options.auth_database = "admin";
+options.database = "app";
+
+auto factory = std::make_unique<crpc::db::mongo::connection_factory>(options, backend, endpoint);
+auto session = factory->open();
+
+crpc::db::mongo::find_request request;
+request.database = "app";
+request.collection = "people";
+request.filter.append("age", crpc::db::mongo::bson_value::make_int32(41));
+auto found = session->find(request);       // first batch plus the cursor id
+auto inserted = session->insert("people", docs);
+```
+
+Wire facts that cost a round trip each to find, all now encoded and tested:
+
+* **The client metadata document has a fixed shape.** `driver` and `os` must be
+  *documents*; sending `driver` as a string is refused with "The 'driver' field is
+  required to be a BSON document in the client metadata document", and omitting `os`
+  gives "Missing required sub-document 'os'".
+* **`conversationId` must be echoed with the exact type the server used.** Converting it
+  to int64 is refused: "is the wrong type 'long', expected type 'int'".
+* **`$db` is required on every OP_MSG request.** The connection adds it if a command
+  builder did not, so a builder cannot produce a request the server rejects.
+* **A write command reports per-document failures in `writeErrors` while `ok` stays 1.**
+  Checking only `ok` reports a duplicate key as a successful insert — silent data loss.
+  `insert()` now inspects `writeErrors` and `writeConcernError` and returns the server's
+  own code and message.
+* **A reply's `responseTo` must match the request id.** A reply that answers something
+  else cannot happen without multiplexing, so accepting it would attribute another
+  command's result to this one.
+
+Not implemented: TLS, compression, sessions and transactions (`begin()` says so rather
+than pretending), and aggregation. `killCursors` exists because an abandoned cursor holds
+server resources until it times out; a cursor-aware client must send it.
 
 ## SQL Server (TDS)
 

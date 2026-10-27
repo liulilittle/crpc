@@ -1,6 +1,8 @@
 // CRPC -- Server-Sent Events framing helpers.
 #include <crpc/http/sse.hpp>
 
+#include <crpc/crypto/base64.hpp>
+
 #include <algorithm>
 #include <cstring>
 
@@ -188,37 +190,9 @@ std::string retry_hint(std::chrono::milliseconds value) {
 }
 
 std::string base64_encode(span<const std::byte> data) {
-    static constexpr char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((data.size() + 2) / 3) * 4);
-    const auto* bytes = reinterpret_cast<const unsigned char*>(data.data());
-    std::size_t i = 0;
-    while (i + 3 <= data.size()) {
-        const u32 block = (static_cast<u32>(bytes[i]) << 16) |
-                          (static_cast<u32>(bytes[i + 1]) << 8) |
-                          static_cast<u32>(bytes[i + 2]);
-        out.push_back(alphabet[(block >> 18) & 0x3Fu]);
-        out.push_back(alphabet[(block >> 12) & 0x3Fu]);
-        out.push_back(alphabet[(block >> 6) & 0x3Fu]);
-        out.push_back(alphabet[block & 0x3Fu]);
-        i += 3;
-    }
-    const std::size_t remaining = data.size() - i;
-    if (remaining == 1) {
-        const u32 block = static_cast<u32>(bytes[i]) << 16;
-        out.push_back(alphabet[(block >> 18) & 0x3Fu]);
-        out.push_back(alphabet[(block >> 12) & 0x3Fu]);
-        out.append("==", 2);
-    } else if (remaining == 2) {
-        const u32 block = (static_cast<u32>(bytes[i]) << 16) |
-                          (static_cast<u32>(bytes[i + 1]) << 8);
-        out.push_back(alphabet[(block >> 18) & 0x3Fu]);
-        out.push_back(alphabet[(block >> 12) & 0x3Fu]);
-        out.push_back(alphabet[(block >> 6) & 0x3Fu]);
-        out.push_back('=');
-    }
-    return out;
+    // One implementation, in the crypto layer: a second copy of the alphabet table is the
+    // kind of duplication that drifts when one side gains URL-safe handling.
+    return crypto::base64_encode(data);
 }
 
 bool is_text(span<const std::byte> data) noexcept {

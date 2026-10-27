@@ -147,9 +147,26 @@ status decode_op_msg(span<const std::byte> message, op_msg_reply& out) {
 bson_document make_hello(std::string_view application_name) {
     bson_document hello;
     hello.append("hello", bson_value::make_int32(1));
+    // The client metadata document has a fixed shape, and `driver` is itself a document
+    // with `name` and `version`. Sending it as a string is refused outright:
+    // "The 'driver' field is required to be a BSON document in the client metadata
+    // document".
     bson_document client;
-    client.append("driver", bson_value::make_text("crpc"));
-    client.append("application", bson_value::make_text(std::string(application_name)));
+    bson_document driver;
+    driver.append("name", bson_value::make_text("crpc"));
+    driver.append("version", bson_value::make_text("1.0"));
+    client.append("driver", bson_value::make_document(std::move(driver)));
+    // `os` is required as well, with `type` mandatory. The server validates the whole
+    // metadata document, so omitting a required sub-document is refused outright.
+    bson_document os;
+    os.append("type", bson_value::make_text("Windows"));
+    client.append("os", bson_value::make_document(std::move(os)));
+    if (!application_name.empty()) {
+        // `application` is also a document, and only `name` is required.
+        bson_document application;
+        application.append("name", bson_value::make_text(std::string(application_name)));
+        client.append("application", bson_value::make_document(std::move(application)));
+    }
     hello.append("client", bson_value::make_document(std::move(client)));
     // The server picks the highest version both sides support; this client speaks OP_MSG
     // and reads no newer feature, so it asks for the range it understands.

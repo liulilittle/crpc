@@ -36,6 +36,19 @@ using sha256_digest = std::array<std::uint8_t, 32>;
 [[nodiscard]] CRPC_API sha256_digest sha256(span<const std::byte> first,
                                             span<const std::byte> second) noexcept;
 
+// HMAC-SHA256 (RFC 2104). SCRAM authentication is defined in terms of it, so a client
+// that substitutes a plain hash cannot authenticate at all.
+[[nodiscard]] CRPC_API sha256_digest hmac_sha256(span<const std::byte> key,
+                                                 span<const std::byte> message);
+
+// PBKDF2-HMAC-SHA256 with one output block, which is what SCRAM's Hi() needs: the output
+// is exactly one SHA-256 digest, so a general multi-block implementation would be dead
+// code. iterations of 0 is refused by returning a zero digest rather than silently
+// producing the wrong value.
+[[nodiscard]] CRPC_API sha256_digest pbkdf2_sha256(span<const std::byte> password,
+                                                   span<const std::byte> salt,
+                                                   std::uint32_t iterations);
+
 // Hex encoding, lowercase. For tests and diagnostics.
 [[nodiscard]] CRPC_API std::string to_hex(sha1_digest digest);
 [[nodiscard]] CRPC_API std::string to_hex(sha256_digest digest);
