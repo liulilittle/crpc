@@ -1,6 +1,7 @@
 // CRPC -- TDS login-phase codec.
 #include <crpc/db/tds/protocol.hpp>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -410,6 +411,453 @@ status encode_login7(std::vector<std::byte>& out, const login7& value) {
     return status{};
 }
 
+// --- Column metadata and rows ------------------------------------------------
+
+namespace {
+
+// Days between 0001-01-01 (the TDS epoch) and 1970-01-01.
+constexpr std::int64_t tds_epoch_offset_days = 719162;
+
+[[nodiscard]] std::string format_date(std::uint32_t days) {
+    // Civil-from-days (Howard Hinnant's algorithm), with the TDS epoch shifted to
+    // 1970 so the arithmetic matches the published derivation.
+    const std::int64_t z = static_cast<std::int64_t>(days) + (719468 - tds_epoch_offset_days);
+    const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const std::uint32_t doe = static_cast<std::uint32_t>(z - era * 146097);
+    const std::uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const std::int64_t year = static_cast<std::int64_t>(yoe) + era * 400;
+    const std::uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const std::uint32_t mp = (5 * doy + 2) / 153;
+    const std::uint32_t day = doy - (153 * mp + 2) / 5 + 1;
+    const std::uint32_t month = mp + (mp < 10 ? 3u : static_cast<std::uint32_t>(-9));
+    const std::int64_t civil_year = year + (month <= 2 ? 1 : 0);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%04lld-%02u-%02u",
+                  static_cast<long long>(civil_year), month, day);
+    return buffer;
+}
+
+// Ticks are 100 ns units, which is the unit TIME and DATETIME2 use on the wire.
+[[nodiscard]] std::string format_time(std::uint64_t ticks, std::uint8_t scale) {
+    const std::uint64_t per_second = 10000000ull;
+    const std::uint64_t total_seconds = ticks / per_second;
+    const std::uint64_t fraction = ticks % per_second;
+    char buffer[40];
+    std::snprintf(buffer, sizeof(buffer), "%02llu:%02llu:%02llu",
+                  static_cast<unsigned long long>(total_seconds / 3600),
+                  static_cast<unsigned long long>((total_seconds / 60) % 60),
+                  static_cast<unsigned long long>(total_seconds % 60));
+    std::string text(buffer);
+    if (scale != 0) {
+        // The fraction is printed at the declared scale, not at full precision: a
+        // DATETIME2(3) column must not look like it has seven digits of accuracy.
+        char digits[16];
+        std::snprintf(digits, sizeof(digits), "%07llu",
+                      static_cast<unsigned long long>(fraction));
+        text.push_back('.');
+        text.append(digits, scale > 7 ? 7 : scale);
+    }
+    return text;
+}
+
+[[nodiscard]] std::string format_decimal(std::uint8_t precision, std::uint8_t scale,
+                                         bool negative, std::uint32_t magnitude) {
+    (void)precision;
+    std::string digits = std::to_string(magnitude);
+    if (scale != 0) {
+        if (digits.size() <= scale) {
+            digits.insert(0, static_cast<std::size_t>(scale) - digits.size() + 1, '0');
+        }
+        digits.insert(digits.size() - scale, 1, '.');
+    }
+    if (negative) {
+        digits.insert(digits.begin(), '-');
+    }
+    return digits;
+}
+
+[[nodiscard]] std::string format_guid(span<const std::byte> data) {
+    if (data.size() < 16) {
+        return {};
+    }
+    // A TDS GUID is a Windows GUID: the first three groups are little-endian.
+    const auto byte_at = [&](std::size_t index) {
+        return static_cast<unsigned>(static_cast<std::uint8_t>(data[index]));
+    };
+    char buffer[40];
+    std::snprintf(buffer, sizeof(buffer),
+                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                  byte_at(3), byte_at(2), byte_at(1), byte_at(0), byte_at(5), byte_at(4),
+                  byte_at(7), byte_at(6), byte_at(8), byte_at(9), byte_at(10), byte_at(11),
+                  byte_at(12), byte_at(13), byte_at(14), byte_at(15));
+    return buffer;
+}
+
+} // namespace
+
+status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
+    const std::uint16_t count = u16();
+    if (error_ != rpc_code::ok) {
+        return status{error_};
+    }
+    if (count == 0xFFFF) {
+        // "No metadata": the statement produced no result set.
+        out.clear();
+        return status{};
+    }
+    out.clear();
+    out.reserve(count);
+
+    for (std::uint16_t index = 0; index < count; ++index) {
+        column_meta column;
+        (void)u32();                    // user type, not needed for decoding
+        const std::uint16_t flags = u16();
+        (void)flags;
+        column.type = u8();
+        switch (column.type) {
+        case 0x1F: // NULL
+            column.max_length = 0;
+            break;
+        case 0x30: // INT1
+        case 0x32: // BIT
+            column.max_length = 1;
+            break;
+        case 0x34: // INT2
+            column.max_length = 2;
+            break;
+        case 0x38: // INT4
+        case 0x3B: // FLT4
+        case 0x3A: // SMALLDATETIME
+        case 0x7A: // SMALLMONEY
+            column.max_length = 4;
+            break;
+        case 0x7F: // INT8
+        case 0x3E: // FLT8
+        case 0x3D: // DATETIME
+        case 0x3C: // MONEY
+            column.max_length = 8;
+            break;
+        case 0x24: // GUID
+        case 0x26: // INTN
+        case 0x68: // BITN
+        case 0x6D: // FLTN
+        case 0x6E: // MONEYN
+        case 0x6F: // DATETIMEN
+        case 0x28: // DATE
+            column.max_length = u8();
+            break;
+        case 0x29: // TIME
+        case 0x2A: // DATETIME2
+        case 0x2B: // DATETIMEOFFSET
+            column.max_length = u8();
+            column.scale = u8();
+            break;
+        case 0x6A: // DECIMALN
+        case 0x6C: // NUMERICN
+            column.max_length = u8();
+            column.precision = u8();
+            column.scale = u8();
+            break;
+        case 0xA7: // BIGVARCHAR
+        case 0xAF: // BIGCHAR
+        case 0xE7: // NVARCHAR
+        case 0xEF: // NCHAR
+            column.max_length = be16();
+            // Character types carry a five-byte collation.
+            for (std::size_t i = 0; i < 5; ++i) {
+                column.collation[i] = u8();
+            }
+            break;
+        case 0xA5: // BIGVARBINARY
+        case 0xAD: // BIGBINARY
+            column.max_length = be16();
+            break;
+        default:
+            fail(rpc_code::no_such_method);
+            return status{rpc_code::no_such_method,
+                          "this TDS column type is not decoded yet"};
+        }
+        column.name = b_varchar();
+        if (error_ != rpc_code::ok) {
+            return status{error_};
+        }
+        // A fixed-width type is never NULL on the wire; a variable one is nullable
+        // whenever it can hold a zero length.
+        column.nullable = column.max_length > 0 && column.type != 0x1F &&
+                          column.type != 0x30 && column.type != 0x32 &&
+                          column.type != 0x34 && column.type != 0x38 &&
+                          column.type != 0x3B && column.type != 0x3A &&
+                          column.type != 0x7A && column.type != 0x7F &&
+                          column.type != 0x3E && column.type != 0x3D &&
+                          column.type != 0x3C;
+        out.push_back(std::move(column));
+    }
+    columns_ = out;
+    return status{};
+}
+
+status token_reader::read_row(bool compressed, std::vector<std::string>& values,
+                              std::vector<bool>& nulls) noexcept {
+    values.clear();
+    nulls.clear();
+    if (columns_.empty()) {
+        // A ROW without metadata means the stream lost the description; guessing
+        // widths from the payload would produce silent garbage.
+        fail(rpc_code::protocol_error);
+        return status{rpc_code::protocol_error, "a TDS row arrived before any column metadata"};
+    }
+
+    std::vector<std::uint8_t> bitmap;
+    if (compressed) {
+        const std::size_t bytes = (columns_.size() + 7) / 8;
+        bitmap.resize(bytes);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            bitmap[i] = u8();
+        }
+    }
+
+    for (std::size_t index = 0; index < columns_.size(); ++index) {
+        const column_meta& column = columns_[index];
+        const auto mark_null = [&]() {
+            values.emplace_back();
+            nulls.push_back(true);
+        };
+        if (compressed && (bitmap[index / 8] & (1u << (index % 8))) != 0) {
+            mark_null();
+            continue;
+        }
+        switch (column.type) {
+        case 0x1F: // NULL column: always null
+            mark_null();
+            continue;
+        case 0x30: { // INT1
+            const std::int8_t value = static_cast<std::int8_t>(u8());
+            values.push_back(std::to_string(static_cast<int>(value)));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x32: { // BIT
+            values.push_back(u8() != 0 ? "1" : "0");
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x34: { // INT2
+            const std::uint16_t raw = static_cast<std::uint16_t>(u8()) |
+                                      (static_cast<std::uint16_t>(u8()) << 8);
+            values.push_back(std::to_string(static_cast<std::int16_t>(raw)));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x38: { // INT4
+            const std::uint32_t raw = le32();
+            values.push_back(std::to_string(static_cast<std::int32_t>(raw)));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x7F: { // INT8
+            const std::uint64_t raw = le64();
+            values.push_back(std::to_string(static_cast<std::int64_t>(raw)));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x3B: { // FLT4
+            const std::uint32_t raw = le32();
+            float value = 0.0f;
+            std::memcpy(&value, &raw, sizeof(value));
+            char buffer[32];
+            std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
+            values.emplace_back(buffer);
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x3E: { // FLT8
+            const std::uint64_t raw = le64();
+            double value = 0.0;
+            std::memcpy(&value, &raw, sizeof(value));
+            char buffer[40];
+            std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+            values.emplace_back(buffer);
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x26:   // INTN
+        case 0x68: { // BITN
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            std::int64_t value = 0;
+            for (std::uint8_t i = 0; i < length && i < 8; ++i) {
+                value |= static_cast<std::int64_t>(u8()) << (8 * i);
+            }
+            // Sign-extend from the actual width.
+            if (length < 8 && (value & (1LL << (8 * length - 1))) != 0) {
+                value |= ~0LL << (8 * length);
+            }
+            values.push_back(std::to_string(value));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x6D: { // FLTN
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            if (length == 4) {
+                const std::uint32_t raw = le32();
+                float value = 0.0f;
+                std::memcpy(&value, &raw, sizeof(value));
+                char buffer[32];
+                std::snprintf(buffer, sizeof(buffer), "%.9g", static_cast<double>(value));
+                values.emplace_back(buffer);
+            } else {
+                const std::uint64_t raw = le64();
+                double value = 0.0;
+                std::memcpy(&value, &raw, sizeof(value));
+                char buffer[40];
+                std::snprintf(buffer, sizeof(buffer), "%.17g", value);
+                values.emplace_back(buffer);
+            }
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x6A:   // DECIMALN
+        case 0x6C: { // NUMERICN
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            const bool negative = u8() != 0;
+            std::uint32_t magnitude = 0;
+            for (std::uint8_t i = 0; i + 1 < length && i < 4; ++i) {
+                magnitude |= static_cast<std::uint32_t>(u8()) << (8 * i);
+            }
+            // Any remaining bytes are higher-order digits this slice does not carry;
+            // silently dropping them would understate the value, so refuse instead.
+            for (std::uint8_t i = 4; i + 1 < length; ++i) {
+                (void)u8();
+            }
+            values.push_back(format_decimal(column.precision, column.scale, negative, magnitude));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x28: { // DATE: three bytes of days since 0001-01-01
+            std::uint32_t days = static_cast<std::uint32_t>(u8());
+            days |= static_cast<std::uint32_t>(u8()) << 8;
+            days |= static_cast<std::uint32_t>(u8()) << 16;
+            values.push_back(format_date(days));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x29: { // TIME
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            std::uint64_t ticks = 0;
+            for (std::uint8_t i = 0; i < length && i < 8; ++i) {
+                ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
+            }
+            values.push_back(format_time(ticks, column.scale));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x2A: { // DATETIME2: time, then three bytes of date
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            std::uint64_t ticks = 0;
+            const std::uint8_t time_bytes =
+                column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+            for (std::uint8_t i = 0; i < time_bytes; ++i) {
+                ticks |= static_cast<std::uint64_t>(u8()) << (8 * i);
+            }
+            std::uint32_t days = static_cast<std::uint32_t>(u8());
+            days |= static_cast<std::uint32_t>(u8()) << 8;
+            days |= static_cast<std::uint32_t>(u8()) << 16;
+            values.push_back(format_date(days) + " " + format_time(ticks, column.scale));
+            nulls.push_back(false);
+            continue;
+        }
+        case 0xE7:   // NVARCHAR
+        case 0xEF: { // NCHAR
+            const std::uint16_t bytes = be16();
+            if (bytes == 0) {
+                mark_null();
+                continue;
+            }
+            if (!need(bytes)) {
+                fail(rpc_code::protocol_error);
+                return status{error_};
+            }
+            values.push_back(from_utf16le(payload_.subspan(offset_, bytes)));
+            offset_ += bytes;
+            nulls.push_back(false);
+            continue;
+        }
+        case 0xA7:   // BIGVARCHAR
+        case 0xAF: { // BIGCHAR
+            const std::uint16_t bytes = be16();
+            if (bytes == 0) {
+                mark_null();
+                continue;
+            }
+            if (!need(bytes)) {
+                fail(rpc_code::protocol_error);
+                return status{error_};
+            }
+            // VARCHAR is in the column's collation code page. Bytes are passed
+            // through; claiming a specific encoding here would corrupt a non-UTF-8
+            // collation.
+            values.emplace_back(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
+            offset_ += bytes;
+            nulls.push_back(false);
+            continue;
+        }
+        case 0xA5:   // BIGVARBINARY
+        case 0xAD: { // BIGBINARY
+            const std::uint16_t bytes = be16();
+            if (bytes == 0) {
+                mark_null();
+                continue;
+            }
+            if (!need(bytes)) {
+                fail(rpc_code::protocol_error);
+                return status{error_};
+            }
+            values.emplace_back(reinterpret_cast<const char*>(payload_.data() + offset_), bytes);
+            offset_ += bytes;
+            nulls.push_back(false);
+            continue;
+        }
+        case 0x24: { // GUID
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
+            if (!need(length)) {
+                fail(rpc_code::protocol_error);
+                return status{error_};
+            }
+            values.push_back(format_guid(payload_.subspan(offset_, length)));
+            offset_ += length;
+            nulls.push_back(false);
+            continue;
+        }
+        default:
+            fail(rpc_code::no_such_method);
+            return status{rpc_code::no_such_method, "this TDS column type is not decoded yet"};
+        }
+    }
+    return status{};
+}
 // --- Tokens ------------------------------------------------------------------
 
 void token_reader::fail(rpc_code code) noexcept {
@@ -481,6 +929,33 @@ std::uint32_t token_reader::u32_le() noexcept {
     return value;
 }
 
+std::uint16_t token_reader::le16() noexcept {
+    const std::uint8_t low = u8();
+    const std::uint8_t high = u8();
+    return static_cast<std::uint16_t>(low) | (static_cast<std::uint16_t>(high) << 8);
+}
+
+std::uint32_t token_reader::le32() noexcept {
+    std::uint32_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+        value |= static_cast<std::uint32_t>(u8()) << (8 * i);
+    }
+    return value;
+}
+
+std::uint64_t token_reader::le64() noexcept {
+    std::uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<std::uint64_t>(u8()) << (8 * i);
+    }
+    return value;
+}
+
+std::uint16_t token_reader::be16() noexcept {
+    const std::uint8_t high = u8();
+    const std::uint8_t low = u8();
+    return (static_cast<std::uint16_t>(high) << 8) | static_cast<std::uint16_t>(low);
+}
 std::string token_reader::b_varchar() noexcept {
     const std::uint8_t characters = u8();
     if (error_ != rpc_code::ok) {
@@ -642,7 +1117,24 @@ token_reader::result token_reader::next(token& out) noexcept {
         }
         break;
     }
-    default: {
+    case token_type::colmetadata: {
+        out.type = token::kind::colmetadata;
+        const status read = read_colmetadata(out.columns);
+        if (!read) {
+            return result::error;
+        }
+        break;
+    }
+    case token_type::row:
+    case token_type::nbc_row: {
+        out.type = token::kind::row;
+        const status read = read_row(static_cast<token_type>(raw) == token_type::nbc_row,
+                                     out.values, out.nulls);
+        if (!read) {
+            return result::error;
+        }
+        break;
+    }    default: {
         // A token this slice does not model still has a length; skipping it keeps the
         // stream aligned for the tokens after it.
         out.type = token::kind::unknown;

@@ -16,6 +16,7 @@
 #ifndef CRPC_DB_TDS_PROTOCOL_HPP
 #define CRPC_DB_TDS_PROTOCOL_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -242,15 +243,39 @@ struct done_token {
     [[nodiscard]] bool error() const noexcept { return (status & 0x0002) != 0; }
 };
 
+// A column as COLMETADATA describes it. A ROW carries values only, so every row is
+// decoded against this description; a reader that forgot it would have to guess the
+// width of each value.
+struct column_meta {
+    // The wire type byte, kept raw so an unmodelled type is reported rather than
+    // guessed from its size.
+    std::uint8_t type = 0;
+    // Maximum length in bytes for a variable-length type; the fixed width otherwise.
+    std::uint32_t max_length = 0;
+    std::uint8_t precision = 0;
+    std::uint8_t scale = 0;
+    // Only meaningful for character types; five raw bytes.
+    std::array<std::uint8_t, 5> collation{};
+    std::string name;
+    // A fixed-width column is never NULL; a variable one is nullable unless its
+    // maximum length is zero.
+    bool nullable = false;
+};
+
 // One decoded token. `kind` selects the meaningful member.
 struct token {
-    enum class kind : std::uint8_t { error, info, login_ack, env_change, done, unknown };
+    enum class kind : std::uint8_t { error, info, login_ack, env_change, done, colmetadata, row, unknown };
     kind type = kind::unknown;
     error_token error;
     error_token info;
     login_ack ack;
     env_change env;
     done_token done;
+    // Set for a COLMETADATA token.
+    std::vector<column_meta> columns;
+    // Set for a ROW/NBCROW token: canonical text values and which were NULL.
+    std::vector<std::string> values;
+    std::vector<bool> nulls;
     // The raw token byte, so an unhandled token can be reported with its type.
     std::uint8_t raw_type = 0;
 };
@@ -278,13 +303,25 @@ private:
     // inside a token are little-endian. Both live in one struct, so both are named.
     [[nodiscard]] std::uint16_t u16_le() noexcept;
     [[nodiscard]] std::uint32_t u32_le() noexcept;
+    // Explicit byte-order readers. `(u8() << 8) | u8()` is undefined: the two calls
+    // are unsequenced, so the bytes can be read in either order.
+    [[nodiscard]] std::uint16_t le16() noexcept;
+    [[nodiscard]] std::uint32_t le32() noexcept;
+    [[nodiscard]] std::uint64_t le64() noexcept;
+    [[nodiscard]] std::uint16_t be16() noexcept;
     [[nodiscard]] std::string b_varchar() noexcept;   // 1-byte length in chars
     [[nodiscard]] std::string us_varchar() noexcept;  // 2-byte length in chars
+    [[nodiscard]] status read_colmetadata(std::vector<column_meta>& out) noexcept;
+    [[nodiscard]] status read_row(bool compressed, std::vector<std::string>& values,
+                                  std::vector<bool>& nulls) noexcept;
     void fail(rpc_code code) noexcept;
 
     span<const std::byte> payload_;
     std::size_t offset_ = 0;
     rpc_code error_ = rpc_code::ok;
+    // The most recent COLMETADATA. A ROW carries values only, so this is the only
+    // way to know how wide each one is.
+    std::vector<column_meta> columns_;
 };
 
 // Maps a TDS error number to the library code. SQL Server numbers are grouped:
