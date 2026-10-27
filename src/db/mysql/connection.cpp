@@ -1729,6 +1729,28 @@ bool connection::is_open() const noexcept { return open_; }
 
 // --- factory -----------------------------------------------------------------
 
+channel_factory::channel_factory(connection_options options, opener open)
+    : options_(std::move(options)), open_(std::move(open)) {}
+
+channel_factory::~channel_factory() = default;
+
+result<db::connection*> channel_factory::open() {
+    if (!open_) {
+        return rpc_error{rpc_code::failed_precondition, "the channel factory has no opener"};
+    }
+    result<std::unique_ptr<channel>> opened = open_();
+    if (!opened) {
+        return opened.error();
+    }
+    auto session = std::unique_ptr<connection>(
+        new connection(options_, std::move(opened.value())));
+    if (!session->is_open()) {
+        return rpc_error{rpc_code::unavailable, "mysql handshake failed"};
+    }
+    return static_cast<db::connection*>(session.release());
+}
+
+std::string_view channel_factory::name() const noexcept { return "mysql-injected"; }
 connection_factory::connection_factory(connection_options options, crpc::backend_factory& backend,
                                        crpc::endpoint endpoint, crpc::runtime* shard)
     : options_(std::move(options)),

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -235,6 +236,26 @@ friend class connection;
     std::uint32_t statement_id_ = 0;
     std::size_t param_count_ = 0;
     std::size_t column_count_ = 0;
+};
+
+// Opens connections over a caller-supplied channel.
+//
+// This is the injectable form of the endpoint factory: tests and custom transports
+// (TLS wrappers, Unix sockets) supply the channel, so the pool plus this adapter can
+// be verified end to end without a server.
+class CRPC_API channel_factory final : public db::connection_factory {
+public:
+    using opener = std::function<result<std::unique_ptr<channel>>()>;
+
+    channel_factory(connection_options options, opener open);
+    ~channel_factory() override;
+
+    [[nodiscard]] result<db::connection*> open() override;
+    [[nodiscard]] std::string_view name() const noexcept override;
+
+private:
+    connection_options options_;
+    opener open_;
 };
 
 // Opens one connection to one endpoint. A pool owns the result.
