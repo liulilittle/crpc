@@ -260,6 +260,54 @@ struct text_row {
 
 [[nodiscard]] CRPC_API status decode_text_row(span<const std::byte> payload, text_row& out);
 
+// --- Prepared statements -----------------------------------------------------
+
+// Command bytes for the prepared-statement protocol.
+inline constexpr std::uint8_t com_stmt_prepare = 0x16;
+inline constexpr std::uint8_t com_stmt_execute = 0x17;
+inline constexpr std::uint8_t com_stmt_close = 0x19;
+inline constexpr std::uint8_t com_stmt_reset = 0x1a;
+
+// The reply to COM_STMT_PREPARE. It is followed by `param_count` parameter
+// definitions (and an EOF) and `column_count` column definitions (and an EOF), so a
+// caller that ignores those counts leaves the stream desynchronised.
+struct prepare_ok {
+    std::uint32_t statement_id = 0;
+    std::uint16_t column_count = 0;
+    std::uint16_t param_count = 0;
+    std::uint16_t warnings = 0;
+};
+
+[[nodiscard]] CRPC_API status decode_prepare_ok(span<const std::byte> payload,
+                                               prepare_ok& out);
+
+// Encodes COM_STMT_EXECUTE for `params`.
+//
+// The type array is always sent (the "new parameters bound" flag is 1): a prepared
+// statement is often executed more than once with different types, and relying on
+// the server's cached types turns a type change into a silent misread of the bytes.
+[[nodiscard]] CRPC_API status encode_stmt_execute(std::vector<std::byte>& out,
+                                                  std::uint32_t statement_id,
+                                                  span<const parameter> params);
+
+// COM_STMT_CLOSE takes the id and nothing else; the server sends no reply.
+[[nodiscard]] CRPC_API std::vector<std::byte> encode_stmt_close(std::uint32_t statement_id);
+
+// One binary-protocol row, already converted to the text form the cursor
+// accessors parse. A binary row carries integers as fixed-width little-endian
+// fields and temporals as length-prefixed tuples, so it cannot share the text
+// decoder; converting here keeps one result-set implementation for both protocols.
+struct binary_row {
+    std::vector<std::string> values;
+    std::vector<bool> nulls;
+};
+
+// Decodes one binary row. `types` is the column types from the result-set
+// definitions, in column order.
+[[nodiscard]] CRPC_API status decode_binary_row(span<const std::byte> payload,
+                                               span<const column_type> types,
+                                               binary_row& out);
+
 // Maps a wire error code to the library code. The server's own code is never lost:
 // it stays in `err_packet::code`, and this only classifies it.
 [[nodiscard]] CRPC_API rpc_code map_error_code(std::uint16_t code) noexcept;

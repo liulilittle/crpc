@@ -274,12 +274,15 @@ is guarded.
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
 - `::crpc::db::column_info`
+- `::crpc::db::parameter`
 - `::crpc::db::mysql::column_definition`
 - `::crpc::db::mysql::eof_packet`
 - `::crpc::db::mysql::err_packet`
 - `::crpc::db::mysql::handshake`
 - `::crpc::db::mysql::handshake_response_options`
 - `::crpc::db::mysql::ok_packet`
+- `::crpc::db::mysql::binary_row`
+- `::crpc::db::mysql::prepare_ok`
 - `::crpc::db::mysql::text_row`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
