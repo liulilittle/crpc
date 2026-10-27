@@ -104,9 +104,49 @@ void connection::fail(const status& error) noexcept {
 
 // --- framing -----------------------------------------------------------------
 
+std::vector<std::byte> connection::all_headers() const {
+    // Captured from sqlcmd's own traffic: the block is 22 bytes even outside a
+    // transaction -- total length, the 18-byte transaction-descriptor header with an
+    // all-zero descriptor, and an outstanding-request count of 1. Sending a bare
+    // 4-byte length instead makes SQL Server reject the message with "the multiple
+    // active result sets (MARS) TDS header is missing", and sending nothing at all
+    // gives "the TDS headers contained errors": both were observed before this.
+    std::vector<std::byte> out;
+    constexpr std::size_t total = 4 + 4 + 2 + transaction_descriptor_size + 4;
+    constexpr std::size_t header_length = 4 + 2 + transaction_descriptor_size + 4;
+    out.push_back(static_cast<std::byte>(total & 0xffu));
+    out.push_back(static_cast<std::byte>((total >> 8) & 0xffu));
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    out.push_back(static_cast<std::byte>(header_length & 0xffu));
+    out.push_back(static_cast<std::byte>((header_length >> 8) & 0xffu));
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0x02}); // header type: transaction descriptor
+    out.push_back(std::byte{0});
+    // Inside a transaction the server's own descriptor must be echoed: sending
+    // zeros gets "should come with valid transaction descriptor".
+    for (const std::uint8_t byte : descriptor_) {
+        out.push_back(static_cast<std::byte>(byte));
+    }
+    out.push_back(std::byte{1}); // outstanding request count
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    return out;
+}
+
 status connection::send_message(packet_type type, span<const std::byte> payload) {
     if (!open_ && type != packet_type::prelogin && type != packet_type::login7) {
         return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    // PRELOGIN and LOGIN7 predate the header block; everything after them carries it.
+    std::vector<std::byte> framed;
+    if (type == packet_type::sql_batch || type == packet_type::rpc ||
+        type == packet_type::transaction_manager) {
+        framed = all_headers();
+        framed.insert(framed.end(), payload.begin(), payload.end());
+        payload = span<const std::byte>(framed.data(), framed.size());
     }
     // The header claims the whole packet, so the body is split at the payload
     // boundary: header_size + chunk <= packet_size.
@@ -258,11 +298,13 @@ status connection::perform_handshake() {
     login.server_name = options_.server_name;
     login.client_interface_name = "crpc";
     login.packet_size = packet_size_;
-    login.option_flags = bit(login_option::init_db_fatal) | bit(login_option::language_fatal) |
-                         bit(login_option::use_db_notify);
-    if (!login.database.empty()) {
-        login.option_flags |= bit(login_option::set_language_on);
-    }
+    // OptionFlags1: fUseDB | fDatabase | fSetLang, and fByteOrder left at 0 because
+    // the client is little-endian. Setting fByteOrder is not harmless: the server
+    // then reads the whole login backwards and rejects it with 17832.
+    login.option_flags = bit(login_option::use_db_notify) | bit(login_option::init_db_fatal) |
+                         bit(login_option::set_language_on);
+    // OptionFlags2: fLanguage | fODBC.
+    login.option_flags |= bit(login_option::language) | bit(login_option::odbc);
 
     std::vector<std::byte> login_payload;
     const status login_encoded = encode_login7(login_payload, login);
@@ -316,6 +358,13 @@ status connection::perform_handshake() {
                     // later message, in both directions.
                     packet_size_ = static_cast<std::uint16_t>(
                         std::min<std::uint32_t>(item.env.new_packet_size, 32767u));
+                }
+                if (item.env.type == env_change_type::begin_transaction) {
+                    descriptor_ = item.env.new_descriptor;
+                    has_descriptor_ = true;
+                } else if (item.env.type == env_change_type::commit_transaction ||
+                           item.env.type == env_change_type::rollback_transaction) {
+                    has_descriptor_ = false;
                 }
                 break;
             case token::kind::error:
@@ -470,6 +519,17 @@ status connection::run_batch(std::string_view sql, result_set** out) {
                     item.env.new_packet_size >= 512) {
                     packet_size_ = static_cast<std::uint16_t>(
                         std::min<std::uint32_t>(item.env.new_packet_size, 32767u));
+                }
+                // A transaction started by a batch hands out its descriptor in the
+                // reply. Every later message must echo it, or the server refuses the
+                // request with "should come with valid transaction descriptor".
+                if (item.env.type == env_change_type::begin_transaction) {
+                    descriptor_ = item.env.new_descriptor;
+                    has_descriptor_ = true;
+                } else if (item.env.type == env_change_type::commit_transaction ||
+                           item.env.type == env_change_type::rollback_transaction) {
+                    has_descriptor_ = false;
+                    descriptor_.fill(0);
                 }
                 break;
             default:

@@ -21,6 +21,7 @@
 #ifndef CRPC_DB_TDS_CONNECTION_HPP
 #define CRPC_DB_TDS_CONNECTION_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -110,6 +111,11 @@ public:
 
 private:
     [[nodiscard]] status perform_handshake();
+    // Every message after the login starts with an AllHeaders block. Without it a
+    // real server answers "the incoming tabular data stream (TDS) protocol stream is
+    // incorrect. The TDS headers contained errors." -- which is what happened before
+    // this block existed.
+    [[nodiscard]] std::vector<std::byte> all_headers() const;
     [[nodiscard]] status send_message(packet_type type, span<const std::byte> payload);
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
     // Sends one batch and decodes the whole reply, returning the first result set.
@@ -126,6 +132,9 @@ private:
     bool in_transaction_ = false;
     bool encrypted_ = false;
     std::size_t received_bytes_ = 0;
+    // Echoed from ENVCHANGE(begin_transaction); cleared on commit and rollback.
+    std::array<std::uint8_t, transaction_descriptor_size> descriptor_{};
+    bool has_descriptor_ = false;
     rpc_error connect_error_;
 };
 

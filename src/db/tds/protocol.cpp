@@ -296,12 +296,16 @@ std::string from_utf16le(span<const std::byte> data) {
 // --- LOGIN7 ------------------------------------------------------------------
 
 std::vector<std::uint8_t> obfuscate_password(std::string_view password) {
+    // LOGIN7 carries the password as UTF-16LE, and *each byte* of that encoding is
+    // nibble-swapped and XORed. Doing this per character instead of per byte emits
+    // half the bytes: the server then reports "an error occurred while evaluating the
+    // password" (18456 state 7), which reads like a wrong credential rather than a
+    // client bug.
+    const std::vector<std::byte> text = utf16le(password);
     std::vector<std::uint8_t> out;
-    out.reserve(password.size());
-    for (const char c : password) {
-        const auto value = static_cast<std::uint8_t>(c);
-        // Nibble swap, then XOR. A password sent as plain bytes is rejected by every
-        // SQL Server and looks like a wrong credential.
+    out.reserve(text.size());
+    for (const std::byte byte : text) {
+        const auto value = static_cast<std::uint8_t>(byte);
         const std::uint8_t swapped =
             static_cast<std::uint8_t>(((value << 4) & 0xF0u) | ((value >> 4) & 0x0Fu));
         out.push_back(static_cast<std::uint8_t>(swapped ^ 0xA5u));
@@ -496,7 +500,10 @@ constexpr std::int64_t tds_epoch_offset_days = 719162;
 } // namespace
 
 status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
-    const std::uint16_t count = u16();
+    // Little-endian, like every other multi-byte field inside a token. Reading the
+    // count big-endian turns a one-column result into "256 columns" and desynchronises
+    // the whole stream, which is how this was found.
+    const std::uint16_t count = u16_le();
     if (error_ != rpc_code::ok) {
         return status{error_};
     }
@@ -510,9 +517,9 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
 
     for (std::uint16_t index = 0; index < count; ++index) {
         column_meta column;
-        (void)u32();                    // user type, not needed for decoding
-        const std::uint16_t flags = u16();
-        (void)flags;
+        (void)u32_le();                 // user type, not needed for decoding
+        column.flags = u16_le();
+        column.nullable = (column.flags & 0x0001u) != 0 || (column.flags & 0x0020u) != 0;
         column.type = u8();
         switch (column.type) {
         case 0x1F: // NULL
@@ -543,14 +550,26 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
         case 0x6D: // FLTN
         case 0x6E: // MONEYN
         case 0x6F: // DATETIMEN
-        case 0x28: // DATE
             column.max_length = u8();
+            break;
+        case 0x28: // DATE: no type info; the value is always three bytes.
+            column.max_length = 3;
             break;
         case 0x29: // TIME
         case 0x2A: // DATETIME2
         case 0x2B: // DATETIMEOFFSET
-            column.max_length = u8();
+            // Only the scale is sent. The byte count follows from it, and reading a
+            // "max length" here as well shifts every later column by one byte.
             column.scale = u8();
+            if (column.type == 0x29) {
+                column.max_length = column.scale <= 2 ? 3 : (column.scale <= 4 ? 4 : 5);
+            } else if (column.type == 0x2A) {
+                column.max_length = static_cast<std::uint32_t>(
+                    (column.scale <= 2 ? 6 : (column.scale <= 4 ? 7 : 8)));
+            } else {
+                column.max_length = static_cast<std::uint32_t>(
+                    (column.scale <= 2 ? 8 : (column.scale <= 4 ? 9 : 10)));
+            }
             break;
         case 0x6A: // DECIMALN
         case 0x6C: // NUMERICN
@@ -562,7 +581,7 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
         case 0xAF: // BIGCHAR
         case 0xE7: // NVARCHAR
         case 0xEF: // NCHAR
-            column.max_length = be16();
+            column.max_length = le16();
             // Character types carry a five-byte collation.
             for (std::size_t i = 0; i < 5; ++i) {
                 column.collation[i] = u8();
@@ -570,7 +589,7 @@ status token_reader::read_colmetadata(std::vector<column_meta>& out) noexcept {
             break;
         case 0xA5: // BIGVARBINARY
         case 0xAD: // BIGBINARY
-            column.max_length = be16();
+            column.max_length = le16();
             break;
         default:
             fail(rpc_code::no_such_method);
@@ -730,7 +749,9 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
                 mark_null();
                 continue;
             }
-            const bool negative = u8() != 0;
+            // The sign byte is 1 for positive and 0 for negative -- the opposite of
+            // the obvious reading, and a capture caught it: 12.34 arrived as -12.34.
+            const bool negative = u8() == 0;
             std::uint32_t magnitude = 0;
             for (std::uint8_t i = 0; i + 1 < length && i < 4; ++i) {
                 magnitude |= static_cast<std::uint32_t>(u8()) << (8 * i);
@@ -744,7 +765,12 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
             nulls.push_back(false);
             continue;
         }
-        case 0x28: { // DATE: three bytes of days since 0001-01-01
+        case 0x28: { // DATE: one length byte, then days since 0001-01-01
+            const std::uint8_t length = u8();
+            if (length == 0) {
+                mark_null();
+                continue;
+            }
             std::uint32_t days = static_cast<std::uint32_t>(u8());
             days |= static_cast<std::uint32_t>(u8()) << 8;
             days |= static_cast<std::uint32_t>(u8()) << 16;
@@ -787,7 +813,7 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
         }
         case 0xE7:   // NVARCHAR
         case 0xEF: { // NCHAR
-            const std::uint16_t bytes = be16();
+            const std::uint16_t bytes = le16();
             if (bytes == 0) {
                 mark_null();
                 continue;
@@ -803,7 +829,7 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
         }
         case 0xA7:   // BIGVARCHAR
         case 0xAF: { // BIGCHAR
-            const std::uint16_t bytes = be16();
+            const std::uint16_t bytes = le16();
             if (bytes == 0) {
                 mark_null();
                 continue;
@@ -822,7 +848,7 @@ status token_reader::read_row(bool compressed, std::vector<std::string>& values,
         }
         case 0xA5:   // BIGVARBINARY
         case 0xAD: { // BIGBINARY
-            const std::uint16_t bytes = be16();
+            const std::uint16_t bytes = le16();
             if (bytes == 0) {
                 mark_null();
                 continue;
@@ -972,7 +998,7 @@ std::string token_reader::b_varchar() noexcept {
 }
 
 std::string token_reader::us_varchar() noexcept {
-    const std::uint16_t characters = u16();
+    const std::uint16_t characters = u16_le();
     if (error_ != rpc_code::ok) {
         return {};
     }
@@ -1001,7 +1027,7 @@ token_reader::result token_reader::next(token& out) noexcept {
     }
 
     const auto read_error_like = [&](error_token& target) {
-        const std::uint16_t length = u16();
+        const std::uint16_t length = u16_le();
         if (error_ != rpc_code::ok) {
             return;
         }
@@ -1033,7 +1059,7 @@ token_reader::result token_reader::next(token& out) noexcept {
         break;
     case token_type::loginack: {
         out.type = token::kind::login_ack;
-        const std::uint16_t length = u16();
+        const std::uint16_t length = u16_le();
         if (error_ != rpc_code::ok) {
             break;
         }
@@ -1054,7 +1080,7 @@ token_reader::result token_reader::next(token& out) noexcept {
     }
     case token_type::envchange: {
         out.type = token::kind::env_change;
-        const std::uint16_t length = u16();
+        const std::uint16_t length = u16_le();
         if (error_ != rpc_code::ok) {
             break;
         }
@@ -1082,12 +1108,18 @@ token_reader::result token_reader::next(token& out) noexcept {
         case env_change_type::begin_transaction:
         case env_change_type::commit_transaction:
         case env_change_type::rollback_transaction: {
-            // An 8-byte transaction descriptor, then the old descriptor as a string.
-            if (!need(8)) {
+            // The new value is length-prefixed: one byte of length, then the
+            // descriptor itself. Without consuming that length byte the client echoes
+            // a descriptor shifted by one, and SQL Server answers "the server failed
+            // to resume the transaction" with digits that look almost right.
+            const std::uint8_t descriptor_length = u8();
+            if (descriptor_length > transaction_descriptor_size) {
                 fail(rpc_code::protocol_error);
                 break;
             }
-            offset_ += 8;
+            for (std::size_t i = 0; i < descriptor_length; ++i) {
+                out.env.new_descriptor[i] = u8();
+            }
             out.env.old_value = b_varchar();
             break;
         }
@@ -1138,7 +1170,7 @@ token_reader::result token_reader::next(token& out) noexcept {
         // A token this slice does not model still has a length; skipping it keeps the
         // stream aligned for the tokens after it.
         out.type = token::kind::unknown;
-        const std::uint16_t length = u16();
+        const std::uint16_t length = u16_le();
         if (error_ != rpc_code::ok) {
             break;
         }

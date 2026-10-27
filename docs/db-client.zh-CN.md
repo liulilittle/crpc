@@ -166,6 +166,19 @@ auto session = factory->open();
 * 只返回第一个结果集；同一应答里后续结果集会被解码后丢弃，保证流仍然对齐。列元数据映射到
   `db::column_info`，ORM 层无需改动。
 
+已对真实 SQL Server 2022（16.0.4305.5）端到端验证：登录、跨包分帧、列元数据、下文列出的
+全部类型取值、错误号、DDL/DML、影响行数，以及一次回滚的事务。`tests/test_db_tds_it.cpp`
+在环境变量给出连接信息时运行这套用例：
+
+```
+CRPC_TDS_IT=1 CRPC_TDS_HOST=127.0.0.1 CRPC_TDS_PORT=1433 \
+CRPC_TDS_USER=sa CRPC_TDS_PASSWORD=... ctest -R crpc_test_db_tds_it
+```
+
+这次真机运行产出的报文抓包已固化为回归用例：token 长度、列数、flags、行值长度都是
+**小端**（只有 8 字节包头是大端），`DATE` 没有类型信息，日期/时间类型只带 scale，
+DECIMAL 符号字节 1 表示正数，`ENVCHANGE(begin_transaction)` 的事务描述符带长度前缀。
+
 限制（明说，不隐藏）：
 
 * **参数被拒绝**（`invalid_argument`）。TDS 通过 RPC `sp_executesql` 绑定参数，本片尚未编码；

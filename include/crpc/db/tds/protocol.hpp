@@ -132,15 +132,36 @@ struct prelogin {
 
 // --- LOGIN7 ------------------------------------------------------------------
 
-// The option flags a LOGIN7 header carries. Only the ones this client sets are
-// named; the rest stay zero.
+// The option flags a LOGIN7 header carries.
+//
+// The three flag bytes are packed into one word here, but they are *three separate
+// bytes on the wire*: OptionFlags1 at offset 24, OptionFlags2 at 25 and OptionFlags3
+// at 27. Bit 0 of OptionFlags1 is fByteOrder, where 1 means big-endian: setting it
+// on an x86 client makes the server read every multi-byte field backwards and reject
+// the login as structurally invalid (error 17832) -- which is exactly what a real
+// server reported while this was wrong.
 enum class login_option : std::uint32_t {
-    use_db_notify = 0x00000001,
-    set_language_on = 0x00000002,
-    init_db_fatal = 0x00000004,
-    language_fatal = 0x00000010,
-    set_language_warn = 0x00000020,
-    integrated_security = 0x00000080
+    // OptionFlags1.
+    byte_order = 0x00000001,      // 1 = big-endian; never set by this client
+    charset = 0x00000002,         // 1 = EBCDIC
+    float_vax = 0x00000004,
+    float_ieee = 0x00000008,
+    dump_load = 0x00000010,
+    use_db_notify = 0x00000020,   // fUseDB: report database changes
+    init_db_fatal = 0x00000040,   // fDatabase: a failed USE is fatal
+    set_language_on = 0x00000080, // fSetLang
+    // OptionFlags2.
+    language = 0x00000100,            // fLanguage
+    odbc = 0x00000200,                // fODBC
+    tran_boundary = 0x00000400,       // fTranBoundary
+    cache_connect = 0x00000800,       // fCacheConnect
+    integrated_security = 0x00008000, // fIntSecurity
+    // OptionFlags3.
+    change_password = 0x00010000,   // fChangePassword
+    yukon_binary_xml = 0x00020000,  // fSendYukonBinaryXML
+    user_instance = 0x00040000,     // fUserInstance
+    unknown_collation = 0x00080000, // fUnknownCollationHandling
+    extension = 0x00100000           // fExtension: runs the federated-auth block
 };
 
 struct login7 {
@@ -236,6 +257,10 @@ struct env_change {
     std::string old_value;
     std::string new_value;
     std::uint32_t new_packet_size = 0;
+    // Set for begin/commit/rollback: the eight-byte transaction descriptor. Every
+    // later message has to echo it in its AllHeaders block, or the server rejects
+    // the message with "the TDS headers contained errors".
+    std::array<std::uint8_t, 8> new_descriptor{};
 };
 
 struct done_token {
@@ -261,6 +286,9 @@ struct column_meta {
     std::uint8_t scale = 0;
     // Only meaningful for character types; five raw bytes.
     std::array<std::uint8_t, 5> collation{};
+    // Raw flags word. Bit 0 is "nullable" and bit 5 is "nullable" for some column
+    // kinds; both are folded into `nullable` below.
+    std::uint16_t flags = 0;
     std::string name;
     // A fixed-width column is never NULL; a variable one is nullable unless its
     // maximum length is zero.
@@ -328,6 +356,9 @@ private:
     // way to know how wide each one is.
     std::vector<column_meta> columns_;
 };
+
+// Size of a transaction descriptor in an ENVCHANGE body and in AllHeaders.
+inline constexpr std::size_t transaction_descriptor_size = 8;
 
 // Maps a TDS error number to the library code. SQL Server numbers are grouped:
 // 2xx/5xx are permission and object errors, 1205 deadlock, 2601/2627 duplicate key.

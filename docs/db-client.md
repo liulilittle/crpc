@@ -190,6 +190,22 @@ What the adapter does:
   and discarded so the stream stays aligned. Column metadata is mapped to
   `db::column_info`, so the ORM layer works unchanged.
 
+Verified end to end against a real SQL Server 2022 (16.0.4305.5): login, framing
+across packets, column metadata, rows of every type listed below, error numbers,
+DDL/DML, affected rows, and a rolled-back transaction. `tests/test_db_tds_it.cpp`
+runs that suite when the server details are in the environment:
+
+```
+CRPC_TDS_IT=1 CRPC_TDS_HOST=127.0.0.1 CRPC_TDS_PORT=1433 \
+CRPC_TDS_USER=sa CRPC_TDS_PASSWORD=... ctest -R crpc_test_db_tds_it
+```
+
+That run is what produced the wire captures now kept as regression tests: token
+lengths, column counts, flags and row value lengths are **little-endian** (only the
+8-byte packet header is big-endian), `DATE` carries no type info, the date/time
+types carry only a scale, the decimal sign byte is 1 for positive, and the
+transaction descriptor in `ENVCHANGE(begin_transaction)` is length-prefixed.
+
 Limits, stated rather than hidden:
 
 * **Parameters are refused** (`invalid_argument`). TDS binds them through an RPC

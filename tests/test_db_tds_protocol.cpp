@@ -57,6 +57,11 @@ void put_be16(std::vector<std::byte>& out, std::uint16_t value) {
     out.push_back(static_cast<std::byte>(value & 0xffu));
 }
 
+void put_u16_le(std::vector<std::byte>& out, std::uint16_t value) {
+    out.push_back(static_cast<std::byte>(value & 0xffu));
+    out.push_back(static_cast<std::byte>((value >> 8) & 0xffu));
+}
+
 void put_u32(std::vector<std::byte>& out, std::uint32_t value) {
     for (int i = 0; i < 4; ++i) {
         out.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xffu));
@@ -141,10 +146,15 @@ CRPC_TEST(tds_prelogin_round_trip) {
 CRPC_TEST(tds_password_obfuscation) {
     // "abc" = 61 62 63 -> nibble swap 16 26 36 -> XOR A5 = B3 83 93.
     const std::vector<std::uint8_t> encoded = crpc::db::tds::obfuscate_password("abc");
-    CRPC_CHECK_EQ(std::size_t{3}, encoded.size());
+    // Two bytes per character: swap each byte of the UTF-16LE unit, then XOR 0xA5.
+    // The high byte of an ASCII character is zero, so it becomes 0xA5.
+    CRPC_CHECK_EQ(std::size_t{6}, encoded.size());
     CRPC_CHECK_EQ(0xB3, static_cast<int>(encoded[0]));
-    CRPC_CHECK_EQ(0x83, static_cast<int>(encoded[1]));
-    CRPC_CHECK_EQ(0x93, static_cast<int>(encoded[2]));
+    CRPC_CHECK_EQ(0xA5, static_cast<int>(encoded[1]));
+    CRPC_CHECK_EQ(0x83, static_cast<int>(encoded[2]));
+    CRPC_CHECK_EQ(0xA5, static_cast<int>(encoded[3]));
+    CRPC_CHECK_EQ(0x93, static_cast<int>(encoded[4]));
+    CRPC_CHECK_EQ(0xA5, static_cast<int>(encoded[5]));
 }
 
 CRPC_TEST(tds_utf16_round_trip) {
@@ -219,7 +229,7 @@ CRPC_TEST(tds_tokens_login_phase) {
     ack.push_back(std::byte{0x00});
     ack.push_back(std::byte{0x07});
     ack.push_back(std::byte{0xd0});
-    put_be16(payload, static_cast<std::uint16_t>(ack.size()));
+    put_u16_le(payload, static_cast<std::uint16_t>(ack.size()));
     payload.insert(payload.end(), ack.begin(), ack.end());
 
     payload.push_back(static_cast<std::byte>(token_type::envchange));
@@ -228,7 +238,7 @@ CRPC_TEST(tds_tokens_login_phase) {
     env.push_back(std::byte{2}); // new value, two characters
     put_text(env, "db");
     env.push_back(std::byte{0}); // old value, empty
-    put_be16(payload, static_cast<std::uint16_t>(env.size()));
+    put_u16_le(payload, static_cast<std::uint16_t>(env.size()));
     payload.insert(payload.end(), env.begin(), env.end());
 
     payload.push_back(static_cast<std::byte>(token_type::done));
@@ -268,13 +278,13 @@ CRPC_TEST(tds_error_token_is_decoded) {
     put_u32(body, 18456); // ERROR numerics are little-endian
     body.push_back(std::byte{1}); // state
     body.push_back(std::byte{14}); // severity
-    put_be16(body, 9); // message length is a big-endian character count
+    put_u16_le(body, 9); // US_VARCHAR: a little-endian character count
     put_text(body, "bad login");
     body.push_back(std::byte{3});
     put_text(body, "srv");
     body.push_back(std::byte{0}); // procedure, empty
     put_u32(body, 1);             // line, little-endian
-    put_be16(payload, static_cast<std::uint16_t>(body.size()));
+    put_u16_le(payload, static_cast<std::uint16_t>(body.size()));
     payload.insert(payload.end(), body.begin(), body.end());
 
     token_reader reader(view(payload));
@@ -295,7 +305,7 @@ CRPC_TEST(tds_unknown_token_is_skipped) {
     // An unmodelled token must not desynchronise the stream: it carries a length.
     std::vector<std::byte> payload;
     payload.push_back(std::byte{0xE4}); // an unhandled token type
-    put_be16(payload, 3);
+    put_u16_le(payload, 3);
     payload.push_back(std::byte{1});
     payload.push_back(std::byte{2});
     payload.push_back(std::byte{3});
@@ -315,6 +325,48 @@ CRPC_TEST(tds_unknown_token_is_skipped) {
                   static_cast<int>(reader.next(done)));
     CRPC_CHECK_EQ(static_cast<int>(token::kind::done), static_cast<int>(done.type));
     CRPC_CHECK_EQ(std::uint64_t{7}, done.done.row_count);
+}
+
+CRPC_TEST(tds_decodes_a_real_login_rejection) {
+    // Bytes captured from SQL Server 2022 (16.0.4305.5) rejecting a login:
+    //   AA 54 00 | number 18456, state 1, class 14, "Login failed for user 'sa'.",
+    //   server "LIULILTE", no procedure, line 1 | FD DONE(error, 0 rows)
+    // Kept verbatim because a hand-built token is exactly how a length convention
+    // bug hides: this one is the server's own framing.
+    static const unsigned char raw[] = {
+        0xaa, 0x54, 0x00, 0x18, 0x48, 0x00, 0x00, 0x01, 0x0e, 0x1b, 0x00, 0x4c, 0x00, 0x6f, 0x00,
+        0x67, 0x00, 0x69, 0x00, 0x6e, 0x00, 0x20, 0x00, 0x66, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6c,
+        0x00, 0x65, 0x00, 0x64, 0x00, 0x20, 0x00, 0x66, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x20, 0x00,
+        0x75, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x20, 0x00, 0x27, 0x00, 0x73, 0x00, 0x61,
+        0x00, 0x27, 0x00, 0x2e, 0x00, 0x08, 0x4c, 0x00, 0x49, 0x00, 0x55, 0x00, 0x4c, 0x00, 0x49,
+        0x00, 0x4c, 0x00, 0x54, 0x00, 0x45, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xfd, 0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    std::vector<std::byte> payload(sizeof raw);
+    for (std::size_t i = 0; i < sizeof raw; ++i) {
+        payload[i] = static_cast<std::byte>(raw[i]);
+    }
+    token_reader reader(crpc::span<const std::byte>(payload.data(), payload.size()));
+    token first;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(first)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::error), static_cast<int>(first.type));
+    CRPC_CHECK_EQ(std::uint32_t{18456}, first.error.number);
+    CRPC_CHECK_EQ(std::uint8_t{14}, first.error.severity);
+    CRPC_CHECK_EQ(std::string("Login failed for user 'sa'."), first.error.message);
+    CRPC_CHECK_EQ(std::string("LIULILTE"), first.error.server_name);
+    CRPC_CHECK_EQ(std::uint32_t{1}, first.error.line);
+
+    token second;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::token_ready),
+                  static_cast<int>(reader.next(second)));
+    CRPC_CHECK_EQ(static_cast<int>(token::kind::done), static_cast<int>(second.type));
+    CRPC_CHECK(second.done.error());
+    CRPC_CHECK_EQ(std::uint64_t{0}, second.done.row_count);
+
+    token third;
+    CRPC_CHECK_EQ(static_cast<int>(token_reader::result::end),
+                  static_cast<int>(reader.next(third)));
 }
 
 CRPC_TEST_MAIN()

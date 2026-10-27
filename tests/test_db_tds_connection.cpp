@@ -80,7 +80,7 @@ void put_b_varchar(bytes& out, std::string_view text) {
 }
 
 void put_us_varchar(bytes& out, std::string_view text) {
-    put_u16_be(out, static_cast<std::uint16_t>(text.size()));
+    put_u16_le(out, static_cast<std::uint16_t>(text.size()));
     put_utf16(out, text);
 }
 
@@ -133,7 +133,7 @@ void put_error(bytes& out, std::uint32_t number, std::uint8_t severity,
     put_b_varchar(body, "");
     put_u32_le(body, 1); // line
     put_u8(out, static_cast<std::uint8_t>(token_type::error));
-    put_u16_be(out, static_cast<std::uint16_t>(body.size()));
+    put_u16_le(out, static_cast<std::uint16_t>(body.size()));
     out.insert(out.end(), body.begin(), body.end());
 }
 
@@ -144,7 +144,7 @@ void put_login_ack(bytes& out) {
     put_b_varchar(body, "Microsoft SQL Server");
     put_u32_be(body, 0x0F00A1B2u); // server version 15.0.161.178
     put_u8(out, static_cast<std::uint8_t>(token_type::loginack));
-    put_u16_be(out, static_cast<std::uint16_t>(body.size()));
+    put_u16_le(out, static_cast<std::uint16_t>(body.size()));
     out.insert(out.end(), body.begin(), body.end());
 }
 
@@ -154,7 +154,7 @@ void put_packet_size_change(bytes& out, std::string_view new_size) {
     put_b_varchar(body, new_size);
     put_b_varchar(body, "4096");
     put_u8(out, static_cast<std::uint8_t>(token_type::envchange));
-    put_u16_be(out, static_cast<std::uint16_t>(body.size()));
+    put_u16_le(out, static_cast<std::uint16_t>(body.size()));
     out.insert(out.end(), body.begin(), body.end());
 }
 
@@ -166,13 +166,13 @@ struct column_spec {
 
 void put_colmetadata(bytes& out, const std::vector<column_spec>& columns) {
     put_u8(out, static_cast<std::uint8_t>(token_type::colmetadata));
-    put_u16_be(out, static_cast<std::uint16_t>(columns.size()));
+    put_u16_le(out, static_cast<std::uint16_t>(columns.size()));
     for (const column_spec& column : columns) {
         put_u32_le(out, 0); // user type
         put_u16_le(out, 1); // flags
         put_u8(out, column.type);
         if (column.type == 0xE7 || column.type == 0xA7) {
-            put_u16_be(out, column.max_length);
+            put_u16_le(out, column.max_length);
             for (int i = 0; i < 5; ++i) {
                 put_u8(out, 0); // collation
             }
@@ -391,11 +391,11 @@ CRPC_TEST(tds_connection_query_returns_rows_and_metadata) {
         put_colmetadata(reply, {{0x38, 0, "id"}, {0xE7, 40, "name"}});
         put_u8(reply, static_cast<std::uint8_t>(token_type::row));
         put_u32_le(reply, 7);
-        put_u16_be(reply, 4);
+        put_u16_le(reply, 4);
         put_utf16(reply, "ab");
         put_u8(reply, static_cast<std::uint8_t>(token_type::row));
         put_u32_le(reply, 8);
-        put_u16_be(reply, 2);
+        put_u16_le(reply, 2);
         put_utf16(reply, "c");
         put_done(reply, 0, 2);
         return reply;
