@@ -156,8 +156,61 @@ returned.
   key exchange, which is not implemented: use TLS, or a `mysql_native_password`
   account. Against a real server the client reports the server's own error, so this
   is a clear failure rather than a hang.
-* Not implemented yet: Oracle, HBase; TLS to the database; server-side cursors;
-  `COM_STMT_FETCH`.
+* Not implemented yet: Oracle; TLS to the database; server-side cursors; `COM_STMT_FETCH`.
+
+## HBase (REST gateway)
+
+HBase has two protocols: the native one (protobuf over a custom RPC, needing the cluster's
+protobuf definitions and a ZooKeeper-derived region map) and the REST gateway that ships
+with it. This adapter speaks the gateway.
+
+```cpp
+#include <crpc/db/hbase/rest.hpp>
+
+crpc::db::hbase::client_options options;
+options.host = "127.0.0.1";
+options.port = 8080;
+
+auto gateway = std::make_unique<crpc::db::hbase::client>(
+    options, [&backend, &options] {
+        crpc::http::client_options http;
+        http.host = options.host;
+        http.port = options.port;
+        return crpc::http::make_client(http, backend,
+                                       crpc::endpoint::tcp(options.host, options.port));
+    });
+
+auto version = gateway->version();          // GET /version
+auto rows = gateway->scan("people", {}, 0); // scanner, drained and released
+```
+
+One asymmetry in the gateway causes 404s that look like missing rows, and it was established
+by probing a real server rather than from memory:
+
+* the **path** carries the raw row key, percent-encoded — `GET /table/row1`;
+* the **JSON body** carries base64 for row keys, column names and cell values —
+  `{"Row":[{"key":"cm93MQ==",...}]}`.
+
+`GET /table/cjE=` (base64 of "r1") answers 404 while `GET /table/r1` answers 200 with the
+same row. The adapter applies each encoding where it belongs, so a caller never handles
+base64.
+
+Other behaviour worth knowing:
+
+* `create_table` and `delete_table` wait for the transition to finish (polling
+  `table_exists`, bounded by `transition_timeout_ms`). HBase creates and deletes
+  asynchronously and the gateway offers no completion signal, so returning early makes the
+  obvious next call — create again after delete — fail against a table that is still being
+  removed.
+* `scan` opens a scanner, drains it, and always releases it: an abandoned scanner holds
+  server resources until it times out. A `limit` stops reading early and still releases.
+* A missing row or table is `not_found`; the gateway answers plain HTTP codes rather than a
+  body-level error object.
+* A column is `family` or `family:qualifier`; cell values are opaque bytes, so a value that
+  is not text survives the round trip.
+
+Not implemented: the native protobuf protocol, filters beyond a start row, and
+multi-version reads.
 
 ## Access (ODBC bridge)
 

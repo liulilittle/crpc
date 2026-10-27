@@ -604,6 +604,13 @@ result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
                 if (pending != rpc_code::ok) {
                     return rpc_error(pending, "connection error");
                 }
+                if (!self.cfg.reconnect_on_eof) {
+                    // A close-delimited body ends here; reconnecting would hide the close
+                    // and leave the reader waiting on a fresh connection.
+                    return rpc_error(self.error_code != rpc_code::ok ? self.error_code
+                                                                    : rpc_code::eof,
+                                     "connection closed");
+                }
                 lk.unlock();
                 const status re = self.reconnect_now(false);
                 if (!re.ok()) {

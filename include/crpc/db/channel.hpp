@@ -91,6 +91,13 @@ public:
 
 private:
     std::unique_ptr<crpc::net::connection> link_;
+    // Bytes taken from the transport but not handed to the caller yet.
+    //
+    // `read_some` asks the transport for everything it has buffered and then copies out what
+    // fits; whatever did not fit is kept here. Dropping it would silently truncate a
+    // response, which is how an HTTP client ends up reporting eof in the middle of a body.
+    std::vector<std::byte> pending_;
+    std::size_t pending_offset_ = 0;
 };
 
 } // namespace db

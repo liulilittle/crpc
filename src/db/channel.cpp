@@ -31,9 +31,23 @@ result<std::size_t> socket_channel::read_some(span<std::byte> buffer) {
     if (buffer.empty()) {
         return std::size_t{0};
     }
-    // One blocking byte proves the peer is alive, then whatever the transport has
-    // already buffered is taken in the same call. That keeps a TLS record layer from
-    // making one syscall per byte while still never blocking for more than one byte.
+    // Leftovers first: they were already taken from the transport and must not be lost.
+    if (pending_offset_ < pending_.size()) {
+        const std::size_t available = pending_.size() - pending_offset_;
+        const std::size_t take = available < buffer.size() ? available : buffer.size();
+        for (std::size_t i = 0; i < take; ++i) {
+            buffer[i] = pending_[pending_offset_ + i];
+        }
+        pending_offset_ += take;
+        if (pending_offset_ == pending_.size()) {
+            pending_.clear();
+            pending_offset_ = 0;
+        }
+        return take;
+    }
+    // One blocking byte proves the peer is alive, then whatever the transport has already
+    // buffered is taken in the same call. That keeps a TLS or HTTP record layer from making
+    // one syscall per byte while never blocking for more than one byte.
     result<std::vector<std::byte>> first = link_->read_exact(1);
     if (!first) {
         return first.error();
@@ -41,12 +55,16 @@ result<std::size_t> socket_channel::read_some(span<std::byte> buffer) {
     buffer[0] = first.value()[0];
     std::size_t total = 1;
     if (buffer.size() > 1) {
-        const std::vector<std::byte> more = link_->read_available();
+        std::vector<std::byte> more = link_->read_available();
         const std::size_t take = more.size() < buffer.size() - 1 ? more.size() : buffer.size() - 1;
         for (std::size_t i = 0; i < take; ++i) {
             buffer[1 + i] = more[i];
         }
         total += take;
+        if (take < more.size()) {
+            pending_.assign(more.begin() + static_cast<std::ptrdiff_t>(take), more.end());
+            pending_offset_ = 0;
+        }
     }
     return total;
 }

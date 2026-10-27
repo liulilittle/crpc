@@ -137,7 +137,50 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 * `LOAD DATA LOCAL INFILE` 只发送你给的字节，没有“按路径读取”模式。
 * `caching_sha2_password` 在**未加密**连接上需要服务端 RSA 密钥交换，本库尚未实现：请用 TLS，
   或改用 `mysql_native_password` 账号。面对真实服务器时客户端会原样返回服务端错误，是明确失败而非挂起。
-* 尚未实现：Oracle、HBase；到数据库的 TLS；服务端游标；`COM_STMT_FETCH`。
+* 尚未实现：Oracle；到数据库的 TLS；服务端游标；`COM_STMT_FETCH`。
+
+## HBase（REST 网关）
+
+HBase 有两套协议：原生协议（protobuf over 自定义 RPC，需要集群的 protobuf 定义与由 ZooKeeper
+推导出的 region 映射）和随发行版提供的 REST 网关。本适配器使用网关。
+
+```cpp
+#include <crpc/db/hbase/rest.hpp>
+
+crpc::db::hbase::client_options options;
+options.host = "127.0.0.1";
+options.port = 8080;
+
+auto gateway = std::make_unique<crpc::db::hbase::client>(
+    options, [&backend, &options] {
+        crpc::http::client_options http;
+        http.host = options.host;
+        http.port = options.port;
+        return crpc::http::make_client(http, backend,
+                                       crpc::endpoint::tcp(options.host, options.port));
+    });
+
+auto version = gateway->version();          // GET /version
+auto rows = gateway->scan("people", {}, 0); // 打开、读完、释放 scanner
+```
+
+网关有一处不对称，会导致「看起来行不存在」的 404。这是对真实服务器探测出来的，不是凭记忆：
+- **路径**里是**原始**行键，按 URL 规则转义 —— `GET /table/row1`；
+- **JSON 体**里行键、列名、单元格值都是 base64 —— `{"Row":[{"key":"cm93MQ==",...}]}`。
+
+`GET /table/cjE=`（"r1" 的 base64）返回 404，而 `GET /table/r1` 返回 200 且是同一行。适配器把两种
+编码各放在该放的位置，调用方从不接触 base64。
+
+其它需要知道的行为：
+- `create_table` / `delete_table` 会等待状态迁移结束（轮询 `table_exists`，由
+  `transition_timeout_ms` 限时）。HBase 的建表与删表是异步的，网关不提供完成信号，提前返回会让
+  紧接着的「删除后重建」失败在一张仍在删除中的表上。
+- `scan` 打开 scanner、读完、并且**总是释放**：被放弃的 scanner 会占用服务端资源直到超时。带
+  `limit` 提前停止时同样会释放。
+- 行或表不存在是 `not_found`；网关用普通 HTTP 状态码而不是响应体里的错误对象。
+- 列写作 `family` 或 `family:qualifier`；单元格值是不透明字节，非文本值也能原样往返。
+
+未实现：原生 protobuf 协议、起始行之外的过滤器、多版本读取。
 
 ## Access（ODBC 桥接）
 

@@ -95,6 +95,15 @@ struct connection_config {
     // it is reached, operations fail with `unavailable` instead of trying
     // again. A successful connect resets the count.
     std::size_t max_reconnects = 0;
+
+    // Whether a peer's clean close is answered by reconnecting. The default suits a
+    // long-lived protocol link, where a dropped connection should be re-established.
+    //
+    // A one-shot request/response exchange must not do that: HTTP/1.1 allows a response
+    // body to be delimited by the close itself, so a client reading such a body would
+    // reconnect behind the caller's back and then wait forever for data that will never
+    // arrive. Setting this to false makes the close surface as `eof`.
+    bool reconnect_on_eof = true;
 };
 
 // One asynchronous connection. It owns one CRPC `io::connection`; the caller

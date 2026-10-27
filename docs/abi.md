@@ -291,6 +291,8 @@ is guarded.
 - `::crpc::db::mongo::find_request`
 - `::crpc::db::mongo::message_header`
 - `::crpc::db::mongo::op_msg_reply`
+- `::crpc::db::hbase::row`
+- `::crpc::http::client_options`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`
