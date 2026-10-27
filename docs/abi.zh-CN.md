@@ -185,6 +185,9 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::mysql::binary_row`
 - `::crpc::db::mysql::prepare_ok`
 - `::crpc::db::mysql::text_row`
+- `::crpc::db::tds::login7`
+- `::crpc::db::tds::packet_header`
+- `::crpc::db::tds::prelogin`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
