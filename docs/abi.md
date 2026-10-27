@@ -321,6 +321,7 @@ is guarded.
 - `::crpc::obs::trace_context`
 - `::crpc::obs::traceparent_result`
 - `::crpc::push::push_envelope`
+- `::crpc::redis::notification`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`
 - `::crpc::redis::bitmap_type`

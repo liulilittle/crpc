@@ -218,6 +218,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::obs::trace_context`
 - `::crpc::obs::traceparent_result`
 - `::crpc::push::push_envelope`
+- `::crpc::redis::notification`
 - `::crpc::push::push_subscription`
 - `::crpc::push::subscribe_request`
 - `::crpc::redis::bitmap_type`
