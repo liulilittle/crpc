@@ -20,7 +20,9 @@
 namespace {
 
 using crpc::db::mysql::binary_row;
+using crpc::db::mysql::capability;
 using crpc::db::mysql::column_type;
+using crpc::db::mysql::mask;
 using crpc::db::mysql::prepare_ok;
 using crpc::db::parameter;
 
@@ -170,6 +172,34 @@ CRPC_TEST(mysql_encode_stmt_execute_mixed_params) {
                                          out.begin() + static_cast<std::ptrdiff_t>(offset + 2))));
     offset += 2;
     CRPC_CHECK_EQ(out.size(), offset);
+}
+
+CRPC_TEST(mysql_handshake_response_lenenc_size) {
+    // A real server found this: the length-encoded auth section is not always nine
+    // bytes. A 32-byte caching_sha2 scramble needs a one-byte prefix, so an estimate
+    // of `size + 9` made the encoder reject its own correct payload.
+    std::vector<std::byte> auth(32, std::byte{0xaa});
+    crpc::db::mysql::handshake_response_options options;
+    options.capabilities = mask(capability::protocol_41) |
+                           mask(capability::secure_connection) |
+                           mask(capability::plugin_auth) |
+                           mask(capability::plugin_auth_lenenc_data);
+    options.username = "u";
+    options.auth_response = view(auth);
+    options.auth_plugin = "caching_sha2_password";
+
+    const std::size_t size = crpc::db::mysql::handshake_response_size(options);
+    std::vector<std::byte> out(size);
+    std::size_t written = 0;
+    const crpc::status encoded = crpc::db::mysql::encode_handshake_response(
+        crpc::span<std::byte>(out.data(), out.size()), options, written);
+    CRPC_CHECK(encoded.ok());
+    CRPC_CHECK_EQ(size, written);
+
+    // 4 caps + 4 max packet + 1 charset + 23 reserved + "u\0" = 34, then the
+    // one-byte length 0x20 and the 32 auth bytes.
+    CRPC_CHECK_EQ(std::size_t{34}, written - (1 + 32 + 22));
+    CRPC_CHECK_EQ(static_cast<int>(0x20), static_cast<int>(out[34]));
 }
 
 CRPC_TEST(mysql_encode_stmt_close) {

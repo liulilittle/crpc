@@ -64,6 +64,20 @@ async::future<result_set*> client::query_async(std::string sql,
         });
 }
 
+result<result_set*> client::call(std::string_view sql, span<parameter> params) {
+    result<pool::lease> lease = impl_->connections.acquire();
+    if (!lease) {
+        return lease.error();
+    }
+    result_set* rows = nullptr;
+    const status ran = lease.value()->call(sql, params, &rows);
+    if (!ran) {
+        return ran.error();
+    }
+    (void)lease.value().release();
+    return rows;
+}
+
 status client::execute(std::string_view sql, span<const parameter> params) {
     result<result_set*> rows = query(sql, params);
     if (!rows) {

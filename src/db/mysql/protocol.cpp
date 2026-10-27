@@ -120,8 +120,15 @@ status write_message(std::vector<std::byte>& out, span<const std::byte> payload,
 
 std::size_t handshake_response_size(const handshake_response_options& options) noexcept {
     const bool lenenc = (options.capabilities & mask(capability::plugin_auth_lenenc_data)) != 0;
-    const std::size_t auth = lenenc ? options.auth_response.size() + 9
-                                    : options.auth_response.size() + 1;
+    // The length-encoded prefix is 1, 3, 4 or 9 bytes depending on the size, not
+    // always 9: a 20-byte native scramble needs one. Estimating 9 made the encoder's
+    // size check fail against a real server that negotiated the capability.
+    std::size_t prefix = 1;
+    if (lenenc) {
+        const std::size_t length = options.auth_response.size();
+        prefix = length < 251 ? 1 : (length <= 0xffffu ? 3 : (length <= 0xffffffu ? 4 : 9));
+    }
+    const std::size_t auth = options.auth_response.size() + (lenenc ? prefix : 1);
     std::size_t size = 4 + 4 + 1 + 23 + options.username.size() + 1 + auth;
     if ((options.capabilities & mask(capability::connect_with_db)) != 0) {
         size += options.database.size() + 1;

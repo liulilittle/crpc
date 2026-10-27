@@ -85,7 +85,7 @@ std::vector<crpc::db::parameter> params;
 params.push_back(crpc::db::parameter::from_int64(7));                       // IN
 params.push_back(crpc::db::parameter::out("total", crpc::db::db_type::int64)); // OUT
 
-auto rows = db.query("CALL place_order(?, ?)", params);   // rows = the proc's result set
+auto rows = db.call("CALL place_order(?, ?)", params);    // rows = the proc's result set
 // params[1] now holds the value the procedure wrote, and is_null is false.
 ```
 
@@ -152,5 +152,9 @@ returned.
 * A result set is materialised, bounded by `max_result_rows` / `max_result_bytes`;
   exceeding either fails with `resource_exhausted` instead of growing memory.
 * `LOAD DATA LOCAL INFILE` sends what you give it; there is no file-path mode.
+* `caching_sha2_password` over an **unencrypted** connection needs the server's RSA
+  key exchange, which is not implemented: use TLS, or a `mysql_native_password`
+  account. Against a real server the client reports the server's own error, so this
+  is a clear failure rather than a hang.
 * Not implemented yet: TDS (SQL Server), Oracle, Access, MongoDB, HBase; TLS to the
   database; server-side cursors; `COM_STMT_FETCH`.

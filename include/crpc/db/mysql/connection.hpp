@@ -123,7 +123,7 @@ public:
     // after the call. That is the documented mechanism; there is no way to bind an
     // OUT parameter directly.
     [[nodiscard]] status call(std::string_view call_sql, span<parameter> params,
-                              result_set** out);
+                              result_set** out) override;
 
     // Inserts `rows` with the prepared-statement protocol, one statement per batch
     // planned by `plan_insert_batches`. Every value is bound; identifiers are
@@ -149,6 +149,9 @@ public:
         return capabilities_;
     }
     [[nodiscard]] const std::string& auth_plugin() const noexcept { return auth_plugin_; }
+    // Why the handshake failed, when it did. A factory that only reports "handshake
+    // failed" hides the server's own message, which is the one thing that helps.
+    [[nodiscard]] const rpc_error& connect_error() const noexcept { return connect_error_; }
 
 private:
     friend class prepared_statement;
@@ -190,6 +193,7 @@ private:
     std::uint8_t sequence_ = 0;
     // Shared with every prepared-statement handle; reset when the session closes.
     std::shared_ptr<void> session_guard_;
+    rpc_error connect_error_;
 };
 
 // A server-side prepared statement, owned by the session that prepared it.

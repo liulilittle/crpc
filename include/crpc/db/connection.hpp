@@ -141,6 +141,25 @@ public:
     // to read). Implemented in terms of `query` so a backend only writes one.
     [[nodiscard]] status execute(std::string_view sql, span<const parameter> params);
 
+    // Runs a stored procedure, writing OUT/INOUT values back into `params`.
+    //
+    // It is a separate entry point rather than a flag on `query` because the
+    // mechanism is backend-specific: MySQL cannot bind a placeholder for a value the
+    // procedure writes, so it rewrites those arguments to session variables and
+    // reads them back. A caller that sent an output parameter through `query` would
+    // be binding a value nobody reads.
+    virtual status call(std::string_view sql, span<parameter> params, result_set** out) {
+        // A backend without procedure support reports it instead of silently
+        // ignoring the output parameters.
+        (void)sql;
+        (void)params;
+        if (out != nullptr) {
+            *out = nullptr;
+        }
+        return status{rpc_code::no_such_method,
+                      "this backend does not implement stored procedures"};
+    }
+
     // Closes the link. Idempotent. A closed connection must fail every later call
     // with `shutting_down`.
     virtual void close() noexcept = 0;

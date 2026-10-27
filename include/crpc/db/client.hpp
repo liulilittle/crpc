@@ -61,8 +61,30 @@ public:
     [[nodiscard]] async::future<result_set*> query_async(std::string sql,
                                                          std::vector<parameter> params = {});
 
+    // A vector is the shape callers usually have; the span overload above stays the
+    // allocation-free form for a caller that built the list itself.
+    [[nodiscard]] result<result_set*> query(std::string_view sql,
+                                            const std::vector<parameter>& params) {
+        return query(sql, span<const parameter>(params.data(), params.size()));
+    }
+
+    // Runs a stored procedure. `params` is deliberately non-const: OUT and INOUT
+    // values are written back into it, and the caller reads them from the same list
+    // it passed in.
+    [[nodiscard]] result<result_set*> call(std::string_view sql, span<parameter> params);
+
+    [[nodiscard]] result<result_set*> call(std::string_view sql,
+                                           std::vector<parameter>& params) {
+        return call(sql, span<parameter>(params.data(), params.size()));
+    }
+
     // Convenience over `query` for a statement that returns no rows.
     [[nodiscard]] status execute(std::string_view sql, span<const parameter> params = {});
+
+    [[nodiscard]] status execute(std::string_view sql,
+                                const std::vector<parameter>& params) {
+        return execute(sql, span<const parameter>(params.data(), params.size()));
+    }
 
     // Closes the pool; outstanding leases are closed when released.
     void close() noexcept;

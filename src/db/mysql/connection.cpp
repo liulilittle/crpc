@@ -267,9 +267,10 @@ bool socket_channel::is_open() const noexcept { return link_ != nullptr && link_
 
 connection::connection(connection_options options, std::unique_ptr<channel> link)
     : options_(std::move(options)), link_(std::move(link)) {
-    session_guard_ = std::make_shared<int>(0);
+session_guard_ = std::make_shared<int>(0);
     const status opened = perform_handshake();
     if (!opened) {
+        connect_error_ = opened.error();
         fail(opened);
     }
 }
@@ -1745,7 +1746,13 @@ result<db::connection*> channel_factory::open() {
     auto session = std::unique_ptr<connection>(
         new connection(options_, std::move(opened.value())));
     if (!session->is_open()) {
-        return rpc_error{rpc_code::unavailable, "mysql handshake failed"};
+        rpc_error error = session->connect_error();
+        if (error.code == rpc_code::ok) {
+            // Report the server's own message: "handshake failed" alone hides
+            // whether it was an auth rejection, a missing database, or a plugin.
+            error = rpc_error{rpc_code::unavailable, "mysql handshake failed"};
+        }
+        return error;
     }
     return static_cast<db::connection*>(session.release());
 }
@@ -1772,7 +1779,13 @@ result<db::connection*> connection_factory::open() {
         options_, std::unique_ptr<channel>(
                       new socket_channel(std::move(config), *backend_, shard_))));
     if (!session->is_open()) {
-        return rpc_error{rpc_code::unavailable, "mysql handshake failed"};
+        rpc_error error = session->connect_error();
+        if (error.code == rpc_code::ok) {
+            // Report the server's own message: "handshake failed" alone hides
+            // whether it was an auth rejection, a missing database, or a plugin.
+            error = rpc_error{rpc_code::unavailable, "mysql handshake failed"};
+        }
+        return error;
     }
     return static_cast<db::connection*>(session.release());
 }

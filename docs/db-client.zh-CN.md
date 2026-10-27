@@ -78,7 +78,7 @@ std::vector<crpc::db::parameter> params;
 params.push_back(crpc::db::parameter::from_int64(7));                       // IN
 params.push_back(crpc::db::parameter::out("total", crpc::db::db_type::int64)); // OUT
 
-auto rows = db.query("CALL place_order(?, ?)", params);   // rows 为过程返回的结果集
+auto rows = db.call("CALL place_order(?, ?)", params);    // rows 为过程返回的结果集
 // params[1] 现在持有过程写入的值，is_null 为 false。
 ```
 
@@ -135,5 +135,7 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 * 结果集是物化的，受 `max_result_rows` / `max_result_bytes` 约束；超限以 `resource_exhausted`
   失败，而不是继续涨内存。
 * `LOAD DATA LOCAL INFILE` 只发送你给的字节，没有“按路径读取”模式。
+* `caching_sha2_password` 在**未加密**连接上需要服务端 RSA 密钥交换，本库尚未实现：请用 TLS，
+  或改用 `mysql_native_password` 账号。面对真实服务器时客户端会原样返回服务端错误，是明确失败而非挂起。
 * 尚未实现：TDS（SQL Server）、Oracle、Access、MongoDB、HBase；到数据库的 TLS；服务端游标；
   `COM_STMT_FETCH`。
