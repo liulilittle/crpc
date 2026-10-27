@@ -18,6 +18,8 @@
 
 #include "test_framework.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -25,6 +27,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <crpc/db/client.hpp>
@@ -442,6 +445,66 @@ CRPC_TEST(tds_it_batch_after_rpc_stays_aligned) {
     if (raw != nullptr) {
         CRPC_CHECK(raw->next());
         CRPC_CHECK_EQ(std::int64_t{99}, raw->get_int64(0).value());
+    }
+}
+
+CRPC_TEST(tds_it_attention_cancels_a_running_batch) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+
+    // A three-second WAITFOR on the session, cancelled from another thread after a
+    // moment. The blocked query must return `canceled` rather than the delay's result,
+    // and the session must stay usable afterwards: a cancel that desynchronises the
+    // stream would be worse than no cancel at all.
+    std::atomic<bool> started{false};
+    crpc::status outcome;
+    std::thread canceller([&] {
+        while (!started.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const crpc::status asked = it.session->cancel();
+        if (!asked) {
+            report("cancel", asked.error());
+        }
+    });
+
+    started.store(true);
+    const auto began = std::chrono::steady_clock::now();
+    crpc::db::result_set* raw = nullptr;
+    outcome = it.session->query("WAITFOR DELAY '00:00:03'; SELECT 1 AS n", {}, &raw);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - began).count();
+    // The cancel must land well inside the three-second delay; if it did not, the test
+    // would pass on a server that simply ignored the ATTENTION.
+    CRPC_CHECK(elapsed < 2000);
+    CRPC_CHECK(outcome.ok() == false);
+    crpc::db::statement_guard guard(raw);
+    canceller.join();
+
+    CRPC_CHECK_FALSE(static_cast<bool>(outcome));
+    if (!outcome) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled),
+                      static_cast<int>(outcome.error().code));
+    }
+    CRPC_CHECK(it.session->is_open());
+
+    // The session must still answer: the attention acknowledgement was consumed.
+    crpc::db::result_set* after = nullptr;
+    const crpc::status ran = it.session->query("SELECT 123 AS n", {}, &after);
+    crpc::db::statement_guard after_guard(after);
+    if (!ran) {
+        report("query after cancel", ran.error());
+    }
+    CRPC_CHECK(static_cast<bool>(ran));
+    if (after != nullptr) {
+        CRPC_CHECK(after->next());
+        CRPC_CHECK_EQ(std::int64_t{123}, after->get_int64(0).value());
     }
 }
 

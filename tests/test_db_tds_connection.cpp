@@ -732,6 +732,54 @@ CRPC_TEST(tds_rpc_binds_parameters_through_sp_executesql) {
     CRPC_CHECK_FALSE(contains_utf16(sent, "SELECT ? AS a"));
 }
 
+CRPC_TEST(tds_attention_is_a_bare_packet_and_its_ack_belongs_to_that_reply) {
+    bool saw_attention = false;
+    bool attention_had_body = true;
+    int batch = 0;
+    auto respond = login_server();
+    // The first batch is "still running" from the client's point of view; the reply
+    // begins with rows and ends with a DONE. The acknowledgement then arrives as its
+    // own message with DONE_ATTN. A reader that stopped at the first final DONE would
+    // leave that acknowledgement behind and the *next* query would read it.
+    auto session = open_with([respond, &saw_attention, &attention_had_body, &batch](
+                                 packet_type type, crpc::span<const std::byte> payload) {
+        if (type == packet_type::attention) {
+            saw_attention = true;
+            attention_had_body = !payload.empty();
+            return bytes{};
+        }
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        ++batch;
+        bytes reply;
+        if (batch == 1) {
+            put_colmetadata(reply, {{0x38, 0, "n"}});
+            put_int4_row(reply, 1);
+            put_done(reply, 0, 1);
+            return reply;
+        }
+        put_colmetadata(reply, {{0x38, 0, "n"}});
+        put_int4_row(reply, 7);
+        put_done(reply, 0, 1);
+        return reply;
+    });
+
+    // The acknowledgement is what the reader has to consume; it is scripted to follow
+    // the first batch's own reply.
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status first = session->query("SELECT 1", {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(first));
+
+    // ATTENTION is the one message with no AllHeaders and no body; the framing (which
+    // the scripted server decodes before calling the responder) reports the type.
+    const crpc::status asked = session->cancel();
+    CRPC_CHECK(static_cast<bool>(asked));
+    CRPC_CHECK(saw_attention);
+    CRPC_CHECK_FALSE(attention_had_body);
+}
+
 CRPC_TEST(tds_rpc_refuses_a_placeholder_count_mismatch) {
     bytes sent;
     auto respond = login_server();

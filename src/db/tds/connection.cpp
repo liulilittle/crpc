@@ -142,6 +142,10 @@ status connection::send_message(packet_type type, span<const std::byte> payload)
     if (!open_ && type != packet_type::prelogin && type != packet_type::login7) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
+    // One message at a time. ATTENTION is written by another thread while this one is
+    // blocked in a read, and interleaving it with a batch's packets would corrupt the
+    // stream for both.
+    const std::lock_guard<std::mutex> guard(write_mutex_);
     // PRELOGIN and LOGIN7 predate the header block; everything after them carries it.
     std::vector<std::byte> framed;
     if (type == packet_type::sql_batch || type == packet_type::rpc ||
@@ -498,6 +502,12 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 }
                 break;
             case token::kind::done: {
+                if (item.done.attention()) {
+                    // The server acknowledged the ATTENTION: the request was stopped.
+                    // Reporting `canceled` is the honest answer even if rows arrived
+                    // before it, because the caller asked to stop.
+                    attention_seen_ = true;
+                }
                 if (item.done.has_row_count) {
                     affected = static_cast<std::int64_t>(std::min<std::uint64_t>(
                         item.done.row_count,
@@ -513,7 +523,11 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 }
                 current.reset();
                 if (!item.done.more_results()) {
-                    finished = true;
+                    // A cancellation is acknowledged in its own message. Stopping at the
+                    // first final DONE would leave that acknowledgement in the stream,
+                    // and the next request would read it as its own reply -- which is
+                    // exactly what happened before this check existed.
+                    finished = !attention_pending_ || attention_seen_;
                 }
                 break;
             }
@@ -547,6 +561,14 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
         }
     }
 
+    if (attention_pending_) {
+        const bool acknowledged = attention_seen_;
+        attention_pending_ = false;
+        attention_seen_ = false;
+        if (acknowledged) {
+            return status{rpc_code::canceled, "the request was cancelled"};
+        }
+    }
     if (server_error.code != rpc_code::ok) {
         return server_error;
     }
@@ -567,12 +589,19 @@ status connection::run_batch(std::string_view sql, result_set** out) {
         *out = nullptr;
     }
     const std::vector<std::byte> encoded = utf16le(sql);
+    // Marked before the bytes go out: a cancel arriving between the write and the flag
+    // would otherwise see an idle session, skip waiting for the acknowledgement, and
+    // leave it to be read as the next reply.
+    in_request_.store(true);
     const status sent =
         send_message(packet_type::sql_batch, span<const std::byte>(encoded.data(), encoded.size()));
     if (!sent) {
+        in_request_.store(false);
         return sent;
     }
-    return read_reply(out, nullptr);
+    const status done = read_reply(out, nullptr);
+    in_request_.store(false);
+    return done;
 }
 
 status connection::run_rpc(const rpc_request& request, result_set** out,
@@ -585,13 +614,49 @@ status connection::run_rpc(const rpc_request& request, result_set** out,
     if (!encoded) {
         return encoded;
     }
-    const status sent = send_message(packet_type::rpc, span<const std::byte>(body.data(), body.size()));
+    in_request_.store(true);
+    const status sent =
+        send_message(packet_type::rpc, span<const std::byte>(body.data(), body.size()));
     if (!sent) {
+        in_request_.store(false);
         return sent;
     }
-    return read_reply(out, written);
+    const status done = read_reply(out, written);
+    in_request_.store(false);
+    return done;
 }
 
+
+status connection::cancel() {
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    // ATTENTION is the one message that carries no AllHeaders block: it is a bare
+    // header with no body, and the server answers with a DONE that has the attention
+    // bit set. The acknowledgement is consumed by whoever is reading the reply.
+    packet_header header;
+    header.type = packet_type::attention;
+    header.length = static_cast<std::uint16_t>(header_size);
+    header.packet_id = packet_id_;
+    header.status = static_cast<std::uint8_t>(packet_status::eom);
+    const std::vector<std::byte> prefix = header_bytes(header);
+    if (prefix.size() != header_size) {
+        return status{rpc_code::protocol_error, "the TDS header did not encode"};
+    }
+    const std::lock_guard<std::mutex> guard(write_mutex_);
+    // Only an in-flight request can be cancelled; an idle session has nothing to
+    // acknowledge, and waiting for that acknowledgement would stall the next reply.
+    attention_pending_ = in_request_.load();
+    attention_seen_ = false;
+    const status sent = link_->write(span<const std::byte>(prefix.data(), prefix.size()));
+    if (!sent) {
+        attention_pending_ = false;
+        fail(sent);
+        return sent;
+    }
+    packet_id_ = static_cast<std::uint8_t>(packet_id_ + 1);
+    return status{};
+}
 
 // --- db::connection ----------------------------------------------------------
 

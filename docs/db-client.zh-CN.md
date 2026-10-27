@@ -190,7 +190,11 @@ DECIMAL 符号字节 1 表示正数，`ENVCHANGE(begin_transaction)` 的事务�
 * **没有 TLS。** 服务端在 PRELOGIN 应答 ENCRYPT_ON 或 ENCRYPT_REQ 时以 `failed_precondition`
   拒绝；构造时设置 `require_encryption = true` 会在写入任何字节之前失败。半截握手会被误判成
   认证失败，把真正原因藏起来。
-* 不支持 MARS、`ATTENTION` 取消与 bulk-load 协议（`bulk_insert` 目前是 MySQL 侧接口）。
+* 取消走 `ATTENTION`：`cancel()` 可以在查询阻塞时从另一线程调用，被阻塞的查询随后返回
+  `rpc_code::canceled`。确认是**单独一条消息**，所以应答循环必须等到带 attention 位的 DONE ——
+  在第一个终止 DONE 就停下会把确认留在流里，下一次查询会把它当成自己的应答。
+  已在真机验证：`WAITFOR DELAY '00:00:03'` 约 160 ms 返回，会话仍可继续使用。
+* 不支持 MARS 与 bulk-load 协议（`bulk_insert` 目前是 MySQL 侧接口）。
 * 目前已解码类型：INT1/2/4/8、BIT、FLT4/8、INTN/BITN/FLTN、DECIMAL/NUMERIC、DATE、TIME、
   DATETIME2、VARCHAR/NVARCHAR/CHAR/NCHAR、VARBINARY/BINARY、GUID。其他线类型以
   `no_such_method` 失败，而不是误读字节。

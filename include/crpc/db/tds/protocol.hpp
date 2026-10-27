@@ -271,6 +271,9 @@ struct done_token {
 
     [[nodiscard]] bool more_results() const noexcept { return (status & 0x0001) != 0; }
     [[nodiscard]] bool error() const noexcept { return (status & 0x0002) != 0; }
+    // DONE_ATTN: this DONE is the acknowledgement of an ATTENTION packet, i.e. the
+    // server stopped the running request because the client asked it to.
+    [[nodiscard]] bool attention() const noexcept { return (status & 0x0020) != 0; }
 };
 
 // A column as COLMETADATA describes it. A ROW carries values only, so every row is

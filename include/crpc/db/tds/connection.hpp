@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,6 +108,15 @@ public:
     [[nodiscard]] status call(std::string_view procedure, span<parameter> params,
                               result_set** out) override;
 
+    // Asks the server to stop the request that is running. Safe to call from another
+    // thread while a query is blocked in a read: it writes a single 8-byte ATTENTION
+    // packet under the same write lock, and the blocked call then returns
+    // `rpc_code::canceled` once the server acknowledges.
+    //
+    // TDS has no way to cancel from the same thread that is waiting, so a caller that
+    // wants a timeout has to arm it elsewhere.
+    [[nodiscard]] status cancel();
+
     // The RETURNSTATUS of the last RPC call, when the procedure returned one.
     [[nodiscard]] std::uint32_t last_return_status() const noexcept {
         return last_return_status_;
@@ -161,6 +172,17 @@ private:
     // Echoed from ENVCHANGE(begin_transaction); cleared on commit and rollback.
     std::array<std::uint8_t, transaction_descriptor_size> descriptor_{};
     bool has_descriptor_ = false;
+    // Serialises whole messages: an ATTENTION from another thread must not land in
+    // the middle of a batch's packets.
+    std::mutex write_mutex_;
+    // A cancel was asked for and its acknowledgement has not been consumed yet. The
+    // acknowledgement is a separate message, so the reply loop has to keep reading.
+    // Written by cancel() on another thread while the reply loop reads them.
+    std::atomic<bool> attention_pending_{false};
+    std::atomic<bool> attention_seen_{false};
+    // True between sending a batch/RPC and reading its final token. Only then can an
+    // ATTENTION be acknowledged, so only then is one worth waiting for.
+    std::atomic<bool> in_request_{false};
     std::uint32_t last_return_status_ = 0;
     bool has_return_status_ = false;
     rpc_error connect_error_;

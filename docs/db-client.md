@@ -220,8 +220,14 @@ Limits, stated rather than hidden:
   refused with `failed_precondition`, and `require_encryption = true` is refused at
   construction before a byte is written. Half a handshake would look like an
   authentication failure and hide the cause.
-* No MARS, no `ATTENTION` cancellation, no bulk-load protocol (`bulk_insert` is a
-  MySQL-side interface today).
+* Cancellation uses `ATTENTION`: `cancel()` is safe to call from another thread while a
+  query is blocked, and the blocked query then returns `rpc_code::canceled`. The
+  acknowledgement arrives as its own message, so the reply loop waits for the DONE that
+  carries the attention bit — a reader that stopped at the first final DONE would leave
+  that acknowledgement behind and the *next* query would read it as its own reply.
+  Verified against a real server: a `WAITFOR DELAY '00:00:03'` returns in about 160 ms
+  and the session stays usable.
+* No MARS, and no bulk-load protocol (`bulk_insert` is a MySQL-side interface today).
 * Types decoded today: INT1/2/4/8, BIT, FLT4/8, INTN/BITN/FLTN, DECIMAL/NUMERIC,
   DATE, TIME, DATETIME2, VARCHAR/NVARCHAR/CHAR/NCHAR, VARBINARY/BINARY, GUID. Any
   other wire type fails the read with `no_such_method` instead of misreading bytes.
