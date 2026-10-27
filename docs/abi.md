@@ -273,6 +273,7 @@ is guarded.
 - `::crpc::cluster::vote_result`
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
+- `::crpc::db::column_info`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
