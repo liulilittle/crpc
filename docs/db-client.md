@@ -156,8 +156,61 @@ returned.
   key exchange, which is not implemented: use TLS, or a `mysql_native_password`
   account. Against a real server the client reports the server's own error, so this
   is a clear failure rather than a hang.
-* Not implemented yet: Oracle, Access, HBase; TLS to the database; server-side cursors;
+* Not implemented yet: Oracle, HBase; TLS to the database; server-side cursors;
   `COM_STMT_FETCH`.
+
+## Access (ODBC bridge)
+
+Access is the one engine here without a usable public wire protocol: Jet/ACE has no
+published frame format, and reverse-engineering its page layout would be enormous and
+version-fragile. Every maintained client goes through a driver, so this adapter drives
+ODBC and says so rather than pretending to speak a protocol.
+
+```cpp
+#include <crpc/db/odbc/connection.hpp>
+
+crpc::db::odbc::connection_options options;
+options.connection_string =
+    "Driver={Microsoft Access Driver (*.mdb)};Dbq=C:\\data\\app.mdb;";
+
+auto session = std::make_unique<crpc::db::odbc::connection>(options);
+if (!session->is_open()) {
+    // The driver's own message and SQLSTATE, not a generic failure.
+    std::printf("%s (%s)\n", session->connect_error().message.c_str(),
+                std::string(session->last_sqlstate()).c_str());
+}
+```
+
+It is a build option (`-DCRPC_WITH_ODBC=ON`, Windows only, links `odbc32`); without it the
+declarations still compile and every call reports `failed_precondition`, so a caller never
+has to know which platform it was built for.
+
+What the bridge does:
+
+* binds every parameter through `SQLBindParameter` — a value never appears in the SQL text,
+  so a string containing a quote is stored as text rather than breaking the statement;
+* uses the wide (`W`) entry points throughout, because a table name or value outside the
+  machine's ANSI code page would otherwise be corrupted before it reached the driver;
+* reports the driver's SQLSTATE alongside the library code. `map_sqlstate` classifies by
+  class: 23xxx is an integrity constraint, 42xxx a syntax or access error, 08xxx a lost
+  connection, 40xxx a deadlock, HYT00/HYT01 a timeout;
+* materialises each result set under `max_result_rows` / `max_result_bytes`, and reads every
+  column as text so the driver's own conversion is the only one applied.
+
+Two driver facts found by running against a real 32-bit Access driver:
+
+* **Jet has no 64-bit integer**, and binding a value as `SQL_BIGINT` is refused with HYC00
+  "optional feature not implemented". The bridge binds the narrowest type that holds the
+  value — `SQL_INTEGER` for anything that fits in 32 bits — and only uses `SQL_BIGINT` when
+  it must.
+* **`note` and `memo` are reserved words** in Jet: `CREATE TABLE (… note VARCHAR(50))` fails
+  with "Syntax error in field definition". Nothing here rewrites SQL, so that is the
+  driver's dialect to live with.
+
+`list_drivers()` reports what the machine offers, because "the Access driver is not
+installed" explains a connection failure better than any error message. Note that the
+Access driver is 32-bit only: a 64-bit process cannot use it, which is why the integration
+case must run against a 32-bit build.
 
 ## MongoDB
 

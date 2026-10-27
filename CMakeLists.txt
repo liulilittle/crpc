@@ -13,6 +13,10 @@ option(CRPC_ENABLE_LTO "Enable link-time optimisation in Release builds" ON)
 option(CRPC_BUILD_SHARED "Build crpc as a shared library" OFF)
 option(CRPC_WITH_OPENSSL "Enable the OpenSSL TLS backend (HTTPS)" OFF)
 
+# The ODBC bridge is what makes the Access adapter possible: Jet/ACE has no published wire
+# protocol, so every maintained client goes through a driver.
+option(CRPC_WITH_ODBC "Enable the ODBC bridge (Microsoft Access and other DSNs)" OFF)
+
 set(CRPC_SANITIZER "" CACHE STRING
     "Sanitizer to enable: empty, address, undefined, or thread")
 
@@ -243,6 +247,15 @@ endif()
 # Platform libraries the transport and timing layers need.
 if(WIN32)
     target_link_libraries(crpc PUBLIC ws2_32 mswsock)
+    if(CRPC_WITH_ODBC)
+        # odbc32 is the driver manager every Windows install ships; a specific driver is
+        # what a connection string names.
+        target_link_libraries(crpc PUBLIC odbc32)
+        target_compile_definitions(crpc PUBLIC CRPC_HAVE_ODBC=1)
+        message(STATUS "CRPC: ODBC bridge enabled")
+    else()
+        message(STATUS "CRPC: ODBC bridge disabled")
+    endif()
 elseif(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(crpc PUBLIC Threads::Threads)

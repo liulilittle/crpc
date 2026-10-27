@@ -137,7 +137,50 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 * `LOAD DATA LOCAL INFILE` 只发送你给的字节，没有“按路径读取”模式。
 * `caching_sha2_password` 在**未加密**连接上需要服务端 RSA 密钥交换，本库尚未实现：请用 TLS，
   或改用 `mysql_native_password` 账号。面对真实服务器时客户端会原样返回服务端错误，是明确失败而非挂起。
-* 尚未实现：Oracle、Access、HBase；到数据库的 TLS；服务端游标；`COM_STMT_FETCH`。
+* 尚未实现：Oracle、HBase；到数据库的 TLS；服务端游标；`COM_STMT_FETCH`。
+
+## Access（ODBC 桥接）
+
+Access 是这里唯一没有可用公开线协议的引擎：Jet/ACE 没有公开的帧格式，逆向它的页布局会极其庞大且
+易随版本失效。所有仍在维护的客户端都经由驱动访问，因此这个适配器驱动 ODBC，并如实说明，而不是假装
+在实现某种协议。
+
+```cpp
+#include <crpc/db/odbc/connection.hpp>
+
+crpc::db::odbc::connection_options options;
+options.connection_string =
+    "Driver={Microsoft Access Driver (*.mdb)};Dbq=C:\\data\\app.mdb;";
+
+auto session = std::make_unique<crpc::db::odbc::connection>(options);
+if (!session->is_open()) {
+    // 驱动自己的消息与 SQLSTATE，而不是笼统的失败。
+    std::printf("%s (%s)\n", session->connect_error().message.c_str(),
+                std::string(session->last_sqlstate()).c_str());
+}
+```
+
+它是编译选项（`-DCRPC_WITH_ODBC=ON`，仅 Windows，链接 `odbc32`）；不开启时声明照常编译，所有调用
+返回 `failed_precondition`，调用方无需知道构建平台。
+
+桥接做了什么：
+
+* 所有参数经 `SQLBindParameter` 绑定 —— 值从不进入 SQL 文本，所以含引号的字符串会被当作文本存储，
+  而不会破坏语句；
+* 全程使用宽字符（`W`）入口：否则表名或值中超出本机 ANSI 代码页的字符在到达驱动前就被破坏；
+* 同时报告驱动的 SQLSTATE 与库错误码。`map_sqlstate` 按类别判定：23xxx 完整性约束、42xxx 语法或
+  权限错误、08xxx 连接丢失、40xxx 死锁、HYT00/HYT01 超时；
+* 每个结果集按 `max_result_rows` / `max_result_bytes` 物化，所有列按文本读取，只让驱动做它自己的转换。
+
+用真实 32 位 Access 驱动跑出来的两个事实：
+
+* **Jet 没有 64 位整数**，把值按 `SQL_BIGINT` 绑定会被拒（HYC00 “可选的功能未实现”）。桥接按能容纳
+  该值的最窄类型绑定 —— 能装进 32 位就用 `SQL_INTEGER`，必须时才用 `SQL_BIGINT`。
+* **`note` 与 `memo` 在 Jet 里是保留字**：`CREATE TABLE (… note VARCHAR(50))` 会报
+  “Syntax error in field definition”。这里不重写 SQL，所以这是必须接受的驱动方言。
+
+`list_drivers()` 报告本机有哪些驱动 —— “Access 驱动没装”比任何错误消息都更能解释连接失败。
+注意 Access 驱动只有 32 位：64 位进程用不了它，所以集成用例必须用 32 位构建运行。
 
 ## MongoDB
 

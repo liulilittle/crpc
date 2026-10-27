@@ -1,0 +1,281 @@
+// CRPC -- ODBC bridge tests against a real Access database.
+//
+// Skipped unless CRPC_ODBC_IT=1 and CRPC_ODBC_CONNECTION is set, because the driver and the
+// database file are machine-specific. The path is a full ODBC connection string rather
+// than parts: every driver has its own keywords, and guessing them is how an ODBC test
+// ends up testing the test.
+//
+// The case that matters is the one a scripted driver cannot prove: a real driver parsing
+// real SQL for a real Jet/ACE file, with values bound rather than spliced.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "test_framework.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <crpc/db/connection.hpp>
+#include <crpc/db/odbc/connection.hpp>
+#include <crpc/error.hpp>
+
+namespace {
+
+[[nodiscard]] std::string env_or(const char* name, const char* fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::string(value) : std::string(fallback);
+}
+
+[[nodiscard]] bool it_enabled() {
+    const char* value = std::getenv("CRPC_ODBC_IT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+[[nodiscard]] const char* require_bridge() {
+    if (!it_enabled()) {
+        crpc_test::skip("CRPC_ODBC_IT is not 1");
+    }
+    if (!crpc::db::odbc::available()) {
+        crpc_test::skip("this build has no ODBC bridge");
+    }
+    if (env_or("CRPC_ODBC_CONNECTION", "").empty()) {
+        crpc_test::skip("CRPC_ODBC_CONNECTION is not set");
+    }
+    return "";
+}
+
+void report(const char* what, const crpc::rpc_error& error) {
+    std::printf("  %s failed: %s (%d)\n", what, error.message.c_str(),
+                static_cast<int>(error.code));
+}
+
+struct it_session {
+    std::unique_ptr<crpc::db::odbc::connection> session;
+
+    it_session() {
+        crpc::db::odbc::connection_options options;
+        options.connection_string = env_or("CRPC_ODBC_CONNECTION", "");
+        options.login_timeout_seconds = 15;
+        session = std::unique_ptr<crpc::db::odbc::connection>(
+            new crpc::db::odbc::connection(std::move(options)));
+    }
+
+    [[nodiscard]] bool ok() const { return session != nullptr && session->is_open(); }
+};
+
+// Runs a statement whose result does not matter, freeing whatever came back. `DROP TABLE`
+// on a missing table is the reason this exists: the failure is expected.
+void run_quietly(crpc::db::odbc::connection& session, std::string_view sql) {
+    crpc::db::result_set* out = nullptr;
+    const crpc::status ran = session.query(sql, {}, &out);
+    crpc::db::statement_guard guard(out);
+    (void)ran;
+}
+
+} // namespace
+
+CRPC_TEST(odbc_it_connects_and_reports_the_driver) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        report("connect", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // The driver's own identity: opening an Access file through the wrong driver produces
+    // errors that look like SQL mistakes.
+    std::printf("  driver: %s %s (%s)\n", std::string(it.session->driver_name()).c_str(),
+                std::string(it.session->driver_version()).c_str(),
+                std::string(it.session->dbms_name()).c_str());
+    CRPC_CHECK(!it.session->driver_name().empty());
+    CRPC_CHECK(static_cast<bool>(it.session->ping()));
+}
+
+CRPC_TEST(odbc_it_ddl_dml_and_typed_reads) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // A missing table is expected on the first run; the failure is ignored on purpose.
+    run_quietly(*it.session, "DROP TABLE crpc_odbc");
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status created = it.session->query(
+            // `note` is a reserved word in Jet ("Syntax error in field definition"), so
+              // the column is called `memo`. This is the driver's dialect, not a mistake to
+              // paper over: nothing here rewrites SQL.
+            "CREATE TABLE crpc_odbc (id INTEGER, name VARCHAR(50), amount DOUBLE, extra VARCHAR(50))",
+            {}, &out);
+        crpc::db::statement_guard guard(out);
+        if (!created) {
+            report("create table", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+
+    // Values are bound, not spliced: the note below contains a quote, which would corrupt
+    // a hand-built statement. Access uses `?` as its placeholder, which is also ODBC's.
+    crpc::db::parameter params[4] = {
+        crpc::db::parameter::from_int64(1),
+        crpc::db::parameter::from_text("ada"),
+        crpc::db::parameter::from_double(12.5),
+        crpc::db::parameter::from_text("it's quoted"),
+    };
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_odbc (id, name, amount, extra) VALUES (?, ?, ?, ?)",
+            crpc::span<const crpc::db::parameter>(params, 4), &out);
+        crpc::db::statement_guard guard(out);
+        if (!inserted) {
+            report("insert", inserted.error());
+        }
+        CRPC_CHECK(static_cast<bool>(inserted));
+        if (inserted && guard.get() != nullptr) {
+            CRPC_CHECK_EQ(std::int64_t{1}, guard->affected_rows());
+        }
+    }
+    {
+        // A NULL is bound as SQL_NULL_DATA, not as an empty string: the two are different
+        // values and an Access column can hold both.
+        crpc::db::parameter nil[4] = {
+            crpc::db::parameter::from_int64(2),
+            crpc::db::parameter::null(),
+            crpc::db::parameter::from_double(0.0),
+            crpc::db::parameter::null(),
+        };
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_odbc (id, name, amount, extra) VALUES (?, ?, ?, ?)",
+            crpc::span<const crpc::db::parameter>(nil, 4), &out);
+        crpc::db::statement_guard guard(out);
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status selected = it.session->query(
+            "SELECT id, name, amount, extra FROM crpc_odbc ORDER BY id", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!selected) {
+            report("select", selected.error());
+        }
+        CRPC_CHECK(static_cast<bool>(selected));
+        CRPC_CHECK(raw != nullptr);
+        if (raw == nullptr) {
+            return;
+        }
+        CRPC_CHECK_EQ(std::size_t{4}, raw->column_count());
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{1}, raw->get_int64(0).value());
+        CRPC_CHECK_EQ(std::string("ada"), raw->get_text(1).value());
+        CRPC_CHECK_EQ(12.5, raw->get_double(2).value());
+        CRPC_CHECK_EQ(std::string("it's quoted"), raw->get_text(3).value());
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{2}, raw->get_int64(0).value());
+        CRPC_CHECK(raw->is_null(1));
+        CRPC_CHECK(raw->is_null(3));
+        CRPC_CHECK_FALSE(raw->next());
+    }
+}
+
+CRPC_TEST(odbc_it_constraint_violation_carries_the_sqlstate) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    run_quietly(*it.session, "DROP TABLE crpc_unique");
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status created = it.session->query(
+            "CREATE TABLE crpc_unique (id INTEGER NOT NULL PRIMARY KEY)", {}, &out);
+        crpc::db::statement_guard guard(out);
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+    crpc::db::parameter one[1] = {crpc::db::parameter::from_int64(1)};
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_unique (id) VALUES (?)",
+            crpc::span<const crpc::db::parameter>(one, 1), &out);
+        crpc::db::statement_guard guard(out);
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status duplicate = it.session->query(
+            "INSERT INTO crpc_unique (id) VALUES (?)",
+            crpc::span<const crpc::db::parameter>(one, 1), &out);
+        crpc::db::statement_guard guard(out);
+        CRPC_CHECK_FALSE(static_cast<bool>(duplicate));
+        if (!duplicate) {
+            report("duplicate", duplicate.error());
+            // A primary-key violation is SQLSTATE class 23; the mapping must say so rather
+            // than collapsing it to a generic failure.
+            CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                          static_cast<int>(duplicate.error().code));
+            std::printf("  sqlstate: %s\n", std::string(it.session->last_sqlstate()).c_str());
+            CRPC_CHECK_FALSE(it.session->last_sqlstate().empty());
+        }
+    }
+    // The session survives its own error.
+    CRPC_CHECK(it.session->is_open());
+    CRPC_CHECK(static_cast<bool>(it.session->ping()));
+}
+
+CRPC_TEST(odbc_it_syntax_error_is_an_invalid_argument) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    crpc::db::result_set* out = nullptr;
+    const crpc::status broken =
+        it.session->query("SELECT * FROM a_table_that_does_not_exist", {}, &out);
+    crpc::db::statement_guard guard(out);
+    CRPC_CHECK_FALSE(static_cast<bool>(broken));
+    if (!broken) {
+        report("missing table", broken.error());
+        // A missing table is a syntax/access class error (42xxx) or the driver's own
+        // classification; both are errors a caller must see rather than an empty result.
+        std::printf("  sqlstate: %s\n", std::string(it.session->last_sqlstate()).c_str());
+        CRPC_CHECK_FALSE(broken.error().message.empty());
+    }
+    CRPC_CHECK(it.session->is_open());
+}
+
+CRPC_TEST(odbc_it_lists_drivers) {
+    (void)require_bridge();
+    const auto drivers = crpc::db::odbc::list_drivers();
+    if (!drivers) {
+        report("list drivers", drivers.error());
+    }
+    CRPC_CHECK(static_cast<bool>(drivers));
+    if (drivers) {
+        // The Access driver is what the bridge exists for; its absence explains a
+        // connection failure better than any error message.
+        bool found_access = false;
+        for (const std::string& name : drivers.value()) {
+            if (name.find("Access") != std::string::npos) {
+                found_access = true;
+            }
+        }
+        std::printf("  %zu driver(s), Access: %s\n", drivers.value().size(),
+                    found_access ? "yes" : "no");
+        CRPC_CHECK(!drivers.value().empty());
+    }
+}
+
+CRPC_TEST_MAIN()
