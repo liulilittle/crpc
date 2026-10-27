@@ -195,7 +195,11 @@ DECIMAL 符号字节 1 表示正数，`ENVCHANGE(begin_transaction)` 的事务�
   `rpc_code::canceled`。确认是**单独一条消息**，所以应答循环必须等到带 attention 位的 DONE ——
   在第一个终止 DONE 就停下会把确认留在流里，下一次查询会把它当成自己的应答。
   已在真机验证：`WAITFOR DELAY '00:00:03'` 约 160 ms 返回，会话仍可继续使用。
-* 不支持 MARS 与 bulk-load 协议（`bulk_insert` 目前是 MySQL 侧接口）。
+* 不支持 MARS 与 bulk-load 协议：`bulk_insert` 发送分批 `INSERT ... VALUES`，所有值都是绑定的。
+  批量大小由服务端两个上限决定——单个请求最多 2100 个参数（还要减去 `sp_executesql` 的
+  两个参数，因此值最多 2098 个），单条语句最多 1000 个行值表达式。所以 2 列表格每条语句
+  是 1049 行而不是 1050 行，这 2 个参数的差别就是「成功」与「参数过多」的分界。
+  `affected` 是成功批次之和；行形状不符会在发送前拒绝。
 * 目前已解码类型：INT1/2/4/8、BIT、FLT4/8、INTN/BITN/FLTN、DECIMAL/NUMERIC、
   MONEY/SMALLMONEY（以及可空的 MONEYN 形式）、DATE、TIME、DATETIME2、DATETIMEOFFSET、
   旧版 DATETIME/SMALLDATETIME 对（以及 DATETIMEN）、VARCHAR/NVARCHAR/CHAR/NCHAR、

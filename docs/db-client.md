@@ -229,7 +229,13 @@ Limits, stated rather than hidden:
   that acknowledgement behind and the *next* query would read it as its own reply.
   Verified against a real server: a `WAITFOR DELAY '00:00:03'` returns in about 160 ms
   and the session stays usable.
-* No MARS, and no bulk-load protocol (`bulk_insert` is a MySQL-side interface today).
+* No MARS, and no bulk-load protocol: `bulk_insert` sends batched `INSERT ... VALUES`
+  with every value bound. Two server limits decide the batch size — 2100 parameters per
+  request (less the two `sp_executesql` arguments, so 2098 for values) and 1000 row-value
+  expressions per statement. A 2-column table therefore gets 1049 rows per statement, not
+  1050, and the off-by-two is the difference between working and "too many parameters".
+  `affected` reports the sum over the batches that succeeded, and a shape mismatch is
+  refused before anything is sent.
 * Types decoded today: INT1/2/4/8, BIT, FLT4/8, INTN/BITN/FLTN, DECIMAL/NUMERIC,
   MONEY/SMALLMONEY (and their nullable MONEYN form), DATE, TIME, DATETIME2,
   DATETIMEOFFSET, the legacy DATETIME/SMALLDATETIME pair (and DATETIMEN),

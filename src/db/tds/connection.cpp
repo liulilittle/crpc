@@ -534,12 +534,17 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                     // before it, because the caller asked to stop.
                     attention_seen_ = true;
                 }
-                if (item.done.has_row_count) {
-                    affected = static_cast<std::int64_t>(std::min<std::uint64_t>(
+                // Counts accumulate across the statements of one request, and DONE_PROC --
+                // the terminal token of an RPC -- always reports zero. Taking the last
+                // count would therefore report 0 rows for every successful INSERT.
+                if (item.done.has_row_count &&
+                    item.raw_type != static_cast<std::uint8_t>(token_type::done_proc)) {
+                    if (affected < 0) {
+                        affected = 0;
+                    }
+                    affected += static_cast<std::int64_t>(std::min<std::uint64_t>(
                         item.done.row_count,
                         static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
-                } else {
-                    affected = 0;
                 }
                 if (current) {
                     current->set_affected_rows(affected);
@@ -1111,6 +1116,138 @@ status connection::call_impl(std::string_view sql, span<const parameter> params,
     }
 
     return run_rpc(request, out, &written);
+}
+
+namespace {
+
+// SQL Server quotes identifiers with brackets and escapes a closing bracket by
+// doubling it. The shared `quote_identifier` uses MySQL backticks, so a TDS statement
+// cannot use it: backticks are not quoting in T-SQL, and the name would be taken
+// literally.
+[[nodiscard]] std::string quote_tds_identifier(std::string_view name) {
+    std::string out;
+    out.reserve(name.size() + 4);
+    out.push_back('[');
+    for (const char c : name) {
+        if (c == ']') {
+            out.push_back(']');
+        }
+        out.push_back(c);
+    }
+    out.push_back(']');
+    return out;
+}
+
+// One `INSERT ... VALUES (...), (...)` statement for `rows` rows, with `?` placeholders
+// that `call_impl` turns into @P<n>. Identifiers are quoted because they cannot be
+// bound; values never appear in the text.
+[[nodiscard]] std::string make_tds_insert(const db::insert_target& target,
+                                          std::size_t rows) {
+    std::string sql;
+    sql.reserve(32 + target.table.size() + target.columns.size() * 16 + rows * 8);
+    sql += "INSERT INTO ";
+    sql += quote_tds_identifier(target.table);
+    sql += " (";
+    for (std::size_t i = 0; i < target.columns.size(); ++i) {
+        if (i != 0) {
+            sql += ", ";
+        }
+        sql += quote_tds_identifier(target.columns[i]);
+    }
+    sql += ") VALUES ";
+    for (std::size_t row = 0; row < rows; ++row) {
+        if (row != 0) {
+            sql += ", ";
+        }
+        sql.push_back('(');
+        for (std::size_t column = 0; column < target.columns.size(); ++column) {
+            if (column != 0) {
+                sql += ", ";
+            }
+            sql.push_back('?');
+        }
+        sql.push_back(')');
+    }
+    return sql;
+}
+
+} // namespace
+
+status connection::bulk_insert(const db::insert_target& target,
+                               span<const std::vector<parameter>> rows,
+                               const db::bulk_options& options, std::uint64_t& affected) {
+    affected = 0;
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (rows.empty()) {
+        return status{};
+    }
+    if (target.columns.empty()) {
+        return status{rpc_code::invalid_argument, "an insert needs at least one column"};
+    }
+    for (const std::vector<parameter>& row : rows) {
+        if (row.size() != target.columns.size()) {
+            return status{rpc_code::invalid_argument,
+                          "a bulk row does not match the column count"};
+        }
+    }
+
+    // SQL Server refuses a request with more than 2100 parameters. The two sp_executesql
+    // arguments (@stmt and @params) count towards that budget as well, so a batch may
+    // only use 2098 for row values -- a 2-column table fits 1049 rows, not 1050, and the
+    // off-by-two is the difference between working and "too many parameters".
+    constexpr std::size_t max_parameters = 2100;
+    constexpr std::size_t reserved_parameters = 2;
+    // A single INSERT also accepts at most 1000 row-value expressions, independent of the
+    // parameter budget. Both limits have to be honoured: a 2-column table is bounded by
+    // the parameter count (1049 rows), a 1-column table by the row-value limit (1000).
+    constexpr std::size_t max_row_values = 1000;
+    std::size_t rows_by_parameters =
+        (max_parameters - reserved_parameters) / target.columns.size();
+    if (rows_by_parameters > max_row_values) {
+        rows_by_parameters = max_row_values;
+    }
+    if (rows_by_parameters == 0) {
+        return status{rpc_code::invalid_argument,
+                      "the table has more columns than one SQL Server request can bind"};
+    }
+
+    db::bulk_options effective = options;
+    if (effective.max_rows_per_statement > rows_by_parameters) {
+        effective.max_rows_per_statement = rows_by_parameters;
+    }
+
+    result<std::vector<std::size_t>> plan =
+        db::plan_insert_batches(target, rows.size(), effective);
+    if (!plan) {
+        return plan.error();
+    }
+
+    std::size_t offset = 0;
+    for (const std::size_t batch : plan.value()) {
+        const std::string sql = make_tds_insert(target, batch);
+        std::vector<parameter> bound;
+        bound.reserve(batch * target.columns.size());
+        for (std::size_t row = 0; row < batch; ++row) {
+            for (const parameter& value : rows[offset + row]) {
+                bound.push_back(value);
+            }
+        }
+        result_set* out = nullptr;
+        std::vector<return_value> written;
+        const status ran = call_impl(sql, span<const parameter>(bound.data(), bound.size()),
+                                     &out, false, written);
+        if (!ran) {
+            return ran;
+        }
+        std::unique_ptr<result_set> guard(out);
+        if (guard != nullptr && guard->affected_rows() > 0) {
+            affected += static_cast<std::uint64_t>(guard->affected_rows());
+        }
+        offset += batch;
+    }
+    return status{};
 }
 
 status connection::query(std::string_view sql, span<const parameter> params, result_set** out) {

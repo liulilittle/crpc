@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <crpc/config.hpp>
+#include <crpc/db/bulk.hpp>
 #include <crpc/db/channel.hpp>
 #include <crpc/db/connection.hpp>
 #include <crpc/db/tds/protocol.hpp>
@@ -111,6 +112,18 @@ public:
     // is not drained desynchronises the stream.
     [[nodiscard]] status query(std::string_view sql, span<const parameter> params,
                                result_set** out) override;
+
+    // Inserts `rows` with batched `INSERT ... VALUES (...), (...)` statements whose
+    // values are all bound.
+    //
+    // SQL Server caps a single request at 2100 parameters, so a batch is sized by
+    // `2100 / column_count` as well as by the caller's `max_rows_per_statement`. Rows
+    // per statement are the unit of failure: a batch that fails discards only its own
+    // rows, and `affected` accumulates the counts of the batches that succeeded.
+    [[nodiscard]] status bulk_insert(const db::insert_target& target,
+                                     span<const std::vector<parameter>> rows,
+                                     const db::bulk_options& options,
+                                     std::uint64_t& affected);
 
     // Calls a stored procedure by name with RPC, writing OUT/INOUT values back into
     // `params`. The procedure's return code is available from `last_return_status()`.

@@ -577,4 +577,111 @@ CRPC_TEST(tds_it_legacy_types) {
                   raw->get_text(4).value());
 }
 
+CRPC_TEST(tds_it_bulk_insert) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status created =
+            it.session->query("IF DB_ID('crpc_tds_it') IS NULL CREATE DATABASE crpc_tds_it", {},
+                              &raw);
+        crpc::db::statement_guard guard(raw);
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+    CRPC_CHECK(static_cast<bool>(it.session->query("USE crpc_tds_it", {}, nullptr)));
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status made = it.session->query(
+            "IF OBJECT_ID('crpc_bulk') IS NOT NULL DROP TABLE crpc_bulk; "
+            "CREATE TABLE crpc_bulk (id int NOT NULL PRIMARY KEY, name nvarchar(50) NULL)",
+            {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!made) {
+            report("create bulk table", made.error());
+        }
+        CRPC_CHECK(static_cast<bool>(made));
+    }
+
+    // Enough rows to need more than one statement at the 2100-parameter bound: two
+    // columns allow 1050 rows per statement, so 2500 rows is three statements.
+    constexpr std::size_t row_count = 2500;
+    std::vector<std::vector<crpc::db::parameter>> rows;
+    rows.reserve(row_count);
+    for (std::size_t i = 0; i < row_count; ++i) {
+        std::vector<crpc::db::parameter> row;
+        row.push_back(crpc::db::parameter::from_int64(static_cast<std::int64_t>(i)));
+        row.push_back(crpc::db::parameter::from_text("row " + std::to_string(i)));
+        rows.push_back(std::move(row));
+    }
+
+    crpc::db::insert_target target;
+    target.table = "crpc_bulk";
+    target.columns = {"id", "name"};
+    crpc::db::bulk_options options;
+    // Ask for more rows per statement than the parameter limit allows; the adapter must
+    // clamp it rather than let the server reject the request.
+    options.max_rows_per_statement = 5000;
+
+    std::uint64_t affected = 0;
+    const crpc::status ran =
+        it.session->bulk_insert(target, crpc::span<const std::vector<crpc::db::parameter>>(
+                                            rows.data(), rows.size()),
+                                options, affected);
+    if (!ran) {
+        report("bulk insert", ran.error());
+    }
+    CRPC_CHECK(static_cast<bool>(ran));
+    CRPC_CHECK_EQ(std::uint64_t{row_count}, affected);
+
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status counted =
+        it.session->query("SELECT COUNT(*) AS n, MIN(id) AS lo, MAX(id) AS hi FROM crpc_bulk",
+                          {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    CRPC_CHECK(static_cast<bool>(counted));
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{static_cast<std::int64_t>(row_count)},
+                      raw->get_int64(0).value());
+        CRPC_CHECK_EQ(std::int64_t{0}, raw->get_int64(1).value());
+        CRPC_CHECK_EQ(std::int64_t{static_cast<std::int64_t>(row_count) - 1},
+                      raw->get_int64(2).value());
+    }
+}
+
+CRPC_TEST(tds_it_bulk_insert_refuses_a_shape_mismatch) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    crpc::db::insert_target target;
+    target.table = "crpc_bulk";
+    target.columns = {"id", "name"};
+    std::vector<std::vector<crpc::db::parameter>> rows;
+    std::vector<crpc::db::parameter> short_row;
+    short_row.push_back(crpc::db::parameter::from_int64(1));
+    rows.push_back(std::move(short_row));
+
+    std::uint64_t affected = 12345;
+    const crpc::status ran =
+        it.session->bulk_insert(target, crpc::span<const std::vector<crpc::db::parameter>>(
+                                            rows.data(), rows.size()),
+                                crpc::db::bulk_options{}, affected);
+    CRPC_CHECK_FALSE(static_cast<bool>(ran));
+    if (!ran) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(ran.error().code));
+        report("shape mismatch", ran.error());
+    }
+    // A refused batch must report zero, not leave a stale count from a previous call.
+    CRPC_CHECK_EQ(std::uint64_t{0}, affected);
+}
+
 CRPC_TEST_MAIN()
