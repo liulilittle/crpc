@@ -82,6 +82,16 @@ public:
     // and reusing a statement id on another connection addresses nothing.
     [[nodiscard]] result<prepared_statement> prepare(std::string_view sql);
 
+    // Executes a stored procedure call, writing OUT/INOUT values back into params.
+    //
+    // MySQL requires a procedure's OUT argument to be a session variable, so an
+    // output placeholder is rewritten to @crpc_out_<n>, INOUT values are assigned
+    // first with a prepared SET, and the variables are read back with one SELECT
+    // after the call. That is the documented mechanism; there is no way to bind an
+    // OUT parameter directly.
+    [[nodiscard]] status call(std::string_view call_sql, span<parameter> params,
+                              result_set** out);
+
     void close() noexcept override;
     [[nodiscard]] bool is_open() const noexcept override;
 
@@ -104,13 +114,18 @@ private:
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
     [[nodiscard]] status send_message(span<const std::byte> payload, std::uint8_t sequence);
     [[nodiscard]] status run_query(std::string_view sql, result_set** out);
-    // Executes a prepared statement and decodes its reply (binary protocol).
+// Executes a prepared statement and decodes its reply (binary protocol).
+    // `allow_more_results` exists for CALL: a procedure returns its result set and
+    // then a trailing OK, and refusing the trailing packet would leave the stream
+    // desynchronised.
     [[nodiscard]] status execute_prepared(std::uint32_t statement_id,
-                                          span<const parameter> params, result_set** out);
+                                          span<const parameter> params, result_set** out,
+                                          bool allow_more_results = false);
     // Sends COM_STMT_CLOSE. The server sends no reply, so this must not read one.
     void release_statement(std::uint32_t statement_id) noexcept;
     // Reads a result set whose rows are encoded by the binary protocol.
-    [[nodiscard]] status read_binary_result(std::uint64_t column_count, result_set** out);
+    [[nodiscard]] status read_binary_result(std::uint64_t column_count, result_set** out,
+                                           bool allow_more_results = false);
     [[nodiscard]] status set_autocommit(bool enabled);
     void fail(const status& error) noexcept;
 
@@ -158,7 +173,11 @@ public:
     void close() noexcept;
 
 private:
-    friend class connection;
+friend class connection;
+    // `allow_more_results` is for CALL: the procedure's result set is followed by a
+    // trailing OK packet.
+    [[nodiscard]] result<result_set*> execute_impl(span<const parameter> params,
+                                                   bool allow_more_results);
     prepared_statement(connection* owner, std::weak_ptr<void> guard,
                        std::uint32_t statement_id, std::size_t params,
                        std::size_t columns) noexcept;

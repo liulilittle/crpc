@@ -2,6 +2,7 @@
 #include <crpc/db/mysql/connection.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -844,7 +845,8 @@ status connection::run_query(std::string_view sql, result_set** out) {
     return status{};
 }
 
-status connection::read_binary_result(std::uint64_t column_count, result_set** out) {
+status connection::read_binary_result(std::uint64_t column_count, result_set** out,
+                                           bool allow_more_results) {
     if (out != nullptr) {
         *out = nullptr;
     }
@@ -931,9 +933,38 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
         set->add_row(std::move(row.values), std::move(row.nulls));
     }
 
+    // A CALL answers a result set and then a trailing OK, flagged with MORE_RESULTS.
+    // When the caller asked for that shape (stored procedures), the extra packet is
+    // read here so the stream stays aligned; otherwise it is refused, because acting
+    // on the first result while another is queued misreads the next command.
     if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) != 0) {
-        fail(status{rpc_code::no_such_method, "mysql multiple result sets are not supported"});
-        return status{rpc_code::no_such_method, "mysql multiple result sets are not supported"};
+        if (!allow_more_results) {
+            fail(status{rpc_code::no_such_method, "mysql multiple result sets are not supported"});
+            return status{rpc_code::no_such_method,
+                          "mysql multiple result sets are not supported"};
+        }
+        std::vector<std::byte> trailing;
+        const status trailing_read = read_message(trailing);
+        if (!trailing_read) {
+            fail(trailing_read);
+            return trailing_read;
+        }
+        const span<const std::byte> trailing_view(trailing.data(), trailing.size());
+        if (!trailing_view.empty() &&
+            static_cast<std::uint8_t>(trailing_view[0]) == 0xff) {
+            err_packet err;
+            const status decoded = decode_err(trailing_view, err);
+            if (!decoded) {
+                return decoded;
+            }
+            return status{map_error_code(err.code), err.message};
+        }
+        if (!trailing_view.empty() &&
+            static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
+            ok_packet ok;
+            (void)decode_ok(trailing_view, capabilities_, ok);
+            status_flags_ = ok.status_flags;
+        }
     }
     if (out != nullptr) {
         *out = set.release();
@@ -942,7 +973,7 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
 }
 
 status connection::execute_prepared(std::uint32_t statement_id, span<const parameter> params,
-                                    result_set** out) {
+                                    result_set** out, bool allow_more_results) {
     if (out != nullptr) {
         *out = nullptr;
     }
@@ -983,6 +1014,34 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
             return decoded;
         }
         status_flags_ = ok.status_flags;
+        // A procedure with no result set still ends with two OK packets when the
+        // call was made through a prepared statement. Leaving the second one in the
+        // stream would make the next command read it as its own answer.
+        if (allow_more_results &&
+            (status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) != 0) {
+            std::vector<std::byte> trailing;
+            const status trailing_read = read_message(trailing);
+            if (!trailing_read) {
+                fail(trailing_read);
+                return trailing_read;
+            }
+            const span<const std::byte> trailing_view(trailing.data(), trailing.size());
+            if (!trailing_view.empty() &&
+                static_cast<std::uint8_t>(trailing_view[0]) == 0xff) {
+                err_packet err;
+                const status err_decoded = decode_err(trailing_view, err);
+                if (!err_decoded) {
+                    return err_decoded;
+                }
+                return status{map_error_code(err.code), err.message};
+            }
+            if (!trailing_view.empty() &&
+                static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
+                ok_packet trailing_ok;
+                (void)decode_ok(trailing_view, capabilities_, trailing_ok);
+                status_flags_ = trailing_ok.status_flags;
+            }
+        }
         if (out != nullptr) {
             *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
         }
@@ -996,7 +1055,267 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
     if (!count_read) {
         return count_read;
     }
-    return read_binary_result(column_count, out);
+    return read_binary_result(column_count, out, allow_more_results);
+}
+
+namespace {
+
+// Rewrites `?` placeholders that are not inside a string literal, a quoted
+// identifier or a comment. A stored procedure's OUT argument must be a session
+// variable, so an output placeholder becomes `@crpc_out_<n>`; an input placeholder
+// stays `?` and is bound.
+//
+// Rewriting SQL text is only safe because this scanner understands the quoting
+// rules: replacing every '?' would corrupt a literal like 'a?b', which is exactly
+// the bug that turns a stored-procedure wrapper into a data-corruption source.
+status rewrite_call_placeholders(std::string_view sql, span<const parameter> params,
+                                 std::string& rewritten, std::vector<std::size_t>& binds,
+                                 std::vector<std::size_t>& outputs) {
+    rewritten.clear();
+    rewritten.reserve(sql.size() + 16);
+    binds.clear();
+    outputs.clear();
+    std::size_t index = 0;
+
+    for (std::size_t i = 0; i < sql.size(); ++i) {
+        const char c = sql[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            const char quote = c;
+            rewritten.push_back(c);
+            ++i;
+            while (i < sql.size()) {
+                rewritten.push_back(sql[i]);
+                if (quote != '`' && sql[i] == '\\' && i + 1 < sql.size()) {
+                    ++i;
+                    rewritten.push_back(sql[i]);
+                } else if (sql[i] == quote) {
+                    // A doubled quote is an escaped quote, not the end.
+                    if (i + 1 < sql.size() && sql[i + 1] == quote) {
+                        ++i;
+                        rewritten.push_back(sql[i]);
+                    } else {
+                        break;
+                    }
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            while (i < sql.size() && sql[i] != '\n') {
+                rewritten.push_back(sql[i]);
+                ++i;
+            }
+            if (i < sql.size()) {
+                rewritten.push_back(sql[i]);
+            }
+            continue;
+        }
+        if (c == '#') {
+            while (i < sql.size() && sql[i] != '\n') {
+                rewritten.push_back(sql[i]);
+                ++i;
+            }
+            if (i < sql.size()) {
+                rewritten.push_back(sql[i]);
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            rewritten.push_back('/');
+            rewritten.push_back('*');
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                rewritten.push_back(sql[i]);
+                ++i;
+            }
+            if (i + 1 < sql.size()) {
+                rewritten.push_back('*');
+                rewritten.push_back('/');
+                ++i;
+            }
+            continue;
+        }
+        if (c == '?') {
+            if (index >= params.size()) {
+                return status{rpc_code::invalid_argument,
+                              "the call has more placeholders than parameters"};
+            }
+            // Both OUT and INOUT must be session variables: MySQL does not accept a
+            // bound placeholder for an argument the procedure writes. Only a pure
+            // input stays ?. An INOUT value is seeded with a prepared SET before
+            // the call; a pure OUT has nothing to seed.
+            if (params[index].is_output()) {
+                rewritten += "@crpc_out_";
+                rewritten += std::to_string(index);
+                outputs.push_back(index);
+            } else {
+                rewritten.push_back('?');
+                binds.push_back(index);
+            }
+            ++index;
+            continue;
+        }
+        rewritten.push_back(c);
+    }
+
+    if (index != params.size()) {
+        return status{rpc_code::invalid_argument,
+                      "the call has fewer placeholders than parameters"};
+    }
+    return status{};
+}
+
+// Writes a read-back value into the caller's parameter, converting the text form to
+// the parameter's declared type. The type comes from the caller because a SELECT of
+// a session variable reports a string.
+void assign_output(parameter& target, std::string_view text, bool is_null) {
+    if (is_null) {
+        target.is_null = true;
+        return;
+    }
+    target.is_null = false;
+    const std::string copy(text);
+    switch (target.type) {
+    case db_type::boolean:
+        target.int_value = (text == "1" || text == "true" || text == "TRUE") ? 1 : 0;
+        return;
+    case db_type::int64: {
+        char* end = nullptr;
+        const long long value = std::strtoll(copy.c_str(), &end, 10);
+        if (end != copy.c_str()) {
+            target.int_value = static_cast<std::int64_t>(value);
+        }
+        return;
+    }
+    case db_type::uint64: {
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(copy.c_str(), &end, 10);
+        if (end != copy.c_str()) {
+            target.uint_value = static_cast<std::uint64_t>(value);
+        }
+        return;
+    }
+    case db_type::real: {
+        char* end = nullptr;
+        const double value = std::strtod(copy.c_str(), &end);
+        if (end != copy.c_str()) {
+            target.real_value = value;
+        }
+        return;
+    }
+    case db_type::blob:
+        target.blob.assign(reinterpret_cast<const std::byte*>(text.data()),
+                           reinterpret_cast<const std::byte*>(text.data()) + text.size());
+        return;
+    default:
+        target.text.assign(text.data(), text.size());
+        return;
+    }
+}
+
+} // namespace
+
+status connection::call(std::string_view call_sql, span<parameter> params, result_set** out) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+
+    std::string rewritten;
+    std::vector<std::size_t> binds;
+    std::vector<std::size_t> outputs;
+    const status rewrite = rewrite_call_placeholders(
+        call_sql, span<const parameter>(params.data(), params.size()), rewritten, binds, outputs);
+    if (!rewrite) {
+        return rewrite;
+    }
+
+    // INOUT parameters arrive as values, so the session variable is seeded first. A
+    // plain OUT parameter has nothing to seed.
+    for (const std::size_t index : outputs) {
+        if (params[index].direction != parameter_direction::input_output) {
+            continue;
+        }
+        const std::string set_sql =
+            "SET @crpc_out_" + std::to_string(index) + " = ?";
+        result<prepared_statement> setter = prepare(set_sql);
+        if (!setter) {
+            return setter.error();
+        }
+        prepared_statement set_statement = std::move(setter.value());
+        const std::vector<parameter> one{params[index]};
+        result<result_set*> applied =
+            set_statement.execute(span<const parameter>(one.data(), one.size()));
+        set_statement.close();
+        if (!applied) {
+            return applied.error();
+        }
+        delete applied.value();
+    }
+
+    std::vector<parameter> bound;
+    bound.reserve(binds.size());
+    for (const std::size_t index : binds) {
+        bound.push_back(params[index]);
+    }
+
+    result<prepared_statement> prepared = prepare(rewritten);
+    if (!prepared) {
+        return prepared.error();
+    }
+    prepared_statement call_statement = std::move(prepared.value());
+    // A procedure answers its result set and then a trailing OK, so the trailing
+    // packet must be drained; refusing it would leave the stream one packet ahead.
+    result<result_set*> executed = call_statement.execute_impl(
+        span<const parameter>(bound.data(), bound.size()), true);
+    if (!executed) {
+        call_statement.close();
+        return executed.error();
+    }
+    result_set* rows = executed.value();
+    call_statement.close();
+
+    if (!outputs.empty()) {
+        std::string select = "SELECT ";
+        for (std::size_t k = 0; k < outputs.size(); ++k) {
+            if (k != 0) {
+                select += ", ";
+            }
+            select += "@crpc_out_" + std::to_string(outputs[k]);
+        }
+        result_set* readback = nullptr;
+        const status read = run_query(select, &readback);
+        if (!read) {
+            delete rows;
+            return read;
+        }
+        std::unique_ptr<result_set> guard(readback);
+        if (readback != nullptr && readback->next()) {
+            for (std::size_t k = 0; k < outputs.size(); ++k) {
+                const bool is_null = readback->is_null(k);
+                std::string_view text;
+                if (!is_null) {
+                    result<std::string_view> value = readback->get_text(k);
+                    if (!value) {
+                        delete rows;
+                        return value.error();
+                    }
+                    text = value.value();
+                }
+                assign_output(params[outputs[k]], text, is_null);
+            }
+        }
+    }
+
+    if (out != nullptr) {
+        *out = rows;
+    } else {
+        delete rows;
+    }
+    return status{};
 }
 
 result<prepared_statement> connection::prepare(std::string_view sql) {
@@ -1130,6 +1449,11 @@ prepared_statement& prepared_statement::operator=(prepared_statement&& other) no
 }
 
 result<result_set*> prepared_statement::execute(span<const parameter> params) {
+    return execute_impl(params, false);
+}
+
+result<result_set*> prepared_statement::execute_impl(span<const parameter> params,
+                                                     bool allow_more_results) {
     if (owner_ == nullptr || guard_.expired()) {
         return rpc_error{rpc_code::failed_precondition, "the statement is not valid"};
     }
@@ -1140,7 +1464,8 @@ result<result_set*> prepared_statement::execute(span<const parameter> params) {
                          "the statement expects a different number of parameters"};
     }
     result_set* set = nullptr;
-    const status ran = owner_->execute_prepared(statement_id_, params, &set);
+    const status ran =
+        owner_->execute_prepared(statement_id_, params, &set, allow_more_results);
     if (!ran) {
         return ran.error();
     }
