@@ -310,22 +310,6 @@ CRPC_TEST(mysql_handshake_error_packet_closes) {
     CRPC_CHECK(raw->closed);
 }
 
-CRPC_TEST(mysql_parameters_are_refused_until_prepared_statements_exist) {
-    harness h;
-    const std::vector<crpc::db::parameter> params{crpc::db::parameter::from_int64(1)};
-    const std::size_t writes_before = h.raw->writes.size();
-    crpc::db::result_set* raw_set = nullptr;
-    const crpc::status ran = h.session->query(
-        "SELECT * FROM t WHERE id = ?",
-        crpc::span<const crpc::db::parameter>(params.data(), params.size()), &raw_set);
-    CRPC_CHECK_FALSE(ran.ok());
-    if (!ran.ok()) {
-        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::no_such_method),
-                      static_cast<int>(ran.code()));
-    }
-    // Nothing was written: splicing a parameter into SQL by hand is injection.
-    CRPC_CHECK_EQ(writes_before, h.raw->writes.size());
-}
 
 CRPC_TEST(mysql_transaction_state_is_tracked) {
     harness h;

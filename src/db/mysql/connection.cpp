@@ -266,6 +266,7 @@ bool socket_channel::is_open() const noexcept { return link_ != nullptr && link_
 
 connection::connection(connection_options options, std::unique_ptr<channel> link)
     : options_(std::move(options)), link_(std::move(link)) {
+    session_guard_ = std::make_shared<int>(0);
     const status opened = perform_handshake();
     if (!opened) {
         fail(opened);
@@ -635,13 +636,26 @@ status connection::query(std::string_view sql, span<const parameter> params, res
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
     }
-    // This backend has no prepared-statement support yet, and splicing a parameter
-    // into the SQL text by hand is how injection happens. Refusing is the only
-    // honest answer until COM_STMT_PREPARE is implemented.
+// Parameters always go through the prepared-statement protocol. Splicing them
+    // into the SQL text is how injection happens, so there is no fallback that
+    // "works" without it.
     if (!params.empty()) {
-        return status{rpc_code::no_such_method,
-                      "mysql parameter binding needs prepared statements, which are not "
-                      "implemented yet; use a literal query with escaping instead"};
+        result<prepared_statement> prepared = prepare(sql);
+        if (!prepared) {
+            return prepared.error();
+        }
+        prepared_statement handle = std::move(prepared.value());
+        result<result_set*> executed = handle.execute(params);
+        if (!executed) {
+            return executed.error();
+        }
+        if (out != nullptr) {
+            *out = executed.value();
+        }
+        // The statement is closed before returning: a pooled connection must not
+        // accumulate server-side statements just because a caller used parameters.
+        handle.close();
+        return status{};
     }
     return run_query(sql, out);
 }
@@ -830,9 +844,336 @@ status connection::run_query(std::string_view sql, result_set** out) {
     return status{};
 }
 
+status connection::read_binary_result(std::uint64_t column_count, result_set** out) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    if (column_count == 0 || column_count > 4096) {
+        return status{rpc_code::protocol_error, "mysql result set column count is implausible"};
+    }
+
+    std::vector<column_info> columns;
+    std::vector<column_type> types;
+    columns.reserve(static_cast<std::size_t>(column_count));
+    types.reserve(static_cast<std::size_t>(column_count));
+    for (std::uint64_t index = 0; index < column_count; ++index) {
+        std::vector<std::byte> definition_payload;
+        const status read = read_message(definition_payload);
+        if (!read) {
+            fail(read);
+            return read;
+        }
+        column_definition definition;
+        const status decoded = decode_column(
+            span<const std::byte>(definition_payload.data(), definition_payload.size()),
+            definition);
+        if (!decoded) {
+            return decoded;
+        }
+        types.push_back(definition.type);
+        columns.push_back(mysql::to_column_info(definition));
+    }
+    if ((capabilities_ & mask(capability::deprecate_eof)) == 0) {
+        std::vector<std::byte> eof_payload;
+        const status eof_read = read_message(eof_payload);
+        if (!eof_read) {
+            fail(eof_read);
+            return eof_read;
+        }
+    }
+
+    std::unique_ptr<memory_result_set> set(
+        new memory_result_set(std::move(columns), {}, -1));
+    for (;;) {
+        std::vector<std::byte> row_payload;
+        const status read = read_message(row_payload);
+        if (!read) {
+            fail(read);
+            return read;
+        }
+        const span<const std::byte> row_view(row_payload.data(), row_payload.size());
+        if (row_view.empty()) {
+            return status{rpc_code::protocol_error, "empty mysql binary row packet"};
+        }
+        const std::uint8_t first = byte_at(row_view, 0);
+        if (first == 0xfe && row_view.size() < 9) {
+            eof_packet eof;
+            (void)decode_eof(row_view, eof);
+            status_flags_ = eof.status_flags;
+            break;
+        }
+        if ((capabilities_ & mask(capability::deprecate_eof)) != 0 && first == 0xfe) {
+            std::size_t ok_offset = 1;
+            std::uint64_t ignored = 0;
+            bool ignored_null = false;
+            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+            if (ok_offset + 4 <= row_view.size()) {
+                status_flags_ = read_u16(row_view, ok_offset);
+            }
+            break;
+        }
+        if (first == 0xff) {
+            err_packet err;
+            const status decoded = decode_err(row_view, err);
+            if (!decoded) {
+                return decoded;
+            }
+            return status{map_error_code(err.code), err.message};
+        }
+
+        binary_row row;
+        const status decoded = decode_binary_row(
+            row_view, span<const column_type>(types.data(), types.size()), row);
+        if (!decoded) {
+            return decoded;
+        }
+        set->add_row(std::move(row.values), std::move(row.nulls));
+    }
+
+    if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) != 0) {
+        fail(status{rpc_code::no_such_method, "mysql multiple result sets are not supported"});
+        return status{rpc_code::no_such_method, "mysql multiple result sets are not supported"};
+    }
+    if (out != nullptr) {
+        *out = set.release();
+    }
+    return status{};
+}
+
+status connection::execute_prepared(std::uint32_t statement_id, span<const parameter> params,
+                                    result_set** out) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    std::vector<std::byte> command;
+    const status encoded = encode_stmt_execute(command, statement_id, params);
+    if (!encoded) {
+        return encoded;
+    }
+    sequence_ = 0;
+    const status sent = send_message(span<const std::byte>(command.data(), command.size()), 0);
+    if (!sent) {
+        fail(sent);
+        return sent;
+    }
+
+    std::vector<std::byte> reply;
+    const status read = read_message(reply);
+    if (!read) {
+        fail(read);
+        return read;
+    }
+    const span<const std::byte> payload(reply.data(), reply.size());
+    if (classify(payload, false) == packet_kind::err) {
+        err_packet err;
+        const status decoded = decode_err(payload, err);
+        if (!decoded) {
+            return decoded;
+        }
+        return status{map_error_code(err.code), err.message};
+    }
+    if (classify(payload, false) == packet_kind::ok) {
+        ok_packet ok;
+        const status decoded = decode_ok(payload, capabilities_, ok);
+        if (!decoded) {
+            return decoded;
+        }
+        status_flags_ = ok.status_flags;
+        if (out != nullptr) {
+            *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+        }
+        return status{};
+    }
+
+    std::size_t offset = 0;
+    std::uint64_t column_count = 0;
+    bool is_null = false;
+    const status count_read = read_lenenc_int(payload, offset, false, column_count, is_null);
+    if (!count_read) {
+        return count_read;
+    }
+    return read_binary_result(column_count, out);
+}
+
+result<prepared_statement> connection::prepare(std::string_view sql) {
+    if (!open_) {
+        return rpc_error{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    std::vector<std::byte> command = encode_command(com_stmt_prepare, sql);
+    sequence_ = 0;
+    const status sent = send_message(span<const std::byte>(command.data(), command.size()), 0);
+    if (!sent) {
+        fail(sent);
+        return sent.error();
+    }
+
+    std::vector<std::byte> reply;
+    const status read = read_message(reply);
+    if (!read) {
+        fail(read);
+        return read.error();
+    }
+    const span<const std::byte> payload(reply.data(), reply.size());
+    if (classify(payload, false) == packet_kind::err) {
+        err_packet err;
+        const status decoded = decode_err(payload, err);
+        if (!decoded) {
+            return decoded.error();
+        }
+        return rpc_error{map_error_code(err.code), err.message};
+    }
+
+    prepare_ok ok;
+    const status decoded = decode_prepare_ok(payload, ok);
+    if (!decoded) {
+        return decoded.error();
+    }
+
+    // The reply is followed by the parameter definitions and the column
+    // definitions, each closed by an EOF. Skipping them by count (rather than by
+    // scanning for EOF) is what keeps the stream aligned: a definition packet can
+    // contain any bytes.
+    if (ok.param_count > 0) {
+        for (std::uint16_t index = 0; index < ok.param_count; ++index) {
+            std::vector<std::byte> ignored;
+            const status skipped = read_message(ignored);
+            if (!skipped) {
+                fail(skipped);
+                return skipped.error();
+            }
+        }
+        if ((capabilities_ & mask(capability::deprecate_eof)) == 0) {
+            std::vector<std::byte> eof_payload;
+            const status eof_read = read_message(eof_payload);
+            if (!eof_read) {
+                fail(eof_read);
+                return eof_read.error();
+            }
+        }
+    }
+    if (ok.column_count > 0) {
+        for (std::uint16_t index = 0; index < ok.column_count; ++index) {
+            std::vector<std::byte> ignored;
+            const status skipped = read_message(ignored);
+            if (!skipped) {
+                fail(skipped);
+                return skipped.error();
+            }
+        }
+        if ((capabilities_ & mask(capability::deprecate_eof)) == 0) {
+            std::vector<std::byte> eof_payload;
+            const status eof_read = read_message(eof_payload);
+            if (!eof_read) {
+                fail(eof_read);
+                return eof_read.error();
+            }
+        }
+    }
+    return prepared_statement(this, session_guard_, ok.statement_id, ok.param_count,
+                              ok.column_count);
+}
+
+void connection::release_statement(std::uint32_t statement_id) noexcept {
+    if (!open_ || statement_id == 0) {
+        return;
+    }
+    std::vector<std::byte> command = encode_stmt_close(statement_id);
+    sequence_ = 0;
+    // COM_STMT_CLOSE has no reply. Reading one here would consume the next command's
+    // answer, so a failure is simply terminal for the session.
+    const status sent = send_message(span<const std::byte>(command.data(), command.size()), 0);
+    if (!sent) {
+        fail(sent);
+    }
+}
+
+// --- prepared_statement ------------------------------------------------------
+
+prepared_statement::prepared_statement(connection* owner, std::weak_ptr<void> guard,
+                                       std::uint32_t statement_id, std::size_t params,
+                                       std::size_t columns) noexcept
+    : owner_(owner),
+      guard_(std::move(guard)),
+      statement_id_(statement_id),
+      param_count_(params),
+      column_count_(columns) {}
+
+prepared_statement::~prepared_statement() { close(); }
+
+prepared_statement::prepared_statement(prepared_statement&& other) noexcept
+    : owner_(other.owner_),
+      guard_(std::move(other.guard_)),
+      statement_id_(other.statement_id_),
+      param_count_(other.param_count_),
+      column_count_(other.column_count_) {
+    // The moved-from handle must not close the statement the moved-to handle owns.
+    other.owner_ = nullptr;
+    other.statement_id_ = 0;
+}
+
+prepared_statement& prepared_statement::operator=(prepared_statement&& other) noexcept {
+    if (this != &other) {
+        close();
+        owner_ = other.owner_;
+        guard_ = std::move(other.guard_);
+        statement_id_ = other.statement_id_;
+        param_count_ = other.param_count_;
+        column_count_ = other.column_count_;
+        other.owner_ = nullptr;
+        other.statement_id_ = 0;
+    }
+    return *this;
+}
+
+result<result_set*> prepared_statement::execute(span<const parameter> params) {
+    if (owner_ == nullptr || guard_.expired()) {
+        return rpc_error{rpc_code::failed_precondition, "the statement is not valid"};
+    }
+    if (params.size() != param_count_) {
+        // A count mismatch would bind values to the wrong placeholders; refusing is
+        // the only safe answer.
+        return rpc_error{rpc_code::invalid_argument,
+                         "the statement expects a different number of parameters"};
+    }
+    result_set* set = nullptr;
+    const status ran = owner_->execute_prepared(statement_id_, params, &set);
+    if (!ran) {
+        return ran.error();
+    }
+    return set;
+}
+
+void prepared_statement::close() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    // If the session is gone, the server already dropped every statement; there is
+    // nothing to send and the owner pointer must not be dereferenced.
+    if (guard_.expired()) {
+        owner_ = nullptr;
+        statement_id_ = 0;
+        return;
+    }
+    connection* owner = owner_;
+    const std::uint32_t id = statement_id_;
+    owner_ = nullptr;
+    statement_id_ = 0;
+    param_count_ = 0;
+    column_count_ = 0;
+    owner->release_statement(id);
+}
+
 void connection::close() noexcept {
     open_ = false;
     in_transaction_ = false;
+    // Expires every prepared-statement handle without touching them: the server
+    // drops all statements when the session ends, and a handle must not call into a
+    // connection that is being destroyed.
+    session_guard_.reset();
     if (link_) {
         link_->close();
     }
