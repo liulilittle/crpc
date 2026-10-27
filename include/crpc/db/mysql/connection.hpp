@@ -53,6 +53,37 @@ struct connection_options {
         mask(capability::multi_results) | mask(capability::deprecate_eof);
 };
 
+// Client-supplied bytes for `LOAD DATA LOCAL INFILE`.
+//
+// The security rule is absolute: the client decides what is sent. The SQL's path
+// literal is never opened, because a client that serves whatever path the *server*
+// names turns a compromised or hostile server into an arbitrary local file read.
+class CRPC_API local_data_source {
+public:
+    virtual ~local_data_source();
+
+    local_data_source(const local_data_source&) = delete;
+    local_data_source& operator=(const local_data_source&) = delete;
+
+    // Fills `buffer` and returns the byte count; 0 means end of data.
+    [[nodiscard]] virtual result<std::size_t> read(span<std::byte> buffer) = 0;
+
+protected:
+    local_data_source() = default;
+};
+
+// A source over bytes the caller already holds.
+class CRPC_API slice_data_source final : public local_data_source {
+public:
+    explicit slice_data_source(span<const std::byte> data) noexcept : data_(data) {}
+
+    [[nodiscard]] result<std::size_t> read(span<std::byte> buffer) override;
+
+private:
+    span<const std::byte> data_;
+    std::size_t offset_ = 0;
+};
+
 // A server-side prepared statement. Declared before `connection` because
 // `prepare()` returns one by value.
 class prepared_statement;
@@ -93,13 +124,19 @@ public:
     [[nodiscard]] status call(std::string_view call_sql, span<parameter> params,
                               result_set** out);
 
-    // Inserts ows with the prepared-statement protocol, one statement per batch
-    // planned by plan_insert_batches. Every value is bound; identifiers are
-    // validated because they cannot be. ffected accumulates the server's count.
+    // Inserts `rows` with the prepared-statement protocol, one statement per batch
+    // planned by `plan_insert_batches`. Every value is bound; identifiers are
+    // validated because they cannot be. `affected` accumulates the server's count.
     [[nodiscard]] status bulk_insert(const db::insert_target& target,
                                      span<const std::vector<parameter>> rows,
                                      const db::bulk_options& options,
                                      std::uint64_t& affected);
+
+    // Streams `source` in answer to a LOAD DATA LOCAL INFILE request. Only the
+    // statement shape is checked; the path literal is never resolved, because the
+    // bytes come from the caller and never from a file the server names.
+    [[nodiscard]] status load_data(std::string_view load_sql, local_data_source& source,
+                                   result_set** out, std::size_t chunk_size = 64u * 1024u);
 
     void close() noexcept override;
     [[nodiscard]] bool is_open() const noexcept override;

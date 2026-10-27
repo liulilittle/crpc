@@ -1318,6 +1318,169 @@ status connection::call(std::string_view call_sql, span<parameter> params, resul
     return status{};
 }
 
+local_data_source::~local_data_source() = default;
+
+result<std::size_t> slice_data_source::read(span<std::byte> buffer) {
+    if (offset_ >= data_.size()) {
+        return std::size_t{0};
+    }
+    const std::size_t take =
+        std::min(buffer.size(), data_.size() - offset_);
+    if (take != 0) {
+        std::memcpy(buffer.data(), data_.data() + offset_, take);
+    }
+    offset_ += take;
+    return take;
+}
+
+namespace {
+
+// True when the statement is a LOAD DATA LOCAL INFILE, ignoring leading whitespace
+// and case. The statement text comes from the caller, so this is a sanity check
+// rather than a security boundary; the boundary is that the data source is the
+// caller's.
+[[nodiscard]] bool is_load_data_local(std::string_view sql) noexcept {
+    std::size_t index = 0;
+    while (index < sql.size() && (sql[index] == ' ' || sql[index] == '\\t' ||
+                                  sql[index] == '\\r' || sql[index] == '\\n')) {
+        ++index;
+    }
+    constexpr std::string_view prefix = "LOAD DATA LOCAL INFILE";
+    if (sql.size() - index < prefix.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        char c = sql[index + i];
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - 'a' + 'A');
+        }
+        if (c != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+status connection::load_data(std::string_view load_sql, local_data_source& source,
+                             result_set** out, std::size_t chunk_size) {
+    if (out != nullptr) {
+        *out = nullptr;
+    }
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    if (!is_load_data_local(load_sql)) {
+        return status{rpc_code::invalid_argument,
+                      "load_data needs a LOAD DATA LOCAL INFILE statement"};
+    }
+    if (chunk_size == 0) {
+        return status{rpc_code::invalid_argument, "the chunk size must be at least 1"};
+    }
+
+    std::vector<std::byte> command = encode_command(0x03, load_sql); // COM_QUERY
+    sequence_ = 0;
+    const status sent = send_message(span<const std::byte>(command.data(), command.size()), 0);
+    if (!sent) {
+        fail(sent);
+        return sent;
+    }
+
+    std::vector<std::byte> reply;
+    const status read = read_message(reply);
+    if (!read) {
+        fail(read);
+        return read;
+    }
+    const span<const std::byte> payload(reply.data(), reply.size());
+    if (!payload.empty() && static_cast<std::uint8_t>(payload[0]) == 0xff) {
+        err_packet err;
+        const status decoded = decode_err(payload, err);
+        if (!decoded) {
+            return decoded;
+        }
+        return status{map_error_code(err.code), err.message};
+    }
+    if (!payload.empty() && static_cast<std::uint8_t>(payload[0]) == 0x00) {
+        // The server answered without asking for data (LOCAL disabled on its side,
+        // or the statement needed none). That is a success, not an error.
+        ok_packet ok;
+        const status decoded = decode_ok(payload, capabilities_, ok);
+        if (!decoded) {
+            return decoded;
+        }
+        status_flags_ = ok.status_flags;
+        if (out != nullptr) {
+            *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+        }
+        return status{};
+    }
+    if (payload.empty() || static_cast<std::uint8_t>(payload[0]) != 0xfb) {
+        return status{rpc_code::protocol_error,
+                      "mysql did not request the local file data"};
+    }
+
+    // The server asked; stream exactly what the caller supplies, then an empty
+    // packet to mark the end. Nothing here opens a path.
+    std::vector<std::byte> buffer(chunk_size);
+    for (;;) {
+        result<std::size_t> produced = source.read(span<std::byte>(buffer.data(), buffer.size()));
+        if (!produced) {
+            // A partial file has already been sent, so the stream is mid-operation:
+            // the only safe outcome is to drop the connection.
+            fail(produced.error());
+            return produced.error();
+        }
+        const std::size_t count = produced.value();
+        if (count == 0) {
+            break;
+        }
+        if (count > buffer.size()) {
+            fail(status{rpc_code::protocol_error, "the data source returned too many bytes"});
+            return status{rpc_code::protocol_error, "the data source returned too many bytes"};
+        }
+        const status chunk_sent =
+            send_message(span<const std::byte>(buffer.data(), count), sequence_);
+        if (!chunk_sent) {
+            fail(chunk_sent);
+            return chunk_sent;
+        }
+    }
+    // An empty packet terminates the data stream.
+    const status terminated = send_message(span<const std::byte>(), sequence_);
+    if (!terminated) {
+        fail(terminated);
+        return terminated;
+    }
+
+    std::vector<std::byte> final_reply;
+    const status final_read = read_message(final_reply);
+    if (!final_read) {
+        fail(final_read);
+        return final_read;
+    }
+    const span<const std::byte> final_view(final_reply.data(), final_reply.size());
+    if (!final_view.empty() && static_cast<std::uint8_t>(final_view[0]) == 0xff) {
+        err_packet err;
+        const status decoded = decode_err(final_view, err);
+        if (!decoded) {
+            return decoded;
+        }
+        return status{map_error_code(err.code), err.message};
+    }
+    ok_packet ok;
+    const status decoded = decode_ok(final_view, capabilities_, ok);
+    if (!decoded) {
+        return decoded;
+    }
+    status_flags_ = ok.status_flags;
+    if (out != nullptr) {
+        *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+    }
+    return status{};
+}
+
 status connection::bulk_insert(const db::insert_target& target,
                                  span<const std::vector<parameter>> rows,
                                  const db::bulk_options& options, std::uint64_t& affected) {
