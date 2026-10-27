@@ -8,6 +8,7 @@
 #include <memory>
 #include <utility>
 
+#include <crpc/db/memory_result_set.hpp>
 #include <crpc/db/mysql/auth.hpp>
 #include <crpc/io.hpp>
 
@@ -24,244 +25,7 @@ namespace {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
 }
 
-// Parses a decimal integer the server sent as text. The text form of an integer
-// column is exactly the value, so no rounding is involved; a malformed one is a
-// protocol error rather than a zero.
-[[nodiscard]] result<std::int64_t> parse_int(std::string_view text) {
-    if (text.empty()) {
-        return rpc_error{rpc_code::decode_error, "empty integer text"};
-    }
-    std::size_t index = 0;
-    bool negative = false;
-    if (text[0] == '-') {
-        negative = true;
-        index = 1;
-    } else if (text[0] == '+') {
-        index = 1;
-    }
-    if (index == text.size()) {
-        return rpc_error{rpc_code::decode_error, "integer text has no digits"};
-    }
-    std::uint64_t value = 0;
-    for (; index < text.size(); ++index) {
-        const char c = text[index];
-        if (c < '0' || c > '9') {
-            return rpc_error{rpc_code::decode_error, "integer text has a non-digit"};
-        }
-        const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
-            return rpc_error{rpc_code::decode_error, "integer text overflows"};
-        }
-        value = value * 10 + digit;
-    }
-    if (negative) {
-        const std::uint64_t limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1u;
-        if (value > limit) {
-            return rpc_error{rpc_code::decode_error, "negative integer text overflows"};
-        }
-        if (value == limit) {
-            return std::numeric_limits<std::int64_t>::min();
-        }
-        return -static_cast<std::int64_t>(value);
-    }
-    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-        // A BIGINT UNSIGNED above INT64_MAX is legal, so it is reported through
-        // `get_uint64`; asking for a signed value is the caller's mistake.
-        return rpc_error{rpc_code::invalid_argument,
-                         "value exceeds int64; read it as uint64"};
-    }
-    return static_cast<std::int64_t>(value);
-}
-
-// A fully materialised result set.
-//
-// The rows are copied at query time on purpose: a cursor that lazily read from the
-// socket would keep the connection busy for as long as the caller holds it, and the
-// pool would have to know that. Materialising bounds the memory (via the options)
-// and lets the connection go back to the pool immediately.
-class memory_result_set final : public result_set {
-public:
-    memory_result_set(std::vector<column_info> columns, std::vector<std::string> names,
-                      std::int64_t affected) noexcept
-        : columns_(std::move(columns)), affected_(affected) {
-        (void)names;
-    }
-
-    void add_row(std::vector<std::string> values, std::vector<bool> nulls) {
-        values_.push_back(std::move(values));
-        nulls_.push_back(std::move(nulls));
-    }
-
-    std::size_t column_count() const noexcept override { return columns_.size(); }
-
-    column_info column(std::size_t index) const override {
-        if (index >= columns_.size()) {
-            return {};
-        }
-        return columns_[index];
-    }
-
-    // Forward-only cursor: `next()` moves to the following row and every accessor
-    // reads that row. Before the first `next()` there is no current row, and the
-    // accessors report NULL rather than reading row 0 behind the caller's back.
-    bool next() override {
-        if (next_ >= values_.size()) {
-            has_row_ = false;
-            return false;
-        }
-        cursor_ = next_++;
-        has_row_ = true;
-        return true;
-    }
-
-    bool is_null(std::size_t index) const noexcept override {
-        if (!has_row_ || cursor_ >= nulls_.size() || index >= nulls_[cursor_].size()) {
-            return true;
-        }
-        return nulls_[cursor_][index];
-    }
-
-    result<std::int64_t> get_int64(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        return parse_int(text);
-    }
-
-    result<std::uint64_t> get_uint64(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        if (text.empty()) {
-            return rpc_error{rpc_code::decode_error, "empty integer text"};
-        }
-        std::uint64_t value = 0;
-        for (const char c : text) {
-            if (c < '0' || c > '9') {
-                return rpc_error{rpc_code::decode_error, "integer text has a non-digit"};
-            }
-            const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
-            if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
-                return rpc_error{rpc_code::decode_error, "integer text overflows"};
-            }
-            value = value * 10 + digit;
-        }
-        return value;
-    }
-
-    result<double> get_double(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        // `strtod` needs a NUL-terminated buffer; the stored value is a std::string,
-        // so a copy of at most one value is made here rather than parsing by hand
-        // and getting the exponent/NaN rules wrong.
-        const std::string copy(text);
-        char* end = nullptr;
-        const double value = std::strtod(copy.c_str(), &end);
-        if (end == copy.c_str() || *end != '\0') {
-            return rpc_error{rpc_code::decode_error, "value is not a number"};
-        }
-        return value;
-    }
-
-    result<bool> get_bool(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        // MySQL's own boolean spelling is 0/1; anything else is a decode error
-        // rather than a C-style truthiness, which would accept "false" as true.
-        if (text == "0") {
-            return false;
-        }
-        if (text == "1") {
-            return true;
-        }
-        return rpc_error{rpc_code::decode_error, "value is not a boolean"};
-    }
-
-    result<std::string_view> get_text(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        return text;
-    }
-
-    result<std::vector<std::byte>> get_blob(std::size_t index) override {
-        const std::string_view text = value_at(index);
-        if (text.data() == nullptr) {
-            return rpc_error{rpc_code::invalid_argument, "column is NULL"};
-        }
-        std::vector<std::byte> out(text.size());
-        std::memcpy(out.data(), text.data(), text.size());
-        return out;
-    }
-
-    std::int64_t affected_rows() const noexcept override { return affected_; }
-
-    void close() noexcept override { closed_ = true; }
-
-private:
-    // A missing cursor position or a NULL both yield a null `data()` pointer, and
-    // every accessor checks it first.
-    [[nodiscard]] std::string_view value_at(std::size_t index) const {
-        if (!has_row_ || cursor_ >= values_.size() || index >= values_[cursor_].size()) {
-            return {};
-        }
-        if (index < nulls_[cursor_].size() && nulls_[cursor_][index]) {
-            return {};
-        }
-        return values_[cursor_][index];
-    }
-
-    std::vector<column_info> columns_;
-    std::vector<std::vector<std::string>> values_;
-    std::vector<std::vector<bool>> nulls_;
-    std::int64_t affected_ = -1;
-    std::size_t next_ = 0;
-    std::size_t cursor_ = 0;
-    bool has_row_ = false;
-    bool closed_ = false;
-};
-
 } // namespace
-
-// --- channel -----------------------------------------------------------------
-
-channel::~channel() = default;
-
-socket_channel::socket_channel(crpc::net::connection_config config,
-                               crpc::backend_factory& backend, crpc::runtime* shard)
-    : link_(new crpc::net::connection(std::move(config), backend, shard)) {}
-
-socket_channel::~socket_channel() { close(); }
-
-result<std::vector<std::byte>> socket_channel::read_exact(std::size_t count) {
-    if (!link_) {
-        return rpc_error{rpc_code::shutting_down, "mysql channel is closed"};
-    }
-    return link_->read_exact(count);
-}
-
-status socket_channel::write(span<const std::byte> data) {
-    if (!link_) {
-        return status{rpc_code::shutting_down, "mysql channel is closed"};
-    }
-    return link_->write(data);
-}
-
-void socket_channel::close() noexcept {
-    if (link_) {
-        link_->close();
-    }
-}
-
-bool socket_channel::is_open() const noexcept { return link_ != nullptr && link_->is_open(); }
 
 // --- connection --------------------------------------------------------------
 
@@ -705,7 +469,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
         }
         status_flags_ = ok.status_flags;
         if (out != nullptr) {
-            auto* set = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+            auto* set = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
             *out = set;
         }
         return status{};
@@ -745,7 +509,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
     }
     const std::int64_t affected = -1;
     std::unique_ptr<memory_result_set> set(
-        new memory_result_set(std::move(columns), std::move(names), affected));
+        new memory_result_set(std::move(columns), affected));
 
     // Without CLIENT_DEPRECATE_EOF an EOF packet closes the column definitions; with
     // it the server omits that terminator.
@@ -886,7 +650,7 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
     }
 
     std::unique_ptr<memory_result_set> set(
-        new memory_result_set(std::move(columns), {}, -1));
+        new memory_result_set(std::move(columns), -1));
     for (;;) {
         std::vector<std::byte> row_payload;
         const status read = read_message(row_payload);
@@ -1044,7 +808,7 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
             }
         }
         if (out != nullptr) {
-            *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+            *out = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
         }
         return status{};
     }
@@ -1413,7 +1177,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         }
         status_flags_ = ok.status_flags;
         if (out != nullptr) {
-            *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+            *out = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
         }
         return status{};
     }
@@ -1477,7 +1241,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
     }
     status_flags_ = ok.status_flags;
     if (out != nullptr) {
-        *out = new memory_result_set({}, {}, static_cast<std::int64_t>(ok.affected_rows));
+        *out = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
     }
     return status{};
 }
