@@ -137,8 +137,39 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 * `LOAD DATA LOCAL INFILE` 只发送你给的字节，没有“按路径读取”模式。
 * `caching_sha2_password` 在**未加密**连接上需要服务端 RSA 密钥交换，本库尚未实现：请用 TLS，
   或改用 `mysql_native_password` 账号。面对真实服务器时客户端会原样返回服务端错误，是明确失败而非挂起。
-* 尚未实现：Oracle、Access、MongoDB、HBase；到数据库的 TLS；服务端游标；
-  `COM_STMT_FETCH`。
+* 尚未实现：Oracle、Access、HBase；到数据库的 TLS；服务端游标；`COM_STMT_FETCH`。
+
+## MongoDB
+
+这一片实现了线协议与文档格式，但**没有**连接对象：测试环境里没有可用的服务端，
+「已连接」的适配器只会是未经验证的声明。
+
+```cpp
+#include <crpc/db/mongo/protocol.hpp>
+
+// BSON：有序文档，全部元素类型。
+crpc::db::mongo::bson_document doc;
+doc.append("name", crpc::db::mongo::bson_value::make_text("widget"));
+doc.append("qty", crpc::db::mongo::bson_value::make_int32(3));
+
+// OP_MSG：头部、flags、一个携带命令文档的 kind-0 段。
+auto message = crpc::db::mongo::encode_op_msg(doc, 1);
+```
+
+已实现：
+
+* BSON 编解码，覆盖本客户端会发送的全部类型；两个最容易出错的长度约定都显式处理：
+  文档的 int32 长度**包含**自己的终止符，字符串的 int32 长度**也包含**自己的 NUL。
+  终止符之后还有字节、长度与内容不符、值被截断，一律拒绝——绝不部分解码。
+* 双向保留字段顺序：命令的第一个字段就是命令名，某些命令还给第一个字段单独的含义。
+* OP_MSG 分帧（opcode 2013）：头部、flag 位、kind-0 段；遇到未知段类型**拒绝**而不是跳过
+  （其长度不可知，跳过会把后面解成另一段）。`moreToCome` 会上报——忽略它的客户端会
+  等待一个永远不会到的应答。
+* 命令：`hello`、`find`、`insert`、`delete`、`getMore`、`killCursors`，以及应答状态
+  （`ok`、`errmsg`）与错误码映射（重复键、认证失败、命名空间不存在、超时、坏值）。
+
+未实现：SCRAM 认证、TLS、压缩、连接与查询层。`killCursors` 存在的原因很实际：
+被放弃的游标会占用服务端资源直到超时，懂游标的客户端必须发送它。
 
 ## SQL Server（TDS）
 

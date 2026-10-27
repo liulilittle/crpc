@@ -288,6 +288,9 @@ is guarded.
 - `::crpc::db::mysql::binary_row`
 - `::crpc::db::mysql::prepare_ok`
 - `::crpc::db::mysql::text_row`
+- `::crpc::db::mongo::find_request`
+- `::crpc::db::mongo::message_header`
+- `::crpc::db::mongo::op_msg_reply`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`

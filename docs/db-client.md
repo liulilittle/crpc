@@ -156,8 +156,47 @@ returned.
   key exchange, which is not implemented: use TLS, or a `mysql_native_password`
   account. Against a real server the client reports the server's own error, so this
   is a clear failure rather than a hang.
-* Not implemented yet: Oracle, Access, MongoDB, HBase; TLS to the database;
-  server-side cursors; `COM_STMT_FETCH`.
+* Not implemented yet: Oracle, Access, HBase; TLS to the database; server-side cursors;
+  `COM_STMT_FETCH`.
+
+## MongoDB
+
+This slice speaks the wire protocol and the document format, and stops short of a
+connection object: there is no server in the test environment, so a "connected" adapter
+would be unverified.
+
+```cpp
+#include <crpc/db/mongo/protocol.hpp>
+
+// BSON: ordered documents, every element type.
+crpc::db::mongo::bson_document doc;
+doc.append("name", crpc::db::mongo::bson_value::make_text("widget"));
+doc.append("qty", crpc::db::mongo::bson_value::make_int32(3));
+
+// OP_MSG: header, flags, one kind-0 section carrying the command document.
+auto message = crpc::db::mongo::encode_op_msg(doc, 1);
+```
+
+What is implemented:
+
+* BSON encode/decode for every element type this client sends, with the two length
+  conventions that cause most decode bugs handled explicitly: a document's int32 length
+  includes its own terminator, and a string's int32 length includes *its* NUL. A document
+  with bytes after its terminator, a length that disagrees with the contents, or a
+  truncated value is refused — never decoded partially.
+* Field order is preserved in both directions, because a command's first field is its
+  name and some commands give the first field a meaning of its own.
+* OP_MSG framing (opcode 2013): header, flag bits, section kind 0, and decoding that
+  refuses an unknown section kind rather than skipping it (its length is unknowable).
+  `moreToCome` is reported, since a client that ignores it waits for a reply that never
+  arrives.
+* Commands: `hello`, `find`, `insert`, `delete`, `getMore`, `killCursors`, plus reply
+  status (`ok`, `errmsg`) and error-code mapping (duplicate key, auth failure, namespace
+  not found, deadline, bad value).
+
+Not implemented: SCRAM authentication, TLS, compression, and the connection/query layer.
+`killCursors` exists because an abandoned cursor holds server resources until it times
+out; a cursor-aware client must send it.
 
 ## SQL Server (TDS)
 
