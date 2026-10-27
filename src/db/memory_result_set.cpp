@@ -184,6 +184,8 @@ result<std::vector<std::byte>> memory_result_set::get_blob(std::size_t index) {
 
 std::int64_t memory_result_set::affected_rows() const noexcept { return affected_; }
 
+void memory_result_set::set_affected_rows(std::int64_t count) noexcept { affected_ = count; }
+
 void memory_result_set::close() noexcept { closed_ = true; }
 
 std::string_view memory_result_set::value_at(std::size_t index) const {

@@ -137,5 +137,43 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 * `LOAD DATA LOCAL INFILE` 只发送你给的字节，没有“按路径读取”模式。
 * `caching_sha2_password` 在**未加密**连接上需要服务端 RSA 密钥交换，本库尚未实现：请用 TLS，
   或改用 `mysql_native_password` 账号。面对真实服务器时客户端会原样返回服务端错误，是明确失败而非挂起。
-* 尚未实现：TDS（SQL Server）、Oracle、Access、MongoDB、HBase；到数据库的 TLS；服务端游标；
+* 尚未实现：Oracle、Access、MongoDB、HBase；到数据库的 TLS；服务端游标；
   `COM_STMT_FETCH`。
+
+## SQL Server（TDS）
+
+```cpp
+#include <crpc/db/tds/connection.hpp>
+
+crpc::db::tds::connection_options options;
+options.user = "sa";
+options.password = "...";
+options.database = "app";
+
+auto factory = std::make_unique<crpc::db::tds::connection_factory>(
+    options, backend, endpoint);
+auto session = factory->open();
+```
+
+适配器做了什么：
+
+* PRELOGIN、LOGIN7 与 SQL 批处理（`packet_type::sql_batch`）；登录应答逐 token 解码，
+  服务端自己的错误号与原文保留在 `connect_error()` 里。
+* 超过协商包大小的消息在收发两个方向都会切分并重组；应答读取直到终止的 DONE token，
+  而不是读到包尾为止——结果集比一个包大是常态。
+* 行数来自 DONE，所以 `affected_rows()` 是“行之后”才知道的值，不是构造时就有的。
+* `BEGIN` / `COMMIT` / `ROLLBACK TRANSACTION` 以批处理发送，同时在本地跟踪事务状态供池使用。
+* 只返回第一个结果集；同一应答里后续结果集会被解码后丢弃，保证流仍然对齐。列元数据映射到
+  `db::column_info`，ORM 层无需改动。
+
+限制（明说，不隐藏）：
+
+* **参数被拒绝**（`invalid_argument`）。TDS 通过 RPC `sp_executesql` 绑定参数，本片尚未编码；
+  绝不用拼接 SQL 文本替代。
+* **没有 TLS。** 服务端在 PRELOGIN 应答 ENCRYPT_ON 或 ENCRYPT_REQ 时以 `failed_precondition`
+  拒绝；构造时设置 `require_encryption = true` 会在写入任何字节之前失败。半截握手会被误判成
+  认证失败，把真正原因藏起来。
+* 不支持 MARS、`ATTENTION` 取消与 bulk-load 协议（`bulk_insert` 目前是 MySQL 侧接口）。
+* 目前已解码类型：INT1/2/4/8、BIT、FLT4/8、INTN/BITN/FLTN、DECIMAL/NUMERIC、DATE、TIME、
+  DATETIME2、VARCHAR/NVARCHAR/CHAR/NCHAR、VARBINARY/BINARY、GUID。其他线类型以
+  `no_such_method` 失败，而不是误读字节。

@@ -77,6 +77,11 @@ inline constexpr std::size_t header_size = 8;
 // maximum is 32767; asking for more is silently clamped, so this stays inside.
 inline constexpr std::uint16_t default_packet_size = 4096;
 
+// Upper bound on one reassembled message. The wire length field is 16 bits per
+// packet, so a message longer than the packet size arrives as several packets; this
+// is the point where the client refuses to keep buffering.
+inline constexpr std::size_t default_max_message_size = 64u * 1024u * 1024u;
+
 [[nodiscard]] CRPC_API status encode_header(span<std::byte> out, const packet_header& header,
                                             std::size_t& written) noexcept;
 [[nodiscard]] CRPC_API status decode_header(span<const std::byte> in,

@@ -156,5 +156,51 @@ returned.
   key exchange, which is not implemented: use TLS, or a `mysql_native_password`
   account. Against a real server the client reports the server's own error, so this
   is a clear failure rather than a hang.
-* Not implemented yet: TDS (SQL Server), Oracle, Access, MongoDB, HBase; TLS to the
-  database; server-side cursors; `COM_STMT_FETCH`.
+* Not implemented yet: Oracle, Access, MongoDB, HBase; TLS to the database;
+  server-side cursors; `COM_STMT_FETCH`.
+
+## SQL Server (TDS)
+
+```cpp
+#include <crpc/db/tds/connection.hpp>
+
+crpc::db::tds::connection_options options;
+options.user = "sa";
+options.password = "...";
+options.database = "app";
+
+auto factory = std::make_unique<crpc::db::tds::connection_factory>(
+    options, backend, endpoint);
+auto session = factory->open();
+```
+
+What the adapter does:
+
+* PRELOGIN, LOGIN7, and SQL batches (`packet_type::sql_batch`); the login reply is
+  decoded token by token, so the server's own message and number survive as
+  `connect_error()`.
+* Messages larger than the negotiated packet size are split and reassembled in both
+  directions, and a reply is read until the terminal DONE token rather than until
+  the end of a packet — a result taller than one packet is ordinary.
+* The row count arrives in DONE, so `affected_rows()` is known after the rows, not
+  before.
+* `BEGIN` / `COMMIT` / `ROLLBACK TRANSACTION` are sent as batches, and the open
+  transaction is also tracked locally for the pool.
+* The first result set is returned; any further sets in the same reply are decoded
+  and discarded so the stream stays aligned. Column metadata is mapped to
+  `db::column_info`, so the ORM layer works unchanged.
+
+Limits, stated rather than hidden:
+
+* **Parameters are refused** (`invalid_argument`). TDS binds them through an RPC
+  `sp_executesql` call, which is not encoded yet; splicing values into the SQL text
+  is never done.
+* **No TLS.** A server that answers PRELOGIN with ENCRYPT_ON or ENCRYPT_REQ is
+  refused with `failed_precondition`, and `require_encryption = true` is refused at
+  construction before a byte is written. Half a handshake would look like an
+  authentication failure and hide the cause.
+* No MARS, no `ATTENTION` cancellation, no bulk-load protocol (`bulk_insert` is a
+  MySQL-side interface today).
+* Types decoded today: INT1/2/4/8, BIT, FLT4/8, INTN/BITN/FLTN, DECIMAL/NUMERIC,
+  DATE, TIME, DATETIME2, VARCHAR/NVARCHAR/CHAR/NCHAR, VARBINARY/BINARY, GUID. Any
+  other wire type fails the read with `no_such_method` instead of misreading bytes.

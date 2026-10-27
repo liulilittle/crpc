@@ -51,6 +51,11 @@ public:
 
     [[nodiscard]] std::int64_t affected_rows() const noexcept override;
 
+    // Some protocols report the row count after the rows rather than before them
+    // (TDS reports it in the terminal DONE token), so the count cannot always be a
+    // constructor argument.
+    void set_affected_rows(std::int64_t count) noexcept;
+
     void close() noexcept override;
 
     // Diagnostics for adapters that enforce row/byte ceilings while decoding.
