@@ -1,6 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-#include <cstdio>
-#include <cstdlib>
 // CRPC -- TDS connection implementation.
 #include <crpc/db/tds/connection.hpp>
 
@@ -151,6 +148,8 @@ status connection::send_message(packet_type type, span<const std::byte> payload)
     const std::lock_guard<std::mutex> guard(write_mutex_);
     // PRELOGIN and LOGIN7 predate the header block; everything after them carries it.
     std::vector<std::byte> framed;
+    // A login packet is never wrapped, even over TLS: the header block is a post-login
+    // concept and SQL Server rejects a LOGIN7 that carries one.
     if (type == packet_type::sql_batch || type == packet_type::rpc ||
         type == packet_type::transaction_manager) {
         framed = all_headers();
@@ -259,9 +258,10 @@ status connection::perform_handshake() {
     packet_size_ = options_.packet_size;
 
     prelogin greeting;
-    // Encryption is offered only when it is demanded, and the handshake below is not
-    // yet verified against a real server, so both encryption options are refused before
-    // a byte is written. Sending ENCRYPT_NOT_SUPPORTED keeps the plaintext path exact.
+    // Encryption is refused before a byte is written: the TLS path completes a handshake but
+    // the server still rejects the encrypted login with 17832, and shipping encryption that
+    // looks protected but is not would be worse than refusing it. See discover.md for the
+    // measurements that ruled out the payload, the record framing and the packet id.
     if (options_.require_encryption || options_.encrypt_login_only) {
         return status{rpc_code::failed_precondition,
                       "TDS encryption is not verified yet; drop require_encryption and "
@@ -274,13 +274,6 @@ status connection::perform_handshake() {
     const status encoded = encode_prelogin(payload, greeting);
     if (!encoded) {
         return encoded;
-    }
-    if (std::getenv("CRPC_TDS_DEBUG") != nullptr) {
-        std::fprintf(stderr, "prelogin out offer=%d bytes:", static_cast<int>(greeting.encryption));
-        for (const std::byte b : payload) {
-            std::fprintf(stderr, " %02x", static_cast<unsigned>(static_cast<std::uint8_t>(b)));
-        }
-        std::fprintf(stderr, "\n");
     }
     const status sent = send_message(packet_type::prelogin, span<const std::byte>(
                                                                 payload.data(), payload.size()));
@@ -297,14 +290,6 @@ status connection::perform_handshake() {
         decode_prelogin(span<const std::byte>(reply.data(), reply.size()), answer);
     if (!decoded) {
         return decoded;
-    }
-    if (std::getenv("CRPC_TDS_DEBUG") != nullptr) {
-        std::fprintf(stderr, "prelogin answer encryption=%d reply=%zu:", 
-                     static_cast<int>(answer.encryption), reply.size());
-        for (const std::byte b : reply) {
-            std::fprintf(stderr, " %02x", static_cast<unsigned>(static_cast<std::uint8_t>(b)));
-        }
-        std::fprintf(stderr, "\n");
     }
     if (answer.encryption == encryption_mode::required ||
         answer.encryption == encryption_mode::on) {

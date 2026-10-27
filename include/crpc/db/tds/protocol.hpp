@@ -43,7 +43,10 @@ enum class packet_type : std::uint8_t {
     transaction_manager = 0x0e,
     login7 = 0x10,
     prelogin = 0x12,
-    sspi = 0x11
+    sspi = 0x11,
+    // A TLS record carried inside a TDS packet, which is how encryption is framed after the
+    // handshake. The value matches the TLS content type for application data (0x17).
+    ssl = 0x17
 };
 
 // Status bits. `eom` marks the last packet of a message; a message split across

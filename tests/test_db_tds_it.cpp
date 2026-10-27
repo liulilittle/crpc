@@ -128,7 +128,11 @@ CRPC_TEST(tds_it_types_round_trip) {
     }
     crpc::db::result_set* raw = nullptr;
     const crpc::status ran = it.session->query(
-        "SELECT CAST(-7 AS int) AS i, CAST('héllo' AS nvarchar(20)) AS s, "
+        // `N'héllo'` is a Unicode literal. A plain 'héllo' is a varchar literal whose code
+        // page is the current database's default collation, so on a database with a non-Unicode
+        // collation the server turns the character into '?' before the client ever sees it --
+        // a failure with nothing to do with the codec.
+        "SELECT CAST(-7 AS int) AS i, CAST(N'héllo' AS nvarchar(20)) AS s, "
         "CAST(12.34 AS decimal(10,2)) AS d, CAST('2024-04-25T12:34:56.1234567' AS datetime2(7)) AS t, "
         "CAST(NULL AS int) AS n, "
         "CAST(0x0102 AS varbinary(4)) AS b, "
