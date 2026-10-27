@@ -275,7 +275,9 @@ is guarded.
 - `::crpc::compression_statistics`
 - `::crpc::db::bulk_options`
 - `::crpc::db::column_info`
+- `::crpc::db::field_binding`
 - `::crpc::db::insert_target`
+- `::crpc::db::mapping_options`
 - `::crpc::db::parameter`
 - `::crpc::db::mysql::column_definition`
 - `::crpc::db::mysql::eof_packet`
