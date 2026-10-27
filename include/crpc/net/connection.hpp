@@ -182,6 +182,20 @@ struct pool_config {
     // Bound on the plain-thread wait for a free connection. The coroutine path
     // parks until a connection is released.
     std::chrono::nanoseconds acquire_timeout{std::chrono::seconds(5)};
+
+    // Ceiling on idle connections. A release beyond it closes the connection, which
+    // is how a burst of concurrency shrinks back instead of leaving the pool at its
+    // high-water mark forever. Zero means "same as max_size".
+    std::size_t max_idle = 0;
+
+    // Close an idle connection that has been unused for longer. Zero disables it.
+    // This is what recovers capacity a quiet server would otherwise hold open.
+    std::chrono::nanoseconds idle_timeout{std::chrono::seconds(60)};
+
+    // Close a connection older than this, measured from when it was opened. Zero
+    // disables it. It exists to recycle a link that may have accumulated
+    // server-side state (a stale plan, a per-connection cache) even while in use.
+    std::chrono::nanoseconds max_lifetime{std::chrono::minutes(30)};
 };
 
 // A fixed-capacity pool of connections to a single endpoint.
@@ -226,6 +240,10 @@ public:
     [[nodiscard]] std::size_t idle() const noexcept;
     [[nodiscard]] std::size_t in_use() const noexcept;
     [[nodiscard]] std::size_t total() const noexcept;
+
+    // Connections opened since construction, including those since closed. Used to
+    // prove that a dead link was really replaced rather than silently reused.
+    [[nodiscard]] std::uint64_t opened() const noexcept;
 
 private:
     struct impl;

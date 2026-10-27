@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -767,10 +768,23 @@ struct connection_pool::impl {
     crpc::backend_factory& backend;
     runtime* shard;
 
+    // One idle slot. The creation stamp is what makes max_lifetime measurable;
+    // the idle stamp is what makes idle_timeout measurable. Both are taken from
+    // steady_clock, so a wall-clock jump cannot make a connection look ancient.
+    struct idle_entry {
+        std::shared_ptr<connection> conn;
+        std::chrono::steady_clock::time_point created;
+        std::chrono::steady_clock::time_point idle_since;
+    };
+
     mutable std::mutex mutex;
     std::condition_variable cv;
-    std::vector<std::shared_ptr<connection>> idle;
+    std::vector<idle_entry> idle;
+    // Creation stamps for every live connection, keyed by identity. The pool hands
+    // out shared_ptr<connection>, so the stamp cannot travel inside the object.
+    std::unordered_map<const connection*, std::chrono::steady_clock::time_point> created;
     std::size_t total = 0;
+    std::uint64_t opened = 0;
     bool closed = false;
 
     impl(pool_config config, crpc::backend_factory& factory, runtime* rt)
@@ -778,6 +792,23 @@ struct connection_pool::impl {
         if (cfg.min_size > cfg.max_size) {
             cfg.min_size = cfg.max_size;
         }
+        if (cfg.max_idle == 0 || cfg.max_idle > cfg.max_size) {
+            cfg.max_idle = cfg.max_size;
+        }
+    }
+
+    // True when the slot must be closed rather than reused.
+    [[nodiscard]] bool expired(const idle_entry& entry,
+                               std::chrono::steady_clock::time_point now) const noexcept {
+        if (cfg.idle_timeout.count() > 0 && now - entry.idle_since >= cfg.idle_timeout) {
+            return true;
+        }
+        return cfg.max_lifetime.count() > 0 && now - entry.created >= cfg.max_lifetime;
+    }
+
+    [[nodiscard]] bool too_old(std::chrono::steady_clock::time_point opened_at,
+                               std::chrono::steady_clock::time_point now) const noexcept {
+        return cfg.max_lifetime.count() > 0 && now - opened_at >= cfg.max_lifetime;
     }
 
     void notify_waiters() noexcept {
@@ -827,19 +858,25 @@ result<std::shared_ptr<connection>> connection_pool::acquire() {
             return rpc_error(rpc_code::shutting_down, "pool is closed");
         }
         while (!self.idle.empty()) {
-            std::shared_ptr<connection> conn = std::move(self.idle.back());
+            impl::idle_entry entry = std::move(self.idle.back());
             self.idle.pop_back();
-            if (conn != nullptr && conn->is_open()) {
-                return conn;
+            const auto now = std::chrono::steady_clock::now();
+            if (entry.conn != nullptr && entry.conn->is_open() && !self.expired(entry, now)) {
+                return std::move(entry.conn);
             }
-            // A peer may have closed while the connection was idle. Never hand
-            // out a dead link; drop it and let the caller create a fresh one.
+            // A peer may have closed while the connection was idle, or the slot may
+            // have outlived its idle/lifetime bound. Never hand out such a link;
+            // close it and let the caller create a fresh one.
+            if (entry.conn != nullptr) {
+                entry.conn->close();
+            }
             if (self.total > 0) {
                 --self.total;
             }
         }
         if (self.total < self.cfg.max_size) {
             ++self.total;
+            ++self.opened;
             lk.unlock();
             std::shared_ptr<connection> created;
             try {
@@ -860,6 +897,9 @@ result<std::shared_ptr<connection>> connection_pool::acquire() {
                 }
                 return rpc_error(rpc_code::shutting_down, "pool is closed");
             }
+            // Record the creation stamp before handing the connection out: the pool
+            // only passes a shared_ptr, so the stamp cannot travel inside it.
+            self.created[created.get()] = std::chrono::steady_clock::now();
             return created;
         }
         const status waited = self.wait_for_pred(
@@ -886,14 +926,39 @@ void connection_pool::release(std::shared_ptr<connection> conn) {
     bool drop = false;
     {
         std::lock_guard<std::mutex> lk(self.mutex);
+        // A second release of an already-idle handle must change nothing. Treating
+        // it as a drop would close a connection that is still in the idle set and
+        // leave `total` disagreeing with idle+in_use.
+        bool already_idle = false;
+        for (const impl::idle_entry& entry : self.idle) {
+            if (entry.conn == conn) {
+                already_idle = true;
+                break;
+            }
+        }
+        if (already_idle) {
+            self.notify_waiters();
+            return;
+        }
         if (self.closed || !conn->is_open()) {
             drop = true;
             if (self.total > 0) {
                 --self.total;
             }
-        } else if (std::find(self.idle.begin(), self.idle.end(), conn) ==
-                   self.idle.end()) {
-            self.idle.push_back(std::move(conn));
+            self.created.erase(conn.get());
+        } else {
+            const auto now = std::chrono::steady_clock::now();
+            const auto stamp = self.created.find(conn.get());
+            const auto created_at = stamp == self.created.end() ? now : stamp->second;
+            if (self.idle.size() >= self.cfg.max_idle || self.too_old(created_at, now)) {
+                drop = true;
+                if (self.total > 0) {
+                    --self.total;
+                }
+                self.created.erase(conn.get());
+            } else {
+                self.idle.push_back(impl::idle_entry{std::move(conn), created_at, now});
+            }
         }
         self.notify_waiters();
     }
@@ -936,7 +1001,9 @@ void connection_pool::warmup() {
                 }
                 stop = true;
             } else {
-                self.idle.push_back(std::move(created));
+                const auto now = std::chrono::steady_clock::now();
+                self.created[created.get()] = now;
+                self.idle.push_back(impl::idle_entry{std::move(created), now, now});
             }
             self.notify_waiters();
         }
@@ -953,7 +1020,7 @@ void connection_pool::warmup() {
 
 void connection_pool::close() noexcept {
     auto& self = *impl_;
-    std::vector<std::shared_ptr<connection>> dropped;
+    std::vector<impl::idle_entry> dropped;
     {
         std::lock_guard<std::mutex> lk(self.mutex);
         if (self.closed) {
@@ -961,12 +1028,13 @@ void connection_pool::close() noexcept {
         }
         self.closed = true;
         dropped.swap(self.idle);
+        self.created.clear();
         self.total = 0;
         self.notify_waiters();
     }
-    for (auto& conn : dropped) {
-        if (conn != nullptr) {
-            conn->close();
+    for (auto& entry : dropped) {
+        if (entry.conn != nullptr) {
+            entry.conn->close();
         }
     }
 }
@@ -982,6 +1050,12 @@ std::size_t connection_pool::in_use() const noexcept {
     std::lock_guard<std::mutex> lk(self.mutex);
     return self.total >= self.idle.size() ? self.total - self.idle.size()
                                           : std::size_t{0};
+}
+
+std::uint64_t connection_pool::opened() const noexcept {
+    auto& self = *impl_;
+    std::lock_guard<std::mutex> lk(self.mutex);
+    return self.opened;
 }
 
 std::size_t connection_pool::total() const noexcept {
