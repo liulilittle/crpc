@@ -938,7 +938,10 @@ CRPC_TEST(tds_it_command_timeout_interrupts_waitfor_on_the_server) {
 
     // The SPID of the session under test, read from a second session so the first
     // can stay in the query.
-    it_session observer;
+    //
+    // The observer must be in the same database: the table under test lives in
+    // crpc_tds_it, and a session that logs in to master cannot see it.
+    it_session observer("crpc_tds_it");
     if (!observer.ok()) {
         report("observer login", observer.session->connect_error());
         CRPC_CHECK(observer.ok());
@@ -1015,6 +1018,9 @@ CRPC_TEST(tds_it_command_timeout_interrupts_waitfor_on_the_server) {
         "SELECT COUNT(*) FROM crpc_timeout_marks", {}, &count_set);
     crpc::db::statement_guard count_guard(count_set);
     CRPC_CHECK(static_cast<bool>(counted));
+    if (!counted) {
+        report("count marks", counted.error());
+    }
     if (count_set != nullptr) {
         CRPC_CHECK(count_set->next());
         CRPC_CHECK_EQ(std::int64_t{0}, count_set->get_int64(0).value());
