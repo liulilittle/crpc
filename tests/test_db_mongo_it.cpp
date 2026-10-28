@@ -129,6 +129,213 @@ void seed_sales(it_session& it) {
     CRPC_CHECK(static_cast<bool>(inserted));
 }
 
+// The connection options the rest of the file builds by hand.
+[[nodiscard]] crpc::db::mongo::connection_options it_options() {
+    crpc::db::mongo::connection_options options;
+    options.user = env_or("CRPC_MONGO_USER", "crpc");
+    options.password = env_or("CRPC_MONGO_PASSWORD", "crpc_pw");
+    options.auth_database = "admin";
+    options.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    return options;
+}
+
+[[nodiscard]] std::string it_host() { return env_or("CRPC_MONGO_HOST", "127.0.0.1"); }
+
+[[nodiscard]] std::uint16_t it_port() {
+    return static_cast<std::uint16_t>(std::stoi(env_or("CRPC_MONGO_PORT", "27017")));
+}
+
+[[nodiscard]] crpc::net::connection_config it_transport_config() {
+    crpc::net::connection_config config;
+    config.ep = crpc::endpoint::tcp(it_host(), it_port());
+    config.operation_timeout = std::chrono::seconds(15);
+    return config;
+}
+
+[[nodiscard]] std::string hex(const std::vector<std::byte>& data) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(data.size() * 2);
+    for (const std::byte byte : data) {
+        const auto value = static_cast<unsigned>(byte);
+        out.push_back(digits[value >> 4]);
+        out.push_back(digits[value & 0x0fu]);
+    }
+    return out;
+}
+
+// A channel that records every send and can drop one send or one reply on demand.
+// The delegation keeps the tests talking to a real server while the injector proves
+// the retryable-write path (a lost reply is exactly the risky case: the server may
+// have run the write).
+class recording_channel final : public crpc::db::channel {
+public:
+    explicit recording_channel(std::unique_ptr<crpc::db::channel> inner)
+        : inner_(std::move(inner)) {}
+
+    crpc::result<std::vector<std::byte>> read_exact(std::size_t count) override {
+        if (!fail_next_read_) {
+            return inner_->read_exact(count);
+        }
+        fail_next_read_ = false;
+        return crpc::rpc_error{crpc::rpc_code::connection_reset,
+                               "injected reply loss"};
+    }
+
+    crpc::status write(crpc::span<const std::byte> data) override {
+        writes_.emplace_back(data.begin(), data.end());
+        if (fail_next_write_) {
+            fail_next_write_ = false;
+            return crpc::status{crpc::rpc_code::connection_reset,
+                                "injected send failure"};
+        }
+        if (fail_next_read_) {
+            // The message is recorded above as sent; the reply is dropped a moment
+            // later, which models the server processing it and then dying.
+            return crpc::status{};
+        }
+        return inner_->write(data);
+    }
+
+    void close() noexcept override { inner_->close(); }
+
+    void inject_send_failure() noexcept { fail_next_write_ = true; }
+    void inject_reply_loss() noexcept { fail_next_read_ = true; }
+    [[nodiscard]] const std::vector<std::vector<std::byte>>& writes() const noexcept {
+        return writes_;
+    }
+
+private:
+    std::unique_ptr<crpc::db::channel> inner_;
+    std::vector<std::vector<std::byte>> writes_;
+    bool fail_next_write_ = false;
+    bool fail_next_read_ = false;
+};
+
+// Decodes the raw OP_MSG bytes that went out and returns the $db field, for diagnosis.
+[[nodiscard]] std::string command_name_of(const std::vector<std::byte>& message) {
+    crpc::db::mongo::op_msg_reply parsed;
+    const crpc::status decoded = crpc::db::mongo::decode_op_msg(
+        crpc::span<const std::byte>(message.data(), message.size()), parsed);
+    if (!decoded || parsed.body.size() == 0) {
+        return "<decode-error>";
+    }
+    return parsed.body.fields().front().first;
+}
+
+// A tiny document printer for the assertions that need to show what came back.
+[[nodiscard]] std::string json_like(const crpc::db::mongo::bson_document& document);
+
+// Finds a top-level command field in a sent OP_MSG and prints its wire bytes, proving
+// exactly what went on the network rather than what a builder intended.
+void print_sent_field(const std::vector<std::byte>& message, const char* name) {
+    std::vector<std::byte> needle;
+    for (const char* p = name;; ++p) {
+        needle.push_back(static_cast<std::byte>(*p));
+        if (*p == '\0') {
+            break;
+        }
+    }
+    const auto found = std::search(message.begin(), message.end(), needle.begin(),
+                                   needle.end());
+    if (found == message.end()) {
+        std::printf("  sent field %s: NOT PRESENT\n", name);
+        return;
+    }
+    const auto value_at = found + static_cast<std::ptrdiff_t>(needle.size());
+    crpc::db::mongo::bson_document value;
+    std::size_t consumed = 0;
+    const crpc::span<const std::byte> remaining(
+        &*value_at, static_cast<std::size_t>(message.end() - value_at));
+    const crpc::status decoded =
+        crpc::db::mongo::decode_bson(remaining, value, consumed);
+    if (!decoded) {
+        std::printf("  sent field %s: present but %s\n", name,
+                    decoded.error().message.c_str());
+        return;
+    }
+    const std::vector<std::byte> raw(&*value_at, &*value_at +
+                                                      static_cast<std::ptrdiff_t>(consumed));
+    std::printf("  sent field %s: %s  (bson %s)\n", name, hex(raw).c_str(),
+                json_like(value).c_str());
+}
+
+// A tiny document printer for the assertions that need to show what came back.
+[[nodiscard]] std::string json_like(const crpc::db::mongo::bson_document& document) {
+    std::string out = "{";
+    bool first = true;
+    for (const auto& field : document.fields()) {
+        if (!first) {
+            out += ", ";
+        }
+        first = false;
+        out += field.first;
+        out += ": ";
+        switch (field.second.type) {
+        case crpc::db::mongo::bson_type::text:
+            out += "\"" + field.second.text + "\"";
+            break;
+        case crpc::db::mongo::bson_type::int32:
+        case crpc::db::mongo::bson_type::int64:
+            out += std::to_string(field.second.integer);
+            break;
+        case crpc::db::mongo::bson_type::boolean:
+            out += field.second.boolean ? "true" : "false";
+            break;
+        case crpc::db::mongo::bson_type::null:
+            out += "null";
+            break;
+        case crpc::db::mongo::bson_type::document:
+            if (field.second.document) {
+                out += json_like(*field.second.document);
+            } else {
+                out += "{}";
+            }
+            break;
+        default:
+            out += "?";
+            break;
+        }
+    }
+    out += "}";
+    return out;
+}
+
+// The session of an explicit connection with a recording channel, for the distributed
+// cases that assert on what went out.
+struct instrumented_session {
+    crpc::iocp_backend backend;
+    std::unique_ptr<crpc::db::mongo::connection> session;
+    recording_channel* recorder = nullptr;
+
+    instrumented_session() {
+        auto inner = std::make_unique<crpc::db::socket_channel>(
+            it_transport_config(), backend);
+        auto recording = std::make_unique<recording_channel>(std::move(inner));
+        recorder = recording.get();
+        session = std::unique_ptr<crpc::db::mongo::connection>(
+            new crpc::db::mongo::connection(it_options(), std::move(recording)));
+    }
+
+    [[nodiscard]] bool ok() const { return session != nullptr && session->is_open(); }
+};
+
+// Returns false when the server is not a replica set; the caller decides whether that
+// is a skip or a failure.
+[[nodiscard]] bool require_replica_set(crpc::db::mongo::connection& session) {
+    if (session.is_replica_set()) {
+        return true;
+    }
+    const char* force = std::getenv("CRPC_MONGO_EXPECT_REPLICA_SET");
+    if (force != nullptr && std::strcmp(force, "1") == 0) {
+        CRPC_CHECK_FALSE(false); // fails the case
+    } else {
+        // noreturn: either skips the case or throws.
+        crpc_test::skip("server is not a replica set; point CRPC_MONGO_PORT at one");
+    }
+    return false;
+}
+
 [[nodiscard]] crpc::db::mongo::aggregate_request sales_pipeline() {
     crpc::db::mongo::aggregate_request request;
     request.database = env_or("CRPC_MONGO_DB", "crpc_it");
@@ -641,6 +848,333 @@ CRPC_TEST(mongo_it_aggregate_crosses_batches_and_releases_the_cursor) {
             CRPC_CHECK_EQ(std::int64_t{43}, code);
         }
     }
+}
+
+CRPC_TEST(mongo_it_topology_discovery_sees_the_replica_set) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    if (!require_replica_set(*it.session)) {
+        return;
+    }
+    const crpc::db::mongo::replica_set_topology& topology = it.session->topology();
+    // The acceptance evidence is setName itself: only a replica set answers it.
+    std::printf("  discovered set=%s me=%s primary=%s members=%zu\n",
+                topology.set_name.c_str(), topology.me.c_str(),
+                topology.primary.c_str(), topology.members.size());
+    CRPC_CHECK_FALSE(topology.set_name.empty());
+    CRPC_CHECK_FALSE(topology.primary.empty());
+    CRPC_CHECK_FALSE(topology.members.empty());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::primary),
+                  static_cast<int>(topology.self_role()));
+    // The node list names the endpoint we actually connected to.
+    const std::string expected = it_host() + ":" + std::to_string(it_port());
+    CRPC_CHECK_EQ(expected, topology.primary);
+}
+
+CRPC_TEST(mongo_it_read_preference_and_concern_are_the_sent_bytes) {
+    (void)require_server();
+    crpc::iocp_backend backend;
+    crpc::db::mongo::connection_options options = it_options();
+    options.read_preference = crpc::db::mongo::read_preference_mode::secondary;
+    options.read_concern = crpc::db::mongo::read_concern_level::majority;
+    auto inner = std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
+    auto recording = std::make_unique<recording_channel>(std::move(inner));
+    recording_channel* recorder = recording.get();
+    std::unique_ptr<crpc::db::mongo::connection> session(
+        new crpc::db::mongo::connection(options, std::move(recording)));
+    if (!session->is_open()) {
+        report("login", session->connect_error());
+        CRPC_CHECK(session->is_open());
+        return;
+    }
+
+    crpc::db::mongo::find_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "people";
+    request.filter.append("age", crpc::db::mongo::bson_value::make_int32(41));
+    const auto found = session->find(request);
+    if (!found) {
+        report("find with read preference", found.error());
+    }
+    CRPC_CHECK(static_cast<bool>(found));
+    if (!found) {
+        return;
+    }
+
+    // The last request the connection wrote is the find. Print the $readPreference
+    // and readConcern bytes that actually went out, then assert their shape.
+    const std::vector<std::vector<std::byte>>& writes = recorder->writes();
+    CRPC_CHECK_FALSE(writes.empty());
+    const std::vector<std::byte>& find_message = writes.back();
+    std::printf("  last sent command: %s\n", command_name_of(find_message).c_str());
+    print_sent_field(find_message, "$readPreference");
+    print_sent_field(find_message, "readConcern");
+
+    crpc::db::mongo::op_msg_reply parsed;
+    const crpc::status decoded = crpc::db::mongo::decode_op_msg(
+        crpc::span<const std::byte>(find_message.data(), find_message.size()), parsed);
+    CRPC_CHECK(static_cast<bool>(decoded));
+    if (!decoded) {
+        return;
+    }
+    const crpc::db::mongo::bson_document& body = parsed.body;
+    const crpc::db::mongo::bson_document* preference = body.get_document("$readPreference");
+    CRPC_CHECK(preference != nullptr);
+    if (preference != nullptr) {
+        std::string mode;
+        CRPC_CHECK(preference->get_text("mode", mode));
+        CRPC_CHECK_EQ(std::string("secondary"), mode);
+    }
+    const crpc::db::mongo::bson_document* concern = body.get_document("readConcern");
+    CRPC_CHECK(concern != nullptr);
+    if (concern != nullptr) {
+        std::string level;
+        CRPC_CHECK(concern->get_text("level", level));
+        CRPC_CHECK_EQ(std::string("majority"), level);
+    }
+}
+
+CRPC_TEST(mongo_it_write_concern_majority_acknowledges) {
+    (void)require_server();
+    crpc::iocp_backend backend;
+    crpc::db::mongo::connection_options options = it_options();
+    options.write_concern = crpc::db::mongo::write_concern_options::majority();
+    auto inner = std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
+    std::unique_ptr<crpc::db::mongo::connection> wc_session(
+        new crpc::db::mongo::connection(options, std::move(inner)));
+    if (!wc_session->is_open()) {
+        report("login", wc_session->connect_error());
+        CRPC_CHECK(wc_session->is_open());
+        return;
+    }
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("wc_majority"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(wc_session->run_command(drop)));
+    }
+    crpc::db::mongo::bson_document document;
+    document.append("_id", crpc::db::mongo::bson_value::make_int32(1));
+    std::vector<crpc::db::mongo::bson_document> documents;
+    documents.push_back(std::move(document));
+    const auto inserted = wc_session->insert("wc_majority", std::move(documents));
+    if (!inserted) {
+        report("insert with w:majority", inserted.error());
+    }
+    CRPC_CHECK(static_cast<bool>(inserted));
+    if (inserted) {
+        CRPC_CHECK_EQ(std::int64_t{1}, inserted.value());
+    }
+}
+
+CRPC_TEST(mongo_it_write_concern_errors_are_reported) {
+    (void)require_server();
+    crpc::iocp_backend backend;
+
+    // 1) An unsatisfiable w on a one-node set is a writeConcernError, not a command
+    //    failure: ok stays 1 and the reply carries the writeConcernError document.
+    crpc::db::mongo::connection_options options = it_options();
+    options.write_concern = crpc::db::mongo::write_concern_options::count(2);
+    options.write_concern.wtimeout_ms = 500;
+    auto inner = std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
+    std::unique_ptr<crpc::db::mongo::connection> session(
+        new crpc::db::mongo::connection(options, std::move(inner)));
+    if (!session->is_open()) {
+        report("login", session->connect_error());
+        CRPC_CHECK(session->is_open());
+        return;
+    }
+    if (!require_replica_set(*session)) {
+        return;
+    }
+
+    crpc::db::mongo::bson_document command;
+    command.append("insert", crpc::db::mongo::bson_value::make_text("wce_case"));
+    crpc::db::mongo::bson_document document;
+    document.append("_id", crpc::db::mongo::bson_value::make_int32(1));
+    std::vector<crpc::db::mongo::bson_value> documents;
+    documents.push_back(crpc::db::mongo::bson_value::make_document(std::move(document)));
+    command.append("documents", crpc::db::mongo::bson_value::make_array(std::move(documents)));
+    const auto answered = session->run_command(command);
+    CRPC_CHECK(static_cast<bool>(answered));
+    if (answered) {
+        CRPC_CHECK(answered.value().ok);
+        CRPC_CHECK(answered.value().has_write_concern_error);
+        std::printf("  writeConcernError: code=%d codeName=%s\n",
+                    answered.value().write_concern_code,
+                    json_like(answered.value().reply).c_str());
+        CRPC_CHECK_EQ(std::int64_t{100}, answered.value().write_concern_code);
+        CRPC_CHECK(answered.value().write_concern_message.find("data-bearing") !=
+                   std::string::npos);
+    }
+
+    // 2) An illegal w value is rejected up front as a command error.
+    crpc::db::mongo::connection_options bad_options = it_options();
+    bad_options.write_concern = crpc::db::mongo::write_concern_options::count(99);
+    auto bad_inner =
+        std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
+    std::unique_ptr<crpc::db::mongo::connection> bad_session(
+        new crpc::db::mongo::connection(bad_options, std::move(bad_inner)));
+    if (!bad_session->is_open()) {
+        report("login", bad_session->connect_error());
+        CRPC_CHECK(bad_session->is_open());
+        return;
+    }
+    crpc::db::mongo::bson_document bad_document;
+    bad_document.append("_id", crpc::db::mongo::bson_value::make_int32(1));
+    std::vector<crpc::db::mongo::bson_document> bad_documents;
+    bad_documents.push_back(std::move(bad_document));
+    const auto rejected = bad_session->insert("wce_case", std::move(bad_documents));
+    CRPC_CHECK_FALSE(static_cast<bool>(rejected));
+    if (!rejected) {
+        std::printf("  w:99 error: %s\n", rejected.error().message.c_str());
+        CRPC_CHECK(rejected.error().message.find("not greater than 50") !=
+                   std::string::npos);
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(rejected.error().code));
+    }
+}
+
+CRPC_TEST(mongo_it_retryable_write_is_not_duplicated_after_a_lost_reply) {
+    (void)require_server();
+    crpc::iocp_backend backend;
+    crpc::db::mongo::connection_options options = it_options();
+    options.reconnect = [&backend]() -> crpc::result<std::unique_ptr<crpc::db::channel>> {
+        std::unique_ptr<crpc::db::channel> fresh(
+            new crpc::db::socket_channel(it_transport_config(), backend));
+        return fresh;
+    };
+    auto inner = std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
+    auto recording = std::make_unique<recording_channel>(std::move(inner));
+    recording_channel* recorder = recording.get();
+    std::unique_ptr<crpc::db::mongo::connection> session(
+        new crpc::db::mongo::connection(options, std::move(recording)));
+    if (!session->is_open()) {
+        report("login", session->connect_error());
+        CRPC_CHECK(session->is_open());
+        return;
+    }
+    if (!require_replica_set(*session)) {
+        return;
+    }
+
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("retry_dedup"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(session->run_command(drop)));
+    }
+    CRPC_CHECK(static_cast<bool>(session->start_session()));
+
+    // Lose the reply to the first insert. The server has seen the write; the connection
+    // reconnects and replays with the same lsid+txnNumber. Exactly one document proves
+    // the server deduplicated rather than the retry running the write twice.
+    recorder->inject_reply_loss();
+    crpc::db::mongo::bson_document document;
+    document.append("_id", crpc::db::mongo::bson_value::make_int32(4242));
+    document.append("tag", crpc::db::mongo::bson_value::make_text("dedup"));
+    std::vector<crpc::db::mongo::bson_document> documents;
+    documents.push_back(std::move(document));
+    const auto inserted = session->insert("retry_dedup", std::move(documents));
+    if (!inserted) {
+        report("insert after lost reply", inserted.error());
+    }
+    CRPC_CHECK(static_cast<bool>(inserted));
+    if (!inserted) {
+        return;
+    }
+    CRPC_CHECK_EQ(std::int64_t{1}, inserted.value());
+
+    crpc::db::mongo::find_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "retry_dedup";
+    request.filter.append("_id", crpc::db::mongo::bson_value::make_int32(4242));
+    const auto found = session->find(request);
+    CRPC_CHECK(static_cast<bool>(found));
+    if (found) {
+        // The retry must not have written twice.
+        CRPC_CHECK_EQ(std::size_t{1}, found.value().batch.size());
+    }
+
+    // A separate write after the replay is a new logical operation: it must be a
+    // different txnNumber, so it lands too.
+    crpc::db::mongo::bson_document second;
+    second.append("_id", crpc::db::mongo::bson_value::make_int32(4243));
+    std::vector<crpc::db::mongo::bson_document> second_documents;
+    second_documents.push_back(std::move(second));
+    const auto second_inserted =
+        session->insert("retry_dedup", std::move(second_documents));
+    CRPC_CHECK(static_cast<bool>(second_inserted));
+    request.filter = crpc::db::mongo::bson_document{};
+    const auto all = session->find(request);
+    CRPC_CHECK(static_cast<bool>(all));
+    if (all) {
+        CRPC_CHECK_EQ(std::size_t{2}, all.value().batch.size());
+    }
+}
+
+CRPC_TEST(mongo_it_session_lifecycle_on_the_server) {
+    (void)require_server();
+    instrumented_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+
+    // An explicit session is the driver's own id, sent on every command.
+    CRPC_CHECK(static_cast<bool>(it.session->start_session()));
+    const std::vector<std::byte> first = it.session->session_id();
+    CRPC_CHECK_EQ(std::size_t{16}, first.size());
+
+    crpc::db::mongo::find_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "people";
+    CRPC_CHECK(static_cast<bool>(it.session->find(request)));
+    // The sent find used the same id the client holds.
+    const crpc::db::mongo::bson_document body = [&]() {
+        const std::vector<std::byte>& message = it.recorder->writes().back();
+        crpc::db::mongo::op_msg_reply parsed;
+        const crpc::status decoded = crpc::db::mongo::decode_op_msg(
+            crpc::span<const std::byte>(message.data(), message.size()), parsed);
+        return decoded ? parsed.body : crpc::db::mongo::bson_document{};
+    }();
+    const crpc::db::mongo::bson_document* sent_lsid = body.get_document("lsid");
+    CRPC_CHECK(sent_lsid != nullptr);
+    if (sent_lsid != nullptr) {
+        const crpc::db::mongo::bson_value* id = sent_lsid->find("id");
+        CRPC_CHECK(id != nullptr);
+        if (id != nullptr) {
+            CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::bson_type::binary),
+                          static_cast<int>(id->type));
+            CRPC_CHECK_EQ(std::size_t{16}, id->bytes.size());
+            CRPC_CHECK(first == id->bytes);
+        }
+    }
+
+    // endSessions reaches the server and the client no longer holds the id.
+    CRPC_CHECK(static_cast<bool>(it.session->end_session()));
+    CRPC_CHECK_FALSE(it.session->has_session());
+    const bool sent_end =
+        std::any_of(it.recorder->writes().begin(), it.recorder->writes().end(),
+                    [](const std::vector<std::byte>& write) {
+                        std::string name = command_name_of(write);
+                        return name == "endSessions";
+                    });
+    CRPC_CHECK(sent_end);
+
+    // After an ended session the next command starts a brand new id.
+    CRPC_CHECK(static_cast<bool>(it.session->find(request)));
+    CRPC_CHECK(it.session->has_session());
+    CRPC_CHECK(it.session->session_id() != first);
+    CRPC_CHECK_EQ(std::size_t{16}, it.session->session_id().size());
 }
 
 CRPC_TEST_MAIN()
