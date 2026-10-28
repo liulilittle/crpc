@@ -185,6 +185,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::mysql::binary_row`
 - `::crpc::db::mysql::prepare_ok`
 - `::crpc::db::mysql::text_row`
+- `::crpc::db::mongo::aggregate_request`
 - `::crpc::db::mongo::find_request`
 - `::crpc::db::mongo::message_header`
 - `::crpc::db::mongo::op_msg_reply`

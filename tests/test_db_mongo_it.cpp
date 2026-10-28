@@ -17,6 +17,7 @@
 
 #include "test_framework.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -90,6 +91,49 @@ struct it_session {
     doc.append("name", crpc::db::mongo::bson_value::make_text(std::move(name)));
     doc.append("age", crpc::db::mongo::bson_value::make_int32(age));
     return doc;
+}
+
+// A sale document for the aggregation cases: a region to group by and an amount to sum
+// and sort.
+[[nodiscard]] crpc::db::mongo::bson_document sale(std::int32_t id, std::string region,
+                                                  std::int32_t amount) {
+    crpc::db::mongo::bson_document doc;
+    doc.append("_id", crpc::db::mongo::bson_value::make_int32(id));
+    doc.append("region", crpc::db::mongo::bson_value::make_text(std::move(region)));
+    doc.append("amount", crpc::db::mongo::bson_value::make_int32(amount));
+    return doc;
+}
+
+void drop_collection(it_session& it, std::string_view name) {
+    crpc::db::mongo::bson_document drop;
+    drop.append("drop", crpc::db::mongo::bson_value::make_text(std::string(name)));
+    drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                           env_or("CRPC_MONGO_DB", "crpc_it")));
+    CRPC_CHECK(static_cast<bool>(it.session->run_command(drop)));
+}
+
+// Five sales: east 10, west 20, east 30, west 40, east 50. Every aggregation case starts
+// from the same data so the expected numbers are fixed.
+void seed_sales(it_session& it) {
+    drop_collection(it, "sales");
+    std::vector<crpc::db::mongo::bson_document> documents;
+    documents.push_back(sale(0, "east", 10));
+    documents.push_back(sale(1, "west", 20));
+    documents.push_back(sale(2, "east", 30));
+    documents.push_back(sale(3, "west", 40));
+    documents.push_back(sale(4, "east", 50));
+    const auto inserted = it.session->insert("sales", std::move(documents));
+    if (!inserted) {
+        report("seed sales", inserted.error());
+    }
+    CRPC_CHECK(static_cast<bool>(inserted));
+}
+
+[[nodiscard]] crpc::db::mongo::aggregate_request sales_pipeline() {
+    crpc::db::mongo::aggregate_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "sales";
+    return request;
 }
 
 } // namespace
@@ -383,6 +427,219 @@ CRPC_TEST(mongo_it_bson_types_survive_the_server) {
     CRPC_CHECK(list != nullptr);
     if (list != nullptr) {
         CRPC_CHECK_EQ(std::size_t{2}, list->array.size());
+    }
+}
+
+CRPC_TEST(mongo_it_aggregate_match_and_group) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    seed_sales(it);
+
+    crpc::db::mongo::aggregate_request request = sales_pipeline();
+    crpc::db::mongo::bson_document match_body;
+    match_body.append("region", crpc::db::mongo::bson_value::make_text("east"));
+    crpc::db::mongo::bson_document match_stage;
+    match_stage.append("$match", crpc::db::mongo::bson_value::make_document(
+                                     std::move(match_body)));
+    request.pipeline.push_back(std::move(match_stage));
+
+    crpc::db::mongo::bson_document group_body;
+    group_body.append("_id", crpc::db::mongo::bson_value::make_text("$region"));
+    crpc::db::mongo::bson_document count_body;
+    count_body.append("$sum", crpc::db::mongo::bson_value::make_int32(1));
+    group_body.append("n", crpc::db::mongo::bson_value::make_document(std::move(count_body)));
+    crpc::db::mongo::bson_document total_body;
+    total_body.append("$sum", crpc::db::mongo::bson_value::make_text("$amount"));
+    group_body.append("total",
+                      crpc::db::mongo::bson_value::make_document(std::move(total_body)));
+    crpc::db::mongo::bson_document group_stage;
+    group_stage.append("$group", crpc::db::mongo::bson_value::make_document(
+                                     std::move(group_body)));
+    request.pipeline.push_back(std::move(group_stage));
+
+    const auto aggregated = it.session->aggregate(request);
+    if (!aggregated) {
+        report("aggregate $match/$group", aggregated.error());
+    }
+    CRPC_CHECK(static_cast<bool>(aggregated));
+    if (!aggregated) {
+        return;
+    }
+    // One group, small enough to come back whole: a group over a collection is the
+    // ordinary aggregation result and must not need a second round trip.
+    CRPC_CHECK_EQ(std::int64_t{0}, aggregated.value().id);
+    CRPC_CHECK_EQ(std::size_t{1}, aggregated.value().batch.size());
+    if (aggregated.value().batch.empty()) {
+        return;
+    }
+    const crpc::db::mongo::bson_document& row = aggregated.value().batch[0];
+    std::string region;
+    CRPC_CHECK(row.get_text("_id", region));
+    CRPC_CHECK_EQ(std::string("east"), region);
+    std::int64_t count = 0;
+    CRPC_CHECK(row.get_int64("n", count));
+    CRPC_CHECK_EQ(std::int64_t{3}, count);
+    std::int64_t total = 0;
+    CRPC_CHECK(row.get_int64("total", total));
+    CRPC_CHECK_EQ(std::int64_t{90}, total);
+}
+
+CRPC_TEST(mongo_it_aggregate_sort_order) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    seed_sales(it);
+
+    crpc::db::mongo::aggregate_request request = sales_pipeline();
+    crpc::db::mongo::bson_document direction;
+    direction.append("amount", crpc::db::mongo::bson_value::make_int32(-1));
+    crpc::db::mongo::bson_document sort_stage;
+    sort_stage.append("$sort", crpc::db::mongo::bson_value::make_document(
+                                   std::move(direction)));
+    request.pipeline.push_back(std::move(sort_stage));
+
+    const auto aggregated = it.session->aggregate(request);
+    if (!aggregated) {
+        report("aggregate $sort", aggregated.error());
+    }
+    CRPC_CHECK(static_cast<bool>(aggregated));
+    if (!aggregated) {
+        return;
+    }
+    CRPC_CHECK_EQ(std::int64_t{0}, aggregated.value().id);
+    CRPC_CHECK_EQ(std::size_t{5}, aggregated.value().batch.size());
+    // Descending by amount: 50, 40, 30, 20, 10.
+    const std::int64_t expected[] = {50, 40, 30, 20, 10};
+    for (std::size_t i = 0; i < aggregated.value().batch.size() && i < 5; ++i) {
+        std::int64_t amount = 0;
+        CRPC_CHECK(aggregated.value().batch[i].get_int64("amount", amount));
+        CRPC_CHECK_EQ(expected[i], amount);
+    }
+}
+
+CRPC_TEST(mongo_it_aggregate_crosses_batches_and_releases_the_cursor) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    seed_sales(it);
+
+    crpc::db::mongo::aggregate_request request = sales_pipeline();
+    crpc::db::mongo::bson_document direction;
+    direction.append("amount", crpc::db::mongo::bson_value::make_int32(1));
+    crpc::db::mongo::bson_document sort_stage;
+    sort_stage.append("$sort", crpc::db::mongo::bson_value::make_document(
+                                   std::move(direction)));
+    request.pipeline.push_back(std::move(sort_stage));
+    // Five documents with a batch of two: the first batch cannot hold them all, so the
+    // rest has to come through getMore on the same cursor.
+    request.batch_size = 2;
+
+    auto first = it.session->aggregate(request);
+    if (!first) {
+        report("aggregate batches", first.error());
+    }
+    CRPC_CHECK(static_cast<bool>(first));
+    if (!first) {
+        return;
+    }
+    crpc::db::mongo::cursor state = std::move(first.value());
+    CRPC_CHECK_EQ(std::size_t{2}, state.batch.size());
+    CRPC_CHECK(state.id != 0);
+    // The id the server handed out, kept so the release can be proven after the cursor is
+    // exhausted and its reply id has become 0.
+    const std::int64_t first_cursor_id = state.id;
+
+    std::vector<std::int64_t> amounts;
+    std::vector<std::int64_t> ids;
+    auto collect = [&amounts, &ids](const crpc::db::mongo::cursor& current) {
+        for (const crpc::db::mongo::bson_document& document : current.batch) {
+            std::int64_t amount = 0;
+            CRPC_CHECK(document.get_int64("amount", amount));
+            amounts.push_back(amount);
+            std::int64_t id = 0;
+            CRPC_CHECK(document.get_int64("_id", id));
+            ids.push_back(id);
+        }
+    };
+    collect(state);
+    while (state.id != 0) {
+        const auto more = it.session->next_batch(state);
+        if (!more) {
+            report("aggregate getMore", more.error());
+            CRPC_CHECK(static_cast<bool>(more));
+            break;
+        }
+        if (!more.value()) {
+            break;
+        }
+        collect(state);
+    }
+    CRPC_CHECK_EQ(std::size_t{5}, amounts.size());
+    CRPC_CHECK_EQ(std::size_t{5}, ids.size());
+    // Ascending by amount, every document exactly once: a batch boundary that repeats or
+    // drops a document shows up here.
+    const std::int64_t expected[] = {10, 20, 30, 40, 50};
+    for (std::size_t i = 0; i < amounts.size() && i < 5; ++i) {
+        CRPC_CHECK_EQ(expected[i], amounts[i]);
+    }
+    std::vector<std::int64_t> sorted_ids = ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    const auto distinct_end = std::unique(sorted_ids.begin(), sorted_ids.end());
+    CRPC_CHECK_EQ(std::size_t{5},
+                  static_cast<std::size_t>(std::distance(sorted_ids.begin(), distinct_end)));
+    // An exhausted cursor is closed by the server, which reports id 0.
+    CRPC_CHECK_EQ(std::int64_t{0}, state.id);
+    // The id previously handed out must now be unknown to the server. Proving that needs
+    // a getMore: a client that only trusted its own id 0 could have leaked the cursor.
+    const auto after_exhaustion =
+        it.session->run_command(crpc::db::mongo::make_get_more(
+            env_or("CRPC_MONGO_DB", "crpc_it"), first_cursor_id, "sales"));
+    CRPC_CHECK(static_cast<bool>(after_exhaustion));
+    if (after_exhaustion) {
+        CRPC_CHECK_FALSE(after_exhaustion.value().ok);
+        std::int64_t code = 0;
+        CRPC_CHECK(after_exhaustion.value().reply.get_int64("code", code));
+        // 43 is CursorNotFound: the server no longer has this cursor.
+        CRPC_CHECK_EQ(std::int64_t{43}, code);
+    }
+
+    // The same cursor path must release a cursor abandoned before it is read out; that is
+    // the killCursors call `find` already makes.
+    auto second = it.session->aggregate(request);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (second) {
+        crpc::db::mongo::cursor abandoned = std::move(second.value());
+        CRPC_CHECK(abandoned.id != 0);
+        const std::int64_t abandoned_id = abandoned.id;
+        const crpc::status released = it.session->close_cursor(abandoned);
+        if (!released) {
+            report("aggregate killCursors", released.error());
+        }
+        CRPC_CHECK(static_cast<bool>(released));
+        CRPC_CHECK_EQ(std::int64_t{0}, abandoned.id);
+        CRPC_CHECK(static_cast<bool>(it.session->close_cursor(abandoned)));
+        const auto killed = it.session->run_command(crpc::db::mongo::make_get_more(
+            env_or("CRPC_MONGO_DB", "crpc_it"), abandoned_id, "sales"));
+        CRPC_CHECK(static_cast<bool>(killed));
+        if (killed) {
+            CRPC_CHECK_FALSE(killed.value().ok);
+            std::int64_t code = 0;
+            CRPC_CHECK(killed.value().reply.get_int64("code", code));
+            CRPC_CHECK_EQ(std::int64_t{43}, code);
+        }
     }
 }
 

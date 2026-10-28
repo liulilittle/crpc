@@ -117,6 +117,21 @@ struct find_request {
 
 [[nodiscard]] CRPC_API bson_document make_find(const find_request& request);
 
+// `aggregate` with an ordered pipeline. The reply is a cursor whose first batch holds the
+// documents the server produced, exactly like `find`.
+struct aggregate_request {
+    std::string database;
+    std::string collection;
+    // Stages in application order. Each is a one-field document such as {$match: {...}}.
+    std::vector<bson_document> pipeline;
+    // Documents per batch; 0 leaves the size to the server.
+    std::int32_t batch_size = 0;
+};
+
+// The command always carries a `cursor` sub-document: the server refuses an aggregate
+// without one ("The 'cursor' option is required"), and an empty one asks for the default.
+[[nodiscard]] CRPC_API bson_document make_aggregate(const aggregate_request& request);
+
 // `insert` with the given documents. `ordered` false tells the server to keep going after
 // a duplicate key, which is what a bulk load usually wants.
 [[nodiscard]] CRPC_API bson_document make_insert(std::string_view collection,

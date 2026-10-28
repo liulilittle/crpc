@@ -178,6 +178,91 @@ CRPC_TEST(mongo_find_command_puts_its_name_first) {
     CRPC_CHECK(command.get_document("filter") != nullptr);
 }
 
+CRPC_TEST(mongo_aggregate_command_carries_the_pipeline_and_a_cursor) {
+    crpc::db::mongo::aggregate_request request;
+    request.database = "app";
+    request.collection = "orders";
+
+    bson_document match_body;
+    match_body.append("state", bson_value::make_text("open"));
+    bson_document match_stage;
+    match_stage.append("$match", bson_value::make_document(match_body));
+    request.pipeline.push_back(std::move(match_stage));
+
+    bson_document group_body;
+    group_body.append("_id", bson_value::make_text("$state"));
+    bson_document count_body;
+    count_body.append("$sum", bson_value::make_int32(1));
+    group_body.append("n", bson_value::make_document(count_body));
+    bson_document group_stage;
+    group_stage.append("$group", bson_value::make_document(group_body));
+    request.pipeline.push_back(std::move(group_stage));
+
+    request.batch_size = 2;
+
+    const bson_document command = crpc::db::mongo::make_aggregate(request);
+    // The command name is the first field and every command carries its database last.
+    CRPC_CHECK_EQ(std::string("aggregate"), command.fields().front().first);
+    CRPC_CHECK_EQ(std::string("$db"), command.fields().back().first);
+    std::string collection;
+    CRPC_CHECK(command.get_text("aggregate", collection));
+    CRPC_CHECK_EQ(std::string("orders"), collection);
+
+    const crpc::db::mongo::bson_value* pipeline = command.find("pipeline");
+    CRPC_CHECK(pipeline != nullptr);
+    if (pipeline != nullptr) {
+        // Stages are an ordered array: the server applies them in exactly this order.
+        CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::bson_type::array),
+                      static_cast<int>(pipeline->type));
+        CRPC_CHECK_EQ(std::size_t{2}, pipeline->array.size());
+        if (pipeline->array.size() == 2) {
+            const bson_document* first = pipeline->array[0].document.get();
+            CRPC_CHECK(first != nullptr);
+            if (first != nullptr) {
+                CRPC_CHECK(first->find("$match") != nullptr);
+            }
+            const bson_document* second = pipeline->array[1].document.get();
+            CRPC_CHECK(second != nullptr);
+            if (second != nullptr) {
+                CRPC_CHECK(second->find("$group") != nullptr);
+            }
+        }
+    }
+
+    // `aggregate` requires a `cursor` sub-document even when the caller leaves the batch
+    // size to the server; `batchSize` is what tells the server to hand back a small batch.
+    const bson_document* cursor = command.get_document("cursor");
+    CRPC_CHECK(cursor != nullptr);
+    if (cursor != nullptr) {
+        std::int64_t batch_size = 0;
+        CRPC_CHECK(cursor->get_int64("batchSize", batch_size));
+        CRPC_CHECK_EQ(std::int64_t{2}, batch_size);
+    }
+
+    std::string database;
+    CRPC_CHECK(command.get_text("$db", database));
+    CRPC_CHECK_EQ(std::string("app"), database);
+}
+
+CRPC_TEST(mongo_aggregate_cursor_is_present_without_a_batch_size) {
+    crpc::db::mongo::aggregate_request request;
+    request.database = "app";
+    request.collection = "orders";
+    bson_document stage;
+    stage.append("$limit", bson_value::make_int32(1));
+    request.pipeline.push_back(std::move(stage));
+
+    const bson_document command = crpc::db::mongo::make_aggregate(request);
+    // The server refuses an aggregate without `cursor`, so an empty one is sent rather
+    // than omitted; leaving `batchSize` out is how the server default applies.
+    const bson_document* cursor = command.get_document("cursor");
+    CRPC_CHECK(cursor != nullptr);
+    if (cursor != nullptr) {
+        CRPC_CHECK_EQ(std::size_t{0}, cursor->size());
+        CRPC_CHECK(cursor->find("batchSize") == nullptr);
+    }
+}
+
 CRPC_TEST(mongo_insert_command_carries_ordered_documents) {
     bson_document first;
     first.append("_id", bson_value::make_int32(1));
