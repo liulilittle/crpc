@@ -29,6 +29,7 @@
 #include <crpc/config.hpp>
 #include <crpc/db/channel.hpp>
 #include <crpc/error.hpp>
+#include <crpc/io.hpp>
 #include <crpc/span.hpp>
 #include <crpc/ws/frame.hpp>
 
@@ -77,6 +78,12 @@ public:
     // the handshake read-ahead caught off the wire is lost.
     stream(std::unique_ptr<db::channel> link, const stream_options& options,
            span<const std::byte> leftover);
+    // The 4-argument form additionally records the connecting peer's socket
+    // address. The server calls it with the address captured at accept time, so
+    // a session can judge where the handshake came from; it is never derived
+    // from a header. Existing 2- and 3-argument call sites keep working.
+    stream(std::unique_ptr<db::channel> link, const stream_options& options,
+           span<const std::byte> leftover, crpc::endpoint peer);
     ~stream();
 
     stream(const stream&) = delete;
@@ -116,6 +123,11 @@ public:
     void abort() noexcept;
 
     [[nodiscard]] bool is_open() const noexcept;
+
+    // The socket address of the connecting peer, recorded by the server at
+    // accept time. `type()` is `inproc`/`none` (rather than `tcp`) for a
+    // channel without an IP, so a caller can tell "no address" from "loopback".
+    [[nodiscard]] const crpc::endpoint& peer() const noexcept;
 
 private:
     struct impl;

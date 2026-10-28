@@ -144,6 +144,11 @@ result<std::unique_ptr<stream>> server::accept() {
                              "the WebSocket server has stopped"};
         }
 
+        // The socket address of whoever is knocking is captured before the
+        // connection is moved into the channel; it must never come from a
+        // header, because the Upgrade request is attacker-controlled.
+        const endpoint peer = connection->remote();
+
         std::unique_ptr<detail::transport_channel> channel;
         const bool tls = wants_tls(impl_->options);
         if (tls) {
@@ -229,7 +234,7 @@ result<std::unique_ptr<stream>> server::accept() {
         session_options.is_client = false; // the server role fixes the mask direction
         return std::unique_ptr<stream>(new stream(std::move(channel),
                                                   session_options,
-                                                  as_bytes(leftover)));
+                                                  as_bytes(leftover), peer));
     }
 }
 
