@@ -27,6 +27,7 @@
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/net/ip.hpp>
 #include <crpc/span.hpp>
 
 namespace crpc::http {
@@ -140,6 +141,26 @@ struct request {
     // True when an `Expect: 100-continue` field was present. The server decides
     // whether to send the interim response; the parser never does.
     bool expect_continue = false;
+
+    // --- Peer and resolved client -------------------------------------------
+    // The address of the socket the request arrived on, filled by the server
+    // from the accepted connection before dispatch. It is never derived from a
+    // header; `valid()` is false when the peer has no IP (an in-process or
+    // Unix-domain channel). The serializer ignores these fields.
+    net::ip_address peer_address;
+    std::uint16_t peer_port = 0;
+
+    // The client after the trusted-proxy resolution
+    // (`http_server_options::trusted_proxies`). With no trusted proxy -- or
+    // when the peer itself is not one -- this is the socket peer and every
+    // forwarding header is ignored. When the peer is trusted,
+    // `resolve_forwarded` walks the chain and fills the client view here; the
+    // original socket peer stays readable in `peer_address`/`peer_port`.
+    net::ip_address client_address;
+    std::uint16_t client_port = 0;
+    bool client_is_https = false;
+    bool used_forwarded_header = false;
+    std::size_t trusted_hops = 0;
 };
 
 struct response {

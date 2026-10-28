@@ -23,9 +23,10 @@ namespace {
 
 struct stream::impl {
     impl(std::unique_ptr<db::channel> link_value, const stream_options& opt,
-         span<const std::byte> leftover)
+         span<const std::byte> leftover, crpc::endpoint peer_value)
         : link(std::move(link_value)),
           options(opt),
+          peer(std::move(peer_value)),
           decoder(frame_decoder::options{!opt.is_client, opt.max_message_bytes}) {
         if (!leftover.empty()) {
             decoded_frame ignored;
@@ -35,6 +36,7 @@ struct stream::impl {
 
     std::unique_ptr<db::channel> link;
     stream_options options;
+    crpc::endpoint peer;
     frame_decoder decoder;
     std::array<std::byte, 16 * 1024> read_chunk{};
 
@@ -54,7 +56,11 @@ stream::stream(std::unique_ptr<db::channel> link, const stream_options& options)
 
 stream::stream(std::unique_ptr<db::channel> link, const stream_options& options,
                span<const std::byte> leftover)
-    : impl_(new impl(std::move(link), options, leftover)) {}
+    : stream(std::move(link), options, leftover, crpc::endpoint{}) {}
+
+stream::stream(std::unique_ptr<db::channel> link, const stream_options& options,
+               span<const std::byte> leftover, crpc::endpoint peer)
+    : impl_(new impl(std::move(link), options, leftover, std::move(peer))) {}
 
 stream::~stream() { abort(); }
 
@@ -395,6 +401,14 @@ void stream::abort() noexcept {
 
 bool stream::is_open() const noexcept {
     return impl_ != nullptr && !impl_->aborted && impl_->link != nullptr;
+}
+
+const endpoint& stream::peer() const noexcept {
+    if (impl_) {
+        return impl_->peer;
+    }
+    static const endpoint k_no_peer;
+    return k_no_peer;
 }
 
 status stream::emit_frame(opcode op, span<const std::byte> payload, bool fin) {
