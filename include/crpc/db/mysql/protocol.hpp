@@ -160,10 +160,13 @@ CRPC_API status encode_handshake_response(span<std::byte> out,
 [[nodiscard]] CRPC_API std::size_t handshake_response_size(
     const handshake_response_options& options) noexcept;
 
-// Encodes the response to an auth-switch request: just the auth response bytes,
-// length-prefixed.
+// Encodes the response to an auth-switch request: exactly the auth response
+// bytes. The packet is a raw string.eof payload -- no length prefix of either
+// form -- because the server reads it whole and hands it to the auth plugin,
+// which expects the bare scramble (a 33-byte caching_sha2 scramble that still
+// carries its lenenc prefix is rejected as a length mismatch).
 CRPC_API void encode_auth_switch_response(std::vector<std::byte>& out,
-                                          span<const std::byte> auth_response, bool lenenc);
+                                          span<const std::byte> auth_response);
 
 // Encodes a command payload: the command byte followed by its argument.
 [[nodiscard]] CRPC_API std::vector<std::byte> encode_command(std::uint8_t command,

@@ -162,6 +162,11 @@ public:
         return capabilities_;
     }
     [[nodiscard]] const std::string& auth_plugin() const noexcept { return auth_plugin_; }
+    // True when authentication completed through caching_sha2_password full
+    // authentication (the server's password cache was cold, so the client had
+    // to prove the password again instead of riding the fast-auth scramble).
+    // Diagnostics only: it observes the exchange shape, never the password.
+    [[nodiscard]] bool used_full_authentication() const noexcept { return full_auth_; }
     // Why the handshake failed, when it did. A factory that only reports "handshake
     // failed" hides the server's own message, which is the one thing that helps.
     [[nodiscard]] const rpc_error& connect_error() const noexcept { return connect_error_; }
@@ -207,6 +212,8 @@ private:
     // Shared with every prepared-statement handle; reset when the session closes.
     std::shared_ptr<void> session_guard_;
     rpc_error connect_error_;
+    // Set when the session needed caching_sha2_password full authentication.
+    bool full_auth_ = false;
 };
 
 // A server-side prepared statement, owned by the session that prepared it.

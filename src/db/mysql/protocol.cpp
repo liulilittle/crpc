@@ -194,13 +194,11 @@ status encode_handshake_response(span<std::byte> out,
     return status{};
 }
 
-void encode_auth_switch_response(std::vector<std::byte>& out, span<const std::byte> auth_response,
-                                 bool lenenc) {
-    if (lenenc) {
-        append_lenenc_int(out, auth_response.size());
-    } else {
-        out.push_back(byte_of(static_cast<std::uint8_t>(auth_response.size())));
-    }
+void encode_auth_switch_response(std::vector<std::byte>& out, span<const std::byte> auth_response) {
+    // The auth-switch response is a raw string.eof payload: the server hands
+    // the whole packet to the auth plugin, which expects the bare scramble.
+    // A length prefix (lenenc or one byte) would be counted as part of the
+    // scramble and rejected as a length mismatch.
     out.insert(out.end(), auth_response.begin(), auth_response.end());
 }
 
