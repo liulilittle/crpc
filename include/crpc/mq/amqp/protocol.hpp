@@ -74,6 +74,7 @@ inline constexpr std::uint16_t channel = 20;
 inline constexpr std::uint16_t exchange = 40;
 inline constexpr std::uint16_t queue = 50;
 inline constexpr std::uint16_t basic = 60;
+inline constexpr std::uint16_t confirm = 85;
 } // namespace class_id
 
 namespace method_id {
@@ -119,6 +120,9 @@ inline constexpr std::uint16_t basic_get_empty = 72;
 inline constexpr std::uint16_t basic_ack = 80;
 inline constexpr std::uint16_t basic_reject = 90;
 inline constexpr std::uint16_t basic_nack = 120;
+// confirm
+inline constexpr std::uint16_t confirm_select = 10;
+inline constexpr std::uint16_t confirm_select_ok = 11;
 } // namespace method_id
 
 struct frame_header {

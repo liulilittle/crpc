@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
+#include <thread>
 #include <utility>
 
 #include <crpc/net/connection.hpp>
@@ -106,10 +108,57 @@ void append_client_properties(writer& out, const connection_options& options) {
 
 } // namespace
 
+std::vector<std::size_t> node_visit_order(std::size_t count,
+                                          std::size_t last_success) noexcept {
+    std::vector<std::size_t> order;
+    if (count == 0) {
+        return order;
+    }
+    order.reserve(count);
+    if (last_success < count) {
+        order.push_back(last_success);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i != last_success) {
+            order.push_back(i);
+        }
+    }
+    return order;
+}
+
+std::chrono::milliseconds node_backoff_delay(std::size_t attempt,
+                                             std::chrono::milliseconds base,
+                                             std::chrono::milliseconds cap,
+                                             std::uint64_t jitter_basis) noexcept {
+    const auto base_ms = base.count() > 0 ? static_cast<std::uint64_t>(base.count()) : 0u;
+    if (base_ms == 0) {
+        return std::chrono::milliseconds(0);
+    }
+    std::uint64_t backoff = base_ms;
+    for (std::size_t i = 0; i < attempt && backoff < std::numeric_limits<std::uint64_t>::max() / 2; ++i) {
+        backoff *= 2;
+    }
+    const std::uint64_t cap_ms =
+        cap.count() > 0 ? static_cast<std::uint64_t>(cap.count()) : backoff;
+    const std::uint64_t bounded = std::min(backoff, cap_ms);
+    // Jitter draws from [0, base) so a fleet of clients does not stampede in
+    // lockstep after a shared outage.
+    const std::uint64_t jitter = jitter_basis % base_ms;
+    const std::uint64_t total = bounded + jitter;
+    return std::chrono::milliseconds(static_cast<std::int64_t>(
+        total > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+            ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+            : total));
+}
+
 // --- connection --------------------------------------------------------------
 
 connection::connection(connection_options options, std::unique_ptr<db::channel> link)
     : options_(std::move(options)), link_(std::move(link)) {
+    if (options_.nodes.empty()) {
+        options_.nodes.push_back({options_.host, options_.port});
+    }
+    nodes_ = options_.nodes;
     last_write_ = std::chrono::steady_clock::now();
     if (link_ == nullptr) {
         connect_error_ = rpc_error{rpc_code::shutting_down, "no channel was supplied"};
@@ -135,27 +184,378 @@ connection::~connection() {
 result<std::unique_ptr<connection>> connection::open(connection_options options,
                                                     crpc::backend_factory& backend,
                                                     crpc::runtime* shard) {
-    crpc::net::connection_config config;
-    config.ep = crpc::endpoint::tcp(options.host, options.port);
-    config.operation_timeout = options.operation_timeout;
-    // An AMQP link cannot be reconnected behind the caller's back: the handshake
-    // and every channel's state would be gone. A close is terminal instead.
-    config.reconnect_on_eof = false;
-
-    auto link = std::unique_ptr<db::channel>(
-        new db::socket_channel(std::move(config), backend, shard));
-    std::unique_ptr<connection> conn(
-        new connection(std::move(options), std::move(link)));
-    if (!conn->is_open()) {
-        return conn->connect_error();
+    std::vector<node_address> candidates = options.nodes;
+    if (candidates.empty()) {
+        candidates.push_back({options.host, options.port});
     }
-    return std::move(conn);
+
+    rpc_error last_error{rpc_code::unavailable,
+                         "every broker in the node list refused the connection"};
+    for (const std::size_t index : node_visit_order(candidates.size(), 0)) {
+        connection_options attempt = options;
+        attempt.host = candidates[index].host;
+        attempt.port = candidates[index].port;
+
+        crpc::net::connection_config config;
+        config.ep = crpc::endpoint::tcp(attempt.host, attempt.port);
+        config.operation_timeout = attempt.operation_timeout;
+        // An AMQP link cannot be reconnected behind the caller's back: the
+        // handshake and every channel's state would be gone. A close is
+        // terminal instead, and failover happens at this client's level.
+        config.reconnect_on_eof = false;
+
+        auto link = std::unique_ptr<db::channel>(
+            new db::socket_channel(std::move(config), backend, shard));
+        std::unique_ptr<connection> conn(
+            new connection(std::move(attempt), std::move(link)));
+        if (conn->is_open()) {
+            conn->backend_ = &backend;
+            conn->shard_ = shard;
+            conn->nodes_ = std::move(candidates);
+            conn->set_node(index);
+            return std::move(conn);
+        }
+        last_error = conn->connect_error();
+    }
+    return last_error;
 }
 
 void connection::fail() noexcept {
     open_.store(false, std::memory_order_release);
     if (link_ != nullptr) {
         link_->close();
+    }
+}
+
+const node_address& connection::active_node() const noexcept {
+    if (node_index_ < nodes_.size()) {
+        return nodes_[node_index_];
+    }
+    static const node_address none;
+    return none;
+}
+
+void connection::set_node(std::size_t index) noexcept {
+    node_index_ = index;
+    last_success_index_ = index;
+}
+
+status connection::ensure_connected() {
+    if (user_closed_) {
+        return status{rpc_code::shutting_down, "the AMQP connection is closed"};
+    }
+    if (open_.load(std::memory_order_acquire) && link_ != nullptr) {
+        return status{};
+    }
+    return reconnect_with_backoff();
+}
+
+status connection::reconnect() {
+    if (user_closed_) {
+        return status{rpc_code::shutting_down, "the AMQP connection is closed"};
+    }
+    if (open_.load(std::memory_order_acquire) && link_ != nullptr) {
+        return status{};
+    }
+    return reconnect_with_backoff();
+}
+
+status connection::reconnect_with_backoff() {
+    if (backend_ == nullptr) {
+        return status{rpc_code::unavailable,
+                      "this connection cannot reconnect: it was not created by "
+                      "connection::open, so no transport backend is available"};
+    }
+    if (nodes_.empty()) {
+        return status{rpc_code::internal, "the connection has no configured broker"};
+    }
+
+    std::uint64_t jitter_basis = 0;
+    for (std::size_t attempt = 0; attempt <= options_.reconnect_attempts; ++attempt) {
+        for (const std::size_t index : node_visit_order(nodes_.size(), last_success_index_)) {
+            const status attached = attach_to_node(index);
+            if (attached.ok()) {
+                connect_error_ = rpc_error{};
+                const status replayed = replay_channels();
+                if (!replayed) {
+                    last_reconnect_error_ = replayed.error();
+                    fail();
+                    return replayed;
+                }
+                return status{};
+            }
+            last_reconnect_error_ = attached.error();
+        }
+        if (attempt < options_.reconnect_attempts) {
+            const auto delay = node_backoff_delay(attempt, options_.reconnect_delay_base,
+                                                  options_.reconnect_delay_cap,
+                                                  jitter_basis++);
+            if (delay.count() > 0) {
+                std::this_thread::sleep_for(delay);
+            }
+        }
+    }
+    return last_reconnect_error_;
+}
+
+status connection::attach_to_node(std::size_t index) {
+    if (index >= nodes_.size()) {
+        return status{rpc_code::invalid_argument, "the node index is out of range"};
+    }
+    crpc::net::connection_config config;
+    config.ep = crpc::endpoint::tcp(nodes_[index].host, nodes_[index].port);
+    config.operation_timeout = options_.operation_timeout;
+    config.reconnect_on_eof = false;
+
+    auto new_link = std::unique_ptr<db::channel>(
+        new db::socket_channel(std::move(config), *backend_, shard_));
+    {
+        // The heartbeat writer is gated on `open_` (false here), but a frame it
+        // started before the text dropped could still be mid-write; the same
+        // mutex serialises the transport swap with writers.
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        if (link_ != nullptr) {
+            link_->close();
+        }
+        link_ = std::move(new_link);
+        open_.store(false, std::memory_order_release);
+    }
+    last_write_ = std::chrono::steady_clock::now();
+    reset_protocol_state();
+
+    const status handshake = perform_handshake();
+    if (!handshake) {
+        if (link_ != nullptr) {
+            link_->close();
+        }
+        return handshake;
+    }
+    open_.store(true, std::memory_order_release);
+    set_node(index);
+    return status{};
+}
+
+void connection::reset_protocol_state() noexcept {
+    pending_methods_.clear();
+    deliveries_.clear();
+    returns_.clear();
+    closed_channels_.clear();
+    channel_errors_.clear();
+    confirm_events_.clear();
+    consumer_cancels_.clear();
+    confirm_results_.clear();
+    next_channel_ = 1;
+    {
+        // The heartbeat thread reads the interval every cycle; publish the
+        // reset under the same mutex to keep the access race-free.
+        std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+        heartbeat_ = 0;
+    }
+    channel_max_ = 0;
+    frame_max_ = default_frame_max;
+}
+
+void connection::register_channel(channel* ch) {
+    channels_.push_back(ch);
+    channels_by_id_[ch->id_] = ch;
+}
+
+void connection::unregister_channel(channel* ch) {
+    const auto it = std::find(channels_.begin(), channels_.end(), ch);
+    if (it != channels_.end()) {
+        channels_.erase(it);
+    }
+    const auto by_id = channels_by_id_.find(ch->id_);
+    if (by_id != channels_by_id_.end() && by_id->second == ch) {
+        channels_by_id_.erase(by_id);
+    }
+}
+
+channel* connection::channel_with_id(std::uint16_t id) noexcept {
+    const auto it = channels_by_id_.find(id);
+    return it != channels_by_id_.end() ? it->second : nullptr;
+}
+
+status connection::replay_channels() {
+    channels_by_id_.clear();
+    for (channel* ch : channels_) {
+        if (ch == nullptr || !ch->open_ || ch->dead_) {
+            continue;
+        }
+        const std::uint16_t id = next_channel_;
+        if (channel_max_ != 0 && id > channel_max_) {
+            return status{rpc_code::resource_exhausted,
+                          "the broker's channel limit is reached during reconnect"};
+        }
+        ++next_channel_;
+
+        writer arguments;
+        arguments.short_string("");  // reserved-1
+        const status sent = send_method(id, class_id::channel, method_id::channel_open,
+                                        span_of(arguments.data()));
+        if (!sent) {
+            return sent;
+        }
+        auto opened = await_method(id, class_id::channel, {method_id::channel_open_ok},
+                                   nullptr);
+        if (!opened) {
+            return status{opened.error()};
+        }
+
+        const std::uint16_t old_id = ch->id_;
+        ch->id_ = id;
+        channels_by_id_[id] = ch;
+        if (old_id != id) {
+            channels_by_id_.erase(old_id);
+        }
+        const status replayed = ch->replay_topology();
+        if (!replayed) {
+            return replayed;
+        }
+    }
+    return status{};
+}
+
+result<connection::confirm_event> connection::wait_confirm(
+    std::uint16_t id, std::uint64_t target_tag, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto& results = confirm_results_[id];
+    for (;;) {
+        auto& events = confirm_events_[id];
+        while (!events.empty()) {
+            confirm_event event = events.front();
+            events.pop_front();
+            if ((event.multiple && event.delivery_tag >= target_tag) ||
+                (!event.multiple && event.delivery_tag == target_tag)) {
+                // `multiple` settles every outstanding tag up to its own; older
+                // events settle nothing this wait is interested in and are
+                // dropped (the confirm sequence only moves forward).
+                results.clear();
+                results[target_tag] = event.acknowledged;
+            }
+        }
+        const auto found = results.find(target_tag);
+        if (found != results.end()) {
+            confirm_event resolved;
+            resolved.delivery_tag = target_tag;
+            resolved.acknowledged = found->second;
+            results.clear();
+            return resolved;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return rpc_error{rpc_code::deadline_exceeded,
+                             "timed out waiting for the broker's publisher confirm"};
+        }
+
+        auto incoming = read_frame();
+        if (!incoming) {
+            if (incoming.error().code == rpc_code::deadline_exceeded) {
+                continue;
+            }
+            return incoming.error();
+        }
+        if (incoming.value().type == frame_type::heartbeat) {
+            continue;
+        }
+        if (incoming.value().type != frame_type::method) {
+            fail();
+            return rpc_error{rpc_code::protocol_error,
+                             "expected a method frame while waiting for a confirm"};
+        }
+        const span<const std::byte> payload = span_of(incoming.value().payload);
+        if (payload.size() < 4) {
+            fail();
+            return rpc_error{rpc_code::protocol_error,
+                             "a method frame is shorter than its header"};
+        }
+        reader head(payload);
+        const std::uint16_t incoming_class = head.u16();
+        const std::uint16_t incoming_method = head.u16();
+        if (!head.ok()) {
+            fail();
+            return head.error();
+        }
+        auto handled = handle_incoming(incoming.value().channel, incoming_class,
+                                       incoming_method, payload.subspan(4));
+        if (!handled) {
+            return handled.error();
+        }
+        if (handled.value()) {
+            const auto error = channel_errors_.find(id);
+            if (error != channel_errors_.end()) {
+                return error->second;
+            }
+            continue;
+        }
+        queued_method queued;
+        queued.channel = incoming.value().channel;
+        queued.class_id = incoming_class;
+        queued.method_id = incoming_method;
+        queued.arguments = copy_bytes(payload.subspan(4));
+        pending_methods_.push_back(std::move(queued));
+    }
+}
+
+result<consumer_cancel> connection::wait_cancel(std::uint16_t id,
+                                                std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const auto pending = consumer_cancels_.find(id);
+        if (pending != consumer_cancels_.end() && !pending->second.empty()) {
+            consumer_cancel out;
+            out.present = true;
+            out.consumer_tag = std::move(pending->second.front());
+            pending->second.pop_front();
+            return out;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return consumer_cancel{};
+        }
+        auto incoming = read_frame();
+        if (!incoming) {
+            if (incoming.error().code == rpc_code::deadline_exceeded) {
+                continue;
+            }
+            return incoming.error();
+        }
+        if (incoming.value().type == frame_type::heartbeat) {
+            continue;
+        }
+        if (incoming.value().type != frame_type::method) {
+            fail();
+            return rpc_error{rpc_code::protocol_error,
+                             "expected a method frame while waiting for a cancel"};
+        }
+        const span<const std::byte> payload = span_of(incoming.value().payload);
+        if (payload.size() < 4) {
+            fail();
+            return rpc_error{rpc_code::protocol_error, "a method frame is shorter than its header"};
+        }
+        reader head(payload);
+        const std::uint16_t incoming_class = head.u16();
+        const std::uint16_t incoming_method = head.u16();
+        if (!head.ok()) {
+            fail();
+            return head.error();
+        }
+        auto handled = handle_incoming(incoming.value().channel, incoming_class,
+                                       incoming_method, payload.subspan(4));
+        if (!handled) {
+            return handled.error();
+        }
+        if (handled.value()) {
+            const auto error = channel_errors_.find(id);
+            if (error != channel_errors_.end()) {
+                return error->second;
+            }
+            continue;
+        }
+        queued_method queued;
+        queued.channel = incoming.value().channel;
+        queued.class_id = incoming_class;
+        queued.method_id = incoming_method;
+        queued.arguments = copy_bytes(payload.subspan(4));
+        pending_methods_.push_back(std::move(queued));
     }
 }
 
@@ -182,6 +582,8 @@ status connection::send_method(std::uint16_t channel_id, std::uint16_t method_cl
 }
 
 status connection::perform_handshake() {
+    server_properties_.clear();
+    server_version_.clear();
     const status header = send_bytes(
         span<const std::byte>(protocol_header.data(), protocol_header.size()));
     if (!header) {
@@ -281,12 +683,17 @@ status connection::perform_handshake() {
                       "the negotiated frame_max cannot hold a frame"};
     }
 
-    if (server_heartbeat == 0) {
-        heartbeat_ = 0;
-    } else if (options_.heartbeat == 0) {
-        heartbeat_ = server_heartbeat;
-    } else {
-        heartbeat_ = std::min(server_heartbeat, options_.heartbeat);
+    // The heartbeat thread recomputes its period from this member every cycle,
+    // so the negotiated value is published under the same mutex it reads under.
+    {
+        std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+        if (server_heartbeat == 0) {
+            heartbeat_ = 0;
+        } else if (options_.heartbeat == 0) {
+            heartbeat_ = server_heartbeat;
+        } else {
+            heartbeat_ = std::min(server_heartbeat, options_.heartbeat);
+        }
     }
 
     writer tune_ok;
@@ -398,6 +805,10 @@ result<bool> connection::handle_incoming(std::uint16_t frame_channel,
                           span<const std::byte>());
         closed_channels_.insert(frame_channel);
         channel_errors_[frame_channel] = close_error("the broker closed the channel", info);
+        // A channel the broker closed is permanent: reconnect must not re-open it.
+        if (channel* ch = channel_with_id(frame_channel); ch != nullptr) {
+            ch->dead_ = true;
+        }
         return true;
     }
 
@@ -450,8 +861,39 @@ result<bool> connection::handle_incoming(std::uint16_t frame_channel,
     }
 
     if (method_class == class_id::basic && method == method_id::basic_cancel) {
-        // A server-initiated cancel (consumer_cancel_notify). This client does not
-        // advertise a handler, but consuming the frame keeps the stream in sync.
+        // A server-initiated cancel (consumer_cancel_notify), e.g. because the
+        // queue was deleted. Record it per channel so `next_cancel` can report
+        // that consumption stopped instead of letting it die silently.
+        reader in(arguments);
+        const std::string tag(in.short_string());
+        if (!in.ok()) {
+            fail();
+            return rpc_error{rpc_code::protocol_error, "Basic.Cancel arguments are malformed"};
+        }
+        consumer_cancels_[frame_channel].push_back(tag);
+        return true;
+    }
+
+    if (method_class == class_id::basic &&
+        (method == method_id::basic_ack || method == method_id::basic_nack)) {
+        // Publisher-confirm outcome for one or more published messages.
+        reader in(arguments);
+        confirm_event event;
+        event.delivery_tag = in.u64();
+        std::uint8_t flags = 0;
+        if (!in.bits(method == method_id::basic_ack ? 1u : 2u, flags)) {
+            fail();
+            return rpc_error{rpc_code::protocol_error,
+                             "Basic.Ack/Basic.Nack flags are malformed"};
+        }
+        event.multiple = (flags & 0x01u) != 0;
+        event.acknowledged = method == method_id::basic_ack;
+        if (!in.ok()) {
+            fail();
+            return rpc_error{rpc_code::protocol_error,
+                             "Basic.Ack/Basic.Nack arguments are malformed"};
+        }
+        confirm_events_[frame_channel].push_back(event);
         return true;
     }
 
@@ -725,13 +1167,8 @@ void connection::start_heartbeat() {
     if (heartbeat_ == 0) {
         return;
     }
-    // AMQP peers send a heartbeat after roughly half the negotiated timeout;
-    // RabbitMQ closes a peer that misses two intervals.
-    const std::int64_t half_ms =
-        std::max<std::int64_t>(100, static_cast<std::int64_t>(heartbeat_) * 1000 / 2);
-    const std::chrono::milliseconds period(half_ms);
     heartbeat_stop_ = false;
-    heartbeat_thread_ = std::thread(&connection::heartbeat_loop, this, period);
+    heartbeat_thread_ = std::thread(&connection::heartbeat_loop, this);
 }
 
 void connection::stop_heartbeat() noexcept {
@@ -745,9 +1182,16 @@ void connection::stop_heartbeat() noexcept {
     }
 }
 
-void connection::heartbeat_loop(std::chrono::milliseconds period) {
+void connection::heartbeat_loop() {
     std::unique_lock<std::mutex> lock(heartbeat_mutex_);
     for (;;) {
+        // The interval is a property of the *current* node and may change after
+        // a reconnect, so it is recomputed every iteration instead of captured
+        // once. A node that proposes no heartbeat gets a conservative idle poll.
+        const std::int64_t asked_ms = static_cast<std::int64_t>(heartbeat_) * 1000 / 2;
+        const std::int64_t half_ms =
+            heartbeat_ == 0 ? 1000 : (std::max<std::int64_t>(100, asked_ms));
+        const std::chrono::milliseconds period(half_ms);
         if (heartbeat_cv_.wait_for(lock, period, [this] { return heartbeat_stop_; })) {
             return;
         }
@@ -770,6 +1214,7 @@ void connection::heartbeat_loop(std::chrono::milliseconds period) {
 }
 
 status connection::close() {
+    user_closed_ = true;
     if (link_ == nullptr) {
         return status{};
     }
@@ -819,8 +1264,9 @@ status connection::close_channel(std::uint16_t id) {
 }
 
 result<std::unique_ptr<channel>> connection::open_channel() {
-    if (!open_.load(std::memory_order_acquire)) {
-        return rpc_error{rpc_code::shutting_down, "the AMQP connection is closed"};
+    const status ready = ensure_connected();
+    if (!ready) {
+        return ready.error();
     }
     if (channel_max_ != 0 && next_channel_ > channel_max_) {
         return rpc_error{rpc_code::resource_exhausted, "the broker's channel limit is reached"};
@@ -839,7 +1285,9 @@ result<std::unique_ptr<channel>> connection::open_channel() {
     if (!opened) {
         return opened.error();
     }
-    return std::unique_ptr<channel>(new channel(this, id));
+    std::unique_ptr<channel> result(new channel(this, id));
+    register_channel(result.get());
+    return result;
 }
 
 // --- channel -----------------------------------------------------------------
@@ -847,133 +1295,67 @@ result<std::unique_ptr<channel>> connection::open_channel() {
 channel::channel(connection* owner, std::uint16_t id) noexcept : owner_(owner), id_(id) {}
 
 channel::~channel() {
-    if (open_ && owner_ != nullptr && owner_->is_open()) {
-        (void)owner_->close_channel(id_);
+    if (owner_ != nullptr) {
+        if (open_ && owner_->is_open()) {
+            (void)owner_->close_channel(id_);
+        }
+        owner_->unregister_channel(this);
     }
 }
 
 bool channel::is_open() const noexcept {
-    return open_ && owner_ != nullptr && owner_->is_open() &&
+    return open_ && !dead_ && owner_ != nullptr && owner_->is_open() &&
            !owner_->channel_closed(id_);
 }
 
-result<queue_declare_result> channel::queue_declare(std::string_view queue, bool passive,
-                                                    bool durable, bool exclusive,
-                                                    bool auto_delete,
-                                                    const field_table& arguments) {
-    if (passive && queue.empty()) {
-        return rpc_error{rpc_code::invalid_argument,
-                         "a passive queue.declare needs a queue name"};
+status channel::ensure_ready() {
+    if (owner_ == nullptr) {
+        return status{rpc_code::shutting_down, "the channel has no connection"};
     }
-    writer out;
-    // AMQP 0-9-1 keeps the deprecated access `ticket` short in every Queue and
-    // Exchange method and in Basic.Publish/Consume/Get. RabbitMQ's decoder
-    // requires it; omitting it shifts the whole argument list and the broker
-    // answers with a frame error rather than a method error.
-    out.u16(0);
-    out.short_string(queue);
-    out.bits(bits_of({passive, durable, exclusive, auto_delete, false}), 5);
-    out.table(arguments);
-    if (!out.ok()) {
-        return rpc_error{out.error(), "Queue.Declare arguments do not fit"};
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the channel is closed"};
     }
-    const status sent = owner_->send_method(id_, class_id::queue, method_id::queue_declare,
-                                            span_of(out.data()));
+    if (dead_) {
+        return status{rpc_code::connection_reset,
+                      "the broker closed this channel; open a new one"};
+    }
+    return owner_->ensure_connected();
+}
+
+status channel::require_live() {
+    if (owner_ == nullptr || !open_ || dead_) {
+        return status{rpc_code::shutting_down, "the channel is closed"};
+    }
+    if (!owner_->is_open()) {
+        return status{rpc_code::connection_reset,
+                      "the connection is down; a delivery from before the drop "
+                      "cannot be acknowledged for the new connection generation"};
+    }
+    return status{};
+}
+
+// Sends one method on this channel's current id and waits for one of `replies`.
+// Used by the public call and by the reconnect replay, so the wire encoding of
+// a declaration stays identical in both paths.
+result<std::vector<std::byte>> channel::exchange_method(
+    std::uint16_t method_class, std::uint16_t method,
+    span<const std::byte> arguments, std::initializer_list<std::uint16_t> replies,
+    std::uint16_t* matched) {
+    const status sent =
+        owner_->send_method(id_, method_class, method, arguments);
     if (!sent) {
         return sent.error();
     }
-    auto reply = owner_->await_method(id_, class_id::queue, {method_id::queue_declare_ok},
-                                      nullptr);
-    if (!reply) {
-        return reply.error();
-    }
-    reader in(span_of(reply.value()));
-    queue_declare_result result;
-    result.queue = std::string(in.short_string());
-    result.message_count = in.u32();
-    result.consumer_count = in.u32();
-    if (!in.ok()) {
-        return rpc_error{rpc_code::protocol_error, "Queue.DeclareOk arguments are malformed"};
-    }
-    return result;
+    return owner_->await_method(id_, method_class, replies, matched);
 }
 
-status channel::queue_delete(std::string_view queue, bool if_unused, bool if_empty) {
-    writer out;
-    out.u16(0); // ticket
-    out.short_string(queue);
-    out.bits(bits_of({if_unused, if_empty, false}), 3);
-    if (!out.ok()) {
-        return status{out.error(), "Queue.Delete arguments do not fit"};
-    }
-    const status sent = owner_->send_method(id_, class_id::queue, method_id::queue_delete,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent;
-    }
-    auto reply = owner_->await_method(id_, class_id::queue, {method_id::queue_delete_ok},
-                                      nullptr);
-    if (!reply) {
-        return status{reply.error()};
-    }
-    return status{};
-}
-
-status channel::queue_bind(std::string_view queue, std::string_view exchange,
-                           std::string_view routing_key, const field_table& arguments) {
-    writer out;
-    out.u16(0); // ticket
-    out.short_string(queue);
-    out.short_string(exchange);
-    out.short_string(routing_key);
-    out.bits(0, 1); // no-wait = false
-    out.table(arguments);
-    if (!out.ok()) {
-        return status{out.error(), "Queue.Bind arguments do not fit"};
-    }
-    const status sent = owner_->send_method(id_, class_id::queue, method_id::queue_bind,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent;
-    }
-    auto reply = owner_->await_method(id_, class_id::queue, {method_id::queue_bind_ok},
-                                      nullptr);
-    if (!reply) {
-        return status{reply.error()};
-    }
-    return status{};
-}
-
-status channel::exchange_declare(std::string_view exchange, std::string_view type,
-                                 bool passive, bool durable, bool auto_delete,
-                                 bool internal, const field_table& arguments) {
-    writer out;
-    out.u16(0); // ticket
-    out.short_string(exchange);
-    out.short_string(type);
-    out.bits(bits_of({passive, durable, auto_delete, internal, false}), 5);
-    out.table(arguments);
-    if (!out.ok()) {
-        return status{out.error(), "Exchange.Declare arguments do not fit"};
-    }
-    const status sent = owner_->send_method(id_, class_id::exchange,
-                                            method_id::exchange_declare,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent;
-    }
-    auto reply = owner_->await_method(id_, class_id::exchange,
-                                      {method_id::exchange_declare_ok}, nullptr);
-    if (!reply) {
-        return status{reply.error()};
-    }
-    return status{};
-}
-
-status channel::basic_publish(std::string_view exchange, std::string_view routing_key,
-                              const message_properties& properties,
-                              span<const std::byte> body, bool mandatory,
-                              bool immediate) {
+// Builds and writes the Basic.Publish method + content frames in one buffer.
+// Does not touch the confirm sequence; the caller advances it once the write
+// went out.
+status channel::send_publish(std::string_view exchange, std::string_view routing_key,
+                             const message_properties& properties,
+                             span<const std::byte> body, bool mandatory,
+                             bool immediate) {
     writer arguments;
     arguments.u16(0); // ticket
     arguments.short_string(exchange);
@@ -996,7 +1378,199 @@ status channel::basic_publish(std::string_view exchange, std::string_view routin
     return owner_->send_bytes(span_of(frames));
 }
 
+result<queue_declare_result> channel::queue_declare(std::string_view queue, bool passive,
+                                                    bool durable, bool exclusive,
+                                                    bool auto_delete,
+                                                    const field_table& arguments) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
+    if (passive && queue.empty()) {
+        return rpc_error{rpc_code::invalid_argument,
+                         "a passive queue.declare needs a queue name"};
+    }
+    writer out;
+    // AMQP 0-9-1 keeps the deprecated access `ticket` short in every Queue and
+    // Exchange method and in Basic.Publish/Consume/Get. RabbitMQ's decoder
+    // requires it; omitting it shifts the whole argument list and the broker
+    // answers with a frame error rather than a method error.
+    out.u16(0);
+    out.short_string(queue);
+    out.bits(bits_of({passive, durable, exclusive, auto_delete, false}), 5);
+    out.table(arguments);
+    if (!out.ok()) {
+        return rpc_error{out.error(), "Queue.Declare arguments do not fit"};
+    }
+    auto reply = exchange_method(class_id::queue, method_id::queue_declare,
+                                 span_of(out.data()), {method_id::queue_declare_ok});
+    if (!reply) {
+        return reply.error();
+    }
+    reader in(span_of(reply.value()));
+    queue_declare_result result;
+    result.queue = std::string(in.short_string());
+    result.message_count = in.u32();
+    result.consumer_count = in.u32();
+    if (!in.ok()) {
+        return rpc_error{rpc_code::protocol_error, "Queue.DeclareOk arguments are malformed"};
+    }
+    if (!result.queue.empty()) {
+        // The resolved name (server-generated names are stored here) is what the
+        // reconnect replay declares, so a broker-generated queue keeps its
+        // identity across a failover. A `passive` declare is replayed as a real
+        // declare: its only meaning was "this queue must exist", and after a
+        // broker restart the fastest way to make that true is to declare it.
+        queue_state state;
+        state.name = result.queue;
+        state.passive = passive;
+        state.durable = durable;
+        state.exclusive = exclusive;
+        state.auto_delete = auto_delete;
+        state.arguments = arguments;
+        queues_[result.queue] = std::move(state);
+    }
+    return result;
+}
+
+status channel::queue_delete(std::string_view queue, bool if_unused, bool if_empty) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
+    writer out;
+    out.u16(0); // ticket
+    out.short_string(queue);
+    out.bits(bits_of({if_unused, if_empty, false}), 3);
+    if (!out.ok()) {
+        return status{out.error(), "Queue.Delete arguments do not fit"};
+    }
+    auto reply = exchange_method(class_id::queue, method_id::queue_delete,
+                                 span_of(out.data()), {method_id::queue_delete_ok});
+    if (!reply) {
+        return status{reply.error()};
+    }
+    // A deleted queue must not be re-created by a reconnect.
+    queues_.erase(std::string(queue));
+    return status{};
+}
+
+status channel::queue_bind(std::string_view queue, std::string_view exchange,
+                           std::string_view routing_key, const field_table& arguments) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
+    writer out;
+    out.u16(0); // ticket
+    out.short_string(queue);
+    out.short_string(exchange);
+    out.short_string(routing_key);
+    out.bits(0, 1); // no-wait = false
+    out.table(arguments);
+    if (!out.ok()) {
+        return status{out.error(), "Queue.Bind arguments do not fit"};
+    }
+    auto reply = exchange_method(class_id::queue, method_id::queue_bind,
+                                 span_of(out.data()), {method_id::queue_bind_ok});
+    if (!reply) {
+        return status{reply.error()};
+    }
+    bind_state state;
+    state.queue = std::string(queue);
+    state.exchange = std::string(exchange);
+    state.routing_key = std::string(routing_key);
+    state.arguments = arguments;
+    binds_.push_back(std::move(state));
+    return status{};
+}
+
+status channel::exchange_declare(std::string_view exchange, std::string_view type,
+                                 bool passive, bool durable, bool auto_delete,
+                                 bool internal, const field_table& arguments) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
+    writer out;
+    out.u16(0); // ticket
+    out.short_string(exchange);
+    out.short_string(type);
+    out.bits(bits_of({passive, durable, auto_delete, internal, false}), 5);
+    out.table(arguments);
+    if (!out.ok()) {
+        return status{out.error(), "Exchange.Declare arguments do not fit"};
+    }
+    auto reply = exchange_method(class_id::exchange, method_id::exchange_declare,
+                                 span_of(out.data()), {method_id::exchange_declare_ok});
+    if (!reply) {
+        return status{reply.error()};
+    }
+    exchange_state state;
+    state.name = std::string(exchange);
+    state.type = std::string(type);
+    state.passive = passive;
+    state.durable = durable;
+    state.auto_delete = auto_delete;
+    state.internal = internal;
+    state.arguments = arguments;
+    exchanges_[state.name] = std::move(state);
+    return status{};
+}
+
+status channel::basic_publish(std::string_view exchange, std::string_view routing_key,
+                              const message_properties& properties,
+                              span<const std::byte> body, bool mandatory,
+                              bool immediate) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
+    const status sent = send_publish(exchange, routing_key, properties, body,
+                                     mandatory, immediate);
+    if (sent && confirm_mode_) {
+        // Every Basic.Publish on a confirm-mode channel consumes a sequence
+        // number on the broker, whether or not the caller waits for it.
+        ++next_publish_tag_;
+    }
+    return sent;
+}
+
+result<publish_confirm> channel::basic_publish_confirm(
+    std::string_view exchange, std::string_view routing_key,
+    const message_properties& properties, span<const std::byte> body, bool mandatory,
+    bool immediate, std::chrono::milliseconds timeout) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
+    if (!confirm_mode_) {
+        return rpc_error{rpc_code::failed_precondition,
+                         "call confirm_select() before basic_publish_confirm()"};
+    }
+    const std::uint64_t tag = next_publish_tag_;
+    const status sent = send_publish(exchange, routing_key, properties, body,
+                                     mandatory, immediate);
+    if (!sent) {
+        return sent.error();
+    }
+    ++next_publish_tag_;
+
+    auto resolved = owner_->wait_confirm(id_, tag, timeout);
+    if (!resolved) {
+        return resolved.error();
+    }
+    publish_confirm result;
+    result.acknowledged = resolved.value().acknowledged;
+    result.delivery_tag = tag;
+    return result;
+}
+
 result<get_result> channel::basic_get(std::string_view queue, bool no_ack) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
     writer out;
     out.u16(0); // ticket
     out.short_string(queue);
@@ -1004,15 +1578,10 @@ result<get_result> channel::basic_get(std::string_view queue, bool no_ack) {
     if (!out.ok()) {
         return rpc_error{out.error(), "Basic.Get arguments do not fit"};
     }
-    const status sent = owner_->send_method(id_, class_id::basic, method_id::basic_get,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent.error();
-    }
     std::uint16_t matched = 0;
-    auto reply = owner_->await_method(
-        id_, class_id::basic, {method_id::basic_get_ok, method_id::basic_get_empty},
-        &matched);
+    auto reply = exchange_method(
+        class_id::basic, method_id::basic_get, span_of(out.data()),
+        {method_id::basic_get_ok, method_id::basic_get_empty}, &matched);
     if (!reply) {
         return reply.error();
     }
@@ -1048,6 +1617,10 @@ result<get_result> channel::basic_get(std::string_view queue, bool no_ack) {
 result<std::string> channel::basic_consume(std::string_view queue,
                                            std::string_view consumer_tag, bool no_ack,
                                            const field_table& arguments) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
     writer out;
     out.u16(0); // ticket
     out.short_string(queue);
@@ -1059,13 +1632,8 @@ result<std::string> channel::basic_consume(std::string_view queue,
     if (!out.ok()) {
         return rpc_error{out.error(), "Basic.Consume arguments do not fit"};
     }
-    const status sent = owner_->send_method(id_, class_id::basic, method_id::basic_consume,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent.error();
-    }
-    auto reply = owner_->await_method(id_, class_id::basic,
-                                      {method_id::basic_consume_ok}, nullptr);
+    auto reply = exchange_method(class_id::basic, method_id::basic_consume,
+                                 span_of(out.data()), {method_id::basic_consume_ok});
     if (!reply) {
         return reply.error();
     }
@@ -1074,30 +1642,54 @@ result<std::string> channel::basic_consume(std::string_view queue,
     if (!in.ok()) {
         return rpc_error{rpc_code::protocol_error, "Basic.ConsumeOk is malformed"};
     }
+    // The granted tag (the broker's generated one when the caller left it
+    // empty) is what a reconnect must reuse to re-register this consumer.
+    consume_state state;
+    state.queue = std::string(queue);
+    state.consumer_tag = tag;
+    state.no_ack = no_ack;
+    state.arguments = arguments;
+    consumes_[tag] = std::move(state);
     return tag;
 }
 
 status channel::basic_cancel(std::string_view consumer_tag, bool no_wait) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
     writer out;
     out.short_string(consumer_tag);
     out.bits(bits_of({no_wait}), 1);
     if (!out.ok()) {
         return status{out.error(), "Basic.Cancel arguments do not fit"};
     }
-    const status sent = owner_->send_method(id_, class_id::basic, method_id::basic_cancel,
-                                            span_of(out.data()));
-    if (!sent || no_wait) {
+    if (no_wait) {
+        const status sent =
+            owner_->send_method(id_, class_id::basic, method_id::basic_cancel,
+                                span_of(out.data()));
+        if (sent) {
+            // A no-wait cancel removes the consumer from the replay set too; the
+            // broker has already received the cancel.
+            consumes_.erase(std::string(consumer_tag));
+        }
         return sent;
     }
-    auto reply = owner_->await_method(id_, class_id::basic, {method_id::basic_cancel_ok},
-                                      nullptr);
+    auto reply = exchange_method(class_id::basic, method_id::basic_cancel,
+                                 span_of(out.data()), {method_id::basic_cancel_ok});
     if (!reply) {
         return status{reply.error()};
     }
+    // A cancelled consumer must not be re-registered by a reconnect.
+    consumes_.erase(std::string(consumer_tag));
     return status{};
 }
 
 status channel::basic_ack(std::uint64_t delivery_tag, bool multiple) {
+    const status live = require_live();
+    if (!live) {
+        return live;
+    }
     writer out;
     out.u64(delivery_tag);
     out.bits(bits_of({multiple}), 1);
@@ -1106,6 +1698,10 @@ status channel::basic_ack(std::uint64_t delivery_tag, bool multiple) {
 }
 
 status channel::basic_nack(std::uint64_t delivery_tag, bool multiple, bool requeue) {
+    const status live = require_live();
+    if (!live) {
+        return live;
+    }
     writer out;
     out.u64(delivery_tag);
     out.bits(bits_of({multiple, requeue}), 2);
@@ -1114,6 +1710,10 @@ status channel::basic_nack(std::uint64_t delivery_tag, bool multiple, bool reque
 }
 
 status channel::basic_reject(std::uint64_t delivery_tag, bool requeue) {
+    const status live = require_live();
+    if (!live) {
+        return live;
+    }
     writer out;
     out.u64(delivery_tag);
     out.bits(bits_of({requeue}), 1);
@@ -1123,24 +1723,31 @@ status channel::basic_reject(std::uint64_t delivery_tag, bool requeue) {
 
 status channel::basic_qos(std::uint16_t prefetch_count, std::uint32_t prefetch_size,
                           bool global) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
     writer out;
     out.u32(prefetch_size);
     out.u16(prefetch_count);
     out.bits(bits_of({global}), 1);
-    const status sent = owner_->send_method(id_, class_id::basic, method_id::basic_qos,
-                                            span_of(out.data()));
-    if (!sent) {
-        return sent;
-    }
-    auto reply = owner_->await_method(id_, class_id::basic, {method_id::basic_qos_ok},
-                                      nullptr);
+    auto reply = exchange_method(class_id::basic, method_id::basic_qos,
+                                 span_of(out.data()), {method_id::basic_qos_ok});
     if (!reply) {
         return status{reply.error()};
     }
+    qos_applied_ = true;
+    qos_.prefetch_count = prefetch_count;
+    qos_.prefetch_size = prefetch_size;
+    qos_.global = global;
     return status{};
 }
 
 result<delivery> channel::next_delivery(std::chrono::milliseconds timeout) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
     if (owner_ == nullptr) {
         return rpc_error{rpc_code::shutting_down, "the channel has no connection"};
     }
@@ -1148,10 +1755,163 @@ result<delivery> channel::next_delivery(std::chrono::milliseconds timeout) {
 }
 
 result<returned_message> channel::next_return(std::chrono::milliseconds timeout) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
     if (owner_ == nullptr) {
         return rpc_error{rpc_code::shutting_down, "the channel has no connection"};
     }
     return owner_->wait_return(timeout);
+}
+
+status channel::confirm_select() {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready;
+    }
+    writer out;
+    out.bits(0, 1); // no-wait = false
+    if (!out.ok()) {
+        return status{out.error(), "Confirm.Select arguments do not fit"};
+    }
+    auto reply = exchange_method(class_id::confirm, method_id::confirm_select,
+                                 span_of(out.data()), {method_id::confirm_select_ok});
+    if (!reply) {
+        return status{reply.error()};
+    }
+    confirm_mode_ = true;
+    next_publish_tag_ = 1;
+    return status{};
+}
+
+result<consumer_cancel> channel::next_cancel(std::chrono::milliseconds timeout) {
+    const status ready = ensure_ready();
+    if (!ready) {
+        return ready.error();
+    }
+    return owner_->wait_cancel(id_, timeout);
+}
+
+status channel::replay_topology() {
+    // A fresh broker channel starts outside confirm mode; re-enter it first so
+    // the confirm sequence restarts at one.
+    if (confirm_mode_) {
+        writer out;
+        out.bits(0, 1); // no-wait = false
+        auto reply = exchange_method(class_id::confirm, method_id::confirm_select,
+                                     span_of(out.data()),
+                                     {method_id::confirm_select_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+        next_publish_tag_ = 1;
+    }
+
+    if (qos_applied_) {
+        writer out;
+        out.u32(qos_.prefetch_size);
+        out.u16(qos_.prefetch_count);
+        out.bits(bits_of({qos_.global}), 1);
+        auto reply = exchange_method(class_id::basic, method_id::basic_qos,
+                                     span_of(out.data()), {method_id::basic_qos_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+    }
+
+    // Exchanges and queues first: bindings and consumers reference them.
+    for (const auto& entry : exchanges_) {
+        const exchange_state& ex = entry.second;
+        writer out;
+        out.u16(0); // ticket
+        out.short_string(ex.name);
+        out.short_string(ex.type);
+        // A passive declare is replayed as a real one: its meaning was "this
+        // must exist", and after a broker restart declaring is what makes it
+        // exist again.
+        out.bits(bits_of({false, ex.durable, ex.auto_delete, ex.internal, false}), 5);
+        out.table(ex.arguments);
+        if (!out.ok()) {
+            return status{out.error(), "Exchange.Declare arguments do not fit"};
+        }
+        auto reply = exchange_method(class_id::exchange, method_id::exchange_declare,
+                                     span_of(out.data()),
+                                     {method_id::exchange_declare_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+    }
+
+    for (const auto& entry : queues_) {
+        const queue_state& state = entry.second;
+        writer out;
+        out.u16(0); // ticket
+        out.short_string(state.name);
+        out.bits(bits_of({false, state.durable, state.exclusive, state.auto_delete,
+                          false}), 5);
+        out.table(state.arguments);
+        if (!out.ok()) {
+            return status{out.error(), "Queue.Declare arguments do not fit"};
+        }
+        auto reply = exchange_method(class_id::queue, method_id::queue_declare,
+                                     span_of(out.data()),
+                                     {method_id::queue_declare_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+    }
+
+    for (const bind_state& bind : binds_) {
+        writer out;
+        out.u16(0); // ticket
+        out.short_string(bind.queue);
+        out.short_string(bind.exchange);
+        out.short_string(bind.routing_key);
+        out.bits(0, 1); // no-wait = false
+        out.table(bind.arguments);
+        if (!out.ok()) {
+            return status{out.error(), "Queue.Bind arguments do not fit"};
+        }
+        auto reply = exchange_method(class_id::queue, method_id::queue_bind,
+                                     span_of(out.data()), {method_id::queue_bind_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+    }
+
+    for (const auto& entry : consumes_) {
+        const consume_state& state = entry.second;
+        writer out;
+        out.u16(0); // ticket
+        out.short_string(state.queue);
+        out.short_string(state.consumer_tag);
+        out.bits(bits_of({false, state.no_ack, false, false}), 4);
+        out.table(state.arguments);
+        if (!out.ok()) {
+            return status{out.error(), "Basic.Consume arguments do not fit"};
+        }
+        auto reply = exchange_method(class_id::basic, method_id::basic_consume,
+                                     span_of(out.data()),
+                                     {method_id::basic_consume_ok});
+        if (!reply) {
+            return status{reply.error()};
+        }
+        // A broker-generated tag stays what it was; re-consuming with the same
+        // explicit tag on the fresh channel keeps the identity stable.
+        reader in(span_of(reply.value()));
+        const std::string granted(in.short_string());
+        if (!in.ok() || granted.empty()) {
+            return status{rpc_code::protocol_error, "Basic.ConsumeOk is malformed"};
+        }
+        if (granted != state.consumer_tag) {
+            consumes_.erase(state.consumer_tag);
+            consume_state updated = state;
+            updated.consumer_tag = granted;
+            consumes_[granted] = std::move(updated);
+        }
+    }
+    return status{};
 }
 
 status channel::close() {
@@ -1159,11 +1919,16 @@ status channel::close() {
         open_ = false;
         return status{};
     }
-    if (!open_) {
+    if (!open_ || dead_) {
+        open_ = false;
         return status{};
     }
     open_ = false;
-    return owner_->close_channel(id_);
+    owner_->unregister_channel(this);
+    if (owner_->is_open()) {
+        return owner_->close_channel(id_);
+    }
+    return status{};
 }
 
 } // namespace amqp

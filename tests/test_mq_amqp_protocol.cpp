@@ -7,6 +7,7 @@
 // live RabbitMQ; this file covers the byte layout in isolation.
 #include "test_framework.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include <crpc/error.hpp>
+#include <crpc/mq/amqp/connection.hpp>
 #include <crpc/mq/amqp/protocol.hpp>
 #include <crpc/mq/amqp/types.hpp>
 #include <crpc/span.hpp>
@@ -353,6 +355,89 @@ CRPC_TEST(amqp_frame_max_smaller_than_the_frame_overhead_is_rejected) {
     CRPC_CHECK_FALSE(appended.ok());
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::encode_error),
                   static_cast<int>(appended.code()));
+}
+
+CRPC_TEST(amqp_node_visit_order_rotates_from_last_success) {
+    namespace order = crpc::mq::amqp;
+    // The node that succeeded last is probed first; the rest follow in index
+    // order. This is what keeps a healthy broker the primary and a recovering
+    // one the first fallback without reordering the configured list.
+    const std::vector<std::size_t> from_one = order::node_visit_order(3, 1);
+    CRPC_CHECK_EQ(std::size_t{3}, from_one.size());
+    CRPC_CHECK_EQ(std::size_t{1}, from_one[0]);
+    CRPC_CHECK_EQ(std::size_t{0}, from_one[1]);
+    CRPC_CHECK_EQ(std::size_t{2}, from_one[2]);
+
+    const std::vector<std::size_t> from_zero = order::node_visit_order(3, 0);
+    CRPC_CHECK_EQ(std::size_t{0}, from_zero[0]);
+    CRPC_CHECK_EQ(std::size_t{1}, from_zero[1]);
+    CRPC_CHECK_EQ(std::size_t{2}, from_zero[2]);
+
+    // Two nodes: the dead primary first, the healthy standby second. This is
+    // the exact shape a failover reconnect visits.
+    const std::vector<std::size_t> pair = order::node_visit_order(2, 0);
+    CRPC_CHECK_EQ(std::size_t{2}, pair.size());
+    CRPC_CHECK_EQ(std::size_t{0}, pair[0]);
+    CRPC_CHECK_EQ(std::size_t{1}, pair[1]);
+
+    // A single node visits only itself, and the rotation never repeats an
+    // index.
+    const std::vector<std::size_t> lone = order::node_visit_order(1, 0);
+    CRPC_CHECK_EQ(std::size_t{1}, lone.size());
+    CRPC_CHECK_EQ(std::size_t{0}, lone[0]);
+
+    const std::vector<std::size_t> empty = order::node_visit_order(0, 0);
+    CRPC_CHECK(empty.empty());
+}
+
+CRPC_TEST(amqp_node_backoff_grows_exponentially_up_to_the_cap) {
+    namespace order = crpc::mq::amqp;
+    using crpc::mq::amqp::node_backoff_delay;
+    using std::chrono::milliseconds;
+    using std::chrono::duration_cast;
+
+    const milliseconds base(100);
+    const milliseconds cap(2000);
+    // Zero jitter isolates the exponential part. The framework compares with
+    // operator<<, which chrono durations do not provide, so compare counts.
+    const auto d0 = node_backoff_delay(0, base, cap, 0).count();
+    const auto d1 = node_backoff_delay(1, base, cap, 0).count();
+    const auto d2 = node_backoff_delay(2, base, cap, 0).count();
+    const auto d3 = node_backoff_delay(3, base, cap, 0).count();
+    const auto d4 = node_backoff_delay(4, base, cap, 0).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(100), d0);
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(200), d1);
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(400), d2);
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(800), d3);
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(1600), d4);
+    // Attempt 5 would be 3200ms; the cap pins the delay at 2000ms.
+    const auto d5 = node_backoff_delay(5, base, cap, 0).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(2000), d5);
+    const auto d100 = node_backoff_delay(100, base, cap, 0).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(2000), d100);
+}
+
+CRPC_TEST(amqp_node_backoff_jitter_stays_within_the_base) {
+    namespace order = crpc::mq::amqp;
+    using crpc::mq::amqp::node_backoff_delay;
+    using std::chrono::milliseconds;
+
+    const milliseconds base(100);
+    const milliseconds cap(1000);
+    // Jitter is deterministic from the basis, so the schedule is testable and
+    // a fleet does not stampede: every agent draws a slightly different delay.
+    const auto j42 = node_backoff_delay(2, base, cap, 42).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(442), j42);
+    const auto j99 = node_backoff_delay(2, base, cap, 99).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(499), j99);
+    // A jitter basis of exactly base wraps to zero.
+    const auto j100 = node_backoff_delay(2, base, cap, 100).count();
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(400), j100);
+    // The jittered delay never exceeds the capped backoff plus base - 1.
+    for (std::uint64_t basis = 0; basis < 400; basis += 17) {
+        const auto delay = node_backoff_delay(10, base, cap, basis).count();
+        CRPC_CHECK(delay <= static_cast<std::int64_t>(2000 + 99));
+    }
 }
 
 CRPC_TEST_MAIN()

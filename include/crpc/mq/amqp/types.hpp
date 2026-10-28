@@ -207,6 +207,27 @@ struct queue_declare_result {
     std::uint32_t consumer_count = 0;
 };
 
+// One publisher-confirm outcome for one Basic.Publish on a channel in confirm
+// mode. `acknowledged=true` is a Basic.Ack from the broker (the message was
+// handled); `false` is a Basic.Nack (the broker could not handle it, e.g. an
+// unroutable mandatory publication). `delivery_tag` is the confirm sequence
+// number the broker acknowledged, which is the tag this client assigned the
+// publication.
+struct publish_confirm {
+    bool acknowledged = false;
+    std::uint64_t delivery_tag = 0;
+};
+
+// One consumer-cancel notification (consumer_cancel_notify). The broker sends
+// Basic.Cancel to a channel when it cancels a consumer itself, e.g. because the
+// queue was deleted. `present=false` means the wait timed out. The consumer
+// named by `consumer_tag` is no longer receiving deliveries; the caller is
+// expected to re-declare the topology and re-consume.
+struct consumer_cancel {
+    bool present = false;
+    std::string consumer_tag;
+};
+
 } // namespace amqp
 } // namespace mq
 } // namespace crpc
