@@ -19,15 +19,20 @@
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/net/channel.hpp>
 #include <crpc/net/connection.hpp>
 #include <crpc/span.hpp>
 
 namespace crpc {
 namespace db {
 
-class CRPC_API channel {
+// The database channel is the byte-channel contract from the unified socket
+// framework (`crpc::net::channel`); this type keeps the `crpc::db` name the
+// adapters already use and pins the semantics that a database connection needs
+// (no silent reconnect, terminal on any error).
+class CRPC_API channel : public net::channel {
 public:
-    virtual ~channel();
+    ~channel() override;
 
     channel(const channel&) = delete;
     channel& operator=(const channel&) = delete;

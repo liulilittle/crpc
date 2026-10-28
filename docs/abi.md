@@ -348,6 +348,10 @@ is guarded.
 - `::crpc::mvc::file_part`
 - `::crpc::mvc::route_entry`
 - `::crpc::mvc::route_params`
+- `::crpc::net::backoff_config`
+- `::crpc::net::connect_options`
+- `::crpc::net::resolve_options`
+- `::crpc::net::retry_report`
 - `::crpc::obs::log_record`
 - `::crpc::obs::trace_context`
 - `::crpc::obs::traceparent_result`
