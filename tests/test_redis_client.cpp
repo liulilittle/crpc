@@ -28,6 +28,7 @@
 #include <crpc/redis/connection.hpp>
 #include <crpc/redis/pipeline.hpp>
 #include <crpc/redis/resp.hpp>
+#include <crpc/redis/sentinel.hpp>
 #include <crpc/runtime.hpp>
 
 #include "test_framework.hpp"
@@ -926,6 +927,406 @@ CRPC_TEST(client_resp3_negotiates_once_per_connection_link) {
     // The pool reuses the same live link, so HELLO must be sent exactly once.
     CRPC_CHECK_EQ(1, *hellos);
     CRPC_CHECK_EQ(std::size_t{1}, c.total());
+}
+
+// --- Sentinel-driven master redirection --------------------------------------
+
+namespace {
+
+// Two in-process Redis endpoints behind one backend. A client starts on `ep_a`
+// and can be repointed at `ep_b`; each side records the commands it received,
+// which is how a test proves where a request was actually served.
+struct two_server_harness {
+    crpc::inproc_backend backend;
+    crpc::endpoint ep_a{crpc::endpoint::inproc("crpc-redis-switch-a")};
+    crpc::endpoint ep_b{crpc::endpoint::inproc("crpc-redis-switch-b")};
+    std::unique_ptr<crpc::listener> listener_a;
+    std::unique_ptr<crpc::listener> listener_b;
+    std::unique_ptr<server_holder> server_a;
+    std::unique_ptr<server_holder> server_b;
+
+    two_server_harness(server_handler handler_a, server_handler handler_b) {
+        server_a = std::make_unique<server_holder>(std::move(handler_a));
+        listener_a = backend.listen(ep_a, crpc::listen_options{});
+        if (listener_a != nullptr) {
+            listener_a->start(server_a.get());
+        }
+        server_b = std::make_unique<server_holder>(std::move(handler_b));
+        listener_b = backend.listen(ep_b, crpc::listen_options{});
+        if (listener_b != nullptr) {
+            listener_b->start(server_b.get());
+        }
+    }
+
+    crpc::redis::client::options options(const crpc::endpoint& ep) const {
+        crpc::redis::client::options opts;
+        opts.pool.connection.ep = ep;
+        opts.pool.connection.operation_timeout = std::chrono::seconds(2);
+        return opts;
+    }
+};
+
+// Builds one flat sentinel field map exactly as `SENTINEL master` answers it.
+crpc::redis::sentinel_reply sentinel_field_map(
+    const crpc::redis::sentinel_address& master, std::uint64_t epoch) {
+    using crpc::redis::sentinel_reply;
+    using crpc::redis::sentinel_reply_type;
+    sentinel_reply map;
+    map.type = sentinel_reply_type::array;
+    const auto add = [&map](std::string key, std::string value) {
+        sentinel_reply k;
+        k.type = sentinel_reply_type::bulk;
+        k.text = std::move(key);
+        sentinel_reply v;
+        v.type = sentinel_reply_type::bulk;
+        v.text = std::move(value);
+        map.elements.push_back(std::move(k));
+        map.elements.push_back(std::move(v));
+    };
+    add("name", "mymaster");
+    add("ip", master.host);
+    add("port", std::to_string(master.port));
+    add("flags", "master");
+    add("config-epoch", std::to_string(epoch));
+    add("num-other-sentinels", "0");
+    add("quorum", "1");
+    return map;
+}
+
+// Minimal sentinel peer: reports the master held in `master`/`epoch`. Bumping
+// those two fields is how a test makes the sentinel observe a failover.
+class redirect_fake_executor final
+    : public crpc::redis::sentinel_command_executor {
+public:
+    crpc::redis::sentinel_address master;
+    std::uint64_t epoch = 0;
+
+    crpc::redis::sentinel_reply execute(
+        const crpc::redis::sentinel_address&,
+        const std::vector<std::string>& command) override {
+        using crpc::redis::sentinel_reply;
+        using crpc::redis::sentinel_reply_type;
+        if (!command.empty() && command[0] == "PING") {
+            sentinel_reply reply;
+            reply.type = sentinel_reply_type::status;
+            reply.text = "PONG";
+            return reply;
+        }
+        if (command.size() >= 2 && command[0] == "SENTINEL") {
+            if (command[1] == "master") {
+                return sentinel_field_map(master, epoch);
+            }
+            if (command[1] == "get-master-addr-by-name") {
+                sentinel_reply reply;
+                reply.type = sentinel_reply_type::array;
+                sentinel_reply host;
+                host.type = sentinel_reply_type::bulk;
+                host.text = master.host;
+                sentinel_reply port;
+                port.type = sentinel_reply_type::bulk;
+                port.text = std::to_string(master.port);
+                reply.elements.push_back(std::move(host));
+                reply.elements.push_back(std::move(port));
+                return reply;
+            }
+            if (command[1] == "replicas" || command[1] == "slaves" ||
+                command[1] == "sentinels") {
+                sentinel_reply reply;
+                reply.type = sentinel_reply_type::array;
+                return reply;
+            }
+        }
+        sentinel_reply error;
+        error.type = sentinel_reply_type::error;
+        error.text = "unknown command";
+        return error;
+    }
+};
+
+// A handler that records every command and answers PONG to everything, which is
+// enough to prove which endpoint served a request.
+server_handler pong_recorder(
+    std::shared_ptr<std::vector<crpc::redis::command>> seen) {
+    return [seen](const crpc::redis::command& cmd) -> scripted_reply {
+        seen->push_back(cmd);
+        return {{"+PONG\r\n"}, {}};
+    };
+}
+
+} // namespace
+
+CRPC_TEST(client_redirect_repoints_pool_to_new_master) {
+    auto seen_a = std::make_shared<std::vector<crpc::redis::command>>();
+    auto seen_b = std::make_shared<std::vector<crpc::redis::command>>();
+    two_server_harness h(pong_recorder(seen_a), pong_recorder(seen_b));
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+
+    CRPC_CHECK(c.connect().ok());
+    CRPC_CHECK_EQ(std::string("crpc-redis-switch-a"), c.master().host);
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
+    CRPC_CHECK_FALSE(c.stats().switching);
+
+    // connect() probes the master with its own PING on the new link.
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK_EQ(std::size_t{2}, seen_a->size());
+    CRPC_CHECK_EQ(std::size_t{0}, seen_b->size());
+
+    CRPC_CHECK(c.redirect(h.ep_b).ok());
+    CRPC_CHECK_EQ(std::uint64_t{1}, c.stats().switch_count);
+    CRPC_CHECK_EQ(std::string("crpc-redis-switch-b"), c.master().host);
+    CRPC_CHECK(c.switching());
+    CRPC_CHECK(c.stats().last_switch != std::chrono::steady_clock::time_point{});
+
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    // The command was served by the new master; the old one saw nothing new.
+    CRPC_CHECK_EQ(std::size_t{2}, seen_a->size());
+    CRPC_CHECK_EQ(std::size_t{1}, seen_b->size());
+    // The first answered round trip confirms the new master and closes the
+    // switch window without counting a rejection.
+    CRPC_CHECK_FALSE(c.switching());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().rejected_during_switch);
+    CRPC_CHECK_EQ(std::string("crpc-redis-switch-b"), c.stats().master.host);
+}
+
+CRPC_TEST(client_redirect_same_master_is_idempotent) {
+    two_server_harness h(basic_handler(), basic_handler());
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+    CRPC_CHECK(c.connect().ok());
+    const std::size_t total_before = c.total();
+    const std::uint64_t opened_before = 0; // pool hides `opened`; total proves reuse
+
+    CRPC_CHECK(c.redirect(h.ep_a).ok());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
+    CRPC_CHECK_FALSE(c.switching());
+    CRPC_CHECK_EQ(total_before, c.total());
+    CRPC_CHECK_EQ(opened_before, 0);
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
+}
+
+CRPC_TEST(client_redirect_retires_old_master_connections) {
+    auto seen_a = std::make_shared<std::vector<crpc::redis::command>>();
+    auto seen_b = std::make_shared<std::vector<crpc::redis::command>>();
+    two_server_harness h(pong_recorder(seen_a), pong_recorder(seen_b));
+
+    crpc::redis::client::options opts = h.options(h.ep_a);
+    opts.pool.max_size = 2;
+    crpc::redis::client c(opts, h.backend);
+
+    CRPC_CHECK(c.connect().ok()); // one idle connection to the old master
+    crpc::result<std::shared_ptr<crpc::redis::connection>> acquired = c.acquire();
+    CRPC_CHECK(acquired.ok());                       // a second, checked-out link
+    std::shared_ptr<crpc::redis::connection> held = std::move(acquired).value();
+    const std::size_t accepts_a_before = h.server_a->accepts();
+    const bool held_open_before = held->is_open();
+    CRPC_CHECK(held_open_before);
+
+    CRPC_CHECK(c.redirect(h.ep_b).ok());
+
+    // Work already accepted on the held connection may finish; the switch does
+    // not yank an in-flight link out from under its caller.
+    CRPC_CHECK_EQ(held_open_before, held->is_open());
+
+    // Returning it must drop and close it: the retired pool never re-lends.
+    c.release(held);
+    CRPC_CHECK_FALSE(held->is_open());
+    CRPC_CHECK_EQ(std::size_t{0}, c.total());
+
+    // The next acquire builds a connection to the new master, not the old one.
+    CRPC_CHECK(c.acquire().ok());
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK_EQ(std::size_t{1}, seen_b->size());
+    // Only connect()'s own probe reached the old master before the switch.
+    CRPC_CHECK_EQ(std::size_t{1}, seen_a->size());
+    CRPC_CHECK_EQ(accepts_a_before, h.server_a->accepts());
+    CRPC_CHECK(h.server_b->accepts() >= 1);
+}
+
+CRPC_TEST(client_switch_window_rejects_with_unavailable) {
+    crpc::inproc_backend backend;
+    const crpc::endpoint ep_a{crpc::endpoint::inproc("crpc-redis-switch-only-a")};
+    const crpc::endpoint ep_b{crpc::endpoint::inproc("crpc-redis-switch-only-b")};
+    server_holder server(basic_handler());
+    std::unique_ptr<crpc::listener> listener = backend.listen(ep_a, crpc::listen_options{});
+    CRPC_CHECK(listener != nullptr);
+    if (listener != nullptr) {
+        listener->start(&server);
+    }
+
+    crpc::redis::client::options opts;
+    opts.pool.connection.ep = ep_a;
+    opts.pool.connection.operation_timeout = std::chrono::seconds(2);
+    crpc::redis::client c(opts, backend);
+    CRPC_CHECK(c.connect().ok());
+
+    // ep_b has no listener: the new master is not ready yet.
+    CRPC_CHECK(c.redirect(ep_b).ok());
+    CRPC_CHECK(c.switching());
+
+    crpc::result<crpc::redis::resp_value> first = c.execute({"PING"});
+    CRPC_CHECK_FALSE(first.ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  static_cast<int>(first.code()));
+    CRPC_CHECK_EQ(std::uint64_t{1}, c.stats().rejected_during_switch);
+    CRPC_CHECK(c.switching());
+
+    crpc::result<crpc::redis::resp_value> second = c.execute({"PING"});
+    CRPC_CHECK_FALSE(second.ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                  static_cast<int>(second.code()));
+    CRPC_CHECK_EQ(std::uint64_t{2}, c.stats().rejected_during_switch);
+}
+
+CRPC_TEST(client_switch_window_closes_on_first_answer) {
+    two_server_harness h(basic_handler(), basic_handler());
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+    CRPC_CHECK(c.connect().ok());
+    CRPC_CHECK(c.redirect(h.ep_b).ok());
+    CRPC_CHECK(c.switching());
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK_FALSE(c.switching());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().rejected_during_switch);
+}
+
+CRPC_TEST(client_redirect_renegotiates_resp3_on_the_new_master) {
+    auto state_a = std::make_shared<connection_state>();
+    auto state_b = std::make_shared<connection_state>();
+    auto seen_b = std::make_shared<std::vector<crpc::redis::command>>();
+    two_server_harness h(
+        hello_aware_handler(state_a),
+        [state_b, seen_b](const crpc::redis::command& cmd) -> scripted_reply {
+            seen_b->push_back(cmd);
+            if (is_hello3(cmd)) {
+                state_b->hello_seen = true;
+                return {{hello3_map_reply}, {}};
+            }
+            if (!cmd.empty() && cmd[0] == "HGETALL") {
+                return state_b->hello_seen
+                           ? scripted_reply{{resp3_hgetall_map}, {}}
+                           : scripted_reply{{resp2_hgetall_array}, {}};
+            }
+            return {{"+OK\r\n"}, {}};
+        });
+    crpc::redis::client::options opts = h.options(h.ep_a);
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    crpc::result<crpc::redis::resp_value> before = c.execute({"HGETALL", "h"});
+    CRPC_CHECK(before.ok());
+    CRPC_CHECK(before.value().is_map());
+    CRPC_CHECK(state_a->hello_seen);
+
+    CRPC_CHECK(c.redirect(h.ep_b).ok());
+
+    crpc::result<crpc::redis::resp_value> after = c.execute({"HGETALL", "h"});
+    CRPC_CHECK(after.ok());
+    CRPC_CHECK(after.value().is_map());
+    CRPC_CHECK(state_b->hello_seen);
+    // The new link began with the HELLO 3 handshake, so RESP3 is negotiated per
+    // connection on the new master rather than inherited from the old link.
+    CRPC_CHECK(seen_b->size() >= 2);
+    if (seen_b->size() >= 2) {
+        CRPC_CHECK(is_hello3((*seen_b)[0]));
+        CRPC_CHECK((*seen_b)[1].size() == 2 && (*seen_b)[1][0] == "HGETALL");
+    }
+}
+
+CRPC_TEST(client_follow_wires_sentinel_master_switch_to_redirect) {
+    redirect_fake_executor executor;
+    executor.master = crpc::redis::sentinel_address{"127.0.0.1", 6380};
+    executor.epoch = 1;
+
+    crpc::redis::sentinel_options options;
+    options.master = executor.master;
+    options.sentinels = {crpc::redis::sentinel_address{"127.0.0.1", 26380}};
+    options.down_after = std::chrono::hours(1);
+    options.quorum = 1;
+    options.auto_failover = false;
+    options.run_id = "client-follow-self";
+    crpc::redis::sentinel monitor(options, executor);
+
+    two_server_harness h(basic_handler(), basic_handler());
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+    CRPC_CHECK(c.follow(monitor, "mymaster"));
+
+    monitor.poll_once_at(std::chrono::steady_clock::now());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
+    CRPC_CHECK_EQ(std::string("crpc-redis-switch-a"), c.master().host);
+
+    // The sentinel peer moves to a new master with a higher config epoch: the
+    // monitor adopts it, emits master_switch, and follow() repoints the pool.
+    executor.master = crpc::redis::sentinel_address{"127.0.0.1", 6381};
+    executor.epoch = 2;
+    monitor.poll_once_at(std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds{10});
+
+    CRPC_CHECK_EQ(std::uint64_t{1}, c.stats().switch_count);
+    CRPC_CHECK_EQ(std::string("127.0.0.1"), c.master().host);
+    CRPC_CHECK_EQ(static_cast<std::uint16_t>(6381), c.master().port);
+    CRPC_CHECK(c.switching());
+}
+
+CRPC_TEST(client_concurrent_request_during_switch_lands_on_new_master) {
+    auto seen_a = std::make_shared<std::vector<crpc::redis::command>>();
+    auto seen_b = std::make_shared<std::vector<crpc::redis::command>>();
+    two_server_harness h(pong_recorder(seen_a), pong_recorder(seen_b));
+    crpc::redis::client::options opts = h.options(h.ep_a);
+    opts.pool.max_size = 1;
+    crpc::redis::client c(opts, h.backend);
+
+    crpc::result<std::shared_ptr<crpc::redis::connection>> held = c.acquire();
+    CRPC_CHECK(held.ok());
+
+    std::atomic<bool> started{false};
+    std::atomic<int> outcome{-1};
+    std::thread worker([&c, &started, &outcome] {
+        started.store(true, std::memory_order_release);
+        outcome.store(c.execute({"PING"}).ok() ? 0 : 1,
+                      std::memory_order_release);
+    });
+    CRPC_CHECK(crpc_test::wait_for(
+        [&started] { return started.load(std::memory_order_acquire); }, 2000));
+
+    // The worker is parked on the (max_size = 1) old pool; the switch wakes it
+    // and it must land on the new master rather than fail or use the old link.
+    CRPC_CHECK(c.redirect(h.ep_b).ok());
+    c.release(std::move(held).value());
+    worker.join();
+
+    CRPC_CHECK_EQ(0, outcome.load(std::memory_order_acquire));
+    CRPC_CHECK_EQ(std::size_t{0}, seen_a->size());
+    CRPC_CHECK_EQ(std::size_t{1}, seen_b->size());
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().rejected_during_switch);
+}
+
+CRPC_TEST(client_redirect_rejects_invalid_addresses) {
+    two_server_harness h(basic_handler(), basic_handler());
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+    CRPC_CHECK(c.connect().ok());
+
+    crpc::status empty_address =
+        c.redirect(crpc::redis::sentinel_address{});
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                  static_cast<int>(empty_address.code()));
+
+    crpc::status empty_endpoint = c.redirect(crpc::endpoint{});
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                  static_cast<int>(empty_endpoint.code()));
+
+    // A rejected redirect leaves the pool pointed where it was.
+    CRPC_CHECK_EQ(std::string("crpc-redis-switch-a"), c.master().host);
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
+}
+
+CRPC_TEST(client_redirect_after_close_is_rejected) {
+    two_server_harness h(basic_handler(), basic_handler());
+    crpc::redis::client c(h.options(h.ep_a), h.backend);
+    CRPC_CHECK(c.connect().ok());
+    c.close();
+    crpc::status st = c.redirect(h.ep_b);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::shutting_down),
+                  static_cast<int>(st.code()));
+    CRPC_CHECK_EQ(std::uint64_t{0}, c.stats().switch_count);
 }
 
 CRPC_TEST_MAIN()
