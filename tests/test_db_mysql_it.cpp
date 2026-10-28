@@ -316,8 +316,13 @@ CRPC_TEST(mysql_it_isolation_level_and_command_timeout_surface) {
         return;
     }
 
-    // SERIALIZABLE is the strongest level; the server echoes it back from its own
-    // session state.
+    // SERIALIZABLE is the strongest level. `begin(level)` emits
+    // `SET TRANSACTION ISOLATION LEVEL ...; START TRANSACTION`, and that scoped
+    // form applies to the *next* transaction only -- it deliberately does not
+    // change the session variable. Reading @@transaction_isolation therefore
+    // proves nothing about the running transaction (it still answers
+    // REPEATABLE-READ). The level that actually applies is what InnoDB recorded
+    // for this transaction, so ask it directly.
     const crpc::status began =
         conn->begin(crpc::db::isolation_level::serializable);
     CRPC_CHECK(began.ok());
@@ -326,13 +331,23 @@ CRPC_TEST(mysql_it_isolation_level_and_command_timeout_surface) {
         return;
     }
     CRPC_CHECK(conn->in_transaction());
+    // Touch a table first: InnoDB only lists a transaction in innodb_trx once it
+    // has started doing work.
+    crpc::db::result_set* touched = nullptr;
+    const crpc::status warm = conn->query("SELECT COUNT(*) FROM iso_probe", {}, &touched);
+    crpc::db::statement_guard touched_guard(touched);
+    CRPC_CHECK(warm.ok());
     crpc::db::result_set* state = nullptr;
-    const crpc::status inspected =
-        conn->query("SELECT @@transaction_isolation", {}, &state);
+    const crpc::status inspected = conn->query(
+        "SELECT trx_isolation_level FROM information_schema.innodb_trx "
+        "WHERE trx_mysql_thread_id = CONNECTION_ID()",
+        {}, &state);
     crpc::db::statement_guard state_guard(state);
     CRPC_CHECK(inspected.ok());
     if (state != nullptr && state->next()) {
         CRPC_CHECK_EQ(std::string("SERIALIZABLE"), std::string(state->get_text(0).value()));
+    } else {
+        CRPC_CHECK(false);
     }
     const crpc::status rolled = conn->rollback();
     CRPC_CHECK(rolled.ok());

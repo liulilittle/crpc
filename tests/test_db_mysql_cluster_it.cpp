@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -83,6 +84,15 @@ public:
 
     [[nodiscard]] crpc::db::mysql::connection& get() const { return *conn_; }
     [[nodiscard]] bool ok() const { return conn_ != nullptr && conn_->is_open(); }
+    // The handshake runs in the constructor, so a failed connection carries the
+    // reason. An integration failure is only actionable with it.
+    [[nodiscard]] std::string error() const {
+        if (conn_ == nullptr) {
+            return "no connection";
+        }
+        const crpc::rpc_error& err = conn_->connect_error();
+        return err.message.empty() ? std::string("connection is closed") : err.message;
+    }
 
 private:
     crpc::iocp_backend backend_;
@@ -100,11 +110,13 @@ struct it_cluster {
     crpc::iocp_backend backend;
     std::unique_ptr<crpc::db::cluster> db;
 
+    // `tune` runs last so a case can override any option the defaults set below.
     it_cluster(crpc::db::read_route reads = crpc::db::read_route::primary,
                crpc::db::replica_depleted_policy depleted =
                    crpc::db::replica_depleted_policy::fallback_to_primary,
                std::vector<std::uint16_t> replica_ports = {},
-               bool discovery = false) {
+               bool discovery = false,
+               const std::function<void(crpc::db::cluster_options&)>& tune = {}) {
         crpc::db::mysql::cluster_config config;
         config.connection.user = env_or("CRPC_MYSQL_USER", "crpc");
         config.connection.password = env_or("CRPC_MYSQL_PASSWORD", "crpc_pw");
@@ -121,6 +133,9 @@ struct it_cluster {
         config.options.pool.max_size = 4;
         config.options.pool.validate_on_borrow = false;
         config.options.replica_retry_cooldown = std::chrono::milliseconds{200};
+        if (tune) {
+            tune(config.options);
+        }
         crpc::result<std::unique_ptr<crpc::db::cluster>> built =
             crpc::db::mysql::make_cluster(config, backend);
         if (built) {
@@ -135,7 +150,14 @@ struct it_cluster {
 
 CRPC_TEST(mysql_cluster_it_write_never_reaches_the_read_only_replica) {
     (void)require_server();
-    it_cluster cluster(crpc::db::read_route::replica);
+    // The replica must actually be in the cluster, otherwise "a write never
+    // reaches the replica" is vacuous: with no replica configured the routing
+    // layer has nowhere to send anything, and the case would pass while proving
+    // nothing. `depleted = error` keeps the read path honest too: a replica that
+    // is not there must be an error, not a silent fallback.
+    it_cluster cluster(crpc::db::read_route::replica,
+                       crpc::db::replica_depleted_policy::error,
+                       {replica_port()});
     CRPC_CHECK(cluster.usable());
     if (!cluster.usable()) {
         return;
@@ -144,6 +166,10 @@ CRPC_TEST(mysql_cluster_it_write_never_reaches_the_read_only_replica) {
     // Control: a direct write to the read-only replica fails server-side (1290).
     raw_session replica(replica_port());
     CRPC_CHECK(replica.ok());
+    if (!replica.ok()) {
+        std::printf("  replica %u: %s\n", static_cast<unsigned>(replica_port()),
+                    replica.error().c_str());
+    }
     if (replica.ok()) {
         const crpc::status direct_write = replica.get().execute("CREATE TABLE clu_ro (id INT)");
         CRPC_CHECK_FALSE(direct_write.ok());
@@ -158,11 +184,22 @@ CRPC_TEST(mysql_cluster_it_write_never_reaches_the_read_only_replica) {
     CRPC_CHECK(cluster.db->execute("CREATE TABLE clu_ro (id BIGINT PRIMARY KEY)").ok());
     CRPC_CHECK(cluster.db->execute("INSERT INTO clu_ro VALUES (1), (2)").ok());
 
-    // Replication is real: the replica now serves the rows written on the
-    // primary even though it rejected direct writes.
+    // Replication is real: the replica serves the rows written on the primary
+    // even though it rejected direct writes. Replication is asynchronous, so a
+    // plain read could land on the replica before the DDL/DML above arrive and
+    // fail with "table doesn't exist" -- that is a race in the test, not a
+    // routing bug. `read_your_writes` makes the cluster wait for the replica to
+    // reach the primary's GTID set first, which is exactly the guarantee this
+    // case is about.
     const crpc::result<crpc::db::result_set*> counted =
-        cluster.db->query("SELECT COUNT(*) FROM clu_ro");
+        cluster.db->query("SELECT COUNT(*) FROM clu_ro", {},
+                          crpc::db::route_hint::read_your_writes());
     CRPC_CHECK(counted.ok());
+    if (!counted.ok()) {
+        std::printf("  consistent replica read: code=%d %s\n",
+                    static_cast<int>(counted.error().code),
+                    counted.error().message.c_str());
+    }
     if (counted.ok() && counted.value() != nullptr && counted.value()->next()) {
         CRPC_CHECK_EQ(std::int64_t{2}, counted.value()->get_int64(0).value());
     }
@@ -236,9 +273,15 @@ CRPC_TEST(mysql_cluster_it_round_robin_reads_both_nodes) {
 
 CRPC_TEST(mysql_cluster_it_prefer_replica_falls_back_when_the_replica_is_silent) {
     (void)require_server();
+    // The default threshold is 3 consecutive failures, so one silent endpoint
+    // would still be `alive` afterwards. This case is about the fallback and the
+    // ejection of a dead endpoint, so ask for ejection on the first failure.
     it_cluster cluster(crpc::db::read_route::prefer_replica,
                        crpc::db::replica_depleted_policy::error,
-                       {dead_port()});
+                       {dead_port()}, false,
+                       [](crpc::db::cluster_options& options) {
+                           options.replica_failure_threshold = 1;
+                       });
     CRPC_CHECK(cluster.usable());
     if (!cluster.usable()) {
         return;
@@ -282,6 +325,14 @@ CRPC_TEST(mysql_cluster_it_consistent_read_waits_for_the_write) {
     CRPC_CHECK(cluster.db->execute("CREATE TABLE clu_gtid (id BIGINT PRIMARY KEY)").ok());
     CRPC_CHECK(cluster.db->execute("INSERT INTO clu_gtid VALUES (10)").ok());
     CRPC_CHECK(cluster.db->execute("INSERT INTO clu_gtid VALUES (20)").ok());
+
+    // The two inserts above are still travelling to the replica. Stop the
+    // replication threads only after the replica has them: otherwise this case
+    // measures "the replica never got the rows" instead of "the replica is
+    // stale by exactly one write", and the expected count below would be
+    // whatever the race produced.
+    drop(cluster.db->query("SELECT COUNT(*) FROM clu_gtid", {},
+                           crpc::db::route_hint::read_your_writes()));
 
     const crpc::status stopped = replica.get().execute("STOP REPLICA");
     CRPC_CHECK(stopped.ok());
