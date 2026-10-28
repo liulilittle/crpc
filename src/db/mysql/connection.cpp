@@ -1,4 +1,4 @@
-// CRPC -- MySQL connection implementation.
+﻿// CRPC -- MySQL connection implementation.
 #include <crpc/db/mysql/connection.hpp>
 
 #include <algorithm>
@@ -23,6 +23,22 @@ namespace {
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
+}
+
+// Builds the library failure for a server ERR packet. `map_error_code` picks
+// the abstract code; the raw provider code and the SQLSTATE are preserved as
+// metadata so a caller can tell two failures that map to the same abstract
+// code apart. The canonical pair is TiDB 9007 (optimistic write conflict at
+// COMMIT) and MySQL 1205 (lock wait timeout): both become
+// `rpc_code::unavailable`, but the metadata keeps them distinguishable and the
+// TiDB retry helper (`crpc::db::tidb::is_transaction_conflict`) keys off it.
+[[nodiscard]] rpc_error server_failure(const err_packet& err) {
+    rpc_error failure{map_error_code(err.code), err.message};
+    failure.metadata.set("sql_code", std::to_string(err.code));
+    if (!err.sql_state.empty()) {
+        failure.metadata.set("sql_state", err.sql_state);
+    }
+    return failure;
 }
 
 } // namespace
@@ -116,7 +132,7 @@ status connection::perform_handshake() {
         if (decode_err(span<const std::byte>(greeting_payload.data(), greeting_payload.size()),
                        err)
                 .ok()) {
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
         return status{rpc_code::protocol_error, "mysql server refused the connection"};
     }
@@ -156,7 +172,7 @@ status connection::perform_handshake() {
         if (classify(view, false) == packet_kind::err) {
             err_packet err;
             (void)decode_err(view, err);
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
     }
     return status{};
@@ -234,7 +250,7 @@ status connection::authenticate(const handshake& greeting) {
             if (!decoded_err) {
                 return decoded_err;
             }
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
         default:
             break;
@@ -339,7 +355,7 @@ status connection::ping() {
     if (classify(payload_view, false) == packet_kind::err) {
         err_packet err;
         (void)decode_err(payload_view, err);
-        return status{map_error_code(err.code), err.message};
+        return status{server_failure(err)};
     }
     return status{};
 }
@@ -452,7 +468,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
         if (!decoded) {
             return decoded;
         }
-        return status{map_error_code(err.code), err.message};
+        return status{server_failure(err)};
     }
     if (classify(payload, false) == packet_kind::local_infile) {
         // LOAD DATA LOCAL INFILE asks the *client* for a file. A database client
@@ -566,7 +582,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
             }
             // A mid-result-set error is the server's answer; the partial rows are
             // discarded rather than returned as if complete.
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
 
         text_row row;
@@ -686,7 +702,7 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
             if (!decoded) {
                 return decoded;
             }
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
 
         binary_row row;
@@ -722,7 +738,7 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
             if (!decoded) {
                 return decoded;
             }
-            return status{map_error_code(err.code), err.message};
+            return status{server_failure(err)};
         }
         if (!trailing_view.empty() &&
             static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
@@ -770,7 +786,7 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
         if (!decoded) {
             return decoded;
         }
-        return status{map_error_code(err.code), err.message};
+        return status{server_failure(err)};
     }
     if (classify(payload, false) == packet_kind::ok) {
         ok_packet ok;
@@ -798,7 +814,7 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
                 if (!err_decoded) {
                     return err_decoded;
                 }
-                return status{map_error_code(err.code), err.message};
+                return status{server_failure(err)};
             }
             if (!trailing_view.empty() &&
                 static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
@@ -1165,7 +1181,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         if (!decoded) {
             return decoded;
         }
-        return status{map_error_code(err.code), err.message};
+        return status{server_failure(err)};
     }
     if (!payload.empty() && static_cast<std::uint8_t>(payload[0]) == 0x00) {
         // The server answered without asking for data (LOCAL disabled on its side,
@@ -1232,7 +1248,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         if (!decoded) {
             return decoded;
         }
-        return status{map_error_code(err.code), err.message};
+        return status{server_failure(err)};
     }
     ok_packet ok;
     const status decoded = decode_ok(final_view, capabilities_, ok);
@@ -1329,7 +1345,7 @@ result<prepared_statement> connection::prepare(std::string_view sql) {
         if (!decoded) {
             return decoded.error();
         }
-        return rpc_error{map_error_code(err.code), err.message};
+        return server_failure(err);
     }
 
     prepare_ok ok;

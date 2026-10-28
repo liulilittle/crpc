@@ -139,7 +139,8 @@ public:
 
     // A statement with no result cursor (DDL, or a DML the caller does not need
     // to read). Implemented in terms of `query` so a backend only writes one.
-    [[nodiscard]] status execute(std::string_view sql, span<const parameter> params);
+    // The parameter span defaults to empty, matching `client::execute`.
+    [[nodiscard]] status execute(std::string_view sql, span<const parameter> params = {});
 
     // Runs a stored procedure, writing OUT/INOUT values back into `params`.
     //
