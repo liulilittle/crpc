@@ -221,6 +221,14 @@ public:
     // `reply_ready` after the terminating line was seen.
     [[nodiscard]] result next(text_reply& out) noexcept;
 
+    // A bare `END` is ambiguous on its own: it is the normal answer to a
+    // retrieval that found nothing, but also a stray line in any other reply.
+    // The parser defaults to the fail-closed reading (protocol_error). A caller
+    // that knows it sent a retrieval command (`get`/`gets`/`gat`/`gats`) enables
+    // this so an all-miss reply decodes as an empty value list. The transport
+    // does that automatically from the request bytes.
+    void set_allow_bare_end(bool allowed) noexcept;
+
     // A stream that ends in the middle of a reply is `protocol_error`.
     [[nodiscard]] status finish() noexcept;
 
@@ -250,6 +258,7 @@ private:
     std::size_t offset_ = 0;
     std::size_t max_value_size_ = default_max_value_size;
     std::size_t max_line_size_ = default_max_line_size;
+    bool allow_bare_end_ = false;
     rpc_code error_ = rpc_code::ok;
     // The most recently read line, without its CRLF.
     std::string line_;

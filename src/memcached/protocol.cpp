@@ -315,6 +315,10 @@ text_parser::text_parser(std::size_t max_value_size) noexcept
 text_parser::text_parser(std::size_t max_value_size, std::size_t max_line_size) noexcept
     : max_value_size_(max_value_size), max_line_size_(max_line_size) {}
 
+void text_parser::set_allow_bare_end(bool allowed) noexcept {
+    allow_bare_end_ = allowed;
+}
+
 void text_parser::feed(span<const std::byte> data) noexcept {
     if (error_ != rpc_code::ok) {
         return;
@@ -464,6 +468,13 @@ text_parser::parse_result text_parser::dispatch(text_reply& out) noexcept {
             out.type = text_reply::kind::stats;
             out.stats_entries = std::move(pending_reply_.stats_entries);
             pending_reply_ = text_reply{};
+            return parse_result::ok;
+        }
+        if (allow_bare_end_) {
+            // A retrieval that found no keys answers with exactly `END`. The
+            // empty value list is a normal reply, not a malformed stream.
+            out = text_reply{};
+            out.type = text_reply::kind::values;
             return parse_result::ok;
         }
         // A bare END without a preceding VALUE/STAT is a protocol violation.

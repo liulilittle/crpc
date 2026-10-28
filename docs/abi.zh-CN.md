@@ -235,6 +235,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::io::io_result`
 - `::crpc::memcached::binary_header`
 - `::crpc::memcached::connection_transport_config`
+- `::crpc::memcached::failover_options`
+- `::crpc::memcached::node_health`
 - `::crpc::memcached::text_reply`
 - `::crpc::mq::amqp::frame`
 - `::crpc::mq::amqp::frame_header`

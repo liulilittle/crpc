@@ -60,6 +60,58 @@ const auto values = cache.get({"user:1", "user:2", "user:3"});
 `server::name` 就是哈希环要哈希的字符串。同一部署内所有客户端必须用同一种写法
 （`host:port`），否则不同客户端的落点会不一致。
 
+## 节点健康、摘除与故障转移
+
+单个 `client` 没有重试策略；`router` 有。它为每个端点维护一份健康记录，因此一台服务器
+挂掉不会拖垮整个缓存。
+
+```cpp
+crpc::memcached::failover_options failover;
+failover.failure_threshold = 3;                     // 连续传输失败次数
+failover.retry_cooldown = std::chrono::seconds(30); // 摘除后多久允许探测
+failover.retry_reads = false;                       // 保持安全默认值
+
+crpc::memcached::router cache(std::move(servers), {}, failover);
+
+for (const auto& node : cache.health()) {
+    // node.name、node.condition（alive/dead）、node.consecutive_failures、
+    // node.last_error、node.last_error_message、node.retry_in
+}
+
+// 不等冷却，立即做一次恢复探测。
+const auto recovered = cache.probe_node(1);
+```
+
+只有传输层失败才计数：`connection_refused`、`connection_reset`、`broken_pipe`、
+`eof`、`deadline_exceeded` 和 `unavailable`。任何回包都会把
+`consecutive_failures` 清零，因为即使 `SERVER_ERROR` 也证明进程还在应答；请求格式
+错误或正常的 `NOT_FOUND` 都不算节点失败。
+
+连续失败达到 `failure_threshold` 后，节点被标记为 dead 并从 ketama 环中移除。经过
+`retry_cooldown` 后，下一次公开的 router 调用（或显式 `probe_node`）会向它发送一条
+`version` 命令：有回包就重新加入环，失败则继续保持 dead 并重新开始冷却。
+`failure_threshold` 设为 0 可以关闭摘除，但仍会更新 `health()`。
+
+**节点被摘除或恢复时，键的落点会改变。** 这是有意为之：从环中移除节点会改变环的归属，
+原本属于该节点的键会落到另一台存活节点；节点恢复后又会移回来。memcached 节点之间不
+复制、不共享数据，所以这个键在新位置上是 miss，直到重新写入。这是故障转移带来的一致性
+后果，router 无法替调用方隐藏。
+
+**默认不会跨节点重试读。** `retry_reads = false` 是正确性决定：跨节点重试可能读到另一
+节点上同名键的另一个值，或者明明数据在原节点上却返回 miss；这两种结果对调用方都像正常
+缓存应答，于是失败被悄悄变成错误数据。除非部署能保证一个键最多只存在于一个节点、且原
+节点失败后接受 miss（例如不会碰撞的纯分片键空间，或客户端并不了解的复制层），否则不要
+打开。开启后，失败的读会按环顺序重试到下一个存活节点；如果没有任何存活节点能应答，调用
+仍然失败。这个开关只决定是否重试当前这次调用；节点一旦被摘除，后续调用会遵循重建后的
+环，也就是上面描述的落点变化。
+
+**写永远不会重试到别的节点。** 把写发到另一个节点会写到错误的哈希位置，使后续读不一致，
+所以写失败必须如实上报。之后的新写是一次新操作，会遵循当时的环。
+
+**所有节点都 dead。** 按键操作返回 `rpc_code::unavailable`（完全没有配置服务器时仍是
+`failed_precondition`），`owner_of()` 返回 -1；冷却未到时不会发起网络调用，router 不会
+为了寻找存活节点而死循环。
+
 ## 不是错误的「结果」
 
 memcached 对常见情形用一个词作答，而那个词并不表示失败。客户端把它们作为值返回，

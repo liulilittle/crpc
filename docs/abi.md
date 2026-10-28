@@ -338,6 +338,8 @@ is guarded.
 - `::crpc::io::io_result`
 - `::crpc::memcached::binary_header`
 - `::crpc::memcached::connection_transport_config`
+- `::crpc::memcached::failover_options`
+- `::crpc::memcached::node_health`
 - `::crpc::memcached::text_reply`
 - `::crpc::mq::amqp::frame`
 - `::crpc::mq::amqp::frame_header`

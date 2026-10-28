@@ -285,6 +285,21 @@ CRPC_TEST(text_parse_missing_key) {
                   static_cast<int>(parser.error()));
 }
 
+CRPC_TEST(text_parse_bare_end_when_enabled) {
+    // The transport enables this for get/gets/gat/gats, where a bare END is the
+    // all-miss reply rather than a stray line.
+    text_parser parser;
+    parser.set_allow_bare_end(true);
+    const std::vector<text_reply> replies = parse_all("END\r\n", parser);
+    CRPC_CHECK_EQ(std::size_t{1}, replies.size());
+    if (replies.size() == 1) {
+        CRPC_CHECK_EQ(static_cast<int>(text_reply::kind::values),
+                      static_cast<int>(replies[0].type));
+        CRPC_CHECK(replies[0].entries.empty());
+    }
+    CRPC_CHECK(parser.finish().ok());
+}
+
 CRPC_TEST(text_parse_status_words) {
     struct expected_word {
         const char* text;

@@ -15,9 +15,17 @@
 //   * fan-out is sequential. Each call parks its coroutine, so a caller that
 //     wants concurrency issues concurrent calls; the router does not open an
 //     unbounded number of in-flight requests behind the caller's back.
+//
+// Node health sits on top of placement. A node that fails repeatedly at the
+// transport level is ejected from the ring, so a key it used to own is placed on
+// another live node. That remapping is deliberate and is *not* transparent:
+// memcached nodes share no data, so the key now lives in a different cache. See
+// the health/ejection rules on `failover_options` before enabling anything that
+// changes routing on failure.
 #ifndef CRPC_MEMCACHED_ROUTER_HPP
 #define CRPC_MEMCACHED_ROUTER_HPP
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -34,6 +42,80 @@
 
 namespace crpc {
 namespace memcached {
+
+// Whether a node currently receives routed traffic.
+enum class node_condition : std::uint8_t {
+    // In the ring and eligible for routing.
+    alive,
+    // Ejected from the ring after `failure_threshold` consecutive transport
+    // failures. It is re-admitted only after a successful probe.
+    dead
+};
+
+// A point-in-time view of one node, for operations and for diagnostics.
+struct CRPC_API node_health {
+    // The `router::server::name` this state belongs to; the same string the ring
+    // hashes.
+    std::string name;
+    node_condition condition = node_condition::alive;
+    // Transport failures since the last successful exchange. Application replies
+    // (`SERVER_ERROR`, `NOT_FOUND`, ...) prove the node is reachable and reset
+    // this to zero; they are not counted as node failures.
+    std::uint32_t consecutive_failures = 0;
+    // The most recent transport failure. Retained after recovery as a diagnostic;
+    // `consecutive_failures == 0` means the node is currently healthy.
+    rpc_code last_error = rpc_code::ok;
+    std::string last_error_message;
+    // Time left before the next recovery probe. Zero while alive, or once the
+    // cooldown has elapsed and a probe is due.
+    std::chrono::milliseconds retry_in{0};
+};
+
+// Node-health policy for `router`.
+//
+// A node is ejected only for transport-level failures: connection refused/reset,
+// broken pipe, EOF, deadline and `unavailable`. A `SERVER_ERROR`, a protocol
+// violation or a routine `NOT_FOUND` means the endpoint answered, so it is alive
+// for routing purposes even when the operation failed.
+//
+// Recovery is probing, not blind re-admission. Once `retry_cooldown` has elapsed
+// the next public router call (or an explicit `probe_node`) sends one `version`
+// command to the dead node. A reply re-admits it to the ring immediately; a
+// failure leaves it dead and restarts the cooldown. Because re-admission changes
+// the ring, keys owned by the recovered node move again - the same consistency
+// consequence as ejection.
+struct CRPC_API failover_options {
+    // Consecutive transport failures before ejection. 0 disables ejection; the
+    // counters and `health()` still update.
+    std::uint32_t failure_threshold = 3;
+
+    // How long a dead node stays out of the ring before a probe is attempted.
+    // Zero means "probe on the next call".
+    std::chrono::milliseconds retry_cooldown{30000};
+
+    // Retry a failed read on the next live node in the ring.
+    //
+    // Default false, and that default is a correctness decision. memcached nodes
+    // do not replicate: a key is stored on exactly one node. If the owner is
+    // unreachable, asking another node can:
+    //   * return a *different* value for a same-named key that happens to be
+    //     stored there (a stale/unrelated value), or
+    //   * return a miss even though the data exists on the unreachable node.
+    // Both look like normal cache answers to the caller, so a cross-node retry
+    // silently converts a detected failure into potentially wrong data.
+    //
+    // Enable it only when the deployment guarantees that a key exists on at most
+    // one node and that a miss is an acceptable outcome for a failed primary
+    // (for example a pure sharding key space where collisions are impossible, or
+    // a replication layer this client does not know about). Writes are never
+    // retried: sending a write to the wrong hash position would make the next
+    // read of that key inconsistent, so a write failure is always reported.
+    //
+    // This flag only controls retrying the *same call*. Once a node is ejected,
+    // later calls follow the rebuilt ring, so they can still land on another
+    // node; that remapping is described above and in the guide.
+    bool retry_reads = false;
+};
 
 // A keyed collection of endpoints.
 class CRPC_API router {
@@ -52,7 +134,12 @@ public:
     // `opts` is applied to every endpoint. It must not carry a key prefix that
     // differs per server: the ring hashes the key as written, so a prefix that
     // varies would place one key on different servers.
-    router(std::vector<server> servers, client::options opts = {});
+    //
+    // `failover` is the node-health policy. Constructing a router never contacts
+    // a server; the first public call may probe nodes that were ejected by an
+    // earlier call and whose cooldown has elapsed.
+    router(std::vector<server> servers, client::options opts = {},
+           failover_options failover = {});
     ~router();
 
     router(const router&) = delete;
@@ -86,17 +173,33 @@ public:
     stats(std::string_view argument = {});
 
     // --- Placement -----------------------------------------------------------
-    // The server index a key is placed on, or -1 when the ring is empty. Exposed
-    // because a caller that migrates data needs to ask the same question the
-    // router answers.
+    // The server index a key is placed on, or -1 when the ring is empty (no
+    // server configured, or every node is dead). Dead nodes are not in the ring.
+    // Exposed because a caller that migrates data needs to ask the same question
+    // the router answers. This is a pure lookup: it never contacts a server and
+    // never triggers a recovery probe.
     [[nodiscard]] std::ptrdiff_t owner_of(std::string_view key) const noexcept;
     [[nodiscard]] std::size_t server_count() const noexcept;
     [[nodiscard]] const std::vector<server>& servers() const noexcept;
 
-private:
-    [[nodiscard]] client& client_for(std::string_view key);
-    [[nodiscard]] const client& client_for(std::string_view key) const;
+    // --- Health --------------------------------------------------------------
+    // A snapshot in server order. Cheap and local: it does not contact servers,
+    // so a dead node with an elapsed cooldown stays `dead` here until a routed
+    // call or `probe_node` actually probes it.
+    [[nodiscard]] std::vector<node_health> health() const;
 
+    // Probes one node immediately, regardless of the cooldown. Returns true when
+    // the node answered (a reply of any kind makes it alive for routing) and
+    // false when the probe failed at the transport level. With ejection disabled
+    // (`failure_threshold == 0`) a failed probe does not mark a live node dead,
+    // but the return value still reports the failed probe. An out-of-range index
+    // is `invalid_argument`.
+    //
+    // The probe is `version`: it is a read-only command present in every
+    // memcached, and any reply proves the endpoint is reachable.
+    [[nodiscard]] result<bool> probe_node(std::size_t index);
+
+private:
     struct impl;
     std::unique_ptr<impl> impl_;
 };
