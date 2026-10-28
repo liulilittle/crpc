@@ -476,13 +476,20 @@ CRPC_TEST(mongo_write_concern_is_a_top_level_field_on_writes) {
 }
 
 CRPC_TEST(mongo_retryable_write_replays_the_same_txn_number) {
-    scripted_channel* first_channel = nullptr;
-    scripted_channel* second_channel_raw = nullptr;
+    // Requests are recorded here rather than read back from the channel objects.
+    // A successful reconnect replaces the connection's channel, which destroys the
+    // original; keeping a `scripted_channel*` and calling requests() on it after
+    // that reads freed memory. In Debug the freed block happened to still hold the
+    // old contents, so the case passed; in Release the count came back as garbage.
+    std::vector<bytes> first_requests;
+    std::vector<bytes> second_requests;
+    bool use_second = false;
     bool injected = false;
 
     crpc::db::mongo::connection_options options;
     options.user.clear();
     const auto server = [&](const bytes& request, std::size_t) -> scripted_answer {
+        (use_second ? second_requests : first_requests).push_back(request);
         if (bytes_contain(request, "hello\x00")) {
             return scripted_answer{false, false, make_reply(request, hello_reply(true))};
         }
@@ -507,13 +514,13 @@ CRPC_TEST(mongo_retryable_write_replays_the_same_txn_number) {
     // The reconnector must be in place before the connection is built: it is copied
     // into the connection at construction.
     options.reconnect = [&]() -> crpc::result<std::unique_ptr<crpc::db::channel>> {
+        use_second = true;
         auto channel = std::make_unique<scripted_channel>(server);
-        second_channel_raw = channel.get();
         std::unique_ptr<crpc::db::channel> base = std::move(channel);
         return base;
     };
 
-    auto connection = make_connection(options, server, &first_channel);
+    auto connection = make_connection(options, server);
     CRPC_CHECK(connection->is_open());
     CRPC_CHECK(connection->is_replica_set());
 
@@ -536,18 +543,16 @@ CRPC_TEST(mongo_retryable_write_replays_the_same_txn_number) {
 
     // The dropped first attempt and the successful retry must use the same txnNumber
     // and the same session id: that is what makes the replay idempotent.
-    const std::vector<bytes>& first_requests = first_channel->requests();
     CRPC_CHECK(first_requests.size() >= 2);
     const auto first_body = request_body(first_requests[1]);
     CRPC_CHECK(static_cast<bool>(first_body));
     if (!first_body) {
         return;
     }
-    CRPC_CHECK(second_channel_raw != nullptr);
-    if (second_channel_raw == nullptr) {
+    CRPC_CHECK(use_second);
+    if (!use_second) {
         return;
     }
-    const std::vector<bytes>& second_requests = second_channel_raw->requests();
     CRPC_CHECK(second_requests.size() >= 2);
     const auto second_body = request_body(second_requests[1]);
     CRPC_CHECK(static_cast<bool>(second_body));
