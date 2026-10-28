@@ -274,6 +274,66 @@ void compare_on_random_grids(bool diagonal, int heuristic_kind,
 
 // --- Edge cases ----------------------------------------------------------------
 
+// The comparison against Dijkstra only proves the algorithm is right for an
+// *admissible* heuristic -- every heuristic in that sweep never overestimates.
+// It cannot tell a correct A* from one that merely happens to work because its
+// heuristic is honest. This case supplies a heuristic that deliberately
+// overestimates by a large factor: A* then explores greedily and returns a
+// suboptimal path, and the check below confirms the test harness can see that.
+//
+// Without this, "A* matches Dijkstra" would be compatible with an implementation
+// that ignores the heuristic entirely, or one that returns the greedy path.
+CRPC_TEST(astar_with_an_inadmissible_heuristic_is_detectably_suboptimal) {
+    world w;
+    // A corridor of open cells with one cheap detour, so the greedy and the
+    // optimal routes differ in cost.
+    obstacle_world(20, 20, 7, 30, w);
+
+    auto neighbors = [&](std::size_t n, std::vector<std::size_t>& out) {
+        neighbours(w, n, false, out);
+    };
+    auto cost = [&](std::size_t a, std::size_t b) { return edge_cost_4(w, a, b); };
+    auto admissible = [&](std::size_t n, std::size_t g) {
+        return static_cast<double>(crpc::algorithm::manhattan_distance(
+            w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g)));
+    };
+    // 50x the true remaining distance: no longer a lower bound.
+    auto inadmissible = [&](std::size_t n, std::size_t g) {
+        return 50.0 * static_cast<double>(crpc::algorithm::manhattan_distance(
+                          w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g)));
+    };
+
+    const std::size_t start = 0;
+    const std::size_t goal = w.index(19, 19);
+    const double reference = dijkstra_cost(start, goal, neighbors, cost);
+    if (std::isinf(reference)) {
+        // Seed 7 must be reachable for this case to mean anything; if the grid
+        // ever changes so it is not, the case would silently stop testing.
+        CRPC_CHECK(false);
+        return;
+    }
+
+    const auto honest =
+        crpc::algorithm::astar_path<std::size_t>(start, goal, neighbors, cost, admissible);
+    CRPC_CHECK(honest.ok());
+    if (honest.ok()) {
+        CRPC_CHECK(close_to(path_cost(w, false, honest.value()), reference));
+    }
+
+    const auto greedy = crpc::algorithm::astar_path<std::size_t>(start, goal, neighbors,
+                                                                 cost, inadmissible);
+    // It still finds *a* path (completeness is independent of admissibility)...
+    CRPC_CHECK(greedy.ok());
+    if (greedy.ok()) {
+        // ...and this is the assertion that proves the comparison has teeth: an
+        // overestimating heuristic produces a cost strictly worse than optimal.
+        // If A* ignored the heuristic, this would equal `reference` and the case
+        // would fail, which is exactly what makes the sweep above meaningful.
+        const double greedy_cost = path_cost(w, false, greedy.value());
+        CRPC_CHECK(greedy_cost > reference + 1e-9);
+    }
+}
+
 CRPC_TEST(astar_start_equals_goal_returns_single_node_path) {
     world w;
     obstacle_world(20, 20, 1, 0, w);
