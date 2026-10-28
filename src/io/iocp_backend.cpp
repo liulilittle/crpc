@@ -1029,12 +1029,23 @@ void handle_accept(overlapped_op* op) noexcept {
     (void)local;
     (void)local_len;
     (void)remote_len;
-    const endpoint rep = endpoint_from_sockaddr(remote);
 
     SOCKET listen_socket = ls->lsock;
     ::setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
                  reinterpret_cast<const char*>(&listen_socket),
                  static_cast<int>(sizeof(listen_socket)));
+
+    // `remote()` must report the accepted socket's real peer. The raw
+    // GetAcceptExSockaddrs view is unreliable for a numeric-name read, and
+    // getpeername only works after SO_UPDATE_ACCEPT_CONTEXT above, so the
+    // kernel itself is the source of truth (the epoll backend does the same).
+    sockaddr_storage peer_ss{};
+    socklen_t peer_len = sizeof(peer_ss);
+    const endpoint rep =
+        ::getpeername(accepted, reinterpret_cast<sockaddr*>(&peer_ss),
+                      &peer_len) == 0
+            ? endpoint_from_sockaddr(reinterpret_cast<const sockaddr*>(&peer_ss))
+            : endpoint::tcp(std::string(), 0);
 
     if (!post_accept(slot)) {
         if (ls->pending.fetch_sub(1) == 1) {

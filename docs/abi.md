@@ -279,7 +279,10 @@ is guarded.
 - `::crpc::db::insert_target`
 - `::crpc::db::mapping_options`
 - `::crpc::db::parameter`
+- `::crpc::db::replica_health`
+- `::crpc::db::mysql::cluster_config`
 - `::crpc::db::mysql::column_definition`
+- `::crpc::db::mysql::discovered_replica`
 - `::crpc::db::mysql::eof_packet`
 - `::crpc::db::mysql::err_packet`
 - `::crpc::db::mysql::handshake`
@@ -295,11 +298,15 @@ is guarded.
 - `::crpc::db::mongo::replica_set_topology`
 - `::crpc::db::mongo::topology_member`
 - `::crpc::db::mongo::write_concern_options`
+- `::crpc::db::hbase::endpoint`
+- `::crpc::db::hbase::endpoint_health`
 - `::crpc::db::hbase::row`
 - `::crpc::db::hbase::scan_filter`
 - `::crpc::db::hbase::scan_options`
 - `::crpc::http::client_options`
 - `::crpc::http::h2_client_options`
+- `::crpc::db::tds::cluster_config`
+- `::crpc::db::tds::discovered_replica`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`

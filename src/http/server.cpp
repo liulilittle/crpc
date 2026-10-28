@@ -34,11 +34,13 @@
 
 #include <crpc/http/content_coding.hpp>
 #include <crpc/http/file_transfer.hpp>
+#include <crpc/http/forwarded.hpp>
 #include <crpc/http/sse.hpp>
 #include <crpc/http2/connection.hpp>
 #include <crpc/http2/frame.hpp>
 #include <crpc/http2/hpack.hpp>
 #include <crpc/mvc/router.hpp>
+#include <crpc/net/ip.hpp>
 
 #include "longpoll_sweep.hpp"
 
@@ -55,6 +57,18 @@ constexpr std::string_view h2_connection_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
                                  text.size());
+}
+
+// The IP of a socket peer, or an invalid address when the transport is not a
+// TCP socket (an in-process channel, for example). The host string on `remote()`
+// is always an IP literal for the TCP backends, so this strict parse is the
+// truth about whether the peer has an address at all.
+[[nodiscard]] net::ip_address peer_ip(const endpoint& peer) noexcept {
+    if (peer.type() != endpoint::kind::tcp) {
+        return net::ip_address{};
+    }
+    result<net::ip_address> parsed = net::ip_address::parse(peer.host());
+    return parsed.ok() ? std::move(parsed.value()) : net::ip_address{};
 }
 
 [[nodiscard]] char ascii_lower(char c) noexcept {
@@ -501,7 +515,8 @@ struct pending_h2_stream {
 class session final : public std::enable_shared_from_this<session> {
 public:
     session(server_state& state, std::size_t shard_index,
-            std::unique_ptr<connection> transport, bool tls_mode);
+            std::unique_ptr<connection> transport, bool tls_mode,
+            const endpoint& peer);
     ~session();
 
     session(const session&) = delete;
@@ -587,6 +602,12 @@ private:
     // Request-side content coding: decodes a gzip/deflate body in place and
     // returns the HTTP status to answer with (200 when no change was needed).
     int decode_request_body(http::request& request);
+    // Fills `request::peer_*` from the accepted connection and, when the peer
+    // is a trusted proxy, resolves the forwarding chain into `request::client_*`
+    // (safe defaults when no proxy is trusted). Returns the HTTP status to
+    // answer with: 200 to serve the request, 400 when the chain is malformed
+    // and the configured policy is `reject_400`. Shared by HTTP/1.1 and HTTP/2.
+    int stamp_forwarded(http::request& request);
     // Response-side content coding: negotiates Accept-Encoding, encodes the
     // body, or replaces the response with 406.
     void apply_response_coding(const http::request& request,
@@ -665,6 +686,9 @@ private:
     runtime* shard_ = nullptr;
     std::size_t shard_index_ = 0;
     bool tls_mode_ = false;
+    // The socket peer captured at accept time (never header-derived).
+    net::ip_address peer_address_;
+    std::uint16_t peer_port_ = 0;
 
     std::unique_ptr<connection> transport_;
     std::unique_ptr<io::tls_stream> tls_;
@@ -1094,8 +1118,13 @@ struct server_state {
             const std::size_t index = static_cast<std::size_t>(
                 next_shard.fetch_add(1, std::memory_order_relaxed)) %
                 shards.size();
-            auto value = std::make_shared<session>(*this, index, std::move(transport),
-                                                   use_tls);
+            // `remote()` is captured before the transport is moved into the
+            // session: it is the one trustworthy answer to "who am I talking
+            // to", and it must never come from request bytes.
+            const endpoint peer = transport->remote();
+            auto value = std::make_shared<session>(*this, index,
+                                                   std::move(transport), use_tls,
+                                                   peer);
             {
                 std::lock_guard<std::mutex> lk(sessions_mutex);
                 // The bound is checked and the session inserted under one lock,
@@ -1253,12 +1282,15 @@ void write_completion::complete(io::io_result result) noexcept {
 // --- session: construction and sources --------------------------------------
 
 session::session(server_state& state, std::size_t shard_index,
-                 std::unique_ptr<connection> transport, bool tls_mode)
+                 std::unique_ptr<connection> transport, bool tls_mode,
+                 const endpoint& peer)
     : state_(state),
       shard_(shard_index < state.shards.size() ? state.shards[shard_index].get()
                                                : nullptr),
       shard_index_(shard_index),
       tls_mode_(tls_mode),
+      peer_address_(peer_ip(peer)),
+      peer_port_(peer.type() == endpoint::kind::tcp ? peer.port() : 0),
       transport_(std::move(transport)),
       parser_(http::http_parser::kind::request, state.options.limits),
       h2_([&state] {
@@ -1784,6 +1816,40 @@ int session::decode_request_body(http::request& request) {
     return 200;
 }
 
+int session::stamp_forwarded(http::request& request) {
+    // The peer is always the truth; the defaults for a resolution failure are
+    // the peer itself, so a request is never served from header content.
+    request.peer_address = peer_address_;
+    request.peer_port = peer_port_;
+    request.client_address = peer_address_;
+    request.client_port = peer_port_;
+    request.client_is_https = false;
+    request.used_forwarded_header = false;
+    request.trusted_hops = 0;
+    // No IP peer (an in-process or Unix-domain channel): nothing can resolve
+    // against an address, and there is nothing a header could claim.
+    if (!peer_address_.valid()) {
+        return 200;
+    }
+    const result<forwarded_client> resolved =
+        http::resolve_forwarded(request, peer_address_,
+                                state_.options.trusted_proxies);
+    if (!resolved.ok()) {
+        if (state_.options.forwarded_invalid ==
+            forwarded_invalid_policy::fallback_to_peer) {
+            return 200; // the client stays the socket peer
+        }
+        return 400;
+    }
+    const forwarded_client& client = resolved.value();
+    request.client_address = client.address;
+    request.client_port = client.port;
+    request.client_is_https = client.is_https();
+    request.used_forwarded_header = client.used_forwarded_header;
+    request.trusted_hops = client.trusted_hops;
+    return 200;
+}
+
 void session::apply_response_coding(const http::request& request,
                                     http::response& response) {
     const std::string* accept = request.headers.find("accept-encoding");
@@ -1933,6 +1999,13 @@ void session::handle_http1_request(http::request request) {
         !request.headers.contains("host")) {
         state_.bad.fetch_add(1, std::memory_order_relaxed);
         send_http1_error(400, "HTTP/1.1 requires a Host header", request, false);
+        return;
+    }
+
+    if (const int forwarded = stamp_forwarded(request); forwarded != 200) {
+        state_.bad.fetch_add(1, std::memory_order_relaxed);
+        send_http1_error(forwarded, "the forwarding header is malformed",
+                         request, keep);
         return;
     }
 
@@ -3806,6 +3879,15 @@ void session::dispatch_h2(u32 stream_id) {
     if (head_only) {
         routed.method = http::method::get;
         routed.method_token = "GET";
+    }
+    if (const int forwarded = stamp_forwarded(routed); forwarded != 200) {
+        http::response response =
+            make_problem(forwarded, "the forwarding header is malformed",
+                         routed.path);
+        response.version = routed.version;
+        state_.handled.fetch_add(1, std::memory_order_relaxed);
+        send_h2_response(stream_id, response, head_only);
+        return;
     }
     // Request content coding, file download and response content coding are
     // HTTP/1.1-only in this slice: HTTP/2 requests that would need them fail

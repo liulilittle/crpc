@@ -39,6 +39,19 @@ namespace http {
 
 enum class forwarded_proto : std::uint8_t { unknown, http, https };
 
+// What a server does when a trusted proxy's forwarding chain cannot be
+// resolved (a malformed `Forwarded` / `X-Forwarded-*` field). Only the socket
+// peer decides whether the headers are read at all; this decides what a
+// failure means.
+enum class forwarded_invalid_policy : std::uint8_t {
+    // Answer 400 Bad Request. The default: a failure is loud, never a silent
+    // fallback to header content.
+    reject_400,
+    // Serve the request with the socket peer as the client. Header content is
+    // still never believed.
+    fallback_to_peer,
+};
+
 // The set of peers whose forwarding headers are believed.
 struct CRPC_API trusted_proxies {
     std::vector<net::ip_network> networks;

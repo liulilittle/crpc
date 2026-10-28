@@ -41,6 +41,7 @@
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
 #include <crpc/http/content_coding.hpp>
+#include <crpc/http/forwarded.hpp>
 #include <crpc/http/message.hpp>
 #include <crpc/io.hpp>
 #include <crpc/io/tls.hpp>
@@ -245,6 +246,21 @@ struct http_server_options {
     std::chrono::milliseconds download_stall_timeout{30000};
     // Read chunk size for a streamed download body.
     std::size_t download_chunk_bytes = 64u * 1024u;
+
+    // --- Reverse-proxy client resolution -------------------------------------
+    // The networks whose forwarding headers (`Forwarded`, `X-Forwarded-*`) are
+    // believed. Empty by default: no proxy is trusted, so every forwarding
+    // header is ignored and the socket peer is the client (the safe default).
+    // When the immediate peer is a trusted proxy, the server resolves the chain
+    // with `resolve_forwarded` before dispatch and fills `request::client_*`;
+    // the original socket peer stays readable in `request::peer_*` for audit.
+    http::trusted_proxies trusted_proxies{};
+    // How a request whose trusted chain does not resolve is answered.
+    // `reject_400` (the default) answers 400 Bad Request;
+    // `fallback_to_peer` serves it with the socket peer as the client.
+    // Header content is never believed when resolution fails.
+    http::forwarded_invalid_policy forwarded_invalid =
+        http::forwarded_invalid_policy::reject_400;
 };
 
 struct http_statistics {

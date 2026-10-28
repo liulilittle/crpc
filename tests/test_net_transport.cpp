@@ -215,6 +215,12 @@ CRPC_TEST(net_connector_local_bind) {
     if (client.ok()) {
         // The connection must have been made from the requested interface.
         CRPC_CHECK_EQ(std::string("127.0.0.1"), client.value()->local().host());
+        // A completed connect() does not mean accept() has returned: the kernel
+        // finishes the handshake for the client first. Closing the listener in
+        // that window cancels the pending accept and the server thread records
+        // an error -- which is correct behaviour for a closed listener, but not
+        // what this case is about. Wait for the accept to land first.
+        (void)crpc_test::wait_for([&] { return server_done.load(); }, 5000);
     } else {
         server->close();
     }
