@@ -868,6 +868,15 @@ public:
                            alpn_length_);
     }
 
+    [[nodiscard]] std::string server_name() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ssl_ == nullptr) {
+            return std::string();
+        }
+        const char* name = SSL_get_servername(ssl_, TLSEXT_NAMETYPE_host_name);
+        return name != nullptr ? std::string(name) : std::string();
+    }
+
     [[nodiscard]] std::error_code error() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return error_;
@@ -1676,6 +1685,10 @@ std::string tls_stream::alpn_protocol() const {
     return impl_ != nullptr ? impl_->alpn_protocol() : std::string();
 }
 
+std::string tls_stream::server_name() const {
+    return impl_ != nullptr ? impl_->server_name() : std::string();
+}
+
 std::error_code tls_stream::error() const noexcept {
     return impl_ != nullptr ? impl_->error() : make_error_code(tls_errc::ssl_configuration_error);
 }
@@ -1861,6 +1874,7 @@ bool tls_stream::handshake_complete() const noexcept { return false; }
 bool tls_stream::handshake_failed() const noexcept { return false; }
 bool tls_stream::session_reused() const noexcept { return false; }
 std::string tls_stream::alpn_protocol() const { return std::string(); }
+std::string tls_stream::server_name() const { return std::string(); }
 std::error_code tls_stream::error() const noexcept {
     return make_error_code(tls_errc::ssl_not_available);
 }
