@@ -601,6 +601,14 @@ status connection::query(std::string_view sql, span<const parameter> params, res
         columns.push_back(std::move(info));
     }
 
+    // Which columns are binary has to be captured before `columns` is moved into the result
+    // set: after the move the vector is empty and indexing it is undefined behaviour.
+    std::vector<bool> binary_columns;
+    binary_columns.reserve(columns.size());
+    for (const column_info& info : columns) {
+        binary_columns.push_back(info.type == db_type::blob);
+    }
+
     std::unique_ptr<memory_result_set> set(new memory_result_set(std::move(columns), -1));
     std::size_t row_bytes = 0;
     for (;;) {
@@ -630,14 +638,21 @@ status connection::query(std::string_view sql, span<const parameter> params, res
         values.reserve(static_cast<std::size_t>(column_count));
         nulls.reserve(static_cast<std::size_t>(column_count));
         for (SQLSMALLINT i = 1; i <= column_count; ++i) {
+            // A binary column is read as bytes, not as text. Asking this driver for a
+            // LONGBINARY as SQL_C_CHAR does not fail -- it answers the value rendered as
+            // hex, so a 5-byte value arrives as the 10 characters "4100420043" and would be
+            // handed to the caller as its own bytes. Measured against the Jet driver: five
+            // bytes in, ten characters out.
+            const bool binary = binary_columns[static_cast<std::size_t>(i - 1)];
             std::string value;
             bool is_null = false;
             for (;;) {
                 char chunk[4096] = {0};
                 SQLLEN indicator = 0;
-                const SQLRETURN got = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i), SQL_C_CHAR,
-                                                 chunk, static_cast<SQLLEN>(sizeof(chunk)),
-                                                 &indicator);
+                const SQLRETURN got =
+                    SQLGetData(stmt, static_cast<SQLUSMALLINT>(i),
+                               binary ? SQL_C_BINARY : SQL_C_CHAR, chunk,
+                               static_cast<SQLLEN>(sizeof(chunk)), &indicator);
                 if (got == SQL_NO_DATA) {
                     break;
                 }
@@ -658,9 +673,18 @@ status connection::query(std::string_view sql, span<const parameter> params, res
                     is_null = true;
                     break;
                 }
-                // For SQL_C_CHAR the driver null-terminates whatever it puts in the buffer,
-                // including a truncated chunk, so the chunk length is the string length.
-                value.append(chunk);
+                // The chunk length comes from the indicator, never from strlen: a binary
+                // value legitimately contains 0x00, and stopping there would truncate it
+                // silently. When the driver reports SQL_NO_TOTAL there is no length to use,
+                // and for SQL_C_CHAR the buffer is null-terminated, so strlen is the only
+                // remaining answer.
+                std::size_t chunk_length = sizeof(chunk) - 1;
+                if (indicator != SQL_NO_TOTAL && indicator >= 0) {
+                    const std::size_t reported = static_cast<std::size_t>(indicator);
+                    const std::size_t capacity = binary ? sizeof(chunk) : sizeof(chunk) - 1;
+                    chunk_length = reported < capacity ? reported : capacity;
+                }
+                value.append(chunk, chunk_length);
                 if (got == SQL_SUCCESS) {
                     // SQL_SUCCESS means the whole value has been returned; only a truncated
                     // chunk comes back as SQL_SUCCESS_WITH_INFO and needs another call.

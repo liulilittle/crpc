@@ -314,6 +314,74 @@ CRPC_TEST(odbc_it_timestamp_round_trips) {
     }
 }
 
+// A binary value is not text: it may contain 0x00, and everything after the first NUL is
+// data, not padding. The reader gets bytes from the driver as SQL_C_CHAR, so it must take
+// the length from the indicator rather than stopping at the first NUL -- otherwise this
+// value comes back as the single byte 0x41 with no error at all.
+CRPC_TEST(odbc_it_binary_with_embedded_nul_survives) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    run_quietly(*it.session, "DROP TABLE crpc_bin");
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status created = it.session->query(
+            "CREATE TABLE crpc_bin (id INTEGER, body LONGBINARY)", {}, &out);
+        crpc::db::statement_guard guard(out);
+        if (!created) {
+            report("create binary table", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+    const std::vector<std::byte> payload = {
+        std::byte{0x41}, std::byte{0x00}, std::byte{0x42},
+        std::byte{0x00}, std::byte{0x43},
+    };
+    {
+        crpc::db::parameter params[2] = {
+            crpc::db::parameter::from_int64(1),
+            crpc::db::parameter::from_blob(payload),
+        };
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_bin (id, body) VALUES (?, ?)",
+            crpc::span<const crpc::db::parameter>(params, 2), &out);
+        crpc::db::statement_guard guard(out);
+        if (!inserted) {
+            report("insert binary", inserted.error());
+        }
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status selected = it.session->query(
+            "SELECT id, body FROM crpc_bin WHERE id = 1", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!selected) {
+            report("select binary", selected.error());
+        }
+        CRPC_CHECK(static_cast<bool>(selected));
+        CRPC_CHECK(raw != nullptr);
+        if (raw == nullptr) {
+            return;
+        }
+        CRPC_CHECK(raw->next());
+        const auto bytes = raw->get_blob(1);
+        if (!bytes) {
+            report("read binary", bytes.error());
+        }
+        CRPC_CHECK(static_cast<bool>(bytes));
+        if (!bytes) {
+            return;
+        }
+        CRPC_CHECK_EQ(payload.size(), bytes.value().size());
+        CRPC_CHECK(bytes.value() == payload);
+    }
+}
+
 CRPC_TEST(odbc_it_constraint_violation_carries_the_sqlstate) {
     (void)require_bridge();
     it_session it;
