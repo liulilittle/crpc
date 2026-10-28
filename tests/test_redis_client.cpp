@@ -606,4 +606,64 @@ CRPC_TEST(client_parks_a_coroutine_until_the_reply_arrives) {
     shard.join();
 }
 
+// --- command() escape hatch --------------------------------------------------
+
+crpc::result<crpc::redis::resp_value> run_command(crpc::redis::client& c,
+                                                  crpc::redis::command args) {
+    return c.command(crpc::span<const std::string>(args.data(), args.size()));
+}
+
+CRPC_TEST(client_command_runs_arbitrary_command) {
+    harness h(basic_handler());
+    crpc::redis::client c(h.options(), h.backend);
+    CRPC_CHECK(c.connect().ok());
+
+    crpc::result<crpc::redis::resp_value> ping = run_command(c, {"PING"});
+    CRPC_CHECK(ping.ok());
+    CRPC_CHECK_EQ(std::string("PONG"), ping.value().as_simple_string());
+
+    crpc::result<crpc::redis::resp_value> bogus = run_command(c, {"BOGUS"});
+    CRPC_CHECK(bogus.ok());
+    CRPC_CHECK(bogus.value().is_error());
+    CRPC_CHECK_EQ(std::string("ERR unknown command"), bogus.value().as_error());
+}
+
+CRPC_TEST(client_command_rejects_empty_args) {
+    harness h(basic_handler());
+    crpc::redis::client c(h.options(), h.backend);
+
+    crpc::result<crpc::redis::resp_value> reply = run_command(c, {});
+    CRPC_CHECK_FALSE(reply.ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                  static_cast<int>(reply.code()));
+}
+
+CRPC_TEST(client_command_encodes_each_argument_as_a_bulk_string) {
+    // None of the sneaky contents can be reinterpreted as a second command: on
+    // the wire every argument is length-prefixed, so CR/LF and embedded frames
+    // are ordinary bytes the decoder must hand back verbatim.
+    auto recorded = std::make_shared<std::vector<crpc::redis::command>>();
+    harness h([recorded](const crpc::redis::command& cmd) -> scripted_reply {
+        recorded->push_back(cmd);
+        return {{"+OK\r\n"}, {}};
+    });
+    crpc::redis::client c(h.options(), h.backend);
+
+    const std::string sneaky = "value\r\n*3\r\n$3\r\nGET\r\n$1\r\nx\r\n";
+    const std::vector<std::string> args{"SET", "key\r\nwith\r\nlines", sneaky,
+                                        "PING", ""};
+    crpc::result<crpc::redis::resp_value> reply = run_command(c, args);
+    CRPC_CHECK(reply.ok());
+    CRPC_CHECK_EQ(std::string("OK"), reply.value().as_simple_string());
+
+    CRPC_CHECK_EQ(std::size_t{1}, recorded->size());
+    const crpc::redis::command& sent = (*recorded)[0];
+    CRPC_CHECK_EQ(std::size_t{5}, sent.size());
+    CRPC_CHECK_EQ(std::string("SET"), sent[0]);
+    CRPC_CHECK_EQ(std::string("key\r\nwith\r\nlines"), sent[1]);
+    CRPC_CHECK_EQ(sneaky, sent[2]);
+    CRPC_CHECK_EQ(std::string("PING"), sent[3]);
+    CRPC_CHECK(sent[4].empty());
+}
+
 CRPC_TEST_MAIN()

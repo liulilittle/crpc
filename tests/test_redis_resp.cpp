@@ -1030,4 +1030,370 @@ CRPC_TEST(resp_parser_fuzz_mutated_values_never_crashes) {
     CRPC_CHECK(true);
 }
 
+// --- RESP3 attributes and streamed frames -----------------------------------
+//
+// Byte forms confirmed against the official RESP3 specification
+// (redis/redis-specifications repository, protocol/RESP3.md), not from memory:
+//   attribute      `|<count>\r\n` then count key/value pairs, then the value it
+//                  augments (spec section "Attribute type");
+//   streamed str   `$?\r\n` then `;<len>\r\n<data>\r\n` chunks, terminated by
+//                  `;0\r\n` (spec section "Streamed strings"); the example in
+//                  the spec spells `$?` / `;4` / `;5` / `;1` / `;0`;
+//   streamed agg   `*?` (also `~?`, `%?`) then elements, terminated by a
+//                  `<CR><LF>` line whose lone byte is `.` (spec section
+//                  "Streamed aggregated data types").
+// Redis 7.0 core commands emit none of these frames (the spec states the
+// server has no command producing streamed strings or aggregates), so every
+// case in this section is a constructed-byte case, not a real-server capture.
+
+CRPC_TEST(resp_parse_resp3_attribute_augments_reply) {
+    const resp_value reply = parse_one("|1\r\n+ttl\r\n:3600\r\n+OK\r\n");
+    CRPC_CHECK(reply.is_simple_string());
+    CRPC_CHECK_EQ(std::string("OK"), reply.as_simple_string());
+    CRPC_CHECK(reply.has_attributes());
+    CRPC_CHECK_EQ(reply.attributes().size(), static_cast<std::size_t>(1));
+    CRPC_CHECK_EQ(std::string("ttl"), reply.attributes()[0].first.as_simple_string());
+    CRPC_CHECK_EQ(reply.attributes()[0].second.as_integer(),
+                  static_cast<std::int64_t>(3600));
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_does_not_change_the_reply) {
+    // A caller that ignores attributes still reads the exact same reply value.
+    const resp_value reply = parse_one("|1\r\n+ttl\r\n:3600\r\n*2\r\n:1\r\n:2\r\n");
+    CRPC_CHECK(reply.is_array());
+    CRPC_CHECK_EQ(reply.as_array().size(), static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(reply.as_array()[1].as_integer(), static_cast<std::int64_t>(2));
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_spec_key_popularity_example) {
+    // The exact example from the RESP3 spec: an attribute whose value is a map.
+    const resp_value reply = parse_one(
+        "|1\r\n+key-popularity\r\n%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n"
+        "*2\r\n:2039123\r\n:9543892\r\n");
+    CRPC_CHECK(reply.is_array());
+    CRPC_CHECK(reply.has_attributes());
+    CRPC_CHECK_EQ(reply.attributes().size(), static_cast<std::size_t>(1));
+    CRPC_CHECK_EQ(std::string("key-popularity"),
+                  reply.attributes()[0].first.as_simple_string());
+    CRPC_CHECK(reply.attributes()[0].second.is_map());
+    CRPC_CHECK_EQ(reply.attributes()[0].second.as_map().size(),
+                  static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(reply.attributes()[0].second.as_map()[1].second.as_double(), 0.0012);
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_nested_inside_array) {
+    // The spec example: the third element of an array carries its own attribute.
+    const resp_value reply = parse_one("*3\r\n:1\r\n:2\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n");
+    CRPC_CHECK(reply.is_array());
+    CRPC_CHECK_FALSE(reply.has_attributes());
+    CRPC_CHECK_FALSE(reply.as_array()[0].has_attributes());
+    CRPC_CHECK(reply.as_array()[2].has_attributes());
+    CRPC_CHECK_EQ(reply.as_array()[2].as_integer(), static_cast<std::int64_t>(3));
+    CRPC_CHECK_EQ(std::string("ttl"),
+                  reply.as_array()[2].attributes()[0].first.as_simple_string());
+    CRPC_CHECK_EQ(reply.as_array()[2].attributes()[0].second.as_integer(),
+                  static_cast<std::int64_t>(3600));
+}
+
+CRPC_TEST(resp_parse_resp3_empty_attribute_map) {
+    const resp_value reply = parse_one("|0\r\n:7\r\n");
+    CRPC_CHECK_EQ(reply.as_integer(), static_cast<std::int64_t>(7));
+    CRPC_CHECK(reply.has_attributes());
+    CRPC_CHECK(reply.attributes().empty());
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_attribute_attached_after_split) {
+    // The attribute frame and the augmented reply may arrive in separate feeds.
+    const std::string text = "|1\r\n+ttl\r\n:3600\r\n+OK\r\n";
+    for (std::size_t split = 1; split < text.size(); ++split) {
+        resp_parser parser;
+        parser.feed(as_span(bytes_of(text.substr(0, split))));
+        resp_value value;
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::need_more));
+        parser.feed(as_span(bytes_of(text.substr(split))));
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::value_ready));
+        CRPC_CHECK(value.is_simple_string());
+        CRPC_CHECK(value.has_attributes());
+        CRPC_CHECK_EQ(value.attributes().size(), static_cast<std::size_t>(1));
+        CRPC_CHECK(parser.finish().ok());
+    }
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_without_reply_is_truncated) {
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("|1\r\n+ttl\r\n:3600\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::need_more));
+    CRPC_CHECK_FALSE(parser.finish().ok());
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_rejects_null_count) {
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("|-1\r\n:3\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_spec_example) {
+    // The exact bytes from the RESP3 spec section "Streamed strings". Note the
+    // spec's own example concatenates to "Hello word", not "Hello world" (the
+    // prose says the latter but the chunks Hell / o wor / d spell the former);
+    // the decoder must reproduce exactly what the chunks carry.
+    const resp_value reply =
+        parse_one("$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;1\r\nd\r\n;0\r\n");
+    CRPC_CHECK(reply.is_bulk_string());
+    CRPC_CHECK_EQ(std::string("Hello word"), reply.as_bulk_string());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_correct_concatenation) {
+    // A canonical "Hello world" split into chunks that do add up, pinning the
+    // intended semantics (each chunk appends its bytes, byte-for-byte).
+    const resp_value reply =
+        parse_one("$?\r\n;5\r\nHello\r\n;1\r\n \r\n;5\r\nworld\r\n;0\r\n");
+    CRPC_CHECK(reply.is_bulk_string());
+    CRPC_CHECK_EQ(std::string("Hello world"), reply.as_bulk_string());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_empty) {
+    const resp_value reply = parse_one("$?\r\n;0\r\n");
+    CRPC_CHECK(reply.is_bulk_string());
+    CRPC_CHECK(reply.as_bulk_string().empty());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_split_at_every_boundary) {
+    const std::string text =
+        "$?\r\n;5\r\nHello\r\n;1\r\n \r\n;5\r\nworld\r\n;0\r\n";
+    for (std::size_t split = 1; split < text.size(); ++split) {
+        resp_parser parser;
+        parser.feed(as_span(bytes_of(text.substr(0, split))));
+        resp_value value;
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::need_more));
+        parser.feed(as_span(bytes_of(text.substr(split))));
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::value_ready));
+        CRPC_CHECK(value.is_bulk_string());
+        CRPC_CHECK_EQ(std::string("Hello world"), value.as_bulk_string());
+        CRPC_CHECK(parser.finish().ok());
+    }
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_rejects_bad_length) {
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("$?\r\n;-1\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_missing_terminator_is_truncated) {
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::need_more));
+    CRPC_CHECK_FALSE(parser.finish().ok());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_respects_size_limit) {
+    resp_parser parser(8u);
+    parser.feed(as_span(bytes_of("$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;0\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::resource_exhausted));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_array_and_set) {
+    const resp_value array = parse_one("*?\r\n:1\r\n:2\r\n.\r\n");
+    CRPC_CHECK(array.is_array());
+    CRPC_CHECK_EQ(array.as_array().size(), static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(array.as_array()[1].as_integer(), static_cast<std::int64_t>(2));
+
+    const resp_value set = parse_one("~?\r\n+a\r\n+b\r\n.\r\n");
+    CRPC_CHECK(set.is_set());
+    CRPC_CHECK_EQ(set.as_set().size(), static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(std::string("b"), set.as_set()[1].as_simple_string());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_map) {
+    const resp_value map = parse_one("%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n");
+    CRPC_CHECK(map.is_map());
+    CRPC_CHECK_EQ(map.as_map().size(), static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(std::string("a"), map.as_map()[0].first.as_simple_string());
+    CRPC_CHECK_EQ(map.as_map()[1].second.as_integer(), static_cast<std::int64_t>(2));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_aggregates_nest) {
+    const resp_value reply =
+        parse_one("*?\r\n$?\r\n;2\r\nab\r\n;0\r\n*?\r\n:7\r\n.\r\n.\r\n");
+    CRPC_CHECK(reply.is_array());
+    CRPC_CHECK_EQ(reply.as_array().size(), static_cast<std::size_t>(2));
+    CRPC_CHECK_EQ(std::string("ab"), reply.as_array()[0].as_bulk_string());
+    CRPC_CHECK(reply.as_array()[1].is_array());
+    CRPC_CHECK_EQ(reply.as_array()[1].as_array()[0].as_integer(),
+                  static_cast<std::int64_t>(7));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_aggregate_split_at_every_boundary) {
+    const std::string text = "*?\r\n:1\r\n%?\r\n+a\r\n:2\r\n.\r\n:3\r\n.\r\n";
+    for (std::size_t split = 1; split < text.size(); ++split) {
+        resp_parser parser;
+        parser.feed(as_span(bytes_of(text.substr(0, split))));
+        resp_value value;
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::need_more));
+        parser.feed(as_span(bytes_of(text.substr(split))));
+        CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                      static_cast<int>(resp_parser::result::value_ready));
+        CRPC_CHECK(value.is_array());
+        CRPC_CHECK_EQ(value.as_array().size(), static_cast<std::size_t>(3));
+        CRPC_CHECK_EQ(value.as_array()[1].as_map()[0].second.as_integer(),
+                      static_cast<std::int64_t>(2));
+        CRPC_CHECK(parser.finish().ok());
+    }
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_map_odd_element_count_rejected) {
+    // `%?` must emit an even number of elements; a terminator where a value is
+    // expected leaves the key without its pair.
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("%?\r\n+a\r\n.\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_push_rejected) {
+    // `>` has no streamed form in the RESP3 spec.
+    resp_parser parser;
+    parser.feed(as_span(bytes_of(">?\r\n.\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::error));
+    CRPC_CHECK_EQ(static_cast<int>(parser.error()),
+                  static_cast<int>(rpc_code::protocol_error));
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_aggregate_missing_terminator_is_truncated) {
+    resp_parser parser;
+    parser.feed(as_span(bytes_of("*?\r\n:1\r\n:2\r\n")));
+    resp_value value;
+    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
+                  static_cast<int>(resp_parser::result::need_more));
+    CRPC_CHECK_FALSE(parser.finish().ok());
+}
+
+CRPC_TEST(resp_parse_resp3_streamed_string_carries_no_attributes) {
+    // Attributes only attach through `|`; a streamed string never sets them.
+    const resp_value reply = parse_one("$?\r\n;3\r\nabc\r\n;0\r\n");
+    CRPC_CHECK(reply.is_bulk_string());
+    CRPC_CHECK_FALSE(reply.has_attributes());
+}
+
+CRPC_TEST(resp_parse_resp3_attribute_augments_streamed_string) {
+    const resp_value reply = parse_one("|1\r\n+ttl\r\n:3600\r\n$?\r\n;3\r\nabc\r\n;0\r\n");
+    CRPC_CHECK(reply.is_bulk_string());
+    CRPC_CHECK_EQ(std::string("abc"), reply.as_bulk_string());
+    CRPC_CHECK(reply.has_attributes());
+    CRPC_CHECK_EQ(reply.attributes().size(), static_cast<std::size_t>(1));
+}
+
+CRPC_TEST(resp_encode_resp3_attribute_round_trips) {
+    resp_value reply{resp_simple_string{"OK"}};
+    resp_map attributes;
+    attributes.emplace_back(resp_value{resp_simple_string{"ttl"}},
+                            resp_value{resp_integer{3600}});
+    reply.set_attributes(std::move(attributes));
+
+    const std::string encoded = encode_value_text(reply, resp_protocol::resp3);
+    CRPC_CHECK_EQ(std::string("|1\r\n+ttl\r\n:3600\r\n+OK\r\n"), encoded);
+    CRPC_CHECK(parse_one(encoded) == reply);
+}
+
+CRPC_TEST(resp_encode_resp3_attribute_size_matches_bytes) {
+    resp_value reply{resp_integer{7}};
+    resp_map attributes;
+    attributes.emplace_back(resp_value{resp_bulk_string{"k"}},
+                            resp_value{resp_double{0.5}});
+    reply.set_attributes(std::move(attributes));
+    const std::size_t declared = encoded_value_size(reply, resp_protocol::resp3);
+    CRPC_CHECK_EQ(declared, encode_value_text(reply, resp_protocol::resp3).size());
+}
+
+CRPC_TEST(resp_encode_resp3_attribute_nested_round_trips) {
+    resp_value item{resp_integer{3}};
+    resp_map attributes;
+    attributes.emplace_back(resp_value{resp_simple_string{"ttl"}},
+                            resp_value{resp_integer{3600}});
+    item.set_attributes(std::move(attributes));
+    const resp_value reply{resp_array_value{{resp_integer{1}, item}}};
+
+    const std::string encoded = encode_value_text(reply, resp_protocol::resp3);
+    CRPC_CHECK_EQ(std::string("*2\r\n:1\r\n|1\r\n+ttl\r\n:3600\r\n:3\r\n"), encoded);
+    CRPC_CHECK(parse_one(encoded) == reply);
+}
+
+CRPC_TEST(resp_encode_resp2_drops_attributes) {
+    // RESP2 has no attribute frame; the fallback encodes only the value.
+    resp_value reply{resp_simple_string{"OK"}};
+    resp_map attributes;
+    attributes.emplace_back(resp_value{resp_simple_string{"ttl"}},
+                            resp_value{resp_integer{3600}});
+    reply.set_attributes(std::move(attributes));
+    CRPC_CHECK_EQ(std::string("+OK\r\n"),
+                  encode_value_text(reply, resp_protocol::resp2));
+    CRPC_CHECK_EQ(static_cast<std::size_t>(5),
+                  encoded_value_size(reply, resp_protocol::resp2));
+}
+
+CRPC_TEST(resp_attribute_equality_distinguishes_attributes) {
+    resp_map one;
+    one.emplace_back(resp_value{resp_simple_string{"ttl"}}, resp_value{resp_integer{1}});
+    resp_map two;
+    two.emplace_back(resp_value{resp_simple_string{"ttl"}}, resp_value{resp_integer{2}});
+
+    resp_value a{resp_integer{5}};
+    a.set_attributes(std::move(one));
+    resp_value b{resp_integer{5}};
+    b.set_attributes(std::move(two));
+    resp_value bare{resp_integer{5}};
+
+    CRPC_CHECK_FALSE(a == b);
+    CRPC_CHECK_FALSE(a == bare);
+    CRPC_CHECK(a == a);
+    resp_value copy = a;
+    CRPC_CHECK(a == copy);
+}
+
+CRPC_TEST(resp_encode_resp3_attribute_forbidden_crlf_is_rejected) {
+    resp_value reply{resp_integer{1}};
+    resp_map attributes;
+    attributes.emplace_back(resp_value{resp_simple_string{"bad\r\nkey"}},
+                            resp_value{resp_integer{1}});
+    reply.set_attributes(std::move(attributes));
+
+    resp_encoder encoder(resp_protocol::resp3);
+    bool threw = false;
+    try {
+        (void)encoder.encode_to_string(reply);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CRPC_CHECK(threw);
+}
+
 CRPC_TEST_MAIN()

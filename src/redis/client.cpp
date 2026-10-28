@@ -114,7 +114,7 @@ status client::connect() {
     std::shared_ptr<connection> conn = std::move(acquired).value();
     command_channel channel(*conn);
     channel.set_protocol(impl_->opts.protocol);
-    result<resp_value> reply = channel.execute(command{"PING"});
+    result<resp_value> reply = channel.execute(resp_command{"PING"});
     impl_->pool.release(std::move(conn));
     return classify(reply);
 }
@@ -137,18 +137,31 @@ std::size_t client::in_use() const noexcept { return impl_->pool.in_use(); }
 
 std::size_t client::total() const noexcept { return impl_->pool.total(); }
 
-result<resp_value> client::execute(const command& cmd) {
+result<resp_value> client::execute(const resp_command& cmd) {
     return execute_over_pool(impl_->pool, impl_->opts.protocol, cmd);
 }
 
 result<std::vector<resp_value>> client::execute_batch(
-    const std::vector<command>& commands) {
+    const std::vector<resp_command>& commands) {
     return execute_batch_over_pool(impl_->pool, impl_->opts.protocol, commands);
+}
+
+result<resp_value> client::command(span<const std::string> args) {
+    if (args.empty()) {
+        return rpc_error{rpc_code::invalid_argument,
+                         "an empty Redis command cannot be sent"};
+    }
+    resp_command cmd;
+    cmd.reserve(args.size());
+    for (const std::string& arg : args) {
+        cmd.push_back(arg);
+    }
+    return execute(cmd);
 }
 
 // --- typed convenience ---------------------------------------------------------
 
-result<resp_value> client::ping() { return execute(command{"PING"}); }
+result<resp_value> client::ping() { return execute(resp_command{"PING"}); }
 
 result<resp_value> client::get(std::string key) {
     return execute(command_builder("GET").arg(std::move(key)).build());

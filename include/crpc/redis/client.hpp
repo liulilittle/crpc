@@ -103,6 +103,14 @@ public:
     [[nodiscard]] result<std::vector<resp_value>> execute_batch(
         const std::vector<command>& commands);
 
+    // Executes an arbitrary command: `args[0]` is the command name and the
+    // rest are its arguments. This is the escape hatch for commands the typed
+    // facade does not wrap. Each argument is encoded as a binary-safe bulk
+    // string, so a value containing CR/LF, spaces or a fake `*N\n...` frame
+    // cannot be split into extra arguments or spliced into a second command.
+    // An empty `args` is rejected with `rpc_code::invalid_argument`.
+    [[nodiscard]] result<resp_value> command(span<const std::string> args);
+
     // --- Typed convenience -----------------------------------------------------
     //
     // Each method builds the command from its arguments, so a caller never has
