@@ -188,6 +188,132 @@ CRPC_TEST(odbc_it_ddl_dml_and_typed_reads) {
     }
 }
 
+// A MEMO column holds far more than the 8 KiB the reader used to bind. The old reader
+// bound a fixed buffer and took the indicator at face value, so a long value came back
+// truncated (or empty when the driver reported SQL_NO_TOTAL) with no error at all -- a
+// silent data-loss bug that only a real driver with a real long value exposes.
+CRPC_TEST(odbc_it_long_text_is_not_truncated) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    run_quietly(*it.session, "DROP TABLE crpc_memo");
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status created = it.session->query(
+            "CREATE TABLE crpc_memo (id INTEGER, body MEMO)", {}, &out);
+        crpc::db::statement_guard guard(out);
+        if (!created) {
+            report("create memo table", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+
+    // 20000 characters, with distinct characters at both ends so a truncation or an
+    // off-by-one in either direction is visible in the comparison.
+    std::string body(20000, 'x');
+    body.front() = 'A';
+    body.back() = 'Z';
+    {
+        crpc::db::parameter params[2] = {
+            crpc::db::parameter::from_int64(1),
+            crpc::db::parameter::from_text(body),
+        };
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_memo (id, body) VALUES (?, ?)",
+            crpc::span<const crpc::db::parameter>(params, 2), &out);
+        crpc::db::statement_guard guard(out);
+        if (!inserted) {
+            report("insert memo", inserted.error());
+        }
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status selected = it.session->query(
+            "SELECT id, body FROM crpc_memo WHERE id = 1", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!selected) {
+            report("select memo", selected.error());
+        }
+        CRPC_CHECK(static_cast<bool>(selected));
+        CRPC_CHECK(raw != nullptr);
+        if (raw == nullptr) {
+            return;
+        }
+        CRPC_CHECK(raw->next());
+        const std::string_view view = raw->get_text(1).value();
+        const std::string round_tripped(view);
+        CRPC_CHECK_EQ(body.size(), round_tripped.size());
+        CRPC_CHECK_EQ(std::string("A"), round_tripped.substr(0, 1));
+        CRPC_CHECK_EQ(std::string("Z"), round_tripped.substr(round_tripped.size() - 1));
+        CRPC_CHECK(round_tripped == body);
+    }
+}
+
+// A timestamp is carried as text with a type tag (see db/types.hpp), so the adapter binds it
+// as a character parameter and lets the driver convert. That is only correct if the driver
+// really converts on write and the value survives; an Access DATETIME column is the case
+// worth pinning, because a lossy or rejected conversion shows up here and nowhere else.
+CRPC_TEST(odbc_it_timestamp_round_trips) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    run_quietly(*it.session, "DROP TABLE crpc_dt");
+    {
+        crpc::db::result_set* out = nullptr;
+        const crpc::status created = it.session->query(
+            "CREATE TABLE crpc_dt (id INTEGER, at DATETIME)", {}, &out);
+        crpc::db::statement_guard guard(out);
+        if (!created) {
+            report("create dt table", created.error());
+        }
+        CRPC_CHECK(static_cast<bool>(created));
+    }
+    {
+        crpc::db::parameter params[2] = {
+            crpc::db::parameter::from_int64(1),
+            crpc::db::parameter::from_text("2024-04-25 12:34:56", crpc::db::db_type::timestamp),
+        };
+        crpc::db::result_set* out = nullptr;
+        const crpc::status inserted = it.session->query(
+            "INSERT INTO crpc_dt (id, at) VALUES (?, ?)",
+            crpc::span<const crpc::db::parameter>(params, 2), &out);
+        crpc::db::statement_guard guard(out);
+        if (!inserted) {
+            report("insert dt", inserted.error());
+        }
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+    {
+        crpc::db::result_set* raw = nullptr;
+        const crpc::status selected = it.session->query(
+            "SELECT id, at FROM crpc_dt WHERE id = 1", {}, &raw);
+        crpc::db::statement_guard guard(raw);
+        if (!selected) {
+            report("select dt", selected.error());
+        }
+        CRPC_CHECK(static_cast<bool>(selected));
+        CRPC_CHECK(raw != nullptr);
+        if (raw == nullptr) {
+            return;
+        }
+        CRPC_CHECK(raw->next());
+        const std::string_view view = raw->get_text(1).value();
+        const std::string text(view);
+        // The driver renders a date in its own format; what must hold is that the instant
+        // survived, not that it is spelled the way it was sent.
+        CRPC_CHECK(text.find("2024-04-25") != std::string::npos);
+        CRPC_CHECK(text.find("12:34:56") != std::string::npos);
+    }
+}
+
 CRPC_TEST(odbc_it_constraint_violation_carries_the_sqlstate) {
     (void)require_bridge();
     it_session it;

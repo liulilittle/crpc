@@ -161,6 +161,10 @@ struct bound_parameter {
     double real = 0.0;
     std::vector<std::byte> blob;
     SQLLEN indicator = 0;
+    // BufferLength for SQLBindParameter. It is ignored for the fixed-size numeric C types
+    // but not for character and binary ones: with 0 the Access driver reads a zero-length
+    // buffer and answers "String data, right truncation" for a long value.
+    SQLLEN buffer_length = 0;
     SQLSMALLINT c_type = SQL_C_CHAR;
     SQLSMALLINT sql_type = SQL_VARCHAR;
     SQLULEN column_size = 0;
@@ -213,15 +217,27 @@ void classify(const parameter& value, bound_parameter& out) {
         out.sql_type = SQL_VARBINARY;
         out.column_size = out.blob.size();
         out.indicator = static_cast<SQLLEN>(out.blob.size());
+        out.buffer_length = static_cast<SQLLEN>(out.blob.size());
         return;
     default:
         // Everything else goes as text: the driver knows its own conversions, and a
         // date, a decimal or a UUID sent as text is what every ODBC driver expects.
         out.text = value.text;
         out.c_type = SQL_C_CHAR;
-        out.sql_type = SQL_VARCHAR;
-        out.column_size = out.text.size() == 0 ? 1 : out.text.size();
+        // A character parameter's ColumnSize is its maximum length, and the Access (Jet)
+        // driver rejects anything above 255 with "Invalid precision value" -- it has no
+        // VARCHAR wider than that, so a longer value is a long character type (MEMO). The
+        // spec says ColumnSize is ignored for the long types, and 0 is the portable value
+        // for "not declared": passing the real length reintroduces the same rejection.
+        if (out.text.size() > 255) {
+            out.sql_type = SQL_LONGVARCHAR;
+            out.column_size = out.text.size();
+        } else {
+            out.sql_type = SQL_VARCHAR;
+            out.column_size = out.text.size() == 0 ? 1 : out.text.size();
+        }
         out.indicator = static_cast<SQLLEN>(out.text.size());
+        out.buffer_length = static_cast<SQLLEN>(out.text.size());
         return;
     }
 }
@@ -503,7 +519,8 @@ status connection::query(std::string_view sql, span<const parameter> params, res
         }
         const SQLRETURN bind_result =
             SQLBindParameter(stmt, static_cast<SQLUSMALLINT>(i + 1), SQL_PARAM_INPUT, one.c_type,
-                             one.sql_type, one.column_size, one.digits, data, 0, &one.indicator);
+                             one.sql_type, one.column_size, one.digits, data, one.buffer_length,
+                             &one.indicator);
         if (!SQL_SUCCEEDED(bind_result)) {
             const std::vector<diagnostic> diagnostics = collect_diagnostics(SQL_HANDLE_STMT, stmt);
             std::string message = "a parameter could not be bound";
@@ -559,9 +576,12 @@ status connection::query(std::string_view sql, span<const parameter> params, res
     columns.reserve(static_cast<std::size_t>(column_count));
     // Every column is read as text: the driver's own conversion is the only one that knows
     // the column's real type, and the library's cursor parses canonical text.
-    std::vector<std::vector<char>> buffers;
-    buffers.reserve(static_cast<std::size_t>(column_count));
-    std::vector<SQLLEN> indicators(static_cast<std::size_t>(column_count), 0);
+    // Columns are read with SQLGetData instead of being bound to a fixed buffer. A bound
+    // buffer has to be sized before the first row, and every value longer than it arrives
+    // truncated with no error at all -- a MEMO column is exactly that case, and a silent
+    // truncation is worse than a failure. SQLGetData is called until the driver says
+    // SQL_NO_DATA, so the length is never assumed. It must also be called in ascending
+    // column order, which the loop below does.
     for (SQLSMALLINT i = 1; i <= column_count; ++i) {
         SQLWCHAR name[256] = {0};
         SQLSMALLINT name_length = 0;
@@ -579,19 +599,6 @@ status connection::query(std::string_view sql, span<const parameter> params, res
         info.scale = static_cast<std::uint32_t>(digits);
         info.nullable = nullable == SQL_NULLABLE;
         columns.push_back(std::move(info));
-        // A generous buffer: Access reports a memo as a very large size, and truncating a
-        // value silently is worse than a larger allocation.
-        const std::size_t width = column_size == 0 || column_size == SQL_NO_TOTAL
-                                      ? 4096
-                                      : (column_size > 8192 ? 8192 : column_size) + 1;
-        buffers.emplace_back(width, '\0');
-        if (!SQL_SUCCEEDED(SQLBindCol(stmt, static_cast<SQLUSMALLINT>(i), SQL_C_CHAR,
-                                      buffers.back().data(),
-                                      static_cast<SQLLEN>(buffers.back().size()),
-                                      &indicators[static_cast<std::size_t>(i - 1)]))) {
-            release();
-            return status{rpc_code::protocol_error, "a column could not be bound for reading"};
-        }
     }
 
     std::unique_ptr<memory_result_set> set(new memory_result_set(std::move(columns), -1));
@@ -622,19 +629,52 @@ status connection::query(std::string_view sql, span<const parameter> params, res
         std::vector<bool> nulls;
         values.reserve(static_cast<std::size_t>(column_count));
         nulls.reserve(static_cast<std::size_t>(column_count));
-        for (SQLSMALLINT i = 0; i < column_count; ++i) {
-            const SQLLEN indicator = indicators[static_cast<std::size_t>(i)];
-            if (indicator == SQL_NULL_DATA) {
+        for (SQLSMALLINT i = 1; i <= column_count; ++i) {
+            std::string value;
+            bool is_null = false;
+            for (;;) {
+                char chunk[4096] = {0};
+                SQLLEN indicator = 0;
+                const SQLRETURN got = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i), SQL_C_CHAR,
+                                                 chunk, static_cast<SQLLEN>(sizeof(chunk)),
+                                                 &indicator);
+                if (got == SQL_NO_DATA) {
+                    break;
+                }
+                if (!SQL_SUCCEEDED(got)) {
+                    const std::vector<diagnostic> diagnostics =
+                        collect_diagnostics(SQL_HANDLE_STMT, stmt);
+                    std::string message = "the driver failed while reading a value";
+                    rpc_code code = rpc_code::application;
+                    if (!diagnostics.empty()) {
+                        message = diagnostics.front().message;
+                        last_sqlstate_ = diagnostics.front().sqlstate;
+                        code = map_sqlstate(last_sqlstate_);
+                    }
+                    release();
+                    return status{code, message};
+                }
+                if (indicator == SQL_NULL_DATA) {
+                    is_null = true;
+                    break;
+                }
+                // For SQL_C_CHAR the driver null-terminates whatever it puts in the buffer,
+                // including a truncated chunk, so the chunk length is the string length.
+                value.append(chunk);
+                if (got == SQL_SUCCESS) {
+                    // SQL_SUCCESS means the whole value has been returned; only a truncated
+                    // chunk comes back as SQL_SUCCESS_WITH_INFO and needs another call.
+                    break;
+                }
+            }
+            row_bytes += value.size();
+            if (is_null) {
                 values.emplace_back();
                 nulls.push_back(true);
-                continue;
+            } else {
+                values.push_back(std::move(value));
+                nulls.push_back(false);
             }
-            const std::size_t length =
-                indicator == SQL_NO_TOTAL ? 0 : static_cast<std::size_t>(indicator);
-            const std::string value(buffers[static_cast<std::size_t>(i)].data(), length);
-            row_bytes += value.size();
-            values.push_back(value);
-            nulls.push_back(false);
         }
         if (row_bytes > impl_->options.max_result_bytes) {
             release();
