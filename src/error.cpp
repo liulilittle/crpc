@@ -41,6 +41,7 @@ const char* to_string(rpc_code code) noexcept {
     case rpc_code::internal:            return "internal";
     case rpc_code::shutting_down:       return "shutting_down";
     case rpc_code::application:         return "application";
+    case rpc_code::permission_denied:   return "permission_denied";
     }
     // An out-of-range value can only arrive from a hostile or newer peer; the
     // frame codec rejects unknown codes before they reach this function.
@@ -76,6 +77,7 @@ int to_http_status(rpc_code code) noexcept {
     case rpc_code::internal:            return 500;
     case rpc_code::shutting_down:       return 503;
     case rpc_code::application:         return 500;
+    case rpc_code::permission_denied:   return 403;
     }
     return 500;
 }

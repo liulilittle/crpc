@@ -200,6 +200,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::tds::rpc_request`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
+- `::crpc::fs::directory_entry`
+- `::crpc::fs::file_info`
 - `::crpc::http2::frame_header`
 - `::crpc::http2::goaway_payload`
 - `::crpc::http2::header_field`

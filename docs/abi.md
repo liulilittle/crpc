@@ -303,6 +303,8 @@ is guarded.
 - `::crpc::db::tds::rpc_request`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
+- `::crpc::fs::directory_entry`
+- `::crpc::fs::file_info`
 - `::crpc::http2::frame_header`
 - `::crpc::http2::goaway_payload`
 - `::crpc::http2::header_field`
