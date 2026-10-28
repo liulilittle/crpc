@@ -285,6 +285,23 @@ bool start_inproc(fixture& f, const fixture_config& cfg) {
     }
     if (cfg.configure_breaker) {
         cb.breaker(cfg.breaker);
+    } else {
+        // The facade builds an endpoint breaker for every endpoint from
+        // `options_.breaker`, so "unconfigured" still means the shipped
+        // default: min_requests=20, slow_call_ratio_threshold=0.5, and a
+        // slow-call threshold derived as max(1 ms, 5 * p99_target) = 1 ms. A
+        // slow success is recorded as a `slow` outcome, so on a busy host --
+        // where a single in-process call was measured at up to 46.9 ms
+        // (probe-10: 32 of 1000 calls over 1 ms) -- the default breaker opens
+        // after 20 calls and rejects everything else with "endpoint circuit
+        // breaker is open", failing tests that never asked for a breaker.
+        // Tests that do not exercise one must not depend on ambient latency:
+        // pin the slow threshold at 5 s (the same value
+        // breaker_records_logical_call_not_attempts already uses) and leave
+        // every other field at the documented default.
+        crpc::resilience::breaker_config relaxed;
+        relaxed.slow_call_threshold = 5s;
+        cb.breaker(relaxed);
     }
     cb.resilience_enabled(cfg.client_resilience_enabled);
     if (cfg.configure_client_rate) {
@@ -351,22 +368,34 @@ struct coroutine_job {
     std::atomic<bool> done{false};
 };
 
+// Takes over the strong reference the spawner handed over as the spawn
+// context (a heap-allocated copy of the shared_ptr). The reference is released
+// after `done` is published, so the job always outlives the last reader that
+// observed `done`.
 void coroutine_entry(void* ctx) {
-    auto* job = static_cast<coroutine_job*>(ctx);
+    std::shared_ptr<coroutine_job> job(
+        std::move(*static_cast<std::shared_ptr<coroutine_job>*>(ctx)));
+    delete static_cast<std::shared_ptr<coroutine_job>*>(ctx);
     job->body();
     job->done.store(true, std::memory_order_release);
 }
 
 bool run_on_shard(crpc::runtime& shard, std::function<void()> body,
                   int timeout_ms = 5000) {
-    auto* job = new coroutine_job{std::move(body), {}};
-    if (!shard.spawn(&coroutine_entry, job)) {
-        delete job;
+    auto job = std::make_shared<coroutine_job>();
+    job->body = std::move(body);
+    // The spawn context owns one strong reference of its own. If the wait
+    // below times out, the spawned coroutine may still be parked on the shard
+    // and must keep the job (and the lambda inside it) alive after this frame
+    // returns; the previous unconditional `delete job` released the context of
+    // a coroutine that could still be running.
+    auto* ctx = new std::shared_ptr<coroutine_job>(job);
+    if (!shard.spawn(&coroutine_entry, ctx)) {
+        delete ctx;
         return false;
     }
     const bool finished = crpc_test::wait_for(
         [job] { return job->done.load(std::memory_order_acquire); }, timeout_ms);
-    delete job;
     return finished;
 }
 
@@ -706,7 +735,13 @@ CRPC_TEST(deadline_exceeded_and_handler_observes) {
         auto stub = f.cli->service<int, int>(kService, kSlow);
         crpc::rpc::call_context ctx;
         ctx.has_deadline = true;
-        ctx.deadline = clock_type::now() + 40ms;
+        // The handler must start running inside this budget for the test to
+        // observe the expiry from inside the handler. A loaded host measured
+        // one in-process call at 46.9 ms (probe-10, the breaker-flake run), so
+        // 40 ms left no margin and the request could be refused before the
+        // handler ever ran, leaving canceled_observed unset forever. 100 ms
+        // still expires well inside the handler's 200 ms loop.
+        ctx.deadline = clock_type::now() + 100ms;
         auto started = stub.call(1, ctx);
         if (!started.ok()) {
             code = static_cast<int>(started.code());
@@ -2696,6 +2731,23 @@ CRPC_TEST(client_remote_retry_after_is_honored) {
         *f.shard,
         [&] {
             auto stub = f.cli->service<int, int>(kService, kEcho);
+            // Burn one token first. The bucket starts empty, so this call is
+            // refused at least once and returns only after a successful
+            // attempt -- which leaves the bucket empty with the next token due
+            // exactly 1/rate later. Anchoring the measured call to the burn
+            // call (a back-to-back coroutine step, microseconds apart) keeps
+            // the advertised hint near 1/rate under any load; anchoring it to
+            // server start did not -- the start-to-call gap grows without
+            // bound on a busy host, the hint shrank below the 150 ms floor and
+            // this test failed with no hint-honoring bug (loop run 4 under
+            // three concurrent full ctest rounds).
+            auto warm = stub.call(123);
+            if (warm.ok()) {
+                auto warm_handle = std::move(warm).value();
+                (void)warm_handle.get();
+            } else {
+                return;
+            }
             const auto begin = clock_type::now();
             auto started = stub.call(5);
             if (!started.ok()) {
@@ -2712,7 +2764,7 @@ CRPC_TEST(client_remote_retry_after_is_honored) {
     CRPC_CHECK(ran);
     CRPC_CHECK_EQ(0, code);
     CRPC_CHECK(elapsed >= 150ms);
-    CRPC_CHECK_EQ(1, f.service.echo_calls.load());
+    CRPC_CHECK_EQ(2, f.service.echo_calls.load());
     CRPC_CHECK(f.cli->resilience_stats().retries_delayed_by_hint >= 1);
 }
 
@@ -2748,6 +2800,20 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
             auto echo = f.cli->service<int, int>(kService, kEcho);
             crpc::rpc::call_context ctx;
             ctx.idempotent = true;
+            // Burn one token first so the measured call is refused with a
+            // hint anchored to the burn call (back-to-back, microseconds
+            // apart) instead of to server start, whose distance to the first
+            // call grows without bound under load and can exceed the whole
+            // 1/rate window (then the first attempt would succeed and no
+            // retry would happen at all). The burn's own retry, if any, has
+            // the same hint-below-backoff shape and must not count either.
+            auto warm = echo.call(123, ctx);
+            if (warm.ok()) {
+                auto warm_handle = std::move(warm).value();
+                (void)warm_handle.get();
+            } else {
+                return;
+            }
             const auto begin = clock_type::now();
             auto started = echo.call(2, ctx);
             if (!started.ok()) {
@@ -2767,7 +2833,9 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
     CRPC_CHECK_EQ(static_cast<crpc::u32>(2), attempts);
     // The wait is the 250 ms policy backoff, not the ~167 ms hint.
     CRPC_CHECK(elapsed >= 200ms);
-    CRPC_CHECK_EQ(static_cast<std::size_t>(1), f.cli->stats().retries);
+    // One retry for the measured call, plus possibly one for the burn call
+    // (whose first attempt is always refused by the empty bucket).
+    CRPC_CHECK(f.cli->stats().retries >= 1);
     CRPC_CHECK_EQ(static_cast<std::size_t>(0),
                   f.cli->resilience_stats().retries_delayed_by_hint);
 }
@@ -5175,6 +5243,157 @@ CRPC_TEST(fallback_overrun_reports_deadline_exceeded) {
     CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.attempted);
     CRPC_CHECK_EQ(static_cast<std::size_t>(1), stats.overrun);
     CRPC_CHECK_EQ(static_cast<std::size_t>(0), stats.applied);
+}
+
+// Service for the shipped-default breaker probes below: one microsecond echo
+// and one 5 ms success, the latter standing in for a handler that does real
+// work (a query, a serialization, a business computation).
+struct default_breaker_probe_service {
+    int fast(const int& value) { return value + 1; }
+
+    static crpc::status slow_ok(void*, const crpc::call_envelope&,
+                                crpc::span<const std::byte> body,
+                                crpc::buffer& out, crpc::rpc::call_context&) {
+        std::this_thread::sleep_for(5ms);
+        int value = 0;
+        const crpc::status decoded = crpc::rpc::call_codec<int>::decode(body, value);
+        if (!decoded.ok()) {
+            return decoded;
+        }
+        return crpc::rpc::call_codec<int>::encode(value + 1, out);
+    }
+};
+
+// Pin one half of the shipped breaker-default semantics with no load involved.
+// With a fully default breaker_config the slow-call threshold derives as
+// max(1 ms, 5 * p99_target) = 1 ms. A microsecond echo (p50 about 3 us on this
+// backend) never crosses it, so the default must keep a fast endpoint closed
+// for the whole run. This is the case the defaults were designed for; a change
+// to the defaults that opens the breaker here is a regression.
+CRPC_TEST(default_breaker_tolerates_microsecond_echo) {
+    crpc::inproc_backend backend;
+    default_breaker_probe_service service;
+    const std::string name = "crpc-default-breaker-fast";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(name), backend);
+    sb.add_service(kService, "svc");
+    sb.template add_method<default_breaker_probe_service,
+                           &default_breaker_probe_service::fast>(kService, kEcho,
+                                                                 "fast", service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc(name), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5s);
+    cb.plain_thread_timeout(5s);
+    // No breaker() call: the facade then runs the shipped default config.
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        srv->stop();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(kService, kEcho);
+    int ok = 0;
+    int refused = 0;
+    for (int i = 0; i < 30; ++i) {
+        auto started = stub.call(i);
+        if (!started.ok()) {
+            ++refused;
+            continue;
+        }
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        if (result.ok() && result.value() == i + 1) {
+            ++ok;
+        } else {
+            ++refused;
+        }
+    }
+    CRPC_CHECK_EQ(30, ok);
+    CRPC_CHECK_EQ(0, refused);
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), cli->stats().breaker_rejections);
+
+    cli->close();
+    srv->stop();
+}
+
+// Deterministic demonstration (independent finding, no load involved) that the
+// shipped breaker defaults open on a *healthy* endpoint whose handler does
+// real work. Every 5 ms call is a slow success (the derived threshold is
+// max(1 ms, 5 * p99_target) = 1 ms); once min_requests=20 outcomes fill the
+// 30 s window, slow_call_ratio_threshold=0.5 trips and the breaker opens for
+// open_duration=10 s. 21st call onwards are refused with unavailable. Whether
+// these defaults are right for real deployments is a product decision; this
+// case only makes the behaviour observable and stable instead of load-dependent.
+CRPC_TEST(default_breaker_opens_on_a_five_millisecond_handler) {
+    crpc::inproc_backend backend;
+    default_breaker_probe_service service;
+    const std::string name = "crpc-default-breaker-slow";
+
+    crpc::server::builder sb;
+    sb.add_listener(crpc::endpoint::inproc(name), backend);
+    sb.add_service(kService, "svc");
+    sb.add_raw_method(kService, kSlow, "slow_ok",
+                      &default_breaker_probe_service::slow_ok, &service);
+    auto srv = sb.build();
+    CRPC_CHECK(srv != nullptr);
+    if (!srv) {
+        return;
+    }
+    CRPC_CHECK(srv->start().ok());
+
+    crpc::client::builder cb;
+    cb.add_endpoint(crpc::endpoint::inproc(name), backend);
+    cb.pool_size(1);
+    cb.default_deadline(5s);
+    cb.plain_thread_timeout(5s);
+    // No breaker() call: shipped defaults, exactly the unconfigured path.
+    auto cli = cb.build();
+    CRPC_CHECK(cli != nullptr);
+    if (!cli) {
+        srv->stop();
+        return;
+    }
+
+    auto stub = cli->service<int, int>(kService, kSlow);
+    int ok = 0;
+    int refused = 0;
+    int first_refused_index = -1;
+    for (int i = 0; i < 30; ++i) {
+        auto started = stub.call(i);
+        if (!started.ok()) {
+            ++refused;
+            if (first_refused_index < 0) {
+                first_refused_index = i;
+            }
+            continue;
+        }
+        auto handle = std::move(started).value();
+        auto result = handle.get();
+        if (result.ok() && result.value() == i + 1) {
+            ++ok;
+        } else {
+            ++refused;
+        }
+    }
+    // The 20 slow successes fill the window; call index 20 is the first
+    // refusal and the remaining 9 are refused while the breaker is open.
+    CRPC_CHECK_EQ(20, ok);
+    CRPC_CHECK_EQ(10, refused);
+    CRPC_CHECK_EQ(20, first_refused_index);
+    CRPC_CHECK(cli->stats().breaker_rejections >= 10);
+
+    cli->close();
+    srv->stop();
 }
 
 } // namespace

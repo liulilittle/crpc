@@ -474,6 +474,13 @@ CRPC_TEST(command_channel_parks_a_coroutine_until_the_reply_arrives) {
             [&state] { return state.done.load(std::memory_order_acquire); }, 3000));
         CRPC_CHECK_EQ(0, state.code);
         CRPC_CHECK_EQ(std::string("PONG"), state.payload);
+
+        // Join the shard while the fixture and channel are still alive: a
+        // coroutine left parked by a timed-out wait must never resume after
+        // the objects it calls are destroyed. stop()/join() are idempotent,
+        // so the calls after the block stay.
+        shard.stop();
+        shard.join();
     }
 
     shard.stop();
