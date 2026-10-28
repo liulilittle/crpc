@@ -5,9 +5,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "reply_util.hpp"
 
 namespace crpc {
 namespace redis {
@@ -48,34 +52,6 @@ struct pooled_connection {
     ~pooled_connection() { pool.release(std::move(conn)); }
 };
 
-result<resp_value> execute_over_pool(connection_pool& pool, resp_protocol protocol,
-                                     const command& cmd) {
-    result<std::shared_ptr<connection>> acquired = pool.acquire();
-    if (!acquired) {
-        return acquired.error();
-    }
-    pooled_connection guard{pool, std::move(acquired).value()};
-    command_channel channel(*guard.conn);
-    channel.set_protocol(protocol);
-    return channel.execute(cmd);
-}
-
-result<std::vector<resp_value>> execute_batch_over_pool(
-    connection_pool& pool, resp_protocol protocol,
-    const std::vector<command>& commands) {
-    if (commands.empty()) {
-        return std::vector<resp_value>{};
-    }
-    result<std::shared_ptr<connection>> acquired = pool.acquire();
-    if (!acquired) {
-        return acquired.error();
-    }
-    pooled_connection guard{pool, std::move(acquired).value()};
-    command_channel channel(*guard.conn);
-    channel.set_protocol(protocol);
-    return channel.execute_batch(commands);
-}
-
 // Turns a command reply into a health status: a transport failure or a Redis
 // error reply is a failure, a well-formed reply is success.
 status classify(const result<resp_value>& reply) {
@@ -88,6 +64,76 @@ status classify(const result<resp_value>& reply) {
     return status{};
 }
 
+// Reads a text field out of a HELLO map entry, folding the string
+// alternatives. Returns nullptr for a non-text value (the integer `proto` or
+// the array `modules`).
+const std::string* map_text_value(const resp_value& value) {
+    return detail::is_text(value) ? &detail::as_text(value) : nullptr;
+}
+
+// Sends `HELLO 3` and turns the reply into `hello_info`. A transport or
+// framing failure fails the result; a server error reply (Redis < 6 has no
+// HELLO command) fails with a clear "RESP3 not supported" error; a reply that
+// is not a map, or that negotiates a proto other than 3, is a protocol error.
+// A failure never downgrades the session silently.
+result<hello_info> negotiate_resp3(connection& conn) {
+    command_channel channel(conn);
+    channel.set_protocol(resp_protocol::resp3);
+    result<resp_value> reply = channel.execute(resp_command{"HELLO", "3"});
+    if (!reply) {
+        return reply.error();
+    }
+    const resp_value& value = reply.value();
+    if (detail::is_error_reply(value)) {
+        return rpc_error{
+            rpc_code::failed_precondition,
+            "RESP3 negotiation failed: server answered HELLO 3 with an error (\""
+                + detail::error_message(value)
+                + "\"); RESP3 requires Redis 6 or newer"};
+    }
+    if (!value.is_map()) {
+        return rpc_error{rpc_code::protocol_error,
+                         "RESP3 negotiation failed: HELLO 3 did not return a map"};
+    }
+    hello_info info;
+    bool saw_proto = false;
+    for (const auto& entry : value.as_map()) {
+        const std::string* key = map_text_value(entry.first);
+        if (key == nullptr) {
+            continue;
+        }
+        const std::string* field = map_text_value(entry.second);
+        if (*key == "server") {
+            if (field != nullptr) {
+                info.server = *field;
+            }
+        } else if (*key == "version") {
+            if (field != nullptr) {
+                info.version = *field;
+            }
+        } else if (*key == "proto") {
+            if (entry.second.is_integer()) {
+                info.proto = entry.second.as_integer();
+                saw_proto = true;
+            }
+        } else if (*key == "mode") {
+            if (field != nullptr) {
+                info.mode = *field;
+            }
+        } else if (*key == "role") {
+            if (field != nullptr) {
+                info.role = *field;
+            }
+        }
+    }
+    if (!saw_proto || info.proto != 3) {
+        return rpc_error{rpc_code::protocol_error,
+                         "RESP3 negotiation failed: server advertised proto "
+                             + std::to_string(info.proto) + " instead of 3"};
+    }
+    return info;
+}
+
 } // namespace
 
 struct client::impl {
@@ -96,10 +142,109 @@ struct client::impl {
     runtime* shard;
     connection_pool pool;
 
+    // RESP3 negotiation state. `negotiated` maps a live connection to the link
+    // generation at which `HELLO 3` was last sent; the weak_ptr guard tells a
+    // recycled heap address from the same connection object, so a stale entry
+    // never lets a fresh connection skip its handshake. `last_hello` is the
+    // most recent successful negotiation. Both are guarded by `negotiate_mutex`.
+    mutable std::mutex negotiate_mutex;
+    std::unordered_map<const connection*,
+                       std::pair<std::weak_ptr<connection>, std::uint64_t>>
+        negotiated;
+    hello_info last_hello;
+
     impl(options o, crpc::backend_factory& b, runtime* rt)
         : opts(std::move(o)), backend(b), shard(rt),
           pool(opts.pool, backend, shard) {}
+
+    // Ensures `conn` runs the requested RESP dialect. RESP2 needs no handshake
+    // and is a no-op. RESP3 sends `HELLO 3` once per connection link
+    // generation; a later acquire of the same live link skips the round trip.
+    result<hello_info> ensure_negotiated(const std::shared_ptr<connection>& conn,
+                                         resp_protocol protocol);
+    // Acquires a pooled connection and, for RESP3, negotiates it before handing
+    // it out. A negotiation failure closes the acquired connection and returns
+    // it to the pool (which drops a closed link), so a refused session cannot
+    // linger as a silent RESP2 fallback.
+    result<std::shared_ptr<connection>> acquire_negotiated(resp_protocol protocol);
+    result<resp_value> execute_over_pool(resp_protocol protocol,
+                                         const resp_command& cmd);
+    result<std::vector<resp_value>> execute_batch_over_pool(
+        resp_protocol protocol, const std::vector<resp_command>& commands);
 };
+
+result<hello_info> client::impl::ensure_negotiated(
+    const std::shared_ptr<connection>& conn, resp_protocol protocol) {
+    if (protocol != resp_protocol::resp3) {
+        return hello_info{};
+    }
+    const connection* raw = conn.get();
+    const std::uint64_t generation = conn->reconnect_count();
+    {
+        std::lock_guard<std::mutex> lock(negotiate_mutex);
+        const auto entry = negotiated.find(raw);
+        if (entry != negotiated.end()) {
+            const std::shared_ptr<connection> alive = entry->second.first.lock();
+            if (alive != nullptr && entry->second.second == generation) {
+                return last_hello;
+            }
+            // A recycled heap address or a newer link generation: renegotiate.
+            negotiated.erase(entry);
+        }
+    }
+
+    result<hello_info> info = negotiate_resp3(*conn);
+    if (!info) {
+        return info.error();
+    }
+
+    std::lock_guard<std::mutex> lock(negotiate_mutex);
+    negotiated[raw] = {conn, generation};
+    last_hello = info.value();
+    return info;
+}
+
+result<std::shared_ptr<connection>> client::impl::acquire_negotiated(
+    resp_protocol protocol) {
+    result<std::shared_ptr<connection>> acquired = pool.acquire();
+    if (!acquired) {
+        return acquired.error();
+    }
+    result<hello_info> handshake = ensure_negotiated(acquired.value(), protocol);
+    if (!handshake) {
+        acquired.value()->close();
+        pool.release(acquired.value());
+        return handshake.error();
+    }
+    return acquired;
+}
+
+result<resp_value> client::impl::execute_over_pool(resp_protocol protocol,
+                                                   const resp_command& cmd) {
+    result<std::shared_ptr<connection>> acquired = acquire_negotiated(protocol);
+    if (!acquired) {
+        return acquired.error();
+    }
+    pooled_connection guard{pool, std::move(acquired).value()};
+    command_channel channel(*guard.conn);
+    channel.set_protocol(protocol);
+    return channel.execute(cmd);
+}
+
+result<std::vector<resp_value>> client::impl::execute_batch_over_pool(
+    resp_protocol protocol, const std::vector<resp_command>& commands) {
+    if (commands.empty()) {
+        return std::vector<resp_value>{};
+    }
+    result<std::shared_ptr<connection>> acquired = acquire_negotiated(protocol);
+    if (!acquired) {
+        return acquired.error();
+    }
+    pooled_connection guard{pool, std::move(acquired).value()};
+    command_channel channel(*guard.conn);
+    channel.set_protocol(protocol);
+    return channel.execute_batch(commands);
+}
 
 client::client(options opts, crpc::backend_factory& backend, runtime* shard)
     : impl_(std::make_unique<impl>(std::move(opts), backend, shard)) {}
@@ -107,9 +252,10 @@ client::client(options opts, crpc::backend_factory& backend, runtime* shard)
 client::~client() = default;
 
 status client::connect() {
-    result<std::shared_ptr<connection>> acquired = impl_->pool.acquire();
+    result<std::shared_ptr<connection>> acquired =
+        impl_->acquire_negotiated(impl_->opts.protocol);
     if (!acquired) {
-        return status{acquired.code()};
+        return status{acquired.error()};
     }
     std::shared_ptr<connection> conn = std::move(acquired).value();
     command_channel channel(*conn);
@@ -119,16 +265,32 @@ status client::connect() {
     return classify(reply);
 }
 
-void client::close() noexcept { impl_->pool.close(); }
+void client::close() noexcept {
+    impl_->pool.close();
+    try {
+        std::lock_guard<std::mutex> lock(impl_->negotiate_mutex);
+        impl_->negotiated.clear();
+    } catch (...) {
+        // close() is noexcept; a mutex failure cannot break the shutdown
+        // contract, and the stale entries self-heal through their weak_ptr.
+    }
+}
 
 bool client::is_open() const noexcept { return impl_->pool.total() > 0; }
 
 status client::health_check() { return classify(ping()); }
 
-result<std::shared_ptr<connection>> client::acquire() { return impl_->pool.acquire(); }
+result<std::shared_ptr<connection>> client::acquire() {
+    return impl_->acquire_negotiated(impl_->opts.protocol);
+}
 
 void client::release(std::shared_ptr<connection> conn) {
     impl_->pool.release(std::move(conn));
+}
+
+hello_info client::hello() const {
+    std::lock_guard<std::mutex> lock(impl_->negotiate_mutex);
+    return impl_->last_hello;
 }
 
 std::size_t client::idle() const noexcept { return impl_->pool.idle(); }
@@ -138,12 +300,12 @@ std::size_t client::in_use() const noexcept { return impl_->pool.in_use(); }
 std::size_t client::total() const noexcept { return impl_->pool.total(); }
 
 result<resp_value> client::execute(const resp_command& cmd) {
-    return execute_over_pool(impl_->pool, impl_->opts.protocol, cmd);
+    return impl_->execute_over_pool(impl_->opts.protocol, cmd);
 }
 
 result<std::vector<resp_value>> client::execute_batch(
     const std::vector<resp_command>& commands) {
-    return execute_batch_over_pool(impl_->pool, impl_->opts.protocol, commands);
+    return impl_->execute_batch_over_pool(impl_->opts.protocol, commands);
 }
 
 result<resp_value> client::command(span<const std::string> args) {

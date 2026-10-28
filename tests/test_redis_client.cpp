@@ -158,11 +158,17 @@ private:
 // long as the client may still hold the matching pooled connection.
 class server_holder final : public crpc::accept_sink {
 public:
-    explicit server_holder(server_handler handler) : handler_(std::move(handler)) {}
+    explicit server_holder(server_handler handler)
+        : factory_([handler = std::move(handler)]() { return handler; }) {}
+
+    // A handler factory lets each accepted connection carry its own state (for
+    // example: "has THIS connection seen HELLO 3 yet").
+    explicit server_holder(std::function<server_handler()> factory)
+        : factory_(std::move(factory)) {}
 
     void on_accept(std::unique_ptr<crpc::connection> conn) noexcept override {
         try {
-            auto server = std::make_unique<fake_redis_server>(conn.get(), handler_);
+            auto server = std::make_unique<fake_redis_server>(conn.get(), factory_());
             servers_.push_back(std::move(server));
             conns_.push_back(std::move(conn));
         } catch (...) {
@@ -172,7 +178,7 @@ public:
     std::size_t accepts() const noexcept { return servers_.size(); }
 
 private:
-    server_handler handler_;
+    std::function<server_handler()> factory_;
     // `conns_` is declared before `servers_` so the reverse destruction order
     // destroys each server (which unbinds from its connection) before the
     // connection it points at.
@@ -187,7 +193,13 @@ struct harness {
     std::unique_ptr<server_holder> server;
 
     harness(server_handler handler) {
-        server = std::make_unique<server_holder>(std::move(handler));
+        boot([handler = std::move(handler)]() { return handler; });
+    }
+
+    explicit harness(std::function<server_handler()> factory) { boot(std::move(factory)); }
+
+    void boot(std::function<server_handler()> factory) {
+        server = std::make_unique<server_holder>(std::move(factory));
         listener = backend.listen(ep, crpc::listen_options{});
         if (listener != nullptr) {
             listener->start(server.get());
@@ -664,6 +676,256 @@ CRPC_TEST(client_command_encodes_each_argument_as_a_bulk_string) {
     CRPC_CHECK_EQ(sneaky, sent[2]);
     CRPC_CHECK_EQ(std::string("PING"), sent[3]);
     CRPC_CHECK(sent[4].empty());
+}
+
+// --- RESP3 negotiation --------------------------------------------------------
+
+namespace {
+
+// Folds simple and bulk strings the way the reply helpers do, so a test does not
+// care which wire form carried the text.
+const std::string* text_of(const crpc::redis::resp_value& value) {
+    if (value.is_simple_string()) {
+        return &value.as_simple_string();
+    }
+    if (value.is_bulk_string()) {
+        return &value.as_bulk_string();
+    }
+    return nullptr;
+}
+
+// A HELLO 3 reply shaped like Redis 7 emits: a map whose `proto` field is 3.
+const char* hello3_map_reply =
+    "%4\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n"
+    "$5\r\nproto\r\n:3\r\n$4\r\nrole\r\n$6\r\nmaster\r\n";
+
+// The same map but with proto 2, impersonating a server that refuses RESP3.
+const char* hello2_map_reply =
+    "%4\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n7.0.15\r\n"
+    "$5\r\nproto\r\n:2\r\n$4\r\nrole\r\n$6\r\nmaster\r\n";
+
+// HGETALL under RESP3 is a map; under RESP2 it is a flat array.
+const char* resp3_hgetall_map = "%1\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+const char* resp2_hgetall_array = "*2\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+
+bool is_hello3(const crpc::redis::command& cmd) {
+    return cmd.size() == 2 && cmd[0] == "HELLO" && cmd[1] == "3";
+}
+
+// Per-connection handshake state. The fake server answers HGETALL with a RESP3
+// map only to a connection that first saw HELLO 3, otherwise with the RESP2
+// flat array -- so a test proves negotiation of THIS connection by observing
+// which reply shape comes back on it.
+struct connection_state {
+    bool hello_seen = false;
+};
+
+server_handler hello_aware_handler(std::shared_ptr<connection_state> state) {
+    return [state](const crpc::redis::command& cmd) -> scripted_reply {
+        if (is_hello3(cmd)) {
+            state->hello_seen = true;
+            return {{hello3_map_reply}, {}};
+        }
+        if (!cmd.empty() && cmd[0] == "HGETALL") {
+            return state->hello_seen
+                       ? scripted_reply{{resp3_hgetall_map}, {}}
+                       : scripted_reply{{resp2_hgetall_array}, {}};
+        }
+        if (!cmd.empty() && cmd[0] == "PING") {
+            return {{"+PONG\r\n"}, {}};
+        }
+        return {{"+OK\r\n"}, {}};
+    };
+}
+
+} // namespace
+
+CRPC_TEST(client_resp3_negotiates_hello_before_first_command) {
+    auto seen = std::make_shared<std::vector<crpc::redis::command>>();
+    harness h([seen](const crpc::redis::command& cmd) -> scripted_reply {
+        seen->push_back(cmd);
+        if (is_hello3(cmd)) {
+            return {{hello3_map_reply}, {}};
+        }
+        if (!cmd.empty() && cmd[0] == "PING") {
+            return {{"+PONG\r\n"}, {}};
+        }
+        return {{"-ERR unexpected command\r\n"}, {}};
+    });
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    CRPC_CHECK(c.connect().ok());
+    // connect() must negotiate first, then run its own PING probe.
+    CRPC_CHECK(seen->size() >= 2);
+    if (seen->size() >= 2) {
+        CRPC_CHECK(is_hello3((*seen)[0]));
+        CRPC_CHECK((*seen)[1].size() == 1 && (*seen)[1][0] == "PING");
+    }
+}
+
+CRPC_TEST(client_resp3_hgetall_returns_map_only_after_negotiation) {
+    auto state = std::make_shared<connection_state>();
+    harness h(hello_aware_handler(state));
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    crpc::result<crpc::redis::resp_value> reply = c.execute({"HGETALL", "h"});
+    CRPC_CHECK(reply.ok());
+    CRPC_CHECK(reply.value().is_map());
+    if (reply.value().is_map()) {
+        CRPC_CHECK_EQ(std::size_t{1}, reply.value().as_map().size());
+        const std::string* value = text_of(reply.value().as_map()[0].second);
+        CRPC_CHECK(value != nullptr && *value == "value");
+    }
+}
+
+CRPC_TEST(client_resp2_never_sends_hello_and_keeps_flat_array) {
+    auto state = std::make_shared<connection_state>();
+    harness h(hello_aware_handler(state));
+    crpc::redis::client c(h.options(), h.backend);
+
+    crpc::result<crpc::redis::resp_value> reply = c.execute({"HGETALL", "h"});
+    CRPC_CHECK(reply.ok());
+    CRPC_CHECK_FALSE(state->hello_seen);
+    CRPC_CHECK_FALSE(reply.value().is_map());
+    CRPC_CHECK(reply.value().is_array());
+    CRPC_CHECK_EQ(std::size_t{2}, reply.value().as_array().size());
+}
+
+CRPC_TEST(client_resp3_pool_negotiates_every_connection) {
+    auto states = std::make_shared<std::vector<std::shared_ptr<connection_state>>>();
+    harness h([states]() -> server_handler {
+        auto state = std::make_shared<connection_state>();
+        states->push_back(state);
+        return hello_aware_handler(state);
+    });
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    opts.pool.max_size = 4;
+    crpc::redis::client c(opts, h.backend);
+
+    // Hold one pooled connection so the next command must open a second one.
+    crpc::result<std::shared_ptr<crpc::redis::connection>> held = c.acquire();
+    CRPC_CHECK(held.ok());
+
+    // Running on the held connection proves that connection was negotiated when
+    // it was acquired; running over the pool proves the fresh connection was
+    // too.
+    crpc::redis::command_channel channel(*held.value());
+    channel.set_protocol(crpc::redis::resp_protocol::resp3);
+    crpc::result<crpc::redis::resp_value> direct = channel.execute({"HGETALL", "h"});
+    CRPC_CHECK(direct.ok());
+    CRPC_CHECK(direct.value().is_map());
+
+    crpc::result<crpc::redis::resp_value> pooled = c.execute({"HGETALL", "h"});
+    CRPC_CHECK(pooled.ok());
+    CRPC_CHECK(pooled.value().is_map());
+
+    CRPC_CHECK_EQ(std::size_t{2}, c.total());
+    CRPC_CHECK_EQ(std::size_t{2}, states->size());
+    for (const std::shared_ptr<connection_state>& state : *states) {
+        CRPC_CHECK(state->hello_seen);
+    }
+
+    c.release(std::move(held).value());
+}
+
+CRPC_TEST(client_resp3_negotiation_failure_is_reported_not_silently_downgraded) {
+    harness h([](const crpc::redis::command& cmd) -> scripted_reply {
+        if (is_hello3(cmd)) {
+            // Redis < 6 has no HELLO command at all.
+            return {{"-ERR unknown command 'HELLO', with args beginning with: '3',\r\n"},
+                    {}};
+        }
+        return {{"+PONG\r\n"}, {}};
+    });
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    crpc::result<crpc::redis::resp_value> reply = c.execute({"PING"});
+    CRPC_CHECK_FALSE(reply.ok());
+    if (reply.ok()) {
+        return;
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                  static_cast<int>(reply.code()));
+    CRPC_CHECK(reply.error().message.find("RESP3") != std::string::npos);
+    CRPC_CHECK(reply.error().message.find("Redis 6") != std::string::npos);
+    // The refused connection must not linger in the pool as a silent RESP2 fallback.
+    CRPC_CHECK_EQ(std::size_t{0}, c.total());
+}
+
+CRPC_TEST(client_resp3_rejects_server_that_answers_proto_2) {
+    harness h([](const crpc::redis::command& cmd) -> scripted_reply {
+        if (is_hello3(cmd)) {
+            return {{hello2_map_reply}, {}};
+        }
+        return {{"+PONG\r\n"}, {}};
+    });
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    crpc::result<crpc::redis::resp_value> reply = c.execute({"PING"});
+    CRPC_CHECK_FALSE(reply.ok());
+    if (reply.ok()) {
+        return;
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::protocol_error),
+                  static_cast<int>(reply.code()));
+    CRPC_CHECK_EQ(std::size_t{0}, c.total());
+}
+
+CRPC_TEST(client_resp3_hello_exposes_server_info) {
+    harness h(hello_aware_handler(std::make_shared<connection_state>()));
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    CRPC_CHECK(c.connect().ok());
+    CRPC_CHECK_EQ(std::string("redis"), c.hello().server);
+    CRPC_CHECK_EQ(std::string("7.0.15"), c.hello().version);
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(3), c.hello().proto);
+    CRPC_CHECK_EQ(std::string("master"), c.hello().role);
+}
+
+CRPC_TEST(client_resp2_hello_stays_empty) {
+    harness h(hello_aware_handler(std::make_shared<connection_state>()));
+    crpc::redis::client c(h.options(), h.backend);
+
+    CRPC_CHECK(c.connect().ok());
+    CRPC_CHECK(c.hello().version.empty());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(0), c.hello().proto);
+}
+
+CRPC_TEST(client_resp3_negotiates_once_per_connection_link) {
+    auto state = std::make_shared<connection_state>();
+    auto hellos = std::make_shared<int>(0);
+    harness h([state, hellos](const crpc::redis::command& cmd) -> scripted_reply {
+        if (is_hello3(cmd)) {
+            ++(*hellos);
+            state->hello_seen = true;
+            return {{hello3_map_reply}, {}};
+        }
+        if (!cmd.empty() && cmd[0] == "PING") {
+            return {{"+PONG\r\n"}, {}};
+        }
+        return {{"+OK\r\n"}, {}};
+    });
+    crpc::redis::client::options opts = h.options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, h.backend);
+
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    CRPC_CHECK(c.execute({"PING"}).ok());
+    // The pool reuses the same live link, so HELLO must be sent exactly once.
+    CRPC_CHECK_EQ(1, *hellos);
+    CRPC_CHECK_EQ(std::size_t{1}, c.total());
 }
 
 CRPC_TEST_MAIN()
