@@ -37,11 +37,13 @@ file(GLOB CRPC_TEST_SOURCES CONFIGURE_DEPENDS
 # crpc_test_<area>. A nested file tests/<area>/test_<case>.cpp joins the
 # executable of that area when it exists, otherwise it gets its own.
 #
-# test_codec and test_mvc are skipped without the RTTI dependency: they use
-# RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM unconditionally and do not compile when
-# CRPC_HAVE_RTTI is off. Every other test builds and runs in both cases, so this
-# is a per-target guard rather than a hard requirement on the whole suite.
-set(CRPC_RTTI_DEPENDENT_TESTS test_codec test_mvc)
+# test_codec, test_mvc and the ORM suite are skipped without the RTTI
+# dependency: they use RTTI_DEFINE_TYPE / CRPC_ORM_ENTITY unconditionally and do
+# not compile when CRPC_HAVE_RTTI is off. Every other test builds and runs in
+# both cases, so this is a per-target guard rather than a hard requirement on
+# the whole suite.
+set(CRPC_RTTI_DEPENDENT_TESTS test_codec test_mvc test_orm_metadata test_orm_sql
+                              test_orm_session test_orm_value test_orm_mysql_it)
 if(NOT CRPC_HAVE_RTTI)
     message(STATUS "CRPC: RTTI dependency absent, skipping ${CRPC_RTTI_DEPENDENT_TESTS}")
 endif()

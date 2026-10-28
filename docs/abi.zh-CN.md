@@ -233,6 +233,11 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::obs::log_record`
 - `::crpc::obs::trace_context`
 - `::crpc::obs::traceparent_result`
+- `::crpc::orm::column_meta`
+- `::crpc::orm::entity_meta`
+- `::crpc::orm::sql::condition`
+- `::crpc::orm::sql::order_term`
+- `::crpc::orm::sql::statement`
 - `::crpc::push::push_envelope`
 - `::crpc::redis::notification`
 - `::crpc::push::push_subscription`
