@@ -195,11 +195,14 @@ CRPC_TEST(response_coro_get_parks_then_resumes) {
     CRPC_CHECK_EQ(0, code.load());
     CRPC_CHECK_EQ(7, value.load());
 
-    delete job;
     cli->close();
     srv->stop();
     shard.stop();
     shard.join();
+    // join() above guarantees no coroutine of this shard runs past this
+    // point, so the job is released only after the coroutine that owns it is
+    // gone (the waits above may have timed out with the coroutine parked).
+    delete job;
 }
 
 // A plain echo call inside a coroutine: get() parks until the server answers
@@ -253,11 +256,14 @@ CRPC_TEST(response_coro_get_success) {
     CRPC_CHECK_EQ(0, code.load());
     CRPC_CHECK_EQ(42, value.load());
 
-    delete job;
     cli->close();
     srv->stop();
     shard.stop();
     shard.join();
+    // join() above guarantees no coroutine of this shard runs past this
+    // point, so the job is released only after the coroutine that owns it is
+    // gone (the waits above may have timed out with the coroutine parked).
+    delete job;
 }
 
 // A server-produced failure inside a coroutine: get() parks, then returns the
@@ -310,11 +316,14 @@ CRPC_TEST(response_coro_get_failure) {
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable), code.load());
     CRPC_CHECK_EQ(-1, value.load());
 
-    delete job;
     cli->close();
     srv->stop();
     shard.stop();
     shard.join();
+    // join() above guarantees no coroutine of this shard runs past this
+    // point, so the job is released only after the coroutine that owns it is
+    // gone (the waits above may have timed out with the coroutine parked).
+    delete job;
 }
 
 CRPC_TEST_MAIN()
