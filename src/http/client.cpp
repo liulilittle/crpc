@@ -4,7 +4,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <system_error>
 #include <utility>
+
+#include <crpc/db/stream_channel.hpp>
+#include <crpc/io/tls.hpp>
 
 namespace crpc {
 namespace http {
@@ -185,6 +189,7 @@ struct length_field {
 struct client::impl {
     client_options options;
     std::unique_ptr<db::channel> link;
+    rpc_error setup_error;
     bool used = false;
 };
 
@@ -192,6 +197,14 @@ client::client(client_options options, std::unique_ptr<db::channel> link)
     : impl_(new impl()) {
     impl_->options = std::move(options);
     impl_->link = std::move(link);
+}
+
+client::client(client_options options, std::unique_ptr<db::channel> link,
+               rpc_error setup_error)
+    : impl_(new impl()) {
+    impl_->options = std::move(options);
+    impl_->link = std::move(link);
+    impl_->setup_error = std::move(setup_error);
 }
 
 client::~client() { close(); }
@@ -204,13 +217,21 @@ void client::close() noexcept {
 
 bool client::is_open() const noexcept {
     // A channel has no generic liveness query: each framing layer knows its own state, and
-    // a TCP link can be half-closed without telling anyone. "Has a link and has not been
-    // used yet" is what this client can answer honestly.
-    return impl_ != nullptr && impl_->link != nullptr && !impl_->used;
+    // a TCP link can be half-closed without telling anyone. "Has a usable link and has not
+    // been used yet" is what this client can answer honestly. A client that failed TLS
+    // setup has no link and is never open.
+    return impl_ != nullptr && impl_->link != nullptr && impl_->setup_error.ok() &&
+           !impl_->used;
 }
 
 result<response> client::send(method verb, std::string_view target, span<const std::byte> body,
                               span<const header> extra_headers) {
+    if (impl_ && !impl_->setup_error.ok()) {
+        // HTTPS requested without the TLS backend, an unusable CA file, or no
+        // host name for SNI: report the stored reason rather than pretending a
+        // connection exists.
+        return impl_->setup_error;
+    }
     if (!impl_ || !impl_->link) {
         return rpc_error{rpc_code::shutting_down, "the HTTP client has no link"};
     }
@@ -229,7 +250,10 @@ result<response> client::send(method verb, std::string_view target, span<const s
     request += target;
     request += " HTTP/1.1\r\nHost: ";
     request += impl_->options.host;
-    if (impl_->options.port != 80) {
+    // The default port is part of the scheme: 443 under TLS, 80 otherwise. It is
+    // omitted from Host only when the connection uses that scheme default.
+    const std::uint16_t default_port = impl_->options.tls ? 443 : 80;
+    if (impl_->options.port != default_port) {
         request += ':';
         request += std::to_string(impl_->options.port);
     }
@@ -439,17 +463,87 @@ result<response> client::send_text(method verb, std::string_view target, std::st
 
 std::unique_ptr<client> make_client(client_options options, crpc::backend_factory& backend,
                                     crpc::endpoint endpoint, crpc::runtime* shard) {
-    crpc::net::connection_config config;
-    config.ep = std::move(endpoint);
-    // A response body may be delimited by the close itself, so a close must surface as eof
-    // rather than a silent reconnect.
-    config.reconnect_on_eof = false;
-    if (options.timeout_seconds != 0) {
-        config.operation_timeout = std::chrono::seconds(options.timeout_seconds);
+    if (!options.tls) {
+        crpc::net::connection_config config;
+        config.ep = std::move(endpoint);
+        // A response body may be delimited by the close itself, so a close must surface as
+        // eof rather than a silent reconnect.
+        config.reconnect_on_eof = false;
+        if (options.timeout_seconds != 0) {
+            config.operation_timeout = std::chrono::seconds(options.timeout_seconds);
+        }
+        auto link = std::unique_ptr<db::channel>(
+            new db::socket_channel(std::move(config), backend, shard));
+        return std::unique_ptr<client>(new client(std::move(options), std::move(link)));
     }
-    auto link = std::unique_ptr<db::channel>(
-        new db::socket_channel(std::move(config), backend, shard));
+
+#if !defined(CRPC_HAVE_OPENSSL)
+    return std::unique_ptr<client>(new client(
+        std::move(options), nullptr,
+        rpc_error{rpc_code::failed_precondition,
+                  "https:// requires the OpenSSL TLS backend: rebuild the library with "
+                  "-DCRPC_WITH_OPENSSL=ON"}));
+#else
+    const std::string sni =
+        options.tls_server_name.empty() ? options.host : options.tls_server_name;
+    if (sni.empty()) {
+        return std::unique_ptr<client>(new client(
+            std::move(options), nullptr,
+            rpc_error{rpc_code::failed_precondition,
+                      "https:// requires a host name for SNI and certificate "
+                      "verification"}));
+    }
+
+    io::tls_config tls;
+    tls.role = io::tls_role::client;
+    // Verification is the default; turning it off is an explicit caller decision.
+    tls.verify = options.tls_verify_peer ? io::tls_verify_mode::peer
+                                         : io::tls_verify_mode::none;
+    tls.ca_bundle = options.tls_ca_bundle;
+    if (options.tls_alpn.empty()) {
+        tls.alpn_protocols.clear();
+    } else {
+        tls.alpn_protocols = {options.tls_alpn};
+    }
+    // A server that does not implement ALPN is still a valid HTTP/1.1 server;
+    // what is advertised is HTTP/1.1 only, so a negotiated value can never
+    // select something this client cannot speak.
+    tls.require_alpn = false;
+
+    std::error_code ec;
+    std::unique_ptr<io::tls_context> context = io::tls_context::create(tls, ec);
+    if (!context || ec) {
+        return std::unique_ptr<client>(new client(
+            std::move(options), nullptr,
+            rpc_error{rpc_code::failed_precondition,
+                      "HTTPS needs a usable TLS context: " +
+                          (ec ? ec.message() : std::string("unknown error"))}));
+    }
+
+    const std::chrono::milliseconds budget =
+        options.timeout_seconds == 0
+            ? std::chrono::milliseconds(0)
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::seconds(options.timeout_seconds));
+    crpc::connect_options connect;
+    if (options.timeout_seconds != 0) {
+        connect.connect_timeout = std::chrono::seconds(options.timeout_seconds);
+    }
+    // TLS needs the raw io::connection (the sink/source pair the record layer
+    // decorates); net::connection hides that pair behind its own framing.
+    std::unique_ptr<crpc::connection> raw = backend.connect(endpoint, connect);
+    if (!raw) {
+        return std::unique_ptr<client>(new client(
+            std::move(options), nullptr,
+            rpc_error{rpc_code::unavailable,
+                      "the HTTPS transport refused to connect"}));
+    }
+    std::unique_ptr<db::channel> link(
+        new db::stream_channel(std::move(raw), *context, sni, budget));
+    // `context` may be released here: the TLS stream retains the shared context
+    // state for the lifetime of the channel.
     return std::unique_ptr<client>(new client(std::move(options), std::move(link)));
+#endif
 }
 
 } // namespace http

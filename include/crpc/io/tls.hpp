@@ -249,6 +249,10 @@ public:
     [[nodiscard]] bool handshake_failed() const noexcept;
     [[nodiscard]] bool session_reused() const noexcept;
     [[nodiscard]] std::string alpn_protocol() const;
+    // The SNI name this session carries. On a server it is the name the client
+    // sent (empty when the client sent none, which is what an IP-address
+    // connection does); on a client it is the name configured at creation.
+    [[nodiscard]] std::string server_name() const;
     [[nodiscard]] std::error_code error() const noexcept;
 
 private:

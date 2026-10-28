@@ -1,14 +1,14 @@
-﻿// CRPC -- WebSocket transport implementation (see transport.hpp).
-#include "transport.hpp"
+// CRPC -- blocking channel over a transport with optional TLS (see the header).
+#include <crpc/db/stream_channel.hpp>
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include <crpc/error.hpp>
 
 namespace crpc {
-namespace ws {
-namespace detail {
+namespace db {
 namespace {
 
 // A sink completion that signals a waiting thread and then destroys itself.
@@ -43,13 +43,17 @@ private:
 [[nodiscard]] bool wait_on(const std::shared_ptr<write_state>& state,
                            std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(state->mu);
+    if (timeout.count() <= 0) {
+        state->cv.wait(lk, [&] { return state->done; });
+        return true;
+    }
     return state->cv.wait_for(lk, timeout, [&] { return state->done; });
 }
 
 } // namespace
 
-transport_channel::transport_channel(std::unique_ptr<crpc::connection> link,
-                                     std::chrono::milliseconds timeout)
+stream_channel::stream_channel(std::unique_ptr<crpc::connection> link,
+                               std::chrono::milliseconds timeout)
     : link_(std::move(link)),
       source_(*this),
       timeout_(timeout) {
@@ -60,10 +64,9 @@ transport_channel::transport_channel(std::unique_ptr<crpc::connection> link,
     }
 }
 
-transport_channel::transport_channel(std::unique_ptr<crpc::connection> link,
-                                     io::tls_context& context,
-                                     std::string hostname,
-                                     std::chrono::milliseconds timeout)
+stream_channel::stream_channel(std::unique_ptr<crpc::connection> link,
+                               io::tls_context& context, std::string hostname,
+                               std::chrono::milliseconds timeout)
     : link_(std::move(link)),
       source_(*this),
       timeout_(timeout) {
@@ -82,9 +85,9 @@ transport_channel::transport_channel(std::unique_ptr<crpc::connection> link,
     link_->bind_source(tls_.get());
 }
 
-transport_channel::~transport_channel() { close(); }
+stream_channel::~stream_channel() { close(); }
 
-std::size_t transport_channel::on_data(span<const std::byte> data) noexcept {
+std::size_t stream_channel::on_data(span<const std::byte> data) noexcept {
     std::lock_guard<std::mutex> lk(mu_);
     // A terminal source (on_eof/on_error) already ran; refusing new data and
     // pausing the backend is the safe response after close.
@@ -100,7 +103,7 @@ std::size_t transport_channel::on_data(span<const std::byte> data) noexcept {
     return take;
 }
 
-void transport_channel::on_eof() noexcept {
+void stream_channel::on_eof() noexcept {
     {
         std::lock_guard<std::mutex> lk(mu_);
         eof_ = true;
@@ -108,7 +111,7 @@ void transport_channel::on_eof() noexcept {
     cv_.notify_all();
 }
 
-void transport_channel::on_error(std::error_code ec) noexcept {
+void stream_channel::on_error(std::error_code ec) noexcept {
     {
         std::lock_guard<std::mutex> lk(mu_);
         err_ = ec;
@@ -117,7 +120,7 @@ void transport_channel::on_error(std::error_code ec) noexcept {
     cv_.notify_all();
 }
 
-void transport_channel::resume_reading() noexcept {
+void stream_channel::resume_reading() noexcept {
     if (tls_) {
         tls_->resume_read();
     }
@@ -126,41 +129,65 @@ void transport_channel::resume_reading() noexcept {
     }
 }
 
-rpc_code transport_channel::map_error(std::error_code ec) const noexcept {
+rpc_error stream_channel::failure(std::error_code ec) const {
     if (!ec) {
-        return rpc_code::ok;
+        return rpc_error{rpc_code::eof, "the peer closed the stream channel"};
     }
     if (ec.category() == rpc_error_category()) {
-        return static_cast<rpc_code>(ec.value());
+        return rpc_error{static_cast<rpc_code>(ec.value()), ec.message()};
     }
-    if (ec == crpc::io::make_error_code(crpc::io::tls_errc::ssl_closed)) {
-        return rpc_code::eof;
+    if (ec.category() == io::tls_error_category()) {
+        switch (static_cast<io::tls_errc>(ec.value())) {
+        case io::tls_errc::ssl_verification_failed:
+            return rpc_error{rpc_code::failed_precondition,
+                             "TLS certificate or host name verification failed"};
+        case io::tls_errc::ssl_configuration_error:
+            return rpc_error{rpc_code::failed_precondition,
+                             "TLS configuration error: " + ec.message()};
+        case io::tls_errc::ssl_alpn_mismatch:
+            return rpc_error{rpc_code::failed_precondition,
+                             "TLS ALPN negotiation failed: " + ec.message()};
+        case io::tls_errc::ssl_not_available:
+            return rpc_error{rpc_code::failed_precondition,
+                             "TLS is not available: rebuild the library with "
+                             "CRPC_WITH_OPENSSL=ON"};
+        case io::tls_errc::ssl_closed:
+            return rpc_error{rpc_code::eof, "the peer closed the TLS connection"};
+        case io::tls_errc::ssl_handshake_failed:
+            return rpc_error{rpc_code::unavailable,
+                             "TLS handshake failed: " + ec.message()};
+        case io::tls_errc::ssl_protocol_error:
+            return rpc_error{rpc_code::protocol_error,
+                             "TLS protocol error: " + ec.message()};
+        case io::tls_errc::ok:
+        default:
+            break;
+        }
     }
     // A fine-grained winsock/errno mapping is not worth replicating here: every
     // transport failure that is not a clean close is reported the way the rest
     // of the library reports a dead link.
-    return rpc_code::connection_reset;
+    return rpc_error{rpc_code::connection_reset,
+                     "the stream channel failed: " + ec.message()};
 }
 
-rpc_error transport_channel::fail_read() const {
-    if (err_) {
-        return rpc_error{map_error(err_), "the WebSocket transport failed"};
+bool stream_channel::wait_for_bytes(std::unique_lock<std::mutex>& lk,
+                                    std::size_t& available) {
+    const auto ready = [&] { return buf_.size() - pos_ != 0 || eof_ || closed_; };
+    bool got = false;
+    if (timeout_.count() <= 0) {
+        cv_.wait(lk, ready);
+        got = true;
+    } else {
+        got = cv_.wait_for(lk, timeout_, ready);
     }
-    return rpc_error{rpc_code::eof, "the peer closed the WebSocket transport"};
-}
-
-bool transport_channel::wait_for_bytes(std::unique_lock<std::mutex>& lk,
-                                       std::size_t& available) {
-    const bool got = cv_.wait_for(lk, timeout_, [&] {
-        return buf_.size() - pos_ != 0 || eof_ || closed_;
-    });
     available = buf_.size() - pos_;
     return got;
 }
 
-result<std::size_t> transport_channel::read_some(span<std::byte> buffer) {
+result<std::size_t> stream_channel::read_some(span<std::byte> buffer) {
     if (closed_) {
-        return rpc_error{rpc_code::shutting_down, "the WebSocket transport is closed"};
+        return rpc_error{rpc_code::shutting_down, "the stream channel is closed"};
     }
     if (buffer.empty()) {
         return std::size_t{0};
@@ -172,10 +199,10 @@ result<std::size_t> transport_channel::read_some(span<std::byte> buffer) {
         std::size_t available = 0;
         if (!wait_for_bytes(lk, available)) {
             return rpc_error{rpc_code::deadline_exceeded,
-                             "a WebSocket read timed out"};
+                             "a stream channel read timed out"};
         }
         if (eof_ && available == 0) {
-            return fail_read();
+            return failure(err_);
         }
         count = std::min(available, buffer.size());
         std::memcpy(buffer.data(), buf_.data() + pos_, count);
@@ -200,9 +227,9 @@ result<std::size_t> transport_channel::read_some(span<std::byte> buffer) {
     return count;
 }
 
-result<std::vector<std::byte>> transport_channel::read_exact(std::size_t count) {
+result<std::vector<std::byte>> stream_channel::read_exact(std::size_t count) {
     if (closed_) {
-        return rpc_error{rpc_code::shutting_down, "the WebSocket transport is closed"};
+        return rpc_error{rpc_code::shutting_down, "the stream channel is closed"};
     }
     std::vector<std::byte> out;
     out.reserve(count);
@@ -221,9 +248,9 @@ result<std::vector<std::byte>> transport_channel::read_exact(std::size_t count) 
     return out;
 }
 
-status transport_channel::write(span<const std::byte> data) {
+status stream_channel::write(span<const std::byte> data) {
     if (closed_) {
-        return status{rpc_code::shutting_down, "the WebSocket transport is closed"};
+        return status{rpc_code::shutting_down, "the stream channel is closed"};
     }
     if (data.empty()) {
         return status{};
@@ -239,26 +266,27 @@ status transport_channel::write(span<const std::byte> data) {
     }
     if (wait_on(state, timeout_)) {
         if (state->result.ec) {
-            const rpc_code mapped = map_error(state->result.ec);
-            if (mapped == rpc_code::eof || mapped == rpc_code::shutting_down) {
-                return status{mapped, "the WebSocket transport closed while writing"};
+            rpc_error mapped = failure(state->result.ec);
+            if (mapped.code == rpc_code::eof ||
+                mapped.code == rpc_code::shutting_down) {
+                return status{mapped.code, "the stream channel closed while writing"};
             }
-            return status{mapped, state->result.ec.message()};
+            return status{std::move(mapped)};
         }
         return status{};
     }
     // The write never completed within budget. Aborting the link cancels the
     // in-flight push, whose completion then wakes the wait below; the caller is
-    // never left with a future write racing a half-written frame.
+    // never left with a future write racing a half-written record.
     if (link_) {
         link_->close();
     }
     (void)wait_on(state, std::chrono::milliseconds(1000));
     return status{rpc_code::deadline_exceeded,
-                  "a WebSocket write timed out; the link was aborted"};
+                  "a stream channel write timed out; the link was aborted"};
 }
 
-void transport_channel::close() noexcept {
+void stream_channel::close() noexcept {
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (closed_) {
@@ -276,11 +304,27 @@ void transport_channel::close() noexcept {
     cv_.notify_all();
 }
 
-bool transport_channel::is_open() const noexcept {
+bool stream_channel::is_open() const noexcept {
     std::lock_guard<std::mutex> lk(mu_);
     return !closed_ && !eof_ && link_ != nullptr && link_->is_open();
 }
 
-} // namespace detail
-} // namespace ws
+std::string stream_channel::tls_server_name() const {
+    return tls_ != nullptr ? tls_->server_name() : std::string();
+}
+
+std::string stream_channel::tls_alpn_protocol() const {
+    return tls_ != nullptr ? tls_->alpn_protocol() : std::string();
+}
+
+bool stream_channel::tls_handshake_complete() const noexcept {
+    return tls_ != nullptr && tls_->handshake_complete();
+}
+
+std::error_code stream_channel::tls_error() const noexcept {
+    return tls_ != nullptr ? tls_->error()
+                           : io::make_error_code(io::tls_errc::ssl_not_available);
+}
+
+} // namespace db
 } // namespace crpc
