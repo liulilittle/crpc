@@ -55,7 +55,7 @@ precisely the 8-byte shift described above, and it matches the server's
 `State 2` rejection of a LOGIN7 that the byte comparison had already proven
 correct.
 
-### ours after the fix, 786 bytes
+### ours after the fix, 1053 bytes
 
 | # | TDS header | inner TLS records |
 | --- | --- | --- |
@@ -65,7 +65,8 @@ correct.
 | 4 | *no header* | `17 03 03 00 d4` application data, 212 B (LOGIN7) |
 | 5 | *no header* | `17 03 03 00 52` application data, 82 B (SELECT 42) |
 | 6 | *no header* | `17 03 03 00 52` application data, 82 B (SELECT 43) |
-| 7 | *no header* | `15 03 03 00 1a` alert, 26 B (close_notify) |
+| 7 | *no header* | `17 03 03 01 06` application data, 262 B (the `sys.dm_exec_connections` query) |
+| 8 | *no header* | `15 03 03 00 1a` alert, 26 B (close_notify) |
 
 The one structural difference that remains is intentional and harmless: the
 plain PRELOGIN is 41 bytes here versus 58 in pytds (pytds sends an INSTOPT option
@@ -84,17 +85,18 @@ the same id base logs in successfully — and the encrypted session now does too
 | 3 | `12 01 00 ea ...` PRELOGIN, len 234, id 0 | Finished 170 B, CCS 1 B, Finished 40 B |
 | 4 | *no header* | `17 03 03 01 99` 409 B, `17 03 03 00 3d` 61 B |
 
-### ours after the fix, 2060 bytes
+### ours after the fix, 2263 bytes
 
 | # | TDS header | inner TLS records |
 | --- | --- | --- |
 | 1 | `04 01 00 25 ...` tabular result, len 37 | — (plain PRELOGIN reply; encryption = `0x01`) |
 | 2 | `12 01 04 d7 ...` PRELOGIN, len 1239, id 0 | same four handshake messages, same lengths (65/842/300/4) |
 | 3 | `12 01 00 ea ...` PRELOGIN, len 234, id 0 | Finished 170 B, CCS 1 B, Finished 40 B |
-| 4 | *no header* | `17 03 03 01 99` 409 B (login ack), `17 03 03 00 3f` 63 B, `17 03 03 00 3f` 63 B |
+| 4 | *no header* | `17 03 03 01 99` 409 B (login ack), `17 03 03 00 3f` 63 B, `17 03 03 00 3f` 63 B, `17 03 03 00 c6` 198 B |
 
-The 63-byte records are the two `SELECT` replies; pytds has one 61-byte record
-because it sends one query.
+The 63-byte records are the two `SELECT` replies and the 198-byte one is the
+`sys.dm_exec_connections` reply; pytds has a single 61-byte record because it
+sends a single query.
 
 ## ClientHello comparison
 

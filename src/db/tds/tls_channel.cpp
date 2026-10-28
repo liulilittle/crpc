@@ -2,10 +2,12 @@
 #include "tls_channel.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +60,19 @@ constexpr std::size_t max_plaintext_chunk = 16 * 1024;
                      std::string(what) + " failed: " + openssl_reason()};
 }
 
+// Two locks, in this order and never the other way round:
+//
+//   send_mutex_ -- keeps the *wire* order of outgoing records. BIO_read and the
+//                  transport write have to happen under the same lock, or two
+//                  threads can pop successive fragments of one stream and write
+//                  them out of order;
+//   ssl_mutex_  -- OpenSSL's own rule: one SSL object is never entered by two
+//                  threads at once. This matters here because cancel() writes an
+//                  ATTENTION packet from another thread while the reply loop is
+//                  blocked in a read.
+//
+// Neither lock is held across a transport *read*: the canceller would otherwise
+// wait for the very read it is trying to interrupt.
 class tls_channel final : public db::channel {
 public:
     tls_channel(std::unique_ptr<db::channel> inner, std::uint16_t packet_size)
@@ -82,6 +97,7 @@ private:
     [[nodiscard]] result<std::vector<std::byte>> read_wrapped();
     [[nodiscard]] status flush_stream();
     [[nodiscard]] status fill_ciphertext();
+    [[nodiscard]] result<std::size_t> decrypt(span<std::byte> buffer);
     void release() noexcept;
 
     std::unique_ptr<db::channel> inner_;
@@ -90,7 +106,9 @@ private:
     SSL* session_ = nullptr;
     BIO* incoming_ = nullptr;
     BIO* outgoing_ = nullptr;
-    bool closed_ = false;
+    std::mutex send_mutex_;
+    std::mutex ssl_mutex_;
+    std::atomic<bool> closed_{false};
 };
 
 status tls_channel::handshake(const tls_client_options& options, std::uint8_t& packet_id) {
@@ -98,10 +116,10 @@ status tls_channel::handshake(const tls_client_options& options, std::uint8_t& p
     if (context_ == nullptr) {
         return tls_failure("creating a TLS context");
     }
-    // SQL Server 2022 on Linux speaks TLS 1.2 for TDS; pinning both ends keeps a
-    // 1.3-capable client from negotiating a version the server's TDS layer does
-    // not associate with the session. This is also what the reference client
-    // (pytds, TLSv1_2_METHOD) does.
+    // SQL Server's TDS endpoint negotiates TLS 1.2, and that is also what the
+    // reference client pins (pytds uses TLSv1_2_METHOD). Pinning both ends keeps a
+    // 1.3-capable client from negotiating a version this server's TDS layer does
+    // not associate with the session.
     (void)SSL_CTX_set_min_proto_version(context_, TLS1_2_VERSION);
     (void)SSL_CTX_set_max_proto_version(context_, TLS1_2_VERSION);
     (void)SSL_CTX_set_options(context_, SSL_OP_NO_COMPRESSION);
@@ -143,8 +161,16 @@ status tls_channel::handshake(const tls_client_options& options, std::uint8_t& p
     SSL_set_connect_state(session_);
 
     for (;;) {
-        ERR_clear_error();
-        const int started = SSL_do_handshake(session_);
+        int started = 0;
+        int reason = 0;
+        {
+            const std::lock_guard<std::mutex> guard(ssl_mutex_);
+            ERR_clear_error();
+            started = SSL_do_handshake(session_);
+            if (started != 1) {
+                reason = SSL_get_error(session_, started);
+            }
+        }
         // Whatever the handshake produced -- ClientHello, ClientKeyExchange,
         // ChangeCipherSpec, Finished -- goes out inside PRELOGIN packets.
         const status sent = flush_handshake(packet_id);
@@ -154,16 +180,17 @@ status tls_channel::handshake(const tls_client_options& options, std::uint8_t& p
         if (started == 1) {
             return status{};
         }
-        const int reason = SSL_get_error(session_, started);
         if (reason == SSL_ERROR_WANT_READ) {
             result<std::vector<std::byte>> body = read_wrapped();
             if (!body) {
                 return body.error();
             }
-            if (!body.value().empty() &&
-                BIO_write(incoming_, body.value().data(),
-                          static_cast<int>(body.value().size())) <= 0) {
-                return tls_failure("buffering the server's handshake");
+            if (!body.value().empty()) {
+                const std::lock_guard<std::mutex> guard(ssl_mutex_);
+                if (BIO_write(incoming_, body.value().data(),
+                              static_cast<int>(body.value().size())) <= 0) {
+                    return tls_failure("buffering the server's handshake");
+                }
             }
             continue;
         }
@@ -177,13 +204,16 @@ status tls_channel::handshake(const tls_client_options& options, std::uint8_t& p
 status tls_channel::flush_handshake(std::uint8_t& packet_id) {
     std::vector<std::byte> pending;
     char buffer[4096];
-    for (;;) {
-        const int got = BIO_read(outgoing_, buffer, static_cast<int>(sizeof buffer));
-        if (got <= 0) {
-            break;
+    {
+        const std::lock_guard<std::mutex> guard(ssl_mutex_);
+        for (;;) {
+            const int got = BIO_read(outgoing_, buffer, static_cast<int>(sizeof buffer));
+            if (got <= 0) {
+                break;
+            }
+            const std::byte* first = reinterpret_cast<const std::byte*>(buffer);
+            pending.insert(pending.end(), first, first + got);
         }
-        const std::byte* first = reinterpret_cast<const std::byte*>(buffer);
-        pending.insert(pending.end(), first, first + got);
     }
     if (pending.empty()) {
         return status{};
@@ -255,16 +285,24 @@ result<std::vector<std::byte>> tls_channel::read_wrapped() {
 }
 
 status tls_channel::flush_stream() {
+    const std::lock_guard<std::mutex> send_guard(send_mutex_);
     char buffer[4096];
     for (;;) {
-        const int got = BIO_read(outgoing_, buffer, static_cast<int>(sizeof buffer));
-        if (got <= 0) {
+        std::size_t got = 0;
+        {
+            const std::lock_guard<std::mutex> guard(ssl_mutex_);
+            const int read = BIO_read(outgoing_, buffer, static_cast<int>(sizeof buffer));
+            if (read > 0) {
+                got = static_cast<std::size_t>(read);
+            }
+        }
+        if (got == 0) {
             return status{};
         }
         // After the handshake the records are the transport payload: no TDS
         // header, exactly as the reference client writes them.
         const std::byte* first = reinterpret_cast<const std::byte*>(buffer);
-        const status sent = inner_->write(span<const std::byte>(first, static_cast<std::size_t>(got)));
+        const status sent = inner_->write(span<const std::byte>(first, got));
         if (!sent) {
             return sent;
         }
@@ -280,99 +318,109 @@ status tls_channel::fill_ciphertext() {
     if (got.value() == 0) {
         return rpc_error{rpc_code::eof, "the transport closed during TLS"};
     }
+    const std::lock_guard<std::mutex> guard(ssl_mutex_);
     if (BIO_write(incoming_, buffer, static_cast<int>(got.value())) <= 0) {
         return tls_failure("buffering ciphertext");
     }
     return status{};
 }
 
+// One decryption attempt: a positive count, or "the caller must feed more
+// ciphertext / flush" signalled by returning 0 with a want_* flag.
+result<std::size_t> tls_channel::decrypt(span<std::byte> buffer) {
+    int got = 0;
+    int reason = 0;
+    {
+        const std::lock_guard<std::mutex> guard(ssl_mutex_);
+        ERR_clear_error();
+        got = SSL_read(session_, buffer.data(),
+                       static_cast<int>(std::min<std::size_t>(buffer.size(),
+                                                              max_plaintext_chunk)));
+        if (got <= 0) {
+            reason = SSL_get_error(session_, got);
+        }
+    }
+    if (got > 0) {
+        return static_cast<std::size_t>(got);
+    }
+    if (reason == SSL_ERROR_WANT_READ) {
+        const status filled = fill_ciphertext();
+        if (!filled) {
+            return filled.error();
+        }
+        return std::size_t{0};
+    }
+    if (reason == SSL_ERROR_WANT_WRITE) {
+        const status flushed = flush_stream();
+        if (!flushed) {
+            return flushed.error();
+        }
+        return std::size_t{0};
+    }
+    if (reason == SSL_ERROR_ZERO_RETURN) {
+        return rpc_error{rpc_code::eof, "the peer closed the TLS stream"};
+    }
+    return tls_failure("TLS read");
+}
+
 result<std::vector<std::byte>> tls_channel::read_exact(std::size_t count) {
-    if (session_ == nullptr || closed_) {
+    if (session_ == nullptr || closed_.load()) {
         return rpc_error{rpc_code::shutting_down, "the TLS channel is closed"};
     }
     std::vector<std::byte> out;
     out.reserve(count);
     while (out.size() < count) {
-        char buffer[max_plaintext_chunk];
+        std::byte buffer[max_plaintext_chunk];
         const std::size_t want = count - out.size();
-        const int cap = static_cast<int>(std::min(want, sizeof buffer));
-        ERR_clear_error();
-        const int got = SSL_read(session_, buffer, cap);
-        if (got > 0) {
-            const std::byte* first = reinterpret_cast<const std::byte*>(buffer);
-            out.insert(out.end(), first, first + got);
-            continue;
+        result<std::size_t> step =
+            decrypt(span<std::byte>(buffer, std::min(want, sizeof buffer)));
+        if (!step) {
+            return step.error();
         }
-        const int reason = SSL_get_error(session_, got);
-        if (reason == SSL_ERROR_WANT_READ) {
-            const status filled = fill_ciphertext();
-            if (!filled) {
-                return filled.error();
-            }
-            continue;
+        if (step.value() != 0) {
+            out.insert(out.end(), buffer, buffer + step.value());
         }
-        if (reason == SSL_ERROR_WANT_WRITE) {
-            const status flushed = flush_stream();
-            if (!flushed) {
-                return flushed.error();
-            }
-            continue;
-        }
-        if (reason == SSL_ERROR_ZERO_RETURN) {
-            return rpc_error{rpc_code::eof, "the peer closed the TLS stream"};
-        }
-        return tls_failure("TLS read");
     }
     return out;
 }
 
 result<std::size_t> tls_channel::read_some(span<std::byte> buffer) {
-    if (session_ == nullptr || closed_) {
+    if (session_ == nullptr || closed_.load()) {
         return rpc_error{rpc_code::shutting_down, "the TLS channel is closed"};
     }
     if (buffer.empty()) {
         return std::size_t{0};
     }
     for (;;) {
-        ERR_clear_error();
-        const int got = SSL_read(session_, buffer.data(),
-                                 static_cast<int>(std::min<std::size_t>(buffer.size(),
-                                                                        max_plaintext_chunk)));
-        if (got > 0) {
-            return static_cast<std::size_t>(got);
+        result<std::size_t> step = decrypt(buffer);
+        if (!step) {
+            return step.error();
         }
-        const int reason = SSL_get_error(session_, got);
-        if (reason == SSL_ERROR_WANT_READ) {
-            const status filled = fill_ciphertext();
-            if (!filled) {
-                return filled.error();
-            }
-            continue;
+        if (step.value() != 0) {
+            return step;
         }
-        if (reason == SSL_ERROR_WANT_WRITE) {
-            const status flushed = flush_stream();
-            if (!flushed) {
-                return flushed.error();
-            }
-            continue;
-        }
-        if (reason == SSL_ERROR_ZERO_RETURN) {
-            return rpc_error{rpc_code::eof, "the peer closed the TLS stream"};
-        }
-        return tls_failure("TLS read");
     }
 }
 
 status tls_channel::write(span<const std::byte> data) {
-    if (session_ == nullptr || closed_) {
+    if (session_ == nullptr || closed_.load()) {
         return status{rpc_code::shutting_down, "the TLS channel is closed"};
     }
     std::size_t offset = 0;
     while (offset < data.size()) {
         const std::size_t rest = data.size() - offset;
         const int cap = static_cast<int>(std::min(rest, max_plaintext_chunk));
-        ERR_clear_error();
-        const int wrote = SSL_write(session_, data.data() + offset, cap);
+        int wrote = 0;
+        int reason = 0;
+        {
+            const std::lock_guard<std::mutex> guard(ssl_mutex_);
+            ERR_clear_error();
+            wrote = SSL_write(session_, data.data() + offset, cap);
+            if (wrote <= 0) {
+                reason = SSL_get_error(session_, wrote);
+            }
+        }
+        // The record exists in the memory BIO now; push it out in one piece.
         const status flushed = flush_stream();
         if (!flushed) {
             return flushed;
@@ -381,7 +429,6 @@ status tls_channel::write(span<const std::byte> data) {
             offset += static_cast<std::size_t>(wrote);
             continue;
         }
-        const int reason = SSL_get_error(session_, wrote);
         if (reason == SSL_ERROR_WANT_READ) {
             const status filled = fill_ciphertext();
             if (!filled) {
@@ -412,18 +459,19 @@ void tls_channel::release() noexcept {
 }
 
 void tls_channel::close() noexcept {
-    if (closed_) {
+    if (closed_.exchange(true)) {
         return;
     }
-    closed_ = true;
     if (session_ != nullptr) {
+        const std::lock_guard<std::mutex> guard(ssl_mutex_);
         ERR_clear_error();
         (void)SSL_shutdown(session_);
-        (void)flush_stream();
     }
+    (void)flush_stream();
     if (inner_) {
         inner_->close();
     }
+    const std::lock_guard<std::mutex> guard(ssl_mutex_);
     release();
 }
 

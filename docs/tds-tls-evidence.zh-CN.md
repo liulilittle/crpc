@@ -45,7 +45,7 @@ connection is structurally invalid`。
 a TDS packet, which is how encryption is framed after the handshake"。这正是上文所说的
 八字节位移，也与服务端对 LOGIN7（字节比对已证明其正确）报出的 `State 2` 拒绝吻合。
 
-### 修复后的我方实现，786 字节
+### 修复后的我方实现，1053 字节
 
 | # | TDS 包头 | 内部 TLS 记录 |
 | --- | --- | --- |
@@ -55,7 +55,8 @@ a TDS packet, which is how encryption is framed after the handshake"。这正是
 | 4 | *无包头* | `17 03 03 00 d4` 应用数据，212 字节（LOGIN7） |
 | 5 | *无包头* | `17 03 03 00 52` 应用数据，82 字节（SELECT 42） |
 | 6 | *无包头* | `17 03 03 00 52` 应用数据，82 字节（SELECT 43） |
-| 7 | *无包头* | `15 03 03 00 1a` alert，26 字节（close_notify） |
+| 7 | *无包头* | `17 03 03 01 06` 应用数据，262 字节（`sys.dm_exec_connections` 查询） |
+| 8 | *无包头* | `15 03 03 00 1a` alert，26 字节（close_notify） |
 
 仍存在的结构性差异是有意为之且无害的：明文 PRELOGIN 这里是 41 字节、pytds 是 58 字节
 （pytds 多发了我们不发的 INSTOPT 选项）；packet id 从 1 开始而不是 0。两者在此前轮次里
@@ -73,16 +74,17 @@ a TDS packet, which is how encryption is framed after the handshake"。这正是
 | 3 | `12 01 00 ea ...` PRELOGIN，长度 234，id 0 | Finished 170 字节、CCS 1 字节、Finished 40 字节 |
 | 4 | *无包头* | `17 03 03 01 99` 409 字节、`17 03 03 00 3d` 61 字节 |
 
-### 修复后的我方实现，2060 字节
+### 修复后的我方实现，2263 字节
 
 | # | TDS 包头 | 内部 TLS 记录 |
 | --- | --- | --- |
 | 1 | `04 01 00 25 ...` tabular result，长度 37 | —（明文 PRELOGIN 应答；encryption = `0x01`） |
 | 2 | `12 01 04 d7 ...` PRELOGIN，长度 1239，id 0 | 同样四条握手消息，长度完全相同（65/842/300/4） |
 | 3 | `12 01 00 ea ...` PRELOGIN，长度 234，id 0 | Finished 170 字节、CCS 1 字节、Finished 40 字节 |
-| 4 | *无包头* | `17 03 03 01 99` 409 字节（登录应答）、`17 03 03 00 3f` 63 字节、`17 03 03 00 3f` 63 字节 |
+| 4 | *无包头* | `17 03 03 01 99` 409 字节（登录应答）、`17 03 03 00 3f` 63 字节、`17 03 03 00 3f` 63 字节、`17 03 03 00 c6` 198 字节 |
 
-两条 63 字节记录是两个 `SELECT` 的应答；pytds 只有一条 61 字节记录，因为它只发了一个查询。
+两条 63 字节记录是两个 `SELECT` 的应答，198 字节那条是 `sys.dm_exec_connections` 的应答；
+pytds 只有一条 61 字节记录，因为它只发了一个查询。
 
 ## ClientHello 比对
 
