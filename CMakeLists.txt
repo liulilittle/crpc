@@ -24,14 +24,30 @@ set(CRPC_SANITIZER "" CACHE STRING
 # headers and static libraries. Set these to the checkout roots, either as cache
 # variables or through the environment (the one-click scripts forward the
 # environment without needing extra arguments).
-set(CRPC_RTTI_DIR "" CACHE PATH "Root of the RTTI checkout")
-set(CRPC_COROCC_DIR "" CACHE PATH "Root of the corocc checkout")
+set(CRPC_RTTI_DIR "" CACHE PATH "Root of the RTTI checkout (overrides the submodule)")
+set(CRPC_COROCC_DIR "" CACHE PATH "Root of the corocc checkout (overrides the submodule)")
 
 if(NOT CRPC_RTTI_DIR AND DEFINED ENV{CRPC_RTTI_DIR})
     set(CRPC_RTTI_DIR "$ENV{CRPC_RTTI_DIR}" CACHE PATH "Root of the RTTI checkout" FORCE)
 endif()
 if(NOT CRPC_COROCC_DIR AND DEFINED ENV{CRPC_COROCC_DIR})
     set(CRPC_COROCC_DIR "$ENV{CRPC_COROCC_DIR}" CACHE PATH "Root of the corocc checkout" FORCE)
+endif()
+
+# Both dependencies are git submodules under third_party/. An explicit cache
+# variable or environment variable still wins, so a checkout that lives
+# elsewhere keeps working without editing anything; but the default is now the
+# in-tree submodule, which is what makes a fresh clone build with no extra
+# flags and pins the dependency to the exact commit this tree was tested with.
+if(NOT CRPC_RTTI_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rtti/CMakeLists.txt")
+    set(CRPC_RTTI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rtti" CACHE PATH
+        "Root of the RTTI checkout" FORCE)
+    set(CRPC_RTTI_FROM_SUBMODULE ON)
+endif()
+if(NOT CRPC_COROCC_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/corocc/CMakeLists.txt")
+    set(CRPC_COROCC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/corocc" CACHE PATH
+        "Root of the corocc checkout" FORCE)
+    set(CRPC_COROCC_FROM_SUBMODULE ON)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -139,6 +155,33 @@ if(CRPC_COROCC_DIR)
 else()
     message(STATUS "CRPC_COROCC_DIR not set: coroutine-backed components are disabled")
     set(CRPC_HAVE_COROCC OFF)
+endif()
+
+# ---------------------------------------------------------------------------
+# Vendored header-only libraries (git submodules under third_party/)
+# ---------------------------------------------------------------------------
+#
+# `mpmc_map` and `mpmc_queue` both declare an INTERFACE target literally named
+# `mpmc`, so add_subdirectory() on both would be a duplicate-target error. They
+# are header-only and their whole interface is an include directory, so this
+# project exposes one combined target instead of editing either checkout. The
+# upstream repositories are treated as read-only: they are already tested where
+# they live, and a local patch here would mean re-testing them here too.
+set(CRPC_MPMC_MAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mpmc_map")
+set(CRPC_MPMC_QUEUE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mpmc_queue")
+
+add_library(crpc_mpmc INTERFACE)
+if(EXISTS "${CRPC_MPMC_MAP_DIR}/include/mpmc/mpmc_map.hpp")
+    target_include_directories(crpc_mpmc INTERFACE "${CRPC_MPMC_MAP_DIR}/include")
+    message(STATUS "CRPC: mpmc_map headers enabled (third_party/mpmc_map)")
+endif()
+if(EXISTS "${CRPC_MPMC_QUEUE_DIR}/include/mpmc/mpmc_queue.hpp")
+    target_include_directories(crpc_mpmc INTERFACE "${CRPC_MPMC_QUEUE_DIR}/include")
+    message(STATUS "CRPC: mpmc_queue headers enabled (third_party/mpmc_queue)")
+endif()
+if(CRPC_HAVE_COROCC)
+    # The queue's blocking operations are built on the coroutine primitives.
+    target_link_libraries(crpc_mpmc INTERFACE corocc)
 endif()
 
 # Without the RTTI checkout the suite still builds and runs: only the targets
@@ -269,6 +312,13 @@ endif()
 if(CRPC_HAVE_RTTI)
     target_link_libraries(crpc PUBLIC rtti)
     target_compile_definitions(crpc PUBLIC CRPC_HAVE_RTTI=1)
+endif()
+
+# The vendored MPMC containers are public API: application code is expected to
+# use them directly for shared state, so the include paths travel with `crpc`.
+if(TARGET crpc_mpmc)
+    target_link_libraries(crpc PUBLIC crpc_mpmc)
+    target_compile_definitions(crpc PUBLIC CRPC_HAVE_MPMC=1)
 endif()
 
 # --- Optional OpenSSL TLS backend -------------------------------------------

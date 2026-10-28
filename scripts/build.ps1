@@ -137,20 +137,27 @@ if ($Jobs -le 0) { $Jobs = [Environment]::ProcessorCount }
 # A missing RTTI checkout is reported here rather than left to the compiler:
 # without it the tests that use RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot build,
 # and the failure surfaces as a wall of unrelated C2065 errors in test_mvc.cpp.
+# The dependencies are git submodules under third_party/, so an unset variable is
+# the normal case and not an error: CMakeLists.txt picks the submodule up. A set
+# variable still wins and is forwarded, so a checkout that lives elsewhere keeps
+# working. Only fail when neither exists, which is the case the error message is
+# actually for.
 $depArgs = @()
 foreach ($dep in @('CRPC_RTTI_DIR', 'CRPC_COROCC_DIR')) {
     $value = [Environment]::GetEnvironmentVariable($dep)
     if ($value) {
         $depArgs += "-D${dep}=$value"
-        Write-Log "$dep=$value"
+        Write-Log "$dep=$value (explicit override)"
     } else {
-        Write-Log "$dep is not set in the environment" 'WARN'
+        Write-Log "$dep not set: using the third_party submodule"
     }
 }
-if (-not [Environment]::GetEnvironmentVariable('CRPC_RTTI_DIR')) {
-    Write-Log ('CRPC_RTTI_DIR is required for the test suite: set it to the RTTI ' +
-               'checkout root before running this script, for example ' +
-               '$env:CRPC_RTTI_DIR = ''F:\RTTI''. Without it the tests that use ' +
+$submoduleRtti = Join-Path $SourceDir 'third_party\rtti\CMakeLists.txt'
+if (-not [Environment]::GetEnvironmentVariable('CRPC_RTTI_DIR') -and
+    -not (Test-Path -LiteralPath $submoduleRtti)) {
+    Write-Log ('No RTTI checkout: neither CRPC_RTTI_DIR nor third_party/rtti exists. ' +
+               'Run "git submodule update --init --recursive", or set ' +
+               '$env:CRPC_RTTI_DIR to a checkout. Without it the tests that use ' +
                'RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot be compiled.') 'ERROR'
     exit 3
 }

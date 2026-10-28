@@ -1,0 +1,12 @@
+[submodule "third_party/rtti"]
+	path = third_party/rtti
+	url = https://github.com/liulilittle/rtti.git
+[submodule "third_party/corocc"]
+	path = third_party/corocc
+	url = https://github.com/liulilittle/corocc.git
+[submodule "third_party/mpmc_map"]
+	path = third_party/mpmc_map
+	url = https://github.com/liulilittle/mpmc_map.git
+[submodule "third_party/mpmc_queue"]
+	path = third_party/mpmc_queue
+	url = https://github.com/liulilittle/mpmc_queue.git
