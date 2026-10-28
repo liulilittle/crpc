@@ -394,15 +394,32 @@ CRPC_TEST(tds_connection_refuses_a_server_that_requires_encryption) {
 CRPC_TEST(tds_connection_refuses_require_encryption_without_tls) {
     crpc::db::tds::connection_options options = options_for_tests();
     options.require_encryption = true;
-    auto link = std::make_unique<scripted_channel>(login_server());
+    // The scripted server reports ENCRYPT_NOT_SUP, so the handshake has to fail whether
+    // or not the build has a TLS backend.
+    bool saw_login7 = false;
+    auto respond = [&saw_login7](packet_type type, crpc::span<const std::byte> payload) {
+        if (type == packet_type::login7) {
+            saw_login7 = true;
+            return bytes{};
+        }
+        return login_server()(type, payload);
+    };
+    auto link = std::make_unique<scripted_channel>(respond);
     scripted_channel* raw = link.get();
     crpc::db::tds::connection session(options, std::move(link));
     CRPC_CHECK_FALSE(session.is_open());
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
                   static_cast<int>(session.connect_error().code));
-    // Nothing may leave the client: a plaintext login the caller believes is
-    // encrypted is worse than a refusal.
+    // A plaintext login the caller believes is encrypted is worse than a refusal, so
+    // LOGIN7 must never leave the client. A build with a TLS backend does send PRELOGIN
+    // (that is how encryption is offered) and then stops when the server declines.
+    CRPC_CHECK_FALSE(saw_login7);
+#if !defined(CRPC_HAVE_OPENSSL)
+    // Without a backend nothing may leave the client at all.
     CRPC_CHECK_EQ(std::size_t{0}, raw->bytes_written());
+#else
+    CRPC_CHECK(raw->bytes_written() > 0);
+#endif
 }
 
 CRPC_TEST(tds_connection_query_returns_rows_and_metadata) {
