@@ -267,6 +267,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::resilience::call_traits`
 - `::crpc::resilience::instance`
 - `::crpc::resilience::smart_policy`
+- `::crpc::ws::client_options`
+- `::crpc::ws::frame_header`
 
 这些记录只受第 7 节政策约束（任何公开结构体布局变更都属 MAJOR），没有构建期检查。
 其中大多数都可以纳入成员数量护栏；`::crpc::endpoint` 不行，因为它的成员是私有的，
