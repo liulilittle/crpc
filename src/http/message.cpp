@@ -607,7 +607,15 @@ bool is_token(std::string_view text) noexcept {
 }
 
 const char* to_string(http_version version) noexcept {
-    return version == http_version::http_1_0 ? "HTTP/1.0" : "HTTP/1.1";
+    switch (version) {
+    case http_version::http_1_0:
+        return "HTTP/1.0";
+    case http_version::http_2:
+        return "HTTP/2";
+    case http_version::http_1_1:
+        break;
+    }
+    return "HTTP/1.1";
 }
 
 status split_target(std::string_view target, target_form& form, std::string& path,

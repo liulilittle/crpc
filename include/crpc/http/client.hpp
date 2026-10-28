@@ -70,11 +70,21 @@ struct client_options {
     // for IP literals) and is verified as an IP address instead.
     std::string tls_server_name;
 
-    // ALPN protocol to advertise. `http/1.1` is the only protocol this client
-    // speaks. Empty disables the ALPN extension entirely. A server that does
-    // not negotiate ALPN is still a valid HTTP/1.1 server, so negotiation is
-    // not required; when a server does answer, the value must be http/1.1.
-    std::string tls_alpn = "http/1.1";
+    // ALPN protocols advertised in preference order. The default offers h2
+    // first and http/1.1 second, which is what a modern origin expects: the
+    // negotiated value decides which engine speaks on the connection, "h2"
+    // selecting the HTTP/2 client and anything else (http/1.1, or no ALPN at
+    // all, which many origins without TLS-ALPN still do) selecting
+    // HTTP/1.1. An empty list disables the ALPN extension entirely.
+    std::vector<std::string> tls_alpn = {"h2", "http/1.1"};
+
+    // Cleartext HTTP/2 (h2c) with prior knowledge (RFC 9113 3.4): the client
+    // opens the connection with the HTTP/2 connection preface instead of an
+    // HTTP/1.1 request line. Off by default because there is no fallback
+    // after the preface -- an HTTP/1.1-only server simply fails the
+    // connection -- so a caller must choose it for endpoints known to speak
+    // h2c. Under TLS this flag has no effect; the negotiated ALPN decides.
+    bool h2c = false;
 
     // The common HTTPS case: TLS on, port 443, verification on.
     [[nodiscard]] static client_options https(std::string host,
@@ -88,6 +98,19 @@ struct client_options {
 };
 
 // One request/response exchange. Constructing it opens the link; `send` may be called once.
+//
+// The protocol spoken on the link is negotiated, not fixed:
+//
+//   * TLS: the ALPN offer defaults to {h2, http/1.1}; when the server selects
+//     "h2" the request runs over HTTP/2 (one stream, `response::version` is
+//     `http_version::http_2`), otherwise it falls back to HTTP/1.1. The
+//     fallback is not a failure: a server without ALPN support is a valid
+//     HTTP/1.1 server.
+//   * cleartext: HTTP/1.1 unless `client_options::h2c` opts into h2c prior
+//     knowledge (no fallback is possible after the preface, hence opt-in).
+//
+// For many requests on one connection, prefer `http/h2_client.hpp`, which
+// multiplexes streams.
 class CRPC_API client final {
 public:
     // Takes ownership of an already-open channel. Separated from the transport so a test

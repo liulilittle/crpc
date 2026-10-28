@@ -71,6 +71,19 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept;
 
+    // Waits until the TLS handshake settles (completed or failed), bounded by
+    // `budget` (a zero or negative budget waits indefinitely, like a zero
+    // channel timeout). Returns ok() once `tls_handshake_complete()` holds;
+    // the mapped TLS failure otherwise, or `deadline_exceeded`.
+    //
+    // The TLS layer drives the handshake from backend callbacks and has no
+    // completion callback of its own for handshake-only flights (no plaintext
+    // is delivered until application data flows), so the wait polls the TLS
+    // state at a coarse interval instead of blocking on the data
+    // condition variable: a wait there would miss the final transition on a
+    // peer that sends no application data after ServerHello.
+    [[nodiscard]] status wait_handshake(std::chrono::milliseconds budget);
+
     // TLS observations. They are empty/false on a cleartext channel and before
     // the corresponding handshake information exists.
     [[nodiscard]] std::string tls_server_name() const;

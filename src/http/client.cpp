@@ -1,14 +1,17 @@
-// CRPC -- HTTP/1.1 client implementation.
+// CRPC -- HTTP client implementation (HTTP/1.1 default, HTTP/2 by negotiation).
 #include <crpc/http/client.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <system_error>
 #include <utility>
 
 #include <crpc/db/stream_channel.hpp>
 #include <crpc/io/tls.hpp>
+
+#include "h2_session.hpp"
 
 namespace crpc {
 namespace http {
@@ -191,6 +194,15 @@ struct client::impl {
     std::unique_ptr<db::channel> link;
     rpc_error setup_error;
     bool used = false;
+    // Set by make_client when the link is the TLS stream channel: the
+    // negotiated ALPN decides the protocol, and the result is only known
+    // after the handshake, so the decision is taken at the first send().
+    db::stream_channel* tls_link = nullptr;
+    bool negotiated = false;
+    bool negotiated_h2 = false;
+    // Created on demand for an h2 connection (negotiated or h2c prior
+    // knowledge).
+    std::unique_ptr<detail::h2_session> h2;
 };
 
 client::client(client_options options, std::unique_ptr<db::channel> link)
@@ -242,6 +254,50 @@ result<response> client::send(method verb, std::string_view target, span<const s
                          "this HTTP client has already sent its request"};
     }
     impl_->used = true;
+
+    // TLS negotiation: the handshake settles on backend callbacks, so wait for
+    // it here (bounded by the request budget) and read the ALPN result. An
+    // h2-capable server selects "h2"; anything else -- http/1.1, or no ALPN
+    // extension at all -- keeps this client on HTTP/1.1. Cleartext connections
+    // have no negotiation: h2c prior knowledge is an explicit option.
+    if (impl_->tls_link != nullptr && !impl_->negotiated) {
+        const std::chrono::milliseconds budget =
+            impl_->options.timeout_seconds == 0
+                ? std::chrono::milliseconds(0)
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::seconds(impl_->options.timeout_seconds));
+        const status handshook = impl_->tls_link->wait_handshake(budget);
+        if (!handshook.ok()) {
+            return handshook.error();
+        }
+        impl_->negotiated = true;
+        impl_->negotiated_h2 = impl_->tls_link->tls_alpn_protocol() == "h2";
+    }
+    const bool use_h2 =
+        impl_->tls_link != nullptr ? impl_->negotiated_h2 : impl_->options.h2c;
+
+    if (use_h2) {
+        if (!impl_->h2) {
+            detail::h2_session_config config;
+            config.scheme = impl_->options.tls ? "https" : "http";
+            config.authority = impl_->options.host;
+            const std::uint16_t default_port = impl_->options.tls ? 443 : 80;
+            if (impl_->options.port != default_port) {
+                config.authority += ':';
+                config.authority += std::to_string(impl_->options.port);
+            }
+            config.default_headers = impl_->options.default_headers;
+            config.max_header_bytes = impl_->options.max_header_bytes;
+            config.max_body_bytes = impl_->options.max_body_bytes;
+            impl_->h2.reset(new detail::h2_session(*impl_->link, std::move(config)));
+        }
+        const result<std::uint32_t> opened =
+            impl_->h2->begin(verb, target, body, extra_headers);
+        if (!opened) {
+            return opened.error();
+        }
+        return impl_->h2->finish(opened.value());
+    }
 
     std::string request;
     request.reserve(128 + target.size() + body.size());
@@ -500,14 +556,11 @@ std::unique_ptr<client> make_client(client_options options, crpc::backend_factor
     tls.verify = options.tls_verify_peer ? io::tls_verify_mode::peer
                                          : io::tls_verify_mode::none;
     tls.ca_bundle = options.tls_ca_bundle;
-    if (options.tls_alpn.empty()) {
-        tls.alpn_protocols.clear();
-    } else {
-        tls.alpn_protocols = {options.tls_alpn};
-    }
-    // A server that does not implement ALPN is still a valid HTTP/1.1 server;
-    // what is advertised is HTTP/1.1 only, so a negotiated value can never
-    // select something this client cannot speak.
+    // Advertise the caller's list (default h2 then http/1.1). Empty disables
+    // the ALPN extension entirely. A server that does not implement ALPN is
+    // still a valid HTTP/1.1 server: the client reads the negotiated value
+    // after the handshake and falls back to HTTP/1.1 unless it says "h2".
+    tls.alpn_protocols = options.tls_alpn;
     tls.require_alpn = false;
 
     std::error_code ec;
@@ -538,11 +591,15 @@ std::unique_ptr<client> make_client(client_options options, crpc::backend_factor
             rpc_error{rpc_code::unavailable,
                       "the HTTPS transport refused to connect"}));
     }
-    std::unique_ptr<db::channel> link(
-        new db::stream_channel(std::move(raw), *context, sni, budget));
+    auto* stream = new db::stream_channel(std::move(raw), *context, sni, budget);
+    std::unique_ptr<client> made(new client(std::move(options),
+                                            std::unique_ptr<db::channel>(stream)));
+    // The negotiated ALPN is only known after the handshake; hand the concrete
+    // channel to the client so the first send() can wait and decide.
+    made->impl_->tls_link = stream;
     // `context` may be released here: the TLS stream retains the shared context
     // state for the lifetime of the channel.
-    return std::unique_ptr<client>(new client(std::move(options), std::move(link)));
+    return made;
 #endif
 }
 

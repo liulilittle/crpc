@@ -487,6 +487,157 @@ CRPC_TEST(it_client_tracking_sends_push_invalidations) {
     CRPC_CHECK(session.exec({"CLIENT", "TRACKING", "off"}).ok());
 }
 
+// A Redis error reply is a *successful* `result`: the bytes were understood and
+// the server answered. Every assertion that means "the command worked" must
+// therefore exclude it explicitly, or a READONLY/NOAUTH reply passes silently.
+bool command_succeeded(const crpc::result<crpc::redis::resp_value>& reply) {
+    return reply.ok() && !reply.value().is_error();
+}
+
+// Reads a string-valued reply with the type checked first. `as_bulk_string()`
+// on any other alternative throws std::bad_variant_access, which reaches
+// std::terminate -- it must never be called on an unchecked reply.
+//
+// Both the bulk and the verbatim alternatives count as text: on a RESP3 link
+// CLIENT INFO answers with a verbatim string ('='), so a bulk-only helper
+// rejects a perfectly good reply. A simple string is accepted too (SET -> +OK).
+bool read_text(const crpc::result<crpc::redis::resp_value>& reply,
+               const char* label, std::string& out) {
+    if (!reply.ok()) {
+        std::printf("  %s: no reply (%s)\n", label, reply.error().message.c_str());
+        std::fflush(stdout);
+        return false;
+    }
+    const crpc::redis::resp_value& value = reply.value();
+    if (value.is_bulk_string()) {
+        out = value.as_bulk_string();
+        return true;
+    }
+    if (value.is_verbatim_string()) {
+        out = value.as_verbatim_string();
+        return true;
+    }
+    if (value.is_simple_string()) {
+        out = value.as_simple_string();
+        return true;
+    }
+    std::printf("  %s: unexpected reply type (bulk=%d verbatim=%d simple=%d "
+                "error=%d int=%d null=%d)\n",
+                label, value.is_bulk_string() ? 1 : 0,
+                value.is_verbatim_string() ? 1 : 0,
+                value.is_simple_string() ? 1 : 0, value.is_error() ? 1 : 0,
+                value.is_integer() ? 1 : 0, value.is_null() ? 1 : 0);
+    if (value.is_error()) {
+        std::printf("  %s: server said: %s\n", label, value.as_error().c_str());
+    }
+    std::fflush(stdout);
+    return false;
+}
+
+// A direct, unpooled command against one port, for putting the topology back
+// into a known shape before the failover case runs.
+crpc::result<crpc::redis::resp_value> admin_command(
+    crpc::iocp_backend& backend, const std::string& host, std::uint16_t port,
+    crpc::redis::command args) {
+    crpc::net::pool_config options;
+    options.connection.ep = crpc::endpoint::tcp(host, port);
+    options.connection.operation_timeout = std::chrono::seconds(5);
+    crpc::redis::connection_pool pool(options, backend);
+    auto acquired = pool.acquire();
+    if (!acquired) {
+        return acquired.error();
+    }
+    std::shared_ptr<crpc::redis::connection> conn = std::move(acquired).value();
+    {
+        crpc::redis::command_channel channel(*conn);
+        channel.set_protocol(crpc::redis::resp_protocol::resp2);
+        crpc::result<crpc::redis::resp_value> reply = channel.execute(args);
+        pool.release(std::move(conn));
+        return reply;
+    }
+}
+
+// Reads INFO replication from one node and reports whether it says `role:master`.
+// Used to wait for a promotion to actually finish: Sentinel can publish the new
+// address before the promoted node has dropped its replica state, and a write
+// in that window is rejected with READONLY.
+bool node_is_master(crpc::iocp_backend& backend, const std::string& host,
+                    std::uint16_t port) {
+    crpc::result<crpc::redis::resp_value> info = admin_command(
+        backend, host, port, crpc::redis::command{"INFO", "replication"});
+    if (!info.ok()) {
+        return false;
+    }
+    std::string text;
+    return read_text(info, "INFO replication", text) &&
+           text.find("role:master") != std::string::npos;
+}
+
+// Flattens a RESP value into a searchable string. Sentinel's introspection
+// replies are arrays of alternating field/value entries, and walking them by
+// hand for every poll would bury the actual condition in type checks.
+void flatten_text(const crpc::redis::resp_value& value, std::string& out) {
+    if (value.is_bulk_string()) {
+        out += value.as_bulk_string();
+    } else if (value.is_verbatim_string()) {
+        out += value.as_verbatim_string();
+    } else if (value.is_simple_string()) {
+        out += value.as_simple_string();
+    } else if (value.is_integer()) {
+        out += std::to_string(value.as_integer());
+    } else if (value.is_array()) {
+        for (const auto& item : value.as_array()) {
+            out += ' ';
+            flatten_text(item, out);
+        }
+    } else if (value.is_map()) {
+        for (const auto& entry : value.as_map()) {
+            out += ' ';
+            flatten_text(entry.first, out);
+            out += ' ';
+            flatten_text(entry.second, out);
+        }
+    }
+}
+
+// Waits until Sentinel reports `replica_port` as a healthy replica of the
+// current master. After SENTINEL RESET the daemon starts from nothing, so
+// FAILOVER is answered with NOGOODSLAVE until discovery has run.
+bool wait_until_replica_known(crpc::iocp_backend& backend, const std::string& host,
+                              std::uint16_t sentinel_port, std::uint16_t replica_port,
+                              std::chrono::seconds budget) {
+    const std::string wanted = host + ":" + std::to_string(replica_port);
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        crpc::result<crpc::redis::resp_value> replicas = admin_command(
+            backend, host, sentinel_port,
+            crpc::redis::command{"SENTINEL", "REPLICAS", "mymaster"});
+        if (replicas.ok() && !replicas.value().is_error()) {
+            std::string text;
+            flatten_text(replicas.value(), text);
+            if (text.find(wanted) != std::string::npos &&
+                text.find("s_down") == std::string::npos &&
+                text.find("disconnected") == std::string::npos) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+}
+
+bool wait_until_master(crpc::iocp_backend& backend, const std::string& host,
+                       std::uint16_t port, std::chrono::seconds budget) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (node_is_master(backend, host, port)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+}
+
 // --- Sentinel-driven failover ------------------------------------------------
 //
 // End-to-end proof that the bridge works against a real Sentinel: a live
@@ -517,10 +668,77 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
         std::stoi(env_or("CRPC_REDIS_SENTINEL_PORT", "26380")));
     const std::string trigger = env_or("CRPC_REDIS_SENTINEL_TRIGGER", "failover");
 
-    const crpc::redis::sentinel_address initial{host, master_port};
-    const crpc::redis::sentinel_address expected_new{host, replica_port};
-
     crpc::iocp_backend backend;
+
+    // The case ends by failing the master over, so it cannot assume which node
+    // is the master when it starts: a second run begins with the roles swapped,
+    // and a client pointed at a demoted node gets READONLY for every write.
+    //
+    // Resetting the daemon with SENTINEL RESET is not an option: that rolls its
+    // config epoch back, and the library monitor correctly treats a lower epoch
+    // as stale, so it would ignore the daemon for the rest of the run. Instead
+    // adopt whatever the daemon currently believes and fail over from there.
+    auto sentinel_master = [&]() -> crpc::result<crpc::redis::resp_value> {
+        return admin_command(backend, host, sentinel_port,
+                             crpc::redis::command{"SENTINEL", "GET-MASTER-ADDR-BY-NAME",
+                                                  "mymaster"});
+    };
+
+    std::uint16_t initial_port = master_port;
+    {
+        crpc::result<crpc::redis::resp_value> view = sentinel_master();
+        if (!view.ok() || !view.value().is_array() || view.value().as_array().size() != 2) {
+            crpc_test::skip("the sentinel daemon did not report a master");
+        }
+        const auto& parts = view.value().as_array();
+        if (!parts[1].is_bulk_string()) {
+            crpc_test::skip("the sentinel daemon reported a master without a port");
+        }
+        const auto reported = static_cast<std::uint16_t>(std::stoi(parts[1].as_bulk_string()));
+        if (reported != master_port && reported != replica_port) {
+            crpc_test::skip("the sentinel daemon monitors an unexpected master");
+        }
+        initial_port = reported;
+    }
+    const std::uint16_t next_port = initial_port == master_port ? replica_port : master_port;
+
+    // Force the pair into "initial_port master, next_port replica" so the case
+    // always starts from the same shape, whichever node the daemon names.
+    {
+        const crpc::result<crpc::redis::resp_value> promote = admin_command(
+            backend, host, initial_port, crpc::redis::command{"REPLICAOF", "NO", "ONE"});
+        if (!promote.ok() || promote.value().is_error()) {
+            const std::string reason =
+                std::string("could not promote ") + std::to_string(initial_port) +
+                " to master: " +
+                (promote.ok() ? promote.value().as_error() : promote.error().message);
+            crpc_test::skip(reason.c_str());
+        }
+        const crpc::result<crpc::redis::resp_value> follow = admin_command(
+            backend, host, next_port,
+            crpc::redis::command{"REPLICAOF", host, std::to_string(initial_port)});
+        if (!follow.ok() || follow.value().is_error()) {
+            const std::string reason =
+                std::string("could not make ") + std::to_string(next_port) +
+                " follow " + std::to_string(initial_port) + ": " +
+                (follow.ok() ? follow.value().as_error() : follow.error().message);
+            crpc_test::skip(reason.c_str());
+        }
+        if (!wait_until_master(backend, host, initial_port, std::chrono::seconds(10))) {
+            crpc_test::skip("the initial master did not come up in time");
+        }
+        if (!wait_until_replica_known(backend, host, sentinel_port, next_port,
+                                      std::chrono::seconds(30))) {
+            crpc_test::skip("the sentinel daemon did not see the replica");
+        }
+        std::printf("  sentinel IT: topology %u master / %u replica\n",
+                    static_cast<unsigned>(initial_port),
+                    static_cast<unsigned>(next_port));
+        std::fflush(stdout);
+    }
+
+    const crpc::redis::sentinel_address initial{host, initial_port};
+    const crpc::redis::sentinel_address expected_new{host, next_port};
 
     // Library monitor: observers only (auto_failover=false). The real daemon
     // performs the promotion; this monitor just has to notice the new
@@ -531,7 +749,12 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
     monitor_opts.master_name = "mymaster";
     monitor_opts.master = initial;
     monitor_opts.sentinels = {{host, sentinel_port}};
-    monitor_opts.self = {host, sentinel_port};
+    // `self` identifies *this* monitor, so the peer list can drop it when a
+    // deployment lists the local node among the sentinels. Setting it to the
+    // daemon's own address therefore filtered the only peer out and left the
+    // monitor with nobody to ask -- it never saw the switch. The monitor here is
+    // a client of that daemon, so it must present a different identity.
+    monitor_opts.self = {host, static_cast<std::uint16_t>(sentinel_port + 1)};
     monitor_opts.down_after = std::chrono::milliseconds(1000);
     monitor_opts.failover_timeout = std::chrono::milliseconds(15000);
     monitor_opts.poll_interval = std::chrono::milliseconds(500);
@@ -542,21 +765,30 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
 
     crpc::redis::client::options client_opts;
     client_opts.pool.connection.ep =
-        crpc::endpoint::tcp(host, master_port);
+        crpc::endpoint::tcp(host, initial_port);
     client_opts.pool.connection.operation_timeout = std::chrono::seconds(5);
     client_opts.protocol = crpc::redis::resp_protocol::resp3;
     crpc::redis::client client(client_opts, backend);
     CRPC_CHECK(client.follow(monitor, "mymaster"));
     std::printf("  sentinel IT: wired, initial master %s:%u\n", host.c_str(),
-                master_port);
+                static_cast<unsigned>(initial_port));
 
     const std::string key =
         "crpc_failover_probe_" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const crpc::result<crpc::redis::resp_value> set_reply =
         client.set(key, "before");
-    CRPC_CHECK(set_reply.ok());
-    CRPC_CHECK_EQ(std::string("before"), client.get(key).value().as_bulk_string());
+    CRPC_CHECK(command_succeeded(set_reply));
+    if (!command_succeeded(set_reply)) {
+        std::printf("  sentinel IT: SET failed: %s\n",
+                    set_reply.ok() ? set_reply.value().as_error().c_str()
+                                   : set_reply.error().message.c_str());
+        std::fflush(stdout);
+        return;
+    }
+    std::string before;
+    CRPC_CHECK(read_text(client.get(key), "initial GET", before));
+    CRPC_CHECK_EQ(std::string("before"), before);
     std::printf("  sentinel IT: write/read on the initial master OK\n");
     std::fflush(stdout);
 
@@ -578,23 +810,26 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
                     info.ok() ? (info.value().is_bulk_string() ? 1 : 0) : -1);
         std::fflush(stdout);
         CRPC_CHECK(info.ok());
-        if (info.ok()) {
-            CRPC_CHECK(info.value().is_bulk_string());
-            if (info.value().is_bulk_string()) {
-                const std::string expected_laddr =
-                    "laddr=" + host + ":" + std::to_string(master_port);
-                CRPC_CHECK(info.value().as_bulk_string().find(expected_laddr) !=
-                           std::string::npos);
-                std::printf("  sentinel IT: old link laddr=%s\n",
-                            expected_laddr.c_str());
-                std::fflush(stdout);
-            }
+        std::string old_info;
+        if (read_text(info, "CLIENT INFO before switch", old_info)) {
+            const std::string expected_laddr =
+                "laddr=" + host + ":" + std::to_string(initial_port);
+            // Print what the server actually reported, so a mismatch names the
+            // endpoint the pool is really on instead of only the expected one.
+            const std::size_t at = old_info.find("laddr=");
+            const std::string actual_laddr =
+                at == std::string::npos ? std::string("<no laddr>")
+                                        : old_info.substr(at, old_info.find('\n', at) - at);
+            std::printf("  sentinel IT: old link expected=%s actual=%s\n",
+                        expected_laddr.c_str(), actual_laddr.c_str());
+            std::fflush(stdout);
+            CRPC_CHECK(old_info.find(expected_laddr) != std::string::npos);
         }
     }
 
     if (trigger == "kill") {
         std::printf("  sentinel IT: kill the master on port %u now (trigger=kill)\n",
-                    master_port);
+                    static_cast<unsigned>(initial_port));
         std::fflush(stdout);
     } else {
         std::printf("  sentinel IT: issuing SENTINEL FAILOVER...\n");
@@ -640,14 +875,23 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
     CRPC_CHECK_EQ(expected_new.host, client.master().host);
     CRPC_CHECK_EQ(expected_new.port, client.master().port);
 
+    // Following the address is the client's job; finishing the promotion is the
+    // daemon's. Sentinel can publish the new master while that node still
+    // answers READONLY, so wait for the node itself before judging the pool.
+    CRPC_CHECK(wait_until_master(backend, host, next_port, std::chrono::seconds(30)));
+
     // The pool now serves the new master: a write lands there and reads back.
-    CRPC_CHECK(client.set(key, "after").ok());
-    crpc::result<crpc::redis::resp_value> written_back = client.get(key);
-    CRPC_CHECK(written_back.ok());
-    if (written_back.ok()) {
-        CRPC_CHECK_EQ(std::string("after"),
-                      written_back.value().as_bulk_string());
+    const crpc::result<crpc::redis::resp_value> after_set = client.set(key, "after");
+    CRPC_CHECK(command_succeeded(after_set));
+    if (!command_succeeded(after_set)) {
+        std::printf("  sentinel IT: post-switch SET failed: %s\n",
+                    after_set.ok() ? after_set.value().as_error().c_str()
+                                   : after_set.error().message.c_str());
+        std::fflush(stdout);
     }
+    std::string after;
+    CRPC_CHECK(read_text(client.get(key), "post-switch GET", after));
+    CRPC_CHECK_EQ(std::string("after"), after);
 
     // The new connection is a RESP3 connection and really sits on 6381
     // (CLIENT INFO shows the laddr of the endpoint the pool talks to).
@@ -669,11 +913,11 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
         crpc::result<crpc::redis::resp_value> info =
             channel.execute({"CLIENT", "INFO"});
         CRPC_CHECK(info.ok());
-        if (info.ok()) {
+        std::string new_info;
+        if (read_text(info, "CLIENT INFO after switch", new_info)) {
             const std::string new_laddr =
-                "laddr=" + host + ":" + std::to_string(replica_port);
-            CRPC_CHECK(info.value().as_bulk_string().find(new_laddr) !=
-                       std::string::npos);
+                "laddr=" + host + ":" + std::to_string(next_port);
+            CRPC_CHECK(new_info.find(new_laddr) != std::string::npos);
         }
         client.release(std::move(fresh).value());
     }
@@ -691,20 +935,18 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
         if (old_write.ok()) {
             CRPC_CHECK(old_write.value().as_error() != std::string{});
         }
-        std::printf("  old-master write after switch: %s\n",
-                    old_write.ok()
-                        ? ("error value: " + old_write.value().as_error()).c_str()
-                        : old_write.error().message.c_str());
+        const std::string old_reason =
+            old_write.ok() ? ("error value: " + old_write.value().as_error())
+                           : old_write.error().message;
+        std::printf("  old-master write after switch: %s\n", old_reason.c_str());
         client.release(std::move(old).value());
     }
 
     // The value on the new master is intact (the old write did not stick).
-    crpc::result<crpc::redis::resp_value> intact = client.get(key);
-    CRPC_CHECK(intact.ok());
-    if (intact.ok()) {
-        CRPC_CHECK_EQ(std::string("after"), intact.value().as_bulk_string());
-    }
-    CRPC_CHECK(client.del({key}).ok());
+    std::string intact;
+    CRPC_CHECK(read_text(client.get(key), "final GET", intact));
+    CRPC_CHECK_EQ(std::string("after"), intact);
+    CRPC_CHECK(command_succeeded(client.del({key})));
 
     const crpc::redis::switch_stats stats = client.stats();
     std::printf(
