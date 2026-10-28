@@ -21,8 +21,13 @@
 
 #if defined(_WIN32)
 #include <crpc/io/iocp_backend.hpp>
+// GetCurrentProcessId() below is a Win32 call. Relying on a transitive include
+// from iocp_backend.hpp happened to work in Debug and failed in Release, where
+// the include order differs -- the declaration must be asked for explicitly.
+#include <windows.h>
 #else
 #include <crpc/io/epoll_backend.hpp>
+#include <unistd.h>
 #endif
 
 #include "test_framework.hpp"
