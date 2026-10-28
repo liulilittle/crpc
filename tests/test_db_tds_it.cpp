@@ -73,6 +73,12 @@ struct it_session {
         options.database = database != nullptr ? database : env_or("CRPC_TDS_DB", "master");
         const std::string host = env_or("CRPC_TDS_HOST", "127.0.0.1");
         const std::string port = env_or("CRPC_TDS_PORT", "1433");
+        // The same name is used for SNI and for LOGIN7's ServerName. It is not
+        // strictly required by this server, but a TLS client without SNI cannot be
+        // verified against a certificate.
+        if (options.server_name.empty()) {
+            options.server_name = host;
+        }
         (void)options;
         crpc::net::connection_config config;
         config.ep = crpc::endpoint::tcp(
@@ -518,21 +524,79 @@ CRPC_TEST(tds_it_attention_cancels_a_running_batch) {
     }
 }
 
-CRPC_TEST(tds_it_encryption_is_refused_until_verified) {
+CRPC_TEST(tds_it_require_encryption_logs_in_and_queries) {
     (void)require_server();
-    // The TLS path completes a handshake but its post-handshake framing is not yet
-    // correct against a real server, so the adapter refuses to encrypt rather than
-    // produce a session that looks protected and is not. This case pins that refusal so
-    // it cannot silently become "encryption attempted" again.
+#if defined(CRPC_HAVE_OPENSSL)
+    // The whole session runs inside TLS: PRELOGIN offers ENCRYPT_ON, the handshake
+    // records travel inside PRELOGIN packets, and LOGIN7 plus the query are written
+    // as ordinary TDS packets inside the encrypted stream.
+    it_session it(nullptr, true);
+    if (!it.ok()) {
+        report("encrypted login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    CRPC_CHECK(it.session->encryption_negotiated());
+    CRPC_CHECK_FALSE(it.session->login_only_encryption());
+
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query("SELECT 42 AS n", {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("encrypted SELECT 42", ran.error());
+    }
+    CRPC_CHECK(static_cast<bool>(ran));
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{42}, raw->get_int64(0).value());
+    }
+
+    // A second query proves the TLS record/frame boundary stayed aligned after the
+    // login reply: a channel that desynchronised would fail here, not on the first.
+    crpc::db::result_set* again = nullptr;
+    const crpc::status second = it.session->query("SELECT 43 AS n", {}, &again);
+    crpc::db::statement_guard again_guard(again);
+    if (!second) {
+        report("encrypted SELECT 43", second.error());
+    }
+    CRPC_CHECK(static_cast<bool>(second));
+    if (again != nullptr) {
+        CRPC_CHECK(again->next());
+        CRPC_CHECK_EQ(std::int64_t{43}, again->get_int64(0).value());
+    }
+
+    // The server's own verdict, not the client's flag: sys.dm_exec_connections reports
+    // per-connection encryption state. This is what makes "the session really is
+    // encrypted" an observation instead of an assumption about our own code path.
+    crpc::db::result_set* state = nullptr;
+    const crpc::status inspected = it.session->query(
+        "SELECT encrypt_option, protocol_type, auth_scheme FROM sys.dm_exec_connections "
+        "WHERE session_id = @@SPID",
+        {}, &state);
+    crpc::db::statement_guard state_guard(state);
+    if (!inspected) {
+        report("sys.dm_exec_connections", inspected.error());
+    }
+    CRPC_CHECK(static_cast<bool>(inspected));
+    const bool have_row = state != nullptr && state->next();
+    CRPC_CHECK(have_row);
+    if (have_row) {
+        CRPC_CHECK_EQ(std::string("TRUE"), state->get_text(0).value());
+        CRPC_CHECK_EQ(std::string("TSQL"), state->get_text(1).value());
+        CRPC_CHECK_EQ(std::string("SQL"), state->get_text(2).value());
+    }
+#else
+    // Without a TLS backend the adapter must refuse before writing a byte rather
+    // than send a plaintext login the caller believes is encrypted.
     it_session it(nullptr, true);
     CRPC_CHECK_FALSE(it.ok());
     const crpc::rpc_error& why = it.session->connect_error();
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
                   static_cast<int>(why.code));
-    CRPC_CHECK(why.message.find("encryption") != std::string::npos);
+    CRPC_CHECK(why.message.find("TLS") != std::string::npos);
 
     // A plaintext session against the same server still works, which is what proves the
-    // refusal is about TLS and not about the endpoint.
+    // refusal is about the missing backend and not about the endpoint.
     it_session plain;
     CRPC_CHECK(plain.ok());
     if (plain.ok()) {
@@ -541,6 +605,7 @@ CRPC_TEST(tds_it_encryption_is_refused_until_verified) {
         crpc::db::statement_guard guard(raw);
         CRPC_CHECK(static_cast<bool>(ran));
     }
+#endif
 }
 
 CRPC_TEST(tds_it_legacy_types) {

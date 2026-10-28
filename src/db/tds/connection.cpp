@@ -12,6 +12,8 @@
 
 #include <crpc/db/memory_result_set.hpp>
 
+#include "tls_channel.hpp"
+
 namespace crpc {
 namespace db {
 namespace tds {
@@ -258,16 +260,22 @@ status connection::perform_handshake() {
     packet_size_ = options_.packet_size;
 
     prelogin greeting;
-    // Encryption is refused before a byte is written: the TLS path completes a handshake but
-    // the server still rejects the encrypted login with 17832, and shipping encryption that
-    // looks protected but is not would be worse than refusing it. See discover.md for the
-    // measurements that ruled out the payload, the record framing and the packet id.
-    if (options_.require_encryption || options_.encrypt_login_only) {
+    // Encryption is negotiated in PRELOGIN. Asking for ENCRYPT_ON makes a server that
+    // cannot do TLS fail the connection instead of receiving a plaintext login.
+    const bool wants_tls = options_.require_encryption || options_.encrypt_login_only;
+    if (wants_tls && !tls_backend_available()) {
         return status{rpc_code::failed_precondition,
-                      "TDS encryption is not verified yet; drop require_encryption and "
-                      "encrypt_login_only, or use a tunnel"};
+                      "TDS encryption is not available; this build has no TLS backend "
+                      "(configure with -DCRPC_WITH_OPENSSL=ON)"};
     }
-    greeting.encryption = encryption_mode::not_supported;
+    // Login-only encryption needs the session to drop back to cleartext after
+    // LOGIN7; that half of the state machine is not implemented, and doing it
+    // wrongly would leave the caller believing the session is protected.
+    if (options_.encrypt_login_only) {
+        return status{rpc_code::failed_precondition,
+                      "TDS login-only encryption is not supported; use require_encryption"};
+    }
+    greeting.encryption = wants_tls ? encryption_mode::on : encryption_mode::not_supported;
     greeting.thread_id = 0;
     greeting.mars = 0;
     std::vector<std::byte> payload;
@@ -291,13 +299,40 @@ status connection::perform_handshake() {
     if (!decoded) {
         return decoded;
     }
-    if (answer.encryption == encryption_mode::required ||
-        answer.encryption == encryption_mode::on) {
-        return status{rpc_code::failed_precondition,
-                      "the server requires TDS encryption and this client has not verified TLS"};
+    switch (answer.encryption) {
+    case encryption_mode::required:
+    case encryption_mode::on: {
+        if (!wants_tls) {
+            return status{rpc_code::failed_precondition,
+                          "the server requires TDS encryption (TLS); set require_encryption"};
+        }
+        tls_client_options tls;
+        tls.server_name = options_.server_name;
+        tls.verify_server = options_.verify_server_certificate;
+        tls.ca_bundle = options_.ca_bundle;
+        tls.packet_size = packet_size_;
+        result<std::unique_ptr<db::channel>> secured =
+            open_tls_channel(std::move(link_), tls, packet_id_);
+        if (!secured) {
+            return secured.error();
+        }
+        link_ = std::move(secured.value());
+        encrypted_ = true;
+        login_only_encryption_ = false;
+        break;
     }
-    encrypted_ = false;
-    login_only_encryption_ = false;
+    case encryption_mode::off:
+    case encryption_mode::not_supported:
+        // The server declined TLS. A caller that demanded it must not silently get
+        // a cleartext session.
+        if (wants_tls) {
+            return status{rpc_code::failed_precondition,
+                          "the server does not support TDS encryption"};
+        }
+        encrypted_ = false;
+        login_only_encryption_ = false;
+        break;
+    }
 
     // LOGIN7. ServerName defaults to the endpoint host when the caller has none,
     // because the server records it and a mismatch shows up in audits.

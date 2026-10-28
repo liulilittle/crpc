@@ -15,9 +15,9 @@
 //     of the reply still has to be drained, or the next query decodes the leftover
 //     as its own answer.
 //
-// Encryption is negotiated in PRELOGIN. This slice refuses a server that requires
-// it instead of pretending to encrypt: half a handshake looks like a login failure
-// and hides the cause.
+// Encryption is negotiated in PRELOGIN. A build with the OpenSSL backend can run
+// the whole session over TLS; a build without it refuses a server that requires
+// encryption instead of sending a plaintext login.
 #ifndef CRPC_DB_TDS_CONNECTION_HPP
 #define CRPC_DB_TDS_CONNECTION_HPP
 
@@ -73,8 +73,9 @@ struct connection_options {
     // refuses TLS fails the connection instead of receiving a plaintext login.
     bool require_encryption = false;
 
-    // Encrypt only the login packet, then continue in the clear. Refused until the TLS
-    // path is verified; see `require_encryption`.
+    // Encrypt only the login packet, then continue in the clear. Not implemented:
+    // the session must drop back to cleartext after LOGIN7 and doing that wrongly
+    // would leave the caller believing the rest is protected.
     bool encrypt_login_only = false;
 
     // Used when TLS is negotiated. A production deployment should leave this on; the
