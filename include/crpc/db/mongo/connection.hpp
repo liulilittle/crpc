@@ -80,6 +80,10 @@ public:
 
     // `find` and the cursor that may follow it.
     [[nodiscard]] result<cursor> find(const find_request& request);
+    // `aggregate` and the cursor over its output. The reply carries the same
+    // {cursor: {id, ns, firstBatch}} document as `find`, so `next_batch` and
+    // `close_cursor` continue and release it through the one cursor path.
+    [[nodiscard]] result<cursor> aggregate(const aggregate_request& request);
     // Fetches the next batch for `state`. Returns false when the cursor is exhausted, and
     // releases it on the server in that case.
     [[nodiscard]] result<bool> next_batch(cursor& state);

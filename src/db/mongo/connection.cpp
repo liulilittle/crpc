@@ -41,6 +41,32 @@ namespace {
     return out;
 }
 
+// `find` and `aggregate` answer with the same cursor document { id, ns, firstBatch }. The
+// collection is kept on the cursor because getMore and killCursors have to name it.
+[[nodiscard]] result<cursor> first_batch(const bson_document& reply, std::string collection,
+                                         std::string_view command_name) {
+    const bson_document* cursor_doc = reply.get_document("cursor");
+    if (cursor_doc == nullptr) {
+        return rpc_error{rpc_code::protocol_error, "a " + std::string(command_name) +
+                                                       " reply carries no cursor document"};
+    }
+    cursor out;
+    out.collection = std::move(collection);
+    std::int64_t id = 0;
+    if (cursor_doc->get_int64("id", id)) {
+        out.id = id;
+    }
+    const bson_value* batch = cursor_doc->find("firstBatch");
+    if (batch != nullptr) {
+        for (const bson_value& item : batch->array) {
+            if (item.document) {
+                out.batch.push_back(*item.document);
+            }
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 connection::connection(connection_options options, std::unique_ptr<db::channel> link)
@@ -321,26 +347,23 @@ result<cursor> connection::find(const find_request& request) {
     if (!answered.value().ok) {
         return rpc_error{rpc_code::not_found, answered.value().error_message};
     }
-    cursor out;
-    out.collection = request.collection;
-    // `cursor` is a sub-document: { id, ns, firstBatch }.
-    const bson_document* cursor_doc = answered.value().reply.get_document("cursor");
-    if (cursor_doc == nullptr) {
-        return rpc_error{rpc_code::protocol_error, "a find reply carries no cursor document"};
+    return first_batch(answered.value().reply, request.collection, "find");
+}
+
+result<cursor> connection::aggregate(const aggregate_request& request) {
+    result<command_result> answered = run_command(make_aggregate(request));
+    if (!answered) {
+        return answered.error();
     }
-    std::int64_t id = 0;
-    if (cursor_doc->get_int64("id", id)) {
-        out.id = id;
+    if (!answered.value().ok) {
+        // The server's own code is what distinguishes a bad pipeline from a missing
+        // collection, so it is read rather than replaced with a generic failure.
+        std::int64_t code = 0;
+        (void)answered.value().reply.get_int64("code", code);
+        return rpc_error{map_mongo_error(static_cast<std::int32_t>(code)),
+                         answered.value().error_message};
     }
-    const bson_value* batch = cursor_doc->find("firstBatch");
-    if (batch != nullptr) {
-        for (const bson_value& item : batch->array) {
-            if (item.document) {
-                out.batch.push_back(*item.document);
-            }
-        }
-    }
-    return out;
+    return first_batch(answered.value().reply, request.collection, "aggregate");
 }
 
 result<bool> connection::next_batch(cursor& state) {

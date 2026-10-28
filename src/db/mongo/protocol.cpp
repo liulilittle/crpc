@@ -197,6 +197,26 @@ bson_document make_find(const find_request& request) {
     return command;
 }
 
+bson_document make_aggregate(const aggregate_request& request) {
+    bson_document command;
+    command.append("aggregate", bson_value::make_text(request.collection));
+    std::vector<bson_value> stages;
+    stages.reserve(request.pipeline.size());
+    for (const bson_document& stage : request.pipeline) {
+        stages.push_back(bson_value::make_document(stage));
+    }
+    command.append("pipeline", bson_value::make_array(std::move(stages)));
+    // A missing `cursor` is refused outright, so the sub-document is always sent; only
+    // `batchSize` is conditional, because 0 means "let the server choose".
+    bson_document cursor_options;
+    if (request.batch_size > 0) {
+        cursor_options.append("batchSize", bson_value::make_int32(request.batch_size));
+    }
+    command.append("cursor", bson_value::make_document(std::move(cursor_options)));
+    command.append("$db", bson_value::make_text(request.database));
+    return command;
+}
+
 bson_document make_insert(std::string_view collection, std::vector<bson_document> documents,
                           bool ordered) {
     bson_document command;
