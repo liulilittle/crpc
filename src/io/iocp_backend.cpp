@@ -224,6 +224,13 @@ struct conn_state {
 
     std::atomic<bool> delivering{false};
 
+    // Bumped by `resume_read()` under `m`. A delivery pass that is already
+    // running when a resume arrives would otherwise finish against a stale view
+    // of `paused` and re-pause the connection, swallowing the resume: the caller
+    // un-paused, saw no data, and nothing would ever wake delivery again.
+    // The pass compares this value before it stops and loops again if it moved.
+    std::uint64_t resume_epoch = 0;
+
     // Set while a send completion is still owned by the backend (posted but its
     // user callback has not run yet). `close()` waits for it so a caller that
     // destroys the completion object after close() returns can never race the
@@ -701,7 +708,14 @@ void handle_read_error(conn_state* st, unsigned long wsa_error) noexcept {
 void deliver_read(conn_state* st) noexcept {
     for (;;) {
         if (st->delivering.exchange(true, std::memory_order_acq_rel)) {
+            // Another pass owns delivery. It will re-check `resume_epoch` before
+            // it stops, so a resume issued now is not lost.
             return;
+        }
+        std::uint64_t pass_epoch = 0;
+        {
+            std::lock_guard<std::mutex> lk(st->m);
+            pass_epoch = st->resume_epoch;
         }
         for (;;) {
             std::byte* ptr = nullptr;
@@ -763,10 +777,15 @@ void deliver_read(conn_state* st) noexcept {
         st->delivering.store(false, std::memory_order_release);
 
         bool more = false;
+        bool resumed = false;
         {
             std::lock_guard<std::mutex> lk(st->m);
-            more = st->phase == conn_phase::open && !st->paused &&
-                   st->rx_off < st->rx_got;
+            // A resume that arrived during this pass outranks the `paused` flag
+            // this pass may have just set from a stale `consumed`: the caller
+            // asked for delivery to continue, so continue.
+            resumed = st->resume_epoch != pass_epoch;
+            more = st->phase == conn_phase::open &&
+                   (resumed || !st->paused) && st->rx_off < st->rx_got;
         }
         if (!more) {
             return;
@@ -1099,6 +1118,9 @@ public:
                 return;
             }
             st_->paused = false;
+            // Tell any in-flight delivery pass that this resume must not be
+            // undone by a decision it already made about `paused`.
+            ++st_->resume_epoch;
         }
         deliver_read(st_.get());
     }

@@ -69,8 +69,22 @@ struct nested_drain_source final : io::source {
 
 struct nested_server final : accept_sink {
     std::mutex m;
-    std::vector<std::unique_ptr<connection>> conns;
+
+    // Declaration order is the destruction order reversed, and it matters here.
+    // A connection holds a *borrowed* pointer to its source (`bind_source`), and
+    // `~iocp_connection` calls `bound.retire()` to wait for any `on_data` that is
+    // still running. That guarantee only helps if the source is still alive when
+    // the connection dies -- so `sources` must be declared BEFORE `conns`, which
+    // makes `conns` destruct first and `sources` last.
+    //
+    // The reverse order (conns first, sources second) is what this test used to
+    // have, and it produced a real 0xC0000005: `sources` were freed, then the
+    // connection destructor waited for a delivery that was already inside a
+    // virtual call on the freed source. Reproduced at roughly 1 in 40 runs under
+    // CPU load, faulting at `iocp_backend.cpp:746` (`s->on_data(...)`).
     std::vector<std::unique_ptr<nested_drain_source>> sources;
+    std::vector<std::unique_ptr<connection>> conns;
+
     std::atomic<int> accepts{0};
 
     void on_accept(std::unique_ptr<connection> c) noexcept override {
