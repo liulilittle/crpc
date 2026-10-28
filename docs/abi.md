@@ -298,6 +298,8 @@ is guarded.
 - `::crpc::db::mongo::replica_set_topology`
 - `::crpc::db::mongo::topology_member`
 - `::crpc::db::mongo::write_concern_options`
+- `::crpc::db::hbase::endpoint`
+- `::crpc::db::hbase::endpoint_health`
 - `::crpc::db::hbase::row`
 - `::crpc::db::hbase::scan_filter`
 - `::crpc::db::hbase::scan_options`

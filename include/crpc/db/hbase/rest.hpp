@@ -19,10 +19,12 @@
 #ifndef CRPC_DB_HBASE_REST_HPP
 #define CRPC_DB_HBASE_REST_HPP
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -144,10 +146,92 @@ struct scan_options {
 // the double encoding of the filter document, can be pinned without a server.
 [[nodiscard]] CRPC_API result<std::string> encode_scanner_request(const scan_options& options);
 
-struct client_options {
-    // The gateway's host and port. HBase REST defaults to 8080; this deployment uses 18080.
+// One REST gateway the client may route to. The endpoints of a deployment are
+// interchangeable gateways to the same cluster; a caller that configures
+// gateways pointing at *different* clusters is asking failover to move data
+// operations between those clusters and must not use this class.
+struct CRPC_API endpoint {
     std::string host;
     std::uint16_t port = 8080;
+};
+
+// Whether an endpoint currently receives routed traffic.
+enum class endpoint_condition : std::uint8_t {
+    // Eligible for routing.
+    alive,
+    // Ejected after `failure_threshold` consecutive transport failures. It is
+    // re-admitted only after a successful `GET /version` probe.
+    dead
+};
+
+// A point-in-time view of one endpoint, for `client::health()`.
+struct CRPC_API endpoint_health {
+    std::string host;
+    std::uint16_t port = 8080;
+    endpoint_condition condition = endpoint_condition::alive;
+    // Transport failures since the last successful exchange. A reply of any
+    // status (200, 404, 500, ...) proves the endpoint answered and resets this
+    // to zero; only transport-level failures count against an endpoint.
+    std::uint32_t consecutive_failures = 0;
+    // The most recent transport failure. Retained after recovery as a
+    // diagnostic; `consecutive_failures == 0` means the endpoint is healthy.
+    rpc_code last_error = rpc_code::ok;
+    std::string last_error_message;
+    // Time left before the next recovery probe. Zero while alive, or once the
+    // cooldown has elapsed and a probe is due.
+    std::chrono::milliseconds retry_in{0};
+    // The last time this endpoint answered a request, wall clock. Epoch when it
+    // has never answered.
+    std::chrono::system_clock::time_point last_success_at{};
+};
+
+struct client_options {
+    // The gateway's host and port. HBase REST defaults to 8080; this deployment uses 18080.
+    //
+    // These two fields configure the single-endpoint form, which is what the
+    // class has always meant. When `endpoints` is non-empty it overrides them
+    // and the client routes across every listed gateway.
+    std::string host;
+    std::uint16_t port = 8080;
+
+    // The complete gateway list, tried in order. An empty list means the single
+    // gateway at `host`/`port` (backwards compatible). Endpoints must all serve
+    // the same cluster; see `endpoint`.
+    std::vector<endpoint> endpoints;
+
+    // --- Failover -------------------------------------------------------------
+    //
+    // An endpoint is ejected only for transport-level failures: connection
+    // refused/reset, broken pipe, EOF, deadline and `unknown_side_effect`. A
+    // reply of any HTTP status means the endpoint answered, so it is alive for
+    // routing purposes even when the operation failed.
+
+    // Consecutive transport failures before an endpoint is marked dead and
+    // skipped. 0 disables ejection; the counters and `health()` still update.
+    std::uint32_t failure_threshold = 3;
+
+    // How long a dead endpoint stays out of service before a `GET /version`
+    // probe is attempted. Zero means "probe on the next call".
+    std::chrono::milliseconds retry_cooldown{30000};
+
+    // Whether a *write* whose request may have been executed (the request was
+    // sent and the connection died before the reply arrived) is replayed on the
+    // next endpoint.
+    //
+    // Default false, and that default is a correctness decision. A replay of a
+    // possibly-executed `put_row`/`delete_row`/`create_table`/`delete_table`
+    // risks a duplicate write or a duplicate delete, because the gateway and
+    // the operations behind it are not idempotent and there is no idempotency
+    // key to deduplicate on. With the default, such a failure returns
+    // `unknown_side_effect` with the side effect explicitly called out, so a
+    // caller can reconcile by reading state instead of guessing. Setting this
+    // opts into at-most-once semantics.
+    //
+    // Reads are idempotent and are always retried on the next live endpoint;
+    // this flag never changes that. A write that was refused at connect time
+    // (no byte could have reached the server) is also always retried, because
+    // replaying it cannot duplicate anything.
+    bool retry_on_uncertain = false;
 
     // Sent as `Accept`. The gateway answers XML by default, and a client that forgets this
     // header has to parse XML.
@@ -171,9 +255,19 @@ class CRPC_API client final {
 public:
     // Opens the gateway connection lazily, through `opener`, so a caller can supply a
     // transport (a test, a TLS wrapper) without this class knowing about sockets.
+    //
+    // Two forms exist. `opener` (no argument) is the original single-endpoint form: the
+    // caller captures the one gateway it opens. `endpoint_opener` receives the endpoint
+    // the client wants to talk to and is what multi-endpoint failover needs: the adapter
+    // opens one fresh HTTP link per attempt, so it must be able to address every listed
+    // gateway. A multi-endpoint list (`client_options::endpoints` with more than one
+    // entry) requires `endpoint_opener`; the single-argument form refuses it rather than
+    // silently serving every endpoint through one connection.
     using opener = std::function<std::unique_ptr<http::client>()>;
+    using endpoint_opener = std::function<std::unique_ptr<http::client>(const endpoint&)>;
 
     client(client_options options, opener open);
+    client(client_options options, endpoint_opener open);
     ~client();
 
     client(const client&) = delete;
@@ -222,16 +316,76 @@ public:
     [[nodiscard]] result<std::vector<row>> scan(std::string_view table,
                                                 const scan_options& options);
 
+    // --- Failover state ------------------------------------------------------
+    //
+    // A snapshot of every endpoint in configured order. Cheap and local: it never
+    // contacts a gateway, so a dead endpoint with an elapsed cooldown still reads `dead`
+    // here until a routed call or `probe_endpoint` actually probes it.
+    [[nodiscard]] std::vector<endpoint_health> health() const;
+
+    // Probes one endpoint immediately with `GET /version` (the gateway's own, cheapest
+    // liveness check), regardless of the cooldown. Returns true when the endpoint
+    // answered — a reply of any kind makes it alive for routing — and false when the
+    // probe failed at the transport level. With ejection disabled
+    // (`failure_threshold == 0`) a failed probe does not mark a live endpoint dead, but
+    // the return value still reports the failed probe. An out-of-range index is
+    // `invalid_argument`.
+    [[nodiscard]] result<bool> probe_endpoint(std::size_t index);
+
 private:
+    // Endpoint health, defined in rest.cpp.
+    struct endpoint_state;
+
     // Polls `table_exists` until it matches `present` or the timeout expires.
     [[nodiscard]] status wait_for_table(std::string_view table, bool present);
-    [[nodiscard]] result<http::response> call(http::method verb, std::string_view target,
-                                              std::string_view body = {},
-                                              std::string_view content_type = {});
-    [[nodiscard]] result<std::unique_ptr<http::client>> open_link();
+
+    // Sends one HTTP exchange to one endpoint, by list index, and records the outcome in
+    // the health state. Every transport-level call — routed methods, scanner drains,
+    // probes — funnels through here so the state cannot drift.
+    [[nodiscard]] result<http::response> send_on(std::size_t index, http::method verb,
+                                                  std::string_view target,
+                                                  std::string_view body = {},
+                                                  std::string_view content_type = {});
+
+    // The failover loop. Tries live endpoints in order starting from the last successful
+    // one; a read failure moves to the next endpoint, a write failure moves only when the
+    // request cannot have been executed (or `retry_on_uncertain` is set), and a reply of
+    // any HTTP status stops the loop because it is an authoritative answer.
+    //
+    // `idempotent` selects the write-side rule described on
+    // `client_options::retry_on_uncertain`. A non-idempotent call whose request may have
+    // been executed on a dying connection returns `unknown_side_effect` instead of
+    // rewinding to the next endpoint.
+    [[nodiscard]] result<http::response> call_routed(http::method verb,
+                                                      std::string_view target,
+                                                      std::string_view body,
+                                                      std::string_view content_type,
+                                                      bool idempotent);
+
+    // Runs one full scan (open, drain, release) against one endpoint, filling `out`.
+    // A transport failure leaves `out` partially filled and is reported so the scan
+    // loop can restart the whole scan on the next endpoint — re-running a read from
+    // scratch is safe, and restarting is the only correct recovery for a scanner, which
+    // is host-local state. An HTTP status reply fails the scan without retrying.
+    [[nodiscard]] status scan_attempt(std::size_t index, std::string_view table,
+                                      const scan_options& options, std::vector<row>& out);
+
+    [[nodiscard]] result<std::unique_ptr<http::client>> make_link(const endpoint& ep);
+    // Probes every dead endpoint whose cooldown elapsed, on this call's behalf.
+    void maybe_probe();
+    void mark_reachable(std::size_t index);
+    void mark_failure(std::size_t index, const rpc_error& error);
+    void resolve_endpoints();
 
     client_options options_;
     opener open_;
+    endpoint_opener open_multi_;
+    std::vector<endpoint> endpoints_;
+    std::vector<endpoint_state> states_;
+    // Index of the last endpoint that answered a request; the next routed call starts
+    // the search here.
+    std::size_t preferred_ = 0;
+    mutable std::mutex mutex_;
 };
 
 // Maps an HTTP status from the gateway to the library code. The gateway uses plain HTTP

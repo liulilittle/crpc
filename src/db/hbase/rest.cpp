@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -12,6 +14,35 @@ namespace crpc {
 namespace db {
 namespace hbase {
 namespace {
+
+// A node is ejected only when the failure says the endpoint is unreachable.
+// A reply of any HTTP status — even 500 or 503 — proves the process is
+// answering, so it must not be counted against the endpoint.
+[[nodiscard]] bool is_transport_failure(rpc_code code) noexcept {
+    switch (code) {
+    case rpc_code::unavailable:
+    case rpc_code::connection_refused:
+    case rpc_code::connection_reset:
+    case rpc_code::broken_pipe:
+    case rpc_code::eof:
+    case rpc_code::deadline_exceeded:
+    case rpc_code::not_acknowledged:
+    case rpc_code::unknown_side_effect:
+    case rpc_code::shutting_down:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Whether a failed attempt may still have been executed by the server. The
+// only failure that provably reached no server byte is a refused connection:
+// the TCP handshake never completed, so nothing was sent. Every other
+// transport failure happens after the connection existed, so the request may
+// have been read and run before the connection died.
+[[nodiscard]] bool request_may_have_run(rpc_code code) noexcept {
+    return code != rpc_code::connection_refused;
+}
 
 [[nodiscard]] std::string base64_of(span<const std::byte> data) {
     return crypto::base64_encode(data);
@@ -711,26 +742,65 @@ result<std::string> encode_scanner_request(const scan_options& options) {
     return out;
 }
 
+struct client::endpoint_state {
+    bool alive = true;
+    // Set while a recovery probe is in flight so concurrent calls do not probe
+    // the same endpoint at once.
+    bool probing = false;
+    std::uint32_t consecutive_failures = 0;
+    rpc_code last_error = rpc_code::ok;
+    std::string last_error_message;
+    std::chrono::system_clock::time_point last_success_at{};
+    std::chrono::steady_clock::time_point dead_since{};
+};
+
+void client::resolve_endpoints() {
+    if (!options_.endpoints.empty()) {
+        endpoints_ = options_.endpoints;
+    } else if (!options_.host.empty()) {
+        endpoints_.push_back(endpoint{options_.host, options_.port});
+    }
+    states_.assign(endpoints_.size(), endpoint_state{});
+}
+
 client::client(client_options options, opener open)
-    : options_(std::move(options)), open_(std::move(open)) {}
+    : options_(std::move(options)), open_(std::move(open)), open_multi_(nullptr),
+      preferred_(0) {
+    resolve_endpoints();
+}
+
+client::client(client_options options, endpoint_opener open)
+    : options_(std::move(options)), open_(nullptr), open_multi_(std::move(open)),
+      preferred_(0) {
+    resolve_endpoints();
+}
 
 client::~client() = default;
 
-result<std::unique_ptr<http::client>> client::open_link() {
-    if (!open_) {
+result<std::unique_ptr<http::client>> client::make_link(const endpoint& ep) {
+    if (!open_multi_ && !open_) {
         return rpc_error{rpc_code::failed_precondition, "the HBase client has no transport"};
     }
-    std::unique_ptr<http::client> link = open_();
+    if (!open_multi_ && endpoints_.size() > 1) {
+        // The zero-argument opener captures one host; a multi-gateway list cannot be
+        // addressed through it, and reusing one connection for every endpoint would
+        // silently defeat the failover the list asked for.
+        return rpc_error{rpc_code::failed_precondition,
+                         "multi-endpoint failover needs an endpoint-aware opener "
+                         "(client::endpoint_opener)"};
+    }
+    std::unique_ptr<http::client> link = open_multi_ ? open_multi_(ep) : open_();
     if (!link) {
         return rpc_error{rpc_code::failed_precondition,
-                         "the HBase transport could not open a connection"};
+                         "the HBase transport could not open a connection to " + ep.host};
     }
     return link;
 }
 
-result<http::response> client::call(http::method verb, std::string_view target,
-                                    std::string_view body, std::string_view content_type) {
-    result<std::unique_ptr<http::client>> link = open_link();
+result<http::response> client::send_on(std::size_t index, http::method verb,
+                                       std::string_view target, std::string_view body,
+                                       std::string_view content_type) {
+    result<std::unique_ptr<http::client>> link = make_link(endpoints_[index]);
     if (!link) {
         return link.error();
     }
@@ -749,13 +819,137 @@ result<http::response> client::call(http::method verb, std::string_view target,
                                             body.size()),
         span<const http::header>(fields, count));
     if (!reply) {
+        mark_failure(index, reply.error());
         return reply.error();
     }
+    mark_reachable(index);
     return reply;
 }
 
+void client::mark_reachable(std::size_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    endpoint_state& state = states_[index];
+    state.consecutive_failures = 0;
+    if (!state.alive) {
+        state.alive = true;
+        state.dead_since = std::chrono::steady_clock::time_point{};
+    }
+    state.last_success_at = std::chrono::system_clock::now();
+}
+
+void client::mark_failure(std::size_t index, const rpc_error& error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!is_transport_failure(error.code)) {
+        // A reply proves the endpoint answered; nothing is counted.
+        return;
+    }
+    endpoint_state& state = states_[index];
+    state.last_error = error.code;
+    state.last_error_message = error.message;
+    if (state.consecutive_failures != std::numeric_limits<std::uint32_t>::max()) {
+        ++state.consecutive_failures;
+    }
+    if (state.alive && options_.failure_threshold != 0 &&
+        state.consecutive_failures >= options_.failure_threshold) {
+        state.alive = false;
+        state.dead_since = std::chrono::steady_clock::now();
+    } else if (!state.alive) {
+        // A failed probe restarts the cooldown so a permanently down gateway is
+        // not probed on every subsequent call.
+        state.dead_since = std::chrono::steady_clock::now();
+    }
+}
+
+void client::maybe_probe() {
+    std::vector<std::size_t> due;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < states_.size(); ++index) {
+            endpoint_state& state = states_[index];
+            if (state.alive || state.probing) {
+                continue;
+            }
+            if (now - state.dead_since < options_.retry_cooldown) {
+                continue;
+            }
+            state.probing = true;
+            due.push_back(index);
+        }
+    }
+    // The probe is `GET /version`: the cheapest endpoint liveness check the
+    // gateway ships, and a read. Probing happens outside the health lock
+    // because it performs a network round trip; `probing` keeps two callers
+    // from probing the same endpoint at once.
+    for (const std::size_t index : due) {
+        (void)send_on(index, http::method::get, "/version");
+        std::lock_guard<std::mutex> lock(mutex_);
+        states_[index].probing = false;
+    }
+}
+
+result<http::response> client::call_routed(http::method verb, std::string_view target,
+                                           std::string_view body, std::string_view content_type,
+                                           bool idempotent) {
+    maybe_probe();
+    std::vector<std::size_t> order;
+    rpc_error last_error{rpc_code::unavailable, "hbase REST has no live gateway"};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (endpoints_.empty()) {
+            return rpc_error{rpc_code::failed_precondition,
+                             "hbase REST has no gateway configured"};
+        }
+        if (!open_multi_ && endpoints_.size() > 1) {
+            return rpc_error{rpc_code::failed_precondition,
+                             "multi-endpoint failover needs an endpoint-aware opener "
+                             "(client::endpoint_opener)"};
+        }
+        // Try every alive endpoint, starting from the one that last answered a
+        // request, wrapping around the list.
+        for (std::size_t step = 0; step < endpoints_.size(); ++step) {
+            const std::size_t index = (preferred_ + step) % endpoints_.size();
+            if (states_[index].alive) {
+                order.push_back(index);
+            }
+        }
+        if (order.empty()) {
+            return last_error;
+        }
+    }
+    for (const std::size_t index : order) {
+        result<http::response> reply = send_on(index, verb, target, body, content_type);
+        if (reply) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            preferred_ = index;
+            return reply;
+        }
+        last_error = reply.error();
+        if (!is_transport_failure(last_error.code)) {
+            // A local error (no transport, a broken opener) is not a gateway
+            // failure; there is nothing another endpoint could improve.
+            return last_error;
+        }
+        if (idempotent || !request_may_have_run(last_error.code) ||
+            options_.retry_on_uncertain) {
+            continue;
+        }
+        // Non-idempotent, and the request may already have been applied on the
+        // dying connection. Replaying it on another gateway could duplicate the
+        // write, so this stops with the side effect explicitly unknown.
+        return rpc_error{
+            rpc_code::unknown_side_effect,
+            "the HBase gateway may have executed the request before the "
+            "connection was lost (" +
+                last_error.message +
+                "); the side effect is unknown and it was not retried on another "
+                "gateway"};
+    }
+    return last_error;
+}
+
 result<std::string> client::version() {
-    result<http::response> reply = call(http::method::get, "/version");
+    result<http::response> reply = call_routed(http::method::get, "/version", {}, {}, true);
     if (!reply) {
         return reply.error();
     }
@@ -768,7 +962,7 @@ result<std::string> client::version() {
 
 result<std::vector<std::string>> client::list_tables() {
     // The gateway answers `{"table":["name",...]}` for the root resource.
-    result<http::response> reply = call(http::method::get, "/");
+    result<http::response> reply = call_routed(http::method::get, "/", {}, {}, true);
     if (!reply) {
         return reply.error();
     }
@@ -941,7 +1135,8 @@ status client::create_table(std::string_view table, span<const std::string> fami
     target += encode_path_segment(span<const std::byte>(
         reinterpret_cast<const std::byte*>(table.data()), table.size()));
     target += "/schema";
-    result<http::response> reply = call(http::method::put, target, body, "text/xml");
+    result<http::response> reply =
+        call_routed(http::method::put, target, body, "text/xml", false);
     if (!reply) {
         return reply.error();
     }
@@ -960,7 +1155,7 @@ status client::delete_table(std::string_view table) {
     target += encode_path_segment(span<const std::byte>(
         reinterpret_cast<const std::byte*>(table.data()), table.size()));
     target += "/schema";
-    result<http::response> reply = call(http::method::del, target);
+    result<http::response> reply = call_routed(http::method::del, target, {}, {}, false);
     if (!reply) {
         return reply.error();
     }
@@ -988,7 +1183,7 @@ status client::put_row(std::string_view table, const row& value) {
         return body.error();
     }
     result<http::response> reply =
-        call(http::method::put, target, body.value(), "application/json");
+        call_routed(http::method::put, target, body.value(), "application/json", false);
     if (!reply) {
         return reply.error();
     }
@@ -1008,7 +1203,7 @@ result<row> client::get_row(std::string_view table, span<const std::byte> key) {
     // The path carries the *raw* key, percent-encoded. Base64 here is the mistake that
     // produces 404s for rows that exist: the gateway decodes the path as the key itself.
     target += encode_path_segment(key);
-    result<http::response> reply = call(http::method::get, target);
+    result<http::response> reply = call_routed(http::method::get, target, {}, {}, true);
     if (!reply) {
         return reply.error();
     }
@@ -1036,7 +1231,7 @@ status client::delete_row(std::string_view table, span<const std::byte> key) {
         reinterpret_cast<const std::byte*>(table.data()), table.size()));
     target += "/";
     target += encode_path_segment(key);
-    result<http::response> reply = call(http::method::del, target);
+    result<http::response> reply = call_routed(http::method::del, target, {}, {}, false);
     if (!reply) {
         return reply.error();
     }
@@ -1055,20 +1250,22 @@ result<std::vector<row>> client::scan(std::string_view table, span<const std::by
     return scan(table, options);
 }
 
-result<std::vector<row>> client::scan(std::string_view table, const scan_options& options) {
+status client::scan_attempt(std::size_t index, std::string_view table,
+                            const scan_options& options, std::vector<row>& out) {
     std::string table_path("/");
     table_path += encode_path_segment(span<const std::byte>(
         reinterpret_cast<const std::byte*>(table.data()), table.size()));
 
     // A scanner is opened with the options document, then drained with GETs. The filter
     // travels in this one request and is applied by the region servers; the rows that arrive
-    // are already the answer.
+    // are already the answer. The whole exchange is pinned to `index`: a scanner is
+    // host-local state, so its drain must never wander onto another gateway.
     result<std::string> request = encode_scanner_request(options);
     if (!request) {
         return request.error();
     }
-    result<http::response> opened =
-        call(http::method::put, table_path + "/scanner", request.value(), "application/json");
+    result<http::response> opened = send_on(
+        index, http::method::put, table_path + "/scanner", request.value(), "application/json");
     if (!opened) {
         return opened.error();
     }
@@ -1092,12 +1289,15 @@ result<std::vector<row>> client::scan(std::string_view table, const scan_options
         target = slash == std::string::npos ? std::string("/") : target.substr(slash);
     }
 
-    std::vector<row> out;
     bool released = false;
     for (;;) {
-        result<http::response> batch = call(http::method::get, target);
+        result<http::response> batch = send_on(index, http::method::get, target);
         if (!batch) {
-            break;
+            // Transport failure: the rows read so far come from an unreconcilable partial
+            // scan. Best effort only — the endpoint is unreachable, so the release may
+            // fail too — and the caller restarts the whole scan on another endpoint.
+            (void)send_on(index, http::method::del, target);
+            return batch.error();
         }
         const int code = batch.value().status_code;
         if (code == 204) {
@@ -1106,13 +1306,13 @@ result<std::vector<row>> client::scan(std::string_view table, const scan_options
             break;
         }
         if (code != 200) {
-            (void)call(http::method::del, target);
+            (void)send_on(index, http::method::del, target);
             return rpc_error{map_http_status(code),
                              "the gateway refused a scanner read: " + batch.value().body};
         }
         result<std::vector<row>> rows = decode_cell_set(batch.value().body);
         if (!rows) {
-            (void)call(http::method::del, target);
+            (void)send_on(index, http::method::del, target);
             return rows.error();
         }
         if (rows.value().empty()) {
@@ -1132,9 +1332,104 @@ result<std::vector<row>> client::scan(std::string_view table, const scan_options
     // A scanner that was not drained must be deleted: an abandoned one holds server resources
     // until it times out, and the gateway keeps it in memory.
     if (!released) {
-        (void)call(http::method::del, target);
+        (void)send_on(index, http::method::del, target);
+    }
+    return status{};
+}
+
+result<std::vector<row>> client::scan(std::string_view table, const scan_options& options) {
+    maybe_probe();
+    std::vector<std::size_t> order;
+    rpc_error last_error{rpc_code::unavailable, "hbase REST has no live gateway"};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (endpoints_.empty()) {
+            return rpc_error{rpc_code::failed_precondition,
+                             "hbase REST has no gateway configured"};
+        }
+        if (!open_multi_ && endpoints_.size() > 1) {
+            return rpc_error{rpc_code::failed_precondition,
+                             "multi-endpoint failover needs an endpoint-aware opener "
+                             "(client::endpoint_opener)"};
+        }
+        for (std::size_t step = 0; step < endpoints_.size(); ++step) {
+            const std::size_t index = (preferred_ + step) % endpoints_.size();
+            if (states_[index].alive) {
+                order.push_back(index);
+            }
+        }
+        if (order.empty()) {
+            return last_error;
+        }
+    }
+    // A scan is a read, so it is retried across endpoints. Each attempt opens a fresh
+    // scanner and drains it; a transport failure on one attempt throws away the partial
+    // rows (re-running a read from scratch is safe, which is what makes the retry
+    // idempotent) and tries the next live gateway. An HTTP status reply — a definitive
+    // answer from one gateway — fails the scan without retrying.
+    std::vector<row> out;
+    for (const std::size_t index : order) {
+        out.clear();
+        const status attempt = scan_attempt(index, table, options, out);
+        if (attempt) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            preferred_ = index;
+            return out;
+        }
+        if (!is_transport_failure(attempt.error().code)) {
+            return attempt.error();
+        }
+        last_error = attempt.error();
+    }
+    return last_error;
+}
+
+std::vector<endpoint_health> client::health() const {
+    std::vector<endpoint_health> out;
+    out.reserve(endpoints_.size());
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t index = 0; index < endpoints_.size(); ++index) {
+        const endpoint_state& state = states_[index];
+        endpoint_health entry;
+        entry.host = endpoints_[index].host;
+        entry.port = endpoints_[index].port;
+        entry.condition = state.alive ? endpoint_condition::alive : endpoint_condition::dead;
+        entry.consecutive_failures = state.consecutive_failures;
+        entry.last_error = state.last_error;
+        entry.last_error_message = state.last_error_message;
+        entry.last_success_at = state.last_success_at;
+        if (!state.alive) {
+            const std::chrono::milliseconds elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - state.dead_since);
+            if (elapsed < options_.retry_cooldown) {
+                entry.retry_in = options_.retry_cooldown - elapsed;
+            }
+        }
+        out.push_back(std::move(entry));
     }
     return out;
+}
+
+result<bool> client::probe_endpoint(std::size_t index) {
+    if (index >= endpoints_.size()) {
+        return rpc_error{rpc_code::invalid_argument,
+                         "hbase REST endpoint probe index is out of range"};
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        states_[index].probing = true;
+    }
+    result<http::response> reply = send_on(index, http::method::get, "/version");
+    std::lock_guard<std::mutex> lock(mutex_);
+    states_[index].probing = false;
+    if (reply) {
+        return true;
+    }
+    // A transport failure is a failed probe even when ejection is disabled; any
+    // other error still means the endpoint answered, and send_on has already
+    // recorded the outcome.
+    return !is_transport_failure(reply.error().code);
 }
 
 } // namespace hbase
