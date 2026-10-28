@@ -366,4 +366,83 @@ CRPC_TEST(mysql_it_isolation_level_and_command_timeout_surface) {
     }
 }
 
+// --- caching_sha2_password full authentication -------------------------------
+//
+// Precondition for a STABLE full-auth run: caching_sha2 fast auth is driven by
+// the server's in-memory password cache, and a cached account answers with the
+// 0x03 (fast success) marker instead of 0x04 (full authentication). The cache
+// is emptied by FLUSH PRIVILEGES (MySQL's authentication-flush audit handler
+// clears the caching_sha2 password cache), so this case opens one session,
+// runs FLUSH PRIVILEGES, and opens a second session, which then must take the
+// full path: 0x01 0x04 -> 0x02 -> server RSA key -> OAEP-encrypted password.
+// If the account lacks the RELOAD privilege the flush fails and the
+// full-auth assertion is skipped rather than made flaky; the connect and
+// SELECT 1 assertions still hold either way.
+//
+// The account is independent of the crpc/crpc_pw cases: it comes from
+// CRPC_MYSQL_SHA2_USER / CRPC_MYSQL_SHA2_PASSWORD (defaults csha2 / csha2_pw,
+// a caching_sha2_password account on the primary), with host/port shared with
+// the other cases.
+CRPC_TEST(mysql_it_caching_sha2_full_auth) {
+    (void)require_server();
+    const std::string user = env_or("CRPC_MYSQL_SHA2_USER", "csha2");
+    const std::string password = env_or("CRPC_MYSQL_SHA2_PASSWORD", "csha2_pw");
+    const std::string host = env_or("CRPC_MYSQL_HOST", "127.0.0.1");
+    const std::string port = env_or("CRPC_MYSQL_PORT", "3306");
+
+    crpc::iocp_backend backend;
+    crpc::db::mysql::connection_options options;
+    options.user = user;
+    options.password = password;
+    // No default database: the caching_sha2 account is not guaranteed any.
+    crpc::db::mysql::connection_factory factory(
+        options, backend,
+        crpc::endpoint::tcp(host, static_cast<std::uint16_t>(std::stoi(port))));
+
+    // First session: whatever the cache state is, it must connect.
+    crpc::result<crpc::db::connection*> first_opened = factory.open();
+    CRPC_CHECK(first_opened.ok());
+    if (!first_opened.ok()) {
+        return;
+    }
+    std::unique_ptr<crpc::db::connection> first(first_opened.value());
+
+    // Empty the server-side cache so the next login cannot ride fast auth.
+    crpc::db::result_set* ignored = nullptr;
+    const crpc::status flushed =
+        static_cast<crpc::db::mysql::connection*>(first.get())->query("FLUSH PRIVILEGES", {}, &ignored);
+    crpc::db::statement_guard flushed_guard(ignored);
+    CRPC_CHECK(flushed.ok());
+
+    // Second session: a cold cache forces the full authentication exchange
+    // over plaintext TCP, i.e. the 0x02 public-key request and the
+    // RSA-OAEP-SHA1 encrypted password.
+    crpc::result<crpc::db::connection*> second_opened = factory.open();
+    CRPC_CHECK(second_opened.ok());
+    if (!second_opened.ok()) {
+        return;
+    }
+    std::unique_ptr<crpc::db::connection> second(second_opened.value());
+    auto* session = static_cast<crpc::db::mysql::connection*>(second.get());
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_EQ(std::string("caching_sha2_password"), session->auth_plugin());
+    if (flushed.ok()) {
+        // Only asserted when the flush actually invalidated the cache.
+        CRPC_CHECK(session->used_full_authentication());
+    }
+
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status ran = session->query("SELECT 1", {}, &rows);
+    crpc::db::statement_guard rows_guard(rows);
+    CRPC_CHECK(ran.ok());
+    if (!ran.ok()) {
+        return;
+    }
+    CRPC_CHECK(rows != nullptr);
+    if (rows != nullptr) {
+        CRPC_CHECK(rows->next());
+        CRPC_CHECK_EQ(static_cast<std::int64_t>(1), rows->get_int64(0).value());
+    }
+}
+
 CRPC_TEST_MAIN()

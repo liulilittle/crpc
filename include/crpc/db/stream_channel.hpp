@@ -63,6 +63,12 @@ public:
     [[nodiscard]] status write(span<const std::byte> data) override;
     void close() noexcept override;
 
+    // True only when a TLS context exists and its handshake completed. A
+    // cleartext transport reports false even on loopback, matching the
+    // caching_sha2 rule that only an end-to-end protected link may carry the
+    // plaintext password.
+    [[nodiscard]] bool is_secure() const noexcept override;
+
     [[nodiscard]] bool is_open() const noexcept;
 
     // Waits until the TLS handshake settles (completed or failed), bounded by

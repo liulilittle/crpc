@@ -4,6 +4,7 @@
 // result-set loop are exercised with a scripted server and no socket. The script
 // is built from the documented packet shapes, not from the client's own encoder,
 // so a systematic mistake cannot agree with itself.
+#include "rsa_test_support.hpp"
 #include "test_framework.hpp"
 
 #include <algorithm>
@@ -150,6 +151,10 @@ public:
     std::deque<std::vector<std::byte>> incoming;
     std::vector<std::vector<std::byte>> writes;
     bool closed = false;
+    // True models a link that protects bytes end to end (established TLS, or a
+    // Unix-domain socket); it drives the cleartext-password branch of
+    // caching_sha2 full authentication.
+    bool secure = false;
 
     crpc::result<std::vector<std::byte>> read_exact(std::size_t count) override {
         std::vector<std::byte> out;
@@ -176,6 +181,8 @@ public:
     }
 
     void close() noexcept override { closed = true; }
+
+    [[nodiscard]] bool is_secure() const noexcept override { return secure; }
 
     void push(std::vector<std::byte> data) { incoming.push_back(std::move(data)); }
 };
@@ -337,6 +344,227 @@ CRPC_TEST(mysql_ping_uses_com_ping) {
     CRPC_CHECK(h.session->ping().ok());
     const std::vector<std::byte>& last = h.raw->writes.back();
     CRPC_CHECK_EQ(static_cast<int>(0x0e), static_cast<int>(last[4]));
+}
+
+// --- caching_sha2_password full authentication -------------------------------
+//
+// The server answers the fast-auth scramble with AuthMoreData packets: 0x03
+// (fast auth succeeded, OK follows), 0x04 (full authentication: the server's
+// password cache was cold), or 0x01 || PEM (the public key answering our 0x02
+// request). Over a link that protects bytes end to end the cleartext password
+// plus its NUL terminator may be sent directly; anywhere else it must be
+// RSA-OAEP-SHA1 encrypted under the server key.
+
+// The RSA test key: the official RSA Labs PKCS#1 v2.1 OAEP example key
+// (public data, published in 2001; see rsa_test_support.hpp for provenance).
+constexpr std::size_t full_auth_key_bytes = 128; // 1024-bit modulus
+
+// The greeting nonce the scripted server announces: bytes 1..20 (see
+// greeting_payload: part 1 is 1..8, part 2 is 9..20).
+[[nodiscard]] std::vector<std::byte> greeting_nonce() {
+    std::vector<std::byte> nonce;
+    for (int i = 1; i <= 20; ++i) {
+        nonce.push_back(static_cast<std::byte>(i));
+    }
+    return nonce;
+}
+
+[[nodiscard]] std::vector<std::byte> auth_more_data(std::byte marker) {
+    return {std::byte{0x01}, marker};
+}
+
+// The reply to a 0x02 public-key request: 0x01 followed by the PEM text.
+[[nodiscard]] std::vector<std::byte> public_key_reply(std::string_view pem) {
+    std::vector<std::byte> payload;
+    payload.push_back(std::byte{0x01});
+    for (const char c : pem) {
+        payload.push_back(static_cast<std::byte>(c));
+    }
+    return payload;
+}
+
+[[nodiscard]] std::vector<std::byte> frame_payload(const std::vector<std::byte>& frame) {
+    return std::vector<std::byte>(frame.begin() + 4, frame.end());
+}
+
+// (password || NUL) XOR cyclic scramble -- the full-auth RSA message.
+[[nodiscard]] std::vector<std::byte> expected_rsa_message(std::string_view password,
+                                                          const std::vector<std::byte>& nonce) {
+    std::vector<std::byte> message(password.size() + 1, std::byte{0});
+    for (std::size_t i = 0; i < password.size(); ++i) {
+        message[i] = static_cast<std::byte>(password[i]);
+    }
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        message[i] = message[i] ^ nonce[i % nonce.size()];
+    }
+    return message;
+}
+
+CRPC_TEST(mysql_full_auth_sends_cleartext_password_on_a_secure_channel) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->secure = true;
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    raw->push(packet(auth_more_data(std::byte{0x04}), 2));
+    raw->push(packet(ok_payload(0, 2), 4));
+
+    connection_options options;
+    options.user = "root";
+    options.password = "s3cret";
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK(session->is_open());
+    // writes[0] is the handshake response; writes[1] must be the password with
+    // its NUL terminator, unencrypted, on the protected link.
+    CRPC_CHECK_EQ(std::size_t{2}, raw->writes.size());
+    if (raw->writes.size() == 2) {
+        const std::vector<std::byte> payload = frame_payload(raw->writes[1]);
+        CRPC_CHECK_EQ(std::size_t{7}, payload.size());
+        // `s3cret` followed by the NUL terminator, in the clear.
+        const std::string expected = "s3cret";
+        bool matches = payload.size() == expected.size() + 1;
+        for (std::size_t i = 0; matches && i < expected.size(); ++i) {
+            matches = payload[i] == static_cast<std::byte>(static_cast<unsigned char>(expected[i]));
+        }
+        CRPC_CHECK(matches);
+        CRPC_CHECK(payload[6] == std::byte{0});
+    }
+    CRPC_CHECK(session->used_full_authentication());
+}
+
+CRPC_TEST(mysql_full_auth_requests_public_key_on_a_plaintext_channel) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    raw->push(packet(auth_more_data(std::byte{0x04}), 2));
+    raw->push(packet(public_key_reply(rsa_test::vector_pem), 4));
+    raw->push(packet(ok_payload(0, 2), 6));
+
+    connection_options options;
+    options.user = "root";
+    options.password = "s3cret";
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_EQ(std::size_t{3}, raw->writes.size());
+    if (raw->writes.size() != 3) {
+        return;
+    }
+    // First the one-byte public-key request.
+    const std::vector<std::byte> request = frame_payload(raw->writes[1]);
+    CRPC_CHECK_EQ(std::size_t{1}, request.size());
+    CRPC_CHECK(request[0] == std::byte{0x02});
+    // Then a ciphertext the size of the modulus, which must decrypt to
+    // (password || NUL) XOR scramble under the test key.
+    const std::vector<std::byte> cipher = frame_payload(raw->writes[2]);
+    CRPC_CHECK_EQ(full_auth_key_bytes, cipher.size());
+    const std::vector<std::byte> em = rsa_test::reference_decrypt(cipher);
+    std::vector<std::byte> message;
+    CRPC_CHECK(rsa_test::reference_oaep_decode(em, message));
+    CRPC_CHECK(expected_rsa_message("s3cret", greeting_nonce()) == message);
+    CRPC_CHECK(session->used_full_authentication());
+}
+
+CRPC_TEST(mysql_fast_auth_more_data_zero_three_is_unchanged) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    raw->push(packet(auth_more_data(std::byte{0x03}), 2));
+    raw->push(packet(ok_payload(0, 2), 3));
+
+    connection_options options;
+    options.user = "root";
+    options.password = "s3cret";
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK(session->is_open());
+    // Fast auth (cache hit): one write only, no full-auth exchange.
+    CRPC_CHECK_EQ(std::size_t{1}, raw->writes.size());
+    CRPC_CHECK_FALSE(session->used_full_authentication());
+}
+
+CRPC_TEST(mysql_full_auth_uses_the_auth_switch_nonce_without_trailing_nuls) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    // Auth switch to the same plugin with a fresh challenge whose wire form
+    // carries two trailing NULs; only the 20 bytes before them may be used.
+    std::vector<std::byte> switch_payload;
+    switch_payload.push_back(std::byte{0xfe});
+    append_text(switch_payload, "caching_sha2_password");
+    switch_payload.push_back(std::byte{0});
+    for (int i = 0; i < 20; ++i) {
+        switch_payload.push_back(static_cast<std::byte>(0x41 + i));
+    }
+    switch_payload.push_back(std::byte{0});
+    switch_payload.push_back(std::byte{0});
+    raw->push(packet(switch_payload, 2));
+    raw->push(packet(auth_more_data(std::byte{0x04}), 4));
+    raw->push(packet(public_key_reply(rsa_test::vector_pem), 6));
+    raw->push(packet(ok_payload(0, 2), 8));
+
+    connection_options options;
+    options.user = "root";
+    options.password = "s3cret";
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_EQ(std::string("caching_sha2_password"), session->auth_plugin());
+    // writes: handshake response, auth-switch response, 0x02 request, ciphertext.
+    CRPC_CHECK_EQ(std::size_t{4}, raw->writes.size());
+    if (raw->writes.size() != 4) {
+        return;
+    }
+    const std::vector<std::byte> request = frame_payload(raw->writes[2]);
+    CRPC_CHECK_EQ(std::size_t{1}, request.size());
+    CRPC_CHECK(request[0] == std::byte{0x02});
+    const std::vector<std::byte> cipher = frame_payload(raw->writes[3]);
+    CRPC_CHECK_EQ(full_auth_key_bytes, cipher.size());
+    const std::vector<std::byte> em = rsa_test::reference_decrypt(cipher);
+    std::vector<std::byte> message;
+    CRPC_CHECK(rsa_test::reference_oaep_decode(em, message));
+    std::vector<std::byte> switch_nonce;
+    for (int i = 0; i < 20; ++i) {
+        switch_nonce.push_back(static_cast<std::byte>(0x41 + i));
+    }
+    CRPC_CHECK(expected_rsa_message("s3cret", switch_nonce) == message);
+    CRPC_CHECK(session->used_full_authentication());
+}
+
+CRPC_TEST(mysql_full_auth_refuses_a_password_too_long_for_the_key) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    raw->push(packet(auth_more_data(std::byte{0x04}), 2));
+    raw->push(packet(public_key_reply(rsa_test::vector_pem), 4));
+
+    connection_options options;
+    options.user = "root";
+    // 200 password bytes + NUL exceed RSAES-OAEP's bound for a 1024-bit key
+    // (k - 2*20 - 2 = 86); the failure must be a clear error, never silence.
+    options.password = std::string(200, 'x');
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK_FALSE(session->is_open());
+    CRPC_CHECK(session->connect_error().message.find("too long") != std::string::npos);
+    CRPC_CHECK(raw->closed);
+}
+
+CRPC_TEST(mysql_full_auth_refuses_a_malformed_public_key) {
+    auto scripted = std::unique_ptr<scripted_channel>(new scripted_channel);
+    scripted_channel* raw = scripted.get();
+    raw->push(packet(greeting_payload("caching_sha2_password"), 0));
+    raw->push(packet(auth_more_data(std::byte{0x04}), 2));
+    raw->push(packet(public_key_reply("not a pem"), 4));
+
+    connection_options options;
+    options.user = "root";
+    options.password = "s3cret";
+    auto session = std::unique_ptr<connection>(
+        new connection(options, std::move(scripted)));
+    CRPC_CHECK_FALSE(session->is_open());
+    CRPC_CHECK(session->connect_error().message.find("PUBLIC KEY") != std::string::npos);
+    CRPC_CHECK(raw->closed);
 }
 
 CRPC_TEST_MAIN()

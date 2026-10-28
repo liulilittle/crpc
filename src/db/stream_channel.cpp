@@ -305,6 +305,8 @@ void stream_channel::close() noexcept {
     cv_.notify_all();
 }
 
+bool stream_channel::is_secure() const noexcept { return tls_handshake_complete(); }
+
 bool stream_channel::is_open() const noexcept {
     std::lock_guard<std::mutex> lk(mu_);
     return !closed_ && !eof_ && link_ != nullptr && link_->is_open();

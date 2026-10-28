@@ -14,10 +14,12 @@
 // An empty password produces an empty response for both plugins, which is what
 // makes "no password" distinguishable from "password that hashes to zeros".
 //
-// What is NOT here: TLS, RSA password exchange (`caching_sha2_password` full
-// authentication over a plaintext connection needs the server's public key), and
-// the `sha256_password` plugin. Those belong to the connection layer, which knows
-// whether the link is encrypted.
+// What is NOT here: TLS, the caching_sha2_password full-authentication exchange
+// (0x04 -> 0x02 -> RSA public key -> OAEP-encrypted password over a plaintext
+// link, or the cleartext password over a protected one), and the
+// `sha256_password` plugin. Those belong to the connection layer, which knows
+// whether the link is encrypted; the RSA half itself lives in
+// `crpc::crypto/rsa.hpp`.
 #ifndef CRPC_DB_MYSQL_AUTH_HPP
 #define CRPC_DB_MYSQL_AUTH_HPP
 

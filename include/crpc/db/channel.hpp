@@ -67,6 +67,15 @@ public:
     // Terminal and idempotent.
     virtual void close() noexcept = 0;
 
+    // True when the link protects bytes end to end from the wire: an
+    // established TLS session qualifies; a plain TCP socket (loopback included)
+    // does not. Protocol layers consult this to pick a credential form --
+    // MySQL's caching_sha2_password full authentication may send the plaintext
+    // password only over such a link, and must RSA-encrypt it anywhere else.
+    // The default is `false` so every channel that does not prove protection
+    // stays honest, and existing implementations need no change.
+    [[nodiscard]] virtual bool is_secure() const noexcept { return false; }
+
 protected:
     channel() = default;
 };

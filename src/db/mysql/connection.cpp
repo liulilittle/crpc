@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -11,6 +12,7 @@
 #include <crpc/db/memory_result_set.hpp>
 #include <crpc/db/result_set_list.hpp>
 #include <crpc/db/mysql/auth.hpp>
+#include <crpc/crypto/rsa.hpp>
 #include <crpc/io.hpp>
 
 namespace crpc {
@@ -24,6 +26,16 @@ namespace {
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
+}
+
+// Trailing NULs are never part of a challenge: the handshake announces one byte
+// more than it means, and an auth-switch request pads the same way.
+[[nodiscard]] std::vector<std::byte> trim_trailing_nuls(span<const std::byte> data) {
+    std::size_t size = data.size();
+    while (size > 0 && data[size - 1] == std::byte{0}) {
+        --size;
+    }
+    return std::vector<std::byte>(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(size));
 }
 
 // Builds the library failure for a server ERR packet. `map_error_code` picks
@@ -374,6 +386,15 @@ status connection::authenticate(const handshake& greeting) {
         return sent;
     }
 
+    // The nonce in force for this authentication round: the greeting's
+    // challenge, or the one an auth-switch request carried. caching_sha2 full
+    // authentication XORs the password with it, so it must be the same
+    // scramble the server just checked the fast-auth response against.
+    std::vector<std::byte> active_nonce = trim_trailing_nuls(nonce);
+    // Set between sending the 0x02 public-key request and receiving the
+    // server's key; in that window the next 0x01 packet is the key itself.
+    bool requesting_public_key = false;
+
     for (;;) {
         std::vector<std::byte> reply;
         const status read = read_message(reply);
@@ -437,12 +458,15 @@ status connection::authenticate(const handshake& greeting) {
                               "unsupported mysql auth plugin: " + plugin};
             }
             const span<const std::byte> switch_nonce(payload_view.data() + offset,
-                                                    payload_view.size() - offset);
+                                                     payload_view.size() - offset);
             // The trailing NUL is not part of the challenge.
             span<const std::byte> trimmed = switch_nonce;
             while (!trimmed.empty() && trimmed[trimmed.size() - 1] == std::byte{0}) {
                 trimmed = span<const std::byte>(trimmed.data(), trimmed.size() - 1);
             }
+            // Full authentication must XOR the password with this same
+            // challenge, so it replaces whatever the greeting carried.
+            active_nonce.assign(trimmed.begin(), trimmed.end());
             result<std::vector<std::byte>> switched =
                 plugin == "caching_sha2_password"
                     ? scramble_caching_sha2_password(options_.password, trimmed)
@@ -455,8 +479,7 @@ status connection::authenticate(const handshake& greeting) {
             std::vector<std::byte> response_payload;
             encode_auth_switch_response(
                 response_payload,
-                span<const std::byte>(switched.value().data(), switched.value().size()),
-                (capabilities_ & mask(capability::plugin_auth_lenenc_data)) != 0);
+                span<const std::byte>(switched.value().data(), switched.value().size()));
             const status resent =
                 send_message(span<const std::byte>(response_payload.data(), response_payload.size()),
                              sequence_);
@@ -466,16 +489,83 @@ status connection::authenticate(const handshake& greeting) {
             continue;
         }
         if (first == 0x01) {
-            // Auth more data. For caching_sha2: 0x03 = fast auth succeeded (an OK
-            // follows), 0x04 = full authentication required, which over a plaintext
-            // link needs the server's RSA key. That is the connection layer's job
-            // and is not implemented here; a TLS link never needs it.
+            // Auth more data. For caching_sha2_password the byte after the
+            // marker selects the meaning:
+            //   0x03    -- fast auth succeeded (server cache hit); an OK follows.
+            //   0x04    -- full authentication: the cache was cold, so the
+            //              client must prove the password again.
+            //   '-' ... -- the PEM public key answering our 0x02 request; the
+            //              key reply can never start with 0x03 or 0x04.
             if (payload_view.size() >= 2 && byte_at(payload_view, 1) == 0x03) {
                 continue;
             }
-            return status{rpc_code::failed_precondition,
-                          "mysql caching_sha2 full authentication is not supported; "
-                          "use TLS or a pre-hashed credential"};
+            if (payload_view.size() >= 2 && byte_at(payload_view, 1) == 0x04) {
+                // Over a link that protects the bytes end to end (an
+                // established TLS session, a Unix-domain socket) MySQL allows
+                // the cleartext password with its NUL terminator. Over
+                // anything else the password must be RSA-OAEP encrypted under
+                // the server key, which is requested with one 0x02 byte.
+                std::vector<std::byte> secret(options_.password.size() + 1, std::byte{0});
+                std::memcpy(secret.data(), options_.password.data(), options_.password.size());
+                if (link_ != nullptr && link_->is_secure()) {
+                    const status sent_secret = send_message(
+                        span<const std::byte>(secret.data(), secret.size()), sequence_);
+                    if (!sent_secret) {
+                        return sent_secret;
+                    }
+                    full_auth_ = true;
+                    continue;
+                }
+                if (active_nonce.empty()) {
+                    return status{rpc_code::protocol_error,
+                                  "mysql server requested full authentication without a nonce"};
+                }
+                const std::byte key_request = std::byte{0x02};
+                const status asked =
+                    send_message(span<const std::byte>(&key_request, 1), sequence_);
+                if (!asked) {
+                    return asked;
+                }
+                requesting_public_key = true;
+                continue;
+            }
+            if (requesting_public_key) {
+                requesting_public_key = false;
+                // Strip the 0x01 marker, then any trailing NUL or padding
+                // whitespace around the PEM text.
+                std::string pem;
+                pem.reserve(payload_view.size() - 1);
+                for (std::size_t i = 1; i < payload_view.size(); ++i) {
+                    pem.push_back(static_cast<char>(byte_at(payload_view, i)));
+                }
+                while (!pem.empty() &&
+                       (pem.back() == '\0' || pem.back() == '\r' || pem.back() == '\n' ||
+                        pem.back() == ' ')) {
+                    pem.pop_back();
+                }
+                // The encrypted message is (password || NUL) XOR scramble,
+                // byte-wise with the 20-byte nonce cycled -- the construction
+                // libmysqlclient sends and the server undoes with
+                // `xor_string` over the whole decrypted buffer.
+                std::vector<std::byte> secret(options_.password.size() + 1, std::byte{0});
+                std::memcpy(secret.data(), options_.password.data(), options_.password.size());
+                for (std::size_t i = 0; i < secret.size(); ++i) {
+                    secret[i] = secret[i] ^ active_nonce[i % active_nonce.size()];
+                }
+                result<std::vector<std::byte>> cipher = crypto::rsa_oaep_sha1_encrypt_pem(
+                    pem, span<const std::byte>(secret.data(), secret.size()));
+                if (!cipher) {
+                    return cipher.error();
+                }
+                const status encrypted = send_message(
+                    span<const std::byte>(cipher.value().data(), cipher.value().size()), sequence_);
+                if (!encrypted) {
+                    return encrypted;
+                }
+                full_auth_ = true;
+                continue;
+            }
+            return status{rpc_code::protocol_error, "unexpected mysql auth packet"};
         }
         return status{rpc_code::protocol_error, "unexpected mysql auth packet"};
     }
