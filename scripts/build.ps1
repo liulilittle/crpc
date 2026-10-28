@@ -34,6 +34,11 @@ param(
 
     [switch]$Shared,
 
+    # Also build the examples. They are OFF in CMake by default, so without this
+    # switch the four quickstarts are never compiled and can silently rot -- a
+    # documentation example that no longer builds is worse than none.
+    [switch]$Examples,
+
     # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
     # parameter defaults before $PSScriptRoot is populated, so a default of
     # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
@@ -196,6 +201,9 @@ foreach ($cfg in $configs) {
         $configureArgs += '-DCRPC_BUILD_SHARED=ON'
     } else {
         $configureArgs += '-DCRPC_BUILD_SHARED=OFF'
+    }
+    if ($Examples) {
+        $configureArgs += '-DCRPC_BUILD_EXAMPLES=ON'
     }
 
     if ($vcvars) {
