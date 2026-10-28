@@ -999,6 +999,18 @@ rpc_code map_error_code(std::uint16_t code) noexcept {
     case 1213: // ER_LOCK_DEADLOCK
         return rpc_code::unavailable;
 
+    // TiDB error space (9xxx, reported over the MySQL wire). 9007 is the
+    // optimistic write conflict: both writers proceed and the loser only learns
+    // at COMMIT that the transaction was aborted ("reason=Optimistic [try
+    // again later]"), so retrying the whole unit can succeed. 8027 means the
+    // optimistic transaction read a schema that changed under it, which the
+    // same retry clears. Both are mapped to the same abstract code as MySQL's
+    // lock-wait/deadlock (temporary conflict, safe to retry); the raw code
+    // stays in the error metadata so 9007 is distinguishable from 1205.
+    case 9007: // TiDB ER_WRITE_CONFLICT
+    case 8027: // TiDB ER_INFO_SCHEMA_CHANGED
+        return rpc_code::unavailable;
+
     // Authentication and permission: the request is well formed but not allowed,
     // and retrying the same request cannot help.
     case 1044: // ER_DBACCESS_DENIED_ERROR

@@ -90,7 +90,11 @@ private:
 class prepared_statement;
 
 // One authenticated MySQL/MariaDB session.
-class CRPC_API connection final : public db::connection {
+//
+// Not `final`: the TiDB adapter (`crpc::db::tidb::connection`) derives from
+// this class because TiDB speaks the same wire protocol; it layers the TiDB
+// capability surface on top without reimplementing the transport.
+class CRPC_API connection : public db::connection {
 public:
     // Performs the handshake and authentication over `link`. On failure the link
     // is closed and the error carries the server's own code and message.
