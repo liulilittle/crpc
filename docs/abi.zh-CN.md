@@ -196,6 +196,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::hbase::scan_filter`
 - `::crpc::db::hbase::scan_options`
 - `::crpc::http::client_options`
+- `::crpc::http::h2_client_options`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`

@@ -53,6 +53,8 @@ the authoritative declaration.
 | Header | Key types | What it is |
 |---|---|---|
 | [`http/server.hpp`](../../include/crpc/http/server.hpp) | `http::http_server`, `http_server::builder` | HTTP/1.1 + HTTP/2 (h2c/h2) + HTTPS server facade over any backend listener. |
+| [`http/client.hpp`](../../include/crpc/http/client.hpp) | `http::client`, `client_options` | HTTP client; HTTP/1.1 by default, HTTP/2 when ALPN negotiates h2 (or h2c prior knowledge). |
+| [`http/h2_client.hpp`](../../include/crpc/http/h2_client.hpp) | `http::h2_client`, `h2_client_options` | Multiplexing HTTP/2 client: concurrent streams on one connection (h2c or TLS+ALPN h2). |
 | [`http/message.hpp`](../../include/crpc/http/message.hpp) | `http::request`, `http::response` | HTTP/1.1 message model, incremental parser and serializer. |
 | [`http2/frame.hpp`](../../include/crpc/http2/frame.hpp) | `h2::frame`, `h2::frame_header` | HTTP/2 frame layer. |
 | [`http2/hpack.hpp`](../../include/crpc/http2/hpack.hpp) | `h2::hpack_encoder`, `h2::hpack_decoder` | HPACK header compression. |

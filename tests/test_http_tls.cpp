@@ -390,7 +390,13 @@ CRPC_TEST(https_convenience_options_are_defaults) {
     CRPC_CHECK(options.tls);
     CRPC_CHECK_EQ(static_cast<unsigned>(443), static_cast<unsigned>(options.port));
     CRPC_CHECK(options.tls_verify_peer); // verification is on unless explicitly off
-    CRPC_CHECK_EQ(std::string("http/1.1"), options.tls_alpn);
+    // The default offer negotiates h2 when the server supports it and keeps
+    // http/1.1 as the fallback.
+    CRPC_CHECK_EQ(std::size_t{2}, options.tls_alpn.size());
+    if (options.tls_alpn.size() == 2) {
+        CRPC_CHECK_EQ(std::string("h2"), options.tls_alpn[0]);
+        CRPC_CHECK_EQ(std::string("http/1.1"), options.tls_alpn[1]);
+    }
     CRPC_CHECK_EQ(std::string("example.com"), options.host);
     const http::client_options explicit_port =
         http::client_options::https("example.com", 8443);

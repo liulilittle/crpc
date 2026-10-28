@@ -60,7 +60,11 @@ enum class method : std::uint8_t {
 
 // --- Versions and target forms -----------------------------------------------
 
-enum class http_version : std::uint8_t { http_1_0, http_1_1 };
+// HTTP versions a message can carry. `http_2` marks a message that was
+// carried over an HTTP/2 stream (RFC 9113): its headers are the HPACK-decoded
+// fields of one stream, and the h1 serializer must not be fed such a message.
+// New values are appended (docs/abi.md section 1).
+enum class http_version : std::uint8_t { http_1_0, http_1_1, http_2 };
 
 [[nodiscard]] CRPC_API const char* to_string(http_version version) noexcept;
 

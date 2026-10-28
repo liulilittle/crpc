@@ -299,6 +299,7 @@ is guarded.
 - `::crpc::db::hbase::scan_filter`
 - `::crpc::db::hbase::scan_options`
 - `::crpc::http::client_options`
+- `::crpc::http::h2_client_options`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
 - `::crpc::db::tds::prelogin`
