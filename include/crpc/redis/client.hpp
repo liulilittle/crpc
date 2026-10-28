@@ -38,6 +38,19 @@
 namespace crpc {
 namespace redis {
 
+// The server half of a successful `HELLO` reply, as reported by
+// `client::hello()`. `proto` is the negotiated protocol version (3 on a RESP3
+// handshake); `server`, `version`, `mode` and `role` are the values the server
+// advertised. A RESP2 client never sends HELLO, so every field stays empty and
+// `proto` stays 0.
+struct hello_info {
+    std::string server;
+    std::string version;
+    std::int64_t proto = 0;
+    std::string mode;
+    std::string role;
+};
+
 // A high-level asynchronous Redis client: a connection pool plus a typed
 // command API. It owns the pool; the backend and shard are borrowed and must
 // outlive the client.
@@ -52,6 +65,11 @@ public:
 
         // RESP dialect used for replies. Commands are always arrays of bulk
         // strings, which are identical in RESP2 and RESP3.
+        //
+        // RESP2 (the default) needs no handshake. RESP3 is negotiated on every
+        // connection when it is first used: the client sends `HELLO 3` and,
+        // when a server refuses it (a Redis before 6 has no HELLO command),
+        // fails the call with a clear error instead of silently downgrading.
         resp_protocol protocol = resp_protocol::resp2;
     };
 
@@ -65,9 +83,11 @@ public:
 
     // --- Connection management -------------------------------------------------
 
-    // Establishes a pooled connection and verifies it with a PING. Returns the
-    // transport error when the endpoint cannot be reached; the pool is left
-    // empty so a later retry can still succeed.
+    // Establishes a pooled connection, negotiates the requested protocol, and
+    // verifies it with a PING. Returns the transport error when the endpoint
+    // cannot be reached, or the negotiation error when a RESP3 client meets a
+    // server without HELLO; the pool is left empty so a later retry can still
+    // succeed.
     status connect();
 
     // Closes every idle connection and rejects further acquires with
@@ -83,9 +103,17 @@ public:
 
     // Direct pool access for callers that need to hold a connection across
     // several commands. `acquire` parks a coroutine when the pool is
-    // exhausted; `release` returns the connection (closing it if it died).
+    // exhausted; a RESP3 client that acquires a connection which has not
+    // negotiated on this link yet sends `HELLO 3` before returning, so a raw
+    // `command_channel` on the result runs on the requested protocol.
+    // `release` returns the connection (closing it if it died).
     [[nodiscard]] result<std::shared_ptr<connection>> acquire();
     void release(std::shared_ptr<connection> conn);
+
+    // The values advertised by the most recent successful `HELLO` handshake on
+    // this endpoint's connections. Empty until a RESP3 client negotiates; see
+    // `hello_info`.
+    [[nodiscard]] hello_info hello() const;
 
     // Pool observability.
     [[nodiscard]] std::size_t idle() const noexcept;

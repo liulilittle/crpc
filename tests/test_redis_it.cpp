@@ -13,9 +13,10 @@
 // What is and is not verifiable against a real server is part of the contract
 // this file documents:
 //   * arbitrary commands via `command()` (INFO, COMMAND COUNT, OBJECT ENCODING);
-//   * after `HELLO 3` the connection answers in RESP3, so maps (HGETALL),
-//     doubles (ZSCORE) and pushes (CLIENT TRACKING invalidations) are real
-//     wire frames the decoder must turn into values;
+//   * the facade negotiates RESP3 when `options.protocol == resp3`: a pooled
+//     connection sends `HELLO 3` once per link before its first command, so
+//     maps (HGETALL), doubles (ZSCORE) and pushes (CLIENT TRACKING
+//     invalidations) are real wire frames the decoder must turn into values;
 //   * RESP3 attribute (`|`) and streamed (`$?`/`*?`/`~?`/`%?`) frames are
 //     part of the spec but no Redis 7 core command emits them (the RESP3 spec
 //     states the server implements neither), so those remain constructed-byte
@@ -154,8 +155,8 @@ bool first_push_kind_is(const crpc::redis::resp_value& value,
     return false;
 }
 
-// Redis spells some fields (e.g. every HELLO entry) as simple strings and
-// others as bulk strings depending on the command; fold the two like the
+// Redis spells some fields as simple strings, others as bulk strings, and
+// INFO/CLIENT INFO as a RESP3 verbatim string (`=`); fold the three like the
 // feature layer's reply helpers do, so an assertion does not care which wire
 // form arrived.
 const std::string* text_of(const crpc::redis::resp_value& value) {
@@ -165,7 +166,37 @@ const std::string* text_of(const crpc::redis::resp_value& value) {
     if (value.is_bulk_string()) {
         return &value.as_bulk_string();
     }
+    if (value.is_verbatim_string()) {
+        return &value.as_verbatim_string();
+    }
     return nullptr;
+}
+
+std::string unique_key(const char* prefix) {
+    return std::string(prefix) +
+           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
+// Finds the protocol number in a `CLIENT INFO` reply. Redis reports it as a
+// `resp=` field (that is wire text, not the same `proto` field as HELLO);
+// returns -1 when the reply is not text or the field is absent.
+std::int64_t client_info_resp(const crpc::redis::resp_value& reply) {
+    const std::string* body = text_of(reply);
+    if (body == nullptr) {
+        return -1;
+    }
+    const std::string_view needle = "resp=";
+    const std::size_t at = body->find(needle);
+    if (at == std::string::npos) {
+        return -1;
+    }
+    std::string_view rest = std::string_view(*body).substr(at + needle.size());
+    const std::size_t nl = rest.find_first_of("\r\n ");
+    if (nl != std::string::npos) {
+        rest = rest.substr(0, nl);
+    }
+    const std::string value(rest);
+    return value.empty() ? -1 : static_cast<std::int64_t>(std::stoll(value));
 }
 
 } // namespace
@@ -254,54 +285,139 @@ CRPC_TEST(it_command_encoding_is_injection_safe) {
     CRPC_CHECK(call(c, {"DEL", key}).ok());
 }
 
-CRPC_TEST(it_hello3_negotiates_resp3_frames) {
+CRPC_TEST(it_resp3_client_negotiates_and_serves_resp3_shapes) {
     (void)require_redis();
-    raw_session session;
-    CRPC_CHECK(session.connect().ok());
+    crpc::iocp_backend backend;
+    crpc::redis::client::options opts = client_options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    crpc::redis::client c(opts, backend);
+    CRPC_CHECK(c.connect().ok());
 
-    crpc::result<crpc::redis::resp_value> hello = session.exec({"HELLO", "3"});
-    CRPC_CHECK(hello.ok());
-    CRPC_CHECK(hello.value().is_map());
-    const std::string* first_key = text_of(hello.value().as_map()[0].first);
-    const std::string* first_value = text_of(hello.value().as_map()[0].second);
-    CRPC_CHECK(first_key != nullptr && *first_key == "server");
-    CRPC_CHECK(first_value != nullptr && *first_value == "redis");
+    // connect() negotiated: HELLO 3 reported the server identity, version and
+    // role, and a RESP3 protocol number.
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(3), c.hello().proto);
+    CRPC_CHECK_EQ(std::string("redis"), c.hello().server);
+    CRPC_CHECK_FALSE(c.hello().version.empty());
+    CRPC_CHECK_FALSE(c.hello().role.empty());
 
-    std::int64_t proto = 0;
-    bool saw_proto = false;
-    for (const auto& entry : hello.value().as_map()) {
-        const std::string* key = text_of(entry.first);
-        if (key != nullptr && *key == "proto") {
-            CRPC_CHECK(entry.second.is_integer());
-            proto = entry.second.as_integer();
-            saw_proto = true;
-        }
+    // Cross-check the advertised version against INFO server.
+    crpc::result<crpc::redis::resp_value> info = call(c, {"INFO", "server"});
+    CRPC_CHECK(info.ok());
+    const std::string* body = text_of(info.value());
+    CRPC_CHECK(body != nullptr);
+    if (body == nullptr) {
+        return;
     }
-    CRPC_CHECK(saw_proto);
-    CRPC_CHECK_EQ(static_cast<std::int64_t>(3), proto);
+    const std::string_view needle = "redis_version:";
+    const std::size_t at = body->find(needle);
+    CRPC_CHECK(at != std::string::npos);
+    const std::string_view version =
+        std::string_view(*body).substr(at + needle.size());
+    const std::size_t nl = version.find('\r');
+    CRPC_CHECK_EQ(std::string(version.substr(0, nl)), c.hello().version);
 
-    const std::string hkey = "crpc:it:resp3:h";
-    CRPC_CHECK(session.exec({"HSET", hkey, "f", "v"}).ok());
-    // HGETALL is `%` (map) only under RESP3; RESP2 would be a flat array.
-    crpc::result<crpc::redis::resp_value> hgetall =
-        session.exec({"HGETALL", hkey});
+    // HGETALL is `%` (map) only under RESP3; under RESP2 it would be a flat
+    // array. The facade path proves the negotiated session actually talks RESP3.
+    const std::string hkey = unique_key("crpc:it:resp3:h:");
+    CRPC_CHECK(c.hset(hkey, "f", "v").ok());
+    crpc::result<crpc::redis::resp_value> hgetall = c.hgetall(hkey);
     CRPC_CHECK(hgetall.ok());
     CRPC_CHECK(hgetall.value().is_map());
-    const std::string* field_value =
-        text_of(hgetall.value().as_map()[0].second);
-    CRPC_CHECK(field_value != nullptr && *field_value == "v");
+    if (hgetall.value().is_map()) {
+        const std::string* field_value =
+            text_of(hgetall.value().as_map()[0].second);
+        CRPC_CHECK(field_value != nullptr && *field_value == "v");
+    }
 
     // ZSCORE is `,` (double) only under RESP3.
-    const std::string zkey = "crpc:it:resp3:z";
-    CRPC_CHECK(session.exec({"ZADD", zkey, "1.5", "m"}).ok());
-    crpc::result<crpc::redis::resp_value> zscore =
-        session.exec({"ZSCORE", zkey, "m"});
+    const std::string zkey = unique_key("crpc:it:resp3:z:");
+    CRPC_CHECK(c.zadd(zkey, 1.5, "m").ok());
+    crpc::result<crpc::redis::resp_value> zscore = c.zscore(zkey, "m");
     CRPC_CHECK(zscore.ok());
     CRPC_CHECK(zscore.value().is_double());
-    CRPC_CHECK_EQ(zscore.value().as_double(), 1.5);
+    if (zscore.value().is_double()) {
+        CRPC_CHECK_EQ(zscore.value().as_double(), 1.5);
+    }
 
-    CRPC_CHECK(session.exec({"DEL", hkey}).ok());
-    CRPC_CHECK(session.exec({"DEL", zkey}).ok());
+    // CLIENT INFO on the live session proves the wire protocol really is 3.
+    crpc::result<crpc::redis::resp_value> client_info = c.execute({"CLIENT", "INFO"});
+    CRPC_CHECK(client_info.ok());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(3), client_info_resp(client_info.value()));
+
+    CRPC_CHECK(c.del({hkey}).ok());
+    CRPC_CHECK(c.del({zkey}).ok());
+}
+
+CRPC_TEST(it_resp2_client_keeps_resp2_shapes) {
+    (void)require_redis();
+    crpc::iocp_backend backend;
+    crpc::redis::client c(client_options(), backend);
+    CRPC_CHECK(c.connect().ok());
+
+    // A RESP2 client never sends HELLO, so no server information is known.
+    CRPC_CHECK(c.hello().version.empty());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(0), c.hello().proto);
+
+    const std::string hkey = unique_key("crpc:it:resp2:h:");
+    CRPC_CHECK(c.hset(hkey, "f", "v").ok());
+    crpc::result<crpc::redis::resp_value> hgetall = c.hgetall(hkey);
+    CRPC_CHECK(hgetall.ok());
+    CRPC_CHECK_FALSE(hgetall.value().is_map());
+    CRPC_CHECK(hgetall.value().is_array());
+    if (hgetall.value().is_array()) {
+        CRPC_CHECK_EQ(std::size_t{2}, hgetall.value().as_array().size());
+    }
+
+    const std::string zkey = unique_key("crpc:it:resp2:z:");
+    CRPC_CHECK(c.zadd(zkey, 1.5, "m").ok());
+    crpc::result<crpc::redis::resp_value> zscore = c.zscore(zkey, "m");
+    CRPC_CHECK(zscore.ok());
+    CRPC_CHECK_FALSE(zscore.value().is_double());
+    if (zscore.value().is_bulk_string()) {
+        CRPC_CHECK_EQ(std::string("1.5"), zscore.value().as_bulk_string());
+    }
+
+    crpc::result<crpc::redis::resp_value> client_info = c.execute({"CLIENT", "INFO"});
+    CRPC_CHECK(client_info.ok());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(2), client_info_resp(client_info.value()));
+
+    CRPC_CHECK(c.del({hkey}).ok());
+    CRPC_CHECK(c.del({zkey}).ok());
+}
+
+CRPC_TEST(it_resp3_pool_negotiates_every_connection) {
+    (void)require_redis();
+    crpc::iocp_backend backend;
+    crpc::redis::client::options opts = client_options();
+    opts.protocol = crpc::redis::resp_protocol::resp3;
+    opts.pool.max_size = 8;
+    crpc::redis::client c(opts, backend);
+
+    // Check out several pooled connections and prove each live session runs
+    // RESP3. acquire() is exactly the path a caller that drives a raw
+    // command_channel over a pooled connection uses.
+    std::vector<std::shared_ptr<crpc::redis::connection>> held;
+    constexpr int connections = 4;
+    for (int i = 0; i < connections; ++i) {
+        crpc::result<std::shared_ptr<crpc::redis::connection>> conn = c.acquire();
+        CRPC_CHECK(conn.ok());
+        held.push_back(std::move(conn).value());
+    }
+    CRPC_CHECK_EQ(static_cast<std::size_t>(connections), c.total());
+
+    for (const std::shared_ptr<crpc::redis::connection>& conn : held) {
+        crpc::redis::command_channel channel(*conn);
+        channel.set_protocol(crpc::redis::resp_protocol::resp3);
+        crpc::result<crpc::redis::resp_value> info =
+            channel.execute({"CLIENT", "INFO"});
+        CRPC_CHECK(info.ok());
+        CRPC_CHECK_EQ(static_cast<std::int64_t>(3), client_info_resp(info.value()));
+    }
+
+    for (std::shared_ptr<crpc::redis::connection>& conn : held) {
+        c.release(std::move(conn));
+    }
+    CRPC_CHECK_EQ(std::size_t{0}, c.in_use());
 }
 
 CRPC_TEST(it_client_tracking_sends_push_invalidations) {
