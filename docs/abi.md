@@ -384,6 +384,8 @@ is guarded.
 - `::crpc::resilience::instance`
 - `::crpc::resilience::retry_policy`
 - `::crpc::resilience::smart_policy`
+- `::crpc::ws::client_options`
+- `::crpc::ws::frame_header`
 
 These records are governed only by the policy in section 7 (any change to a
 public struct layout is a MAJOR change), not by a build-time check. Most of them
