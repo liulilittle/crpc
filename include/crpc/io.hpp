@@ -192,7 +192,20 @@ struct connect_options {
 
 struct listen_options {
     std::size_t backlog = 1024;
+
+    // Ask for SO_REUSEPORT so several listeners can share one port and have the
+    // kernel spread connections across them.
+    //
+    // This is a Linux feature and it is honoured only there. On Windows the
+    // nearest option, SO_REUSEADDR, does not load-balance: it lets a second
+    // listener bind the same port while every connection keeps going to the
+    // first one, so the second listener accepts nothing at all. That was
+    // measured, and it is why a Windows listener always gets
+    // SO_EXCLUSIVEADDRUSE instead and a conflicting bind fails with
+    // WSAEADDRINUSE -- a loud error rather than a silent one. So on Windows this
+    // flag is ignored, and that is deliberate, not an oversight.
     bool reuse_port = true;
+
     std::size_t recv_buffer_bytes = 64 * 1024;
     std::size_t send_buffer_bytes = 64 * 1024;
 };
