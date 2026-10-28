@@ -77,7 +77,11 @@ enum class rpc_code : u16 {
     // The endpoint is shutting down.
     shutting_down = 20,
     // The remote handler returned an application error (carried in metadata).
-    application = 21
+    application = 21,
+    // The caller lacks permission for an operation the OS refused (access
+    // denied, read-only target, ACL). Also returned by the fs layer for
+    // sharing / lock violations.
+    permission_denied = 22
 };
 
 // True when retrying the same request could plausibly succeed without changing
