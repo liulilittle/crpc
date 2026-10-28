@@ -195,6 +195,14 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::tds::prelogin`
 - `::crpc::db::tds::rpc_parameter`
 - `::crpc::db::tds::rpc_request`
+- `::crpc::db::oracle::tns_accept`
+- `::crpc::db::oracle::tns_connect`
+- `::crpc::db::oracle::tns_header`
+- `::crpc::db::oracle::tns_refuse`
+- `::crpc::db::oracle::ttc_column`
+- `::crpc::db::oracle::ttc_execute`
+- `::crpc::db::oracle::ttc_fetch`
+- `::crpc::db::oracle::ttc_value`
 - `::crpc::flow::rtt_tracker`
 - `::crpc::frame`
 - `::crpc::http2::frame_header`
