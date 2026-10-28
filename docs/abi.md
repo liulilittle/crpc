@@ -326,6 +326,9 @@ is guarded.
 - `::crpc::memcached::binary_header`
 - `::crpc::memcached::connection_transport_config`
 - `::crpc::memcached::text_reply`
+- `::crpc::mq::amqp::frame`
+- `::crpc::mq::amqp::frame_header`
+- `::crpc::mq::amqp::message_properties`
 - `::crpc::mvc::binding_limits`
 - `::crpc::mvc::file_part`
 - `::crpc::mvc::route_entry`
