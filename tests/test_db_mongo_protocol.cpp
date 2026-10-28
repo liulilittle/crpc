@@ -361,4 +361,230 @@ CRPC_TEST(mongo_error_codes_map_to_the_library_codes) {
                   static_cast<int>(crpc::db::mongo::map_mongo_error(2)));
 }
 
+// --- Distributed (replica set) support --------------------------------------
+//
+// The wire names below are the strings MongoDB itself accepts. A driver that sends
+// "secondarypreferred" or "primary_preferred" is silently treated as owning a read
+// preference the server does not know, so the exact spelling is part of the contract.
+
+CRPC_TEST(mongo_read_preference_modes_have_the_wire_names) {
+    using crpc::db::mongo::read_preference_mode;
+    using crpc::db::mongo::to_string;
+    CRPC_CHECK_EQ(std::string("primary"), to_string(read_preference_mode::primary));
+    CRPC_CHECK_EQ(std::string("primaryPreferred"),
+                  to_string(read_preference_mode::primary_preferred));
+    CRPC_CHECK_EQ(std::string("secondary"), to_string(read_preference_mode::secondary));
+    CRPC_CHECK_EQ(std::string("secondaryPreferred"),
+                  to_string(read_preference_mode::secondary_preferred));
+    CRPC_CHECK_EQ(std::string("nearest"), to_string(read_preference_mode::nearest));
+
+    // The command field is always {mode: "..."} and nothing else, which is what the
+    // server's $readPreference parser requires.
+    for (const read_preference_mode mode :
+         {read_preference_mode::primary, read_preference_mode::primary_preferred,
+          read_preference_mode::secondary, read_preference_mode::secondary_preferred,
+          read_preference_mode::nearest}) {
+        const bson_document document = crpc::db::mongo::make_read_preference_document(mode);
+        CRPC_CHECK_EQ(std::size_t{1}, document.size());
+        std::string name;
+        CRPC_CHECK(document.get_text("mode", name));
+        CRPC_CHECK_EQ(std::string(to_string(mode)), name);
+    }
+}
+
+CRPC_TEST(mongo_read_concern_levels_have_the_wire_names) {
+    using crpc::db::mongo::read_concern_level;
+    using crpc::db::mongo::to_string;
+    CRPC_CHECK_EQ(std::string("local"), to_string(read_concern_level::local));
+    CRPC_CHECK_EQ(std::string("majority"), to_string(read_concern_level::majority));
+    CRPC_CHECK_EQ(std::string("snapshot"), to_string(read_concern_level::snapshot));
+    CRPC_CHECK_EQ(std::string("linearizable"), to_string(read_concern_level::linearizable));
+
+    for (const read_concern_level level :
+         {read_concern_level::local, read_concern_level::majority,
+          read_concern_level::snapshot, read_concern_level::linearizable}) {
+        const bson_document document = crpc::db::mongo::make_read_concern_document(level);
+        CRPC_CHECK_EQ(std::size_t{1}, document.size());
+        std::string name;
+        CRPC_CHECK(document.get_text("level", name));
+        CRPC_CHECK_EQ(std::string(to_string(level)), name);
+    }
+}
+
+CRPC_TEST(mongo_write_concern_document_encodes_w_j_and_wtimeout) {
+    using crpc::db::mongo::make_write_concern_document;
+    using crpc::db::mongo::write_concern_options;
+
+    // An unconfigured concern sends no field at all, so the server's default applies.
+    write_concern_options unset;
+    CRPC_CHECK_FALSE(unset.configured());
+    CRPC_CHECK(make_write_concern_document(unset).empty());
+
+    write_concern_options majority = write_concern_options::majority();
+    majority.journal = true;
+    majority.wtimeout_ms = 1500;
+    CRPC_CHECK(majority.configured());
+    const bson_document document = make_write_concern_document(majority);
+    std::string w;
+    CRPC_CHECK(document.get_text("w", w));
+    CRPC_CHECK_EQ(std::string("majority"), w);
+    bool journal = false;
+    CRPC_CHECK(document.get_boolean("j", journal));
+    CRPC_CHECK(journal);
+    std::int64_t wtimeout = 0;
+    CRPC_CHECK(document.get_int64("wtimeout", wtimeout));
+    CRPC_CHECK_EQ(std::int64_t{1500}, wtimeout);
+
+    // A numeric w is an int32 and must not be spelled as a string.
+    const bson_document numeric =
+        make_write_concern_document(write_concern_options::count(2));
+    std::int64_t nodes = 0;
+    CRPC_CHECK(numeric.get_int64("w", nodes));
+    CRPC_CHECK_EQ(std::int64_t{2}, nodes);
+    const crpc::db::mongo::bson_value* numeric_w = numeric.find("w");
+    CRPC_CHECK(numeric_w != nullptr);
+    if (numeric_w != nullptr) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::bson_type::int32),
+                      static_cast<int>(numeric_w->type));
+    }
+    CRPC_CHECK(numeric.find("j") == nullptr);
+    CRPC_CHECK(numeric.find("wtimeout") == nullptr);
+}
+
+// Builds a document value from a list of strings, the way hello reports hosts.
+[[nodiscard]] bson_value text_array(std::initializer_list<const char*> values) {
+    std::vector<bson_value> items;
+    for (const char* value : values) {
+        items.push_back(bson_value::make_text(value));
+    }
+    return bson_value::make_array(std::move(items));
+}
+
+CRPC_TEST(mongo_topology_reads_a_secondaries_hello) {
+    bson_document hello;
+    hello.append("ok", bson_value::make_real(1.0));
+    hello.append("setName", bson_value::make_text("rs0"));
+    hello.append("isWritablePrimary", bson_value::make_boolean(false));
+    hello.append("secondary", bson_value::make_boolean(true));
+    hello.append("me", bson_value::make_text("b:27018"));
+    hello.append("primary", bson_value::make_text("a:27018"));
+    hello.append("hosts", text_array({"a:27018", "b:27018", "c:27018"}));
+
+    crpc::db::mongo::replica_set_topology topology;
+    const crpc::status parsed =
+        crpc::db::mongo::parse_hello_topology(hello, topology);
+    CRPC_CHECK(static_cast<bool>(parsed));
+    CRPC_CHECK(topology.replica_set);
+    CRPC_CHECK_EQ(std::string("rs0"), topology.set_name);
+    CRPC_CHECK_FALSE(topology.writable_primary);
+    CRPC_CHECK(topology.secondary);
+    CRPC_CHECK_FALSE(topology.arbiter);
+    CRPC_CHECK_EQ(std::string("b:27018"), topology.me);
+    CRPC_CHECK_EQ(std::string("a:27018"), topology.primary);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::secondary),
+                  static_cast<int>(topology.self_role()));
+    CRPC_CHECK_EQ(std::size_t{3}, topology.members.size());
+    // The member named in `primary` is the primary; the other hosts in `hosts` are
+    // data-bearing secondaries (hosts never lists arbiters).
+    for (const crpc::db::mongo::topology_member& member : topology.members) {
+        const crpc::db::mongo::topology_role expected =
+            member.host == "a:27018" ? crpc::db::mongo::topology_role::primary
+                                     : crpc::db::mongo::topology_role::secondary;
+        CRPC_CHECK_EQ(static_cast<int>(expected), static_cast<int>(member.role));
+    }
+}
+
+CRPC_TEST(mongo_topology_reads_a_primary_hello_with_an_arbiter) {
+    bson_document hello;
+    hello.append("setName", bson_value::make_text("rs1"));
+    hello.append("isWritablePrimary", bson_value::make_boolean(true));
+    hello.append("secondary", bson_value::make_boolean(false));
+    hello.append("me", bson_value::make_text("a:1"));
+    hello.append("primary", bson_value::make_text("a:1"));
+    hello.append("hosts", text_array({"a:1", "b:1", "c:1"}));
+    hello.append("arbiters", text_array({"d:1"}));
+
+    crpc::db::mongo::replica_set_topology topology;
+    CRPC_CHECK(static_cast<bool>(crpc::db::mongo::parse_hello_topology(hello, topology)));
+    CRPC_CHECK(topology.replica_set);
+    CRPC_CHECK(topology.writable_primary);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::primary),
+                  static_cast<int>(topology.self_role()));
+    CRPC_CHECK_EQ(std::size_t{4}, topology.members.size());
+    bool saw_arbiter = false;
+    for (const crpc::db::mongo::topology_member& member : topology.members) {
+        if (member.host == "d:1") {
+            saw_arbiter = true;
+            CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::arbiter),
+                          static_cast<int>(member.role));
+        }
+    }
+    CRPC_CHECK(saw_arbiter);
+}
+
+CRPC_TEST(mongo_topology_recognises_an_arbiter_self) {
+    bson_document hello;
+    hello.append("setName", bson_value::make_text("rs0"));
+    hello.append("arbiterOnly", bson_value::make_boolean(true));
+    hello.append("secondary", bson_value::make_boolean(false));
+    hello.append("hosts", text_array({"a:1"}));
+    hello.append("arbiters", text_array({"d:1"}));
+
+    crpc::db::mongo::replica_set_topology topology;
+    CRPC_CHECK(static_cast<bool>(crpc::db::mongo::parse_hello_topology(hello, topology)));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::arbiter),
+                  static_cast<int>(topology.self_role()));
+}
+
+CRPC_TEST(mongo_topology_on_a_standalone_is_not_a_replica_set) {
+    // The standalone hello has no setName and no hosts; treating it as a one-node set
+    // would make the client send txnNumber, which a standalone refuses outright.
+    bson_document hello;
+    hello.append("ok", bson_value::make_real(1.0));
+    hello.append("isWritablePrimary", bson_value::make_boolean(true));
+    hello.append("maxWireVersion", bson_value::make_int32(21));
+
+    crpc::db::mongo::replica_set_topology topology;
+    CRPC_CHECK(static_cast<bool>(crpc::db::mongo::parse_hello_topology(hello, topology)));
+    CRPC_CHECK_FALSE(topology.replica_set);
+    CRPC_CHECK(topology.set_name.empty());
+    CRPC_CHECK(topology.writable_primary);
+    CRPC_CHECK(topology.members.empty());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::topology_role::primary),
+                  static_cast<int>(topology.self_role()));
+}
+
+CRPC_TEST(mongo_end_sessions_carries_uuid_binaries) {
+    // The server refuses a session id that is not binary subtype 4:
+    //   "BSON field 'endSessions.endSessionsFromClient.id' is the wrong binData
+    //    type 'general', expected type 'UUID'".
+    const std::vector<std::byte> id(16, std::byte{0x5A});
+    const bson_document command = crpc::db::mongo::make_end_sessions({id});
+    CRPC_CHECK_EQ(std::string("endSessions"), command.fields().front().first);
+    const crpc::db::mongo::bson_value* sessions = command.find("endSessions");
+    CRPC_CHECK(sessions != nullptr);
+    if (sessions != nullptr) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::bson_type::array),
+                      static_cast<int>(sessions->type));
+        CRPC_CHECK_EQ(std::size_t{1}, sessions->array.size());
+        if (sessions->array.size() == 1) {
+            const bson_document* entry = sessions->array[0].document.get();
+            CRPC_CHECK(entry != nullptr);
+            if (entry != nullptr) {
+                const crpc::db::mongo::bson_value* value = entry->find("id");
+                CRPC_CHECK(value != nullptr);
+                if (value != nullptr) {
+                    CRPC_CHECK_EQ(static_cast<int>(crpc::db::mongo::bson_type::binary),
+                                  static_cast<int>(value->type));
+                    CRPC_CHECK_EQ(static_cast<int>(4), static_cast<int>(value->subtype));
+                    CRPC_CHECK_EQ(std::size_t{16}, value->bytes.size());
+                }
+            }
+        }
+    }
+    std::string database;
+    CRPC_CHECK(command.get_text("$db", database));
+    CRPC_CHECK_EQ(std::string("admin"), database);
+}
+
 CRPC_TEST_MAIN()

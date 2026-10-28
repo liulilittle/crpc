@@ -34,6 +34,11 @@ namespace crpc {
 namespace db {
 namespace mongo {
 
+// Re-opens the transport after a transport failure. Set it and a retryable write can
+// be replayed once with the same lsid and txnNumber, which is what the server uses to
+// deduplicate.
+using reconnector = std::function<result<std::unique_ptr<db::channel>>()>;
+
 struct connection_options {
     std::string user;
     std::string password;
@@ -49,6 +54,25 @@ struct connection_options {
     // Bound on one reply, before it is refused. A reply larger than this fails with
     // `resource_exhausted` instead of growing until the process dies.
     std::size_t max_message_size = 48u * 1024u * 1024u;
+
+    // Distributed semantics. Each is a command-wide default; the wire field appears
+    // only when the settings say the server must be told.
+    //
+    // Reads only: how the driver may prefer a node. `primary` (the default) is the
+    // server's own default and sends no `$readPreference`. The field is sent as a
+    // `$readPreference` top-level command field, positioned like `$db`.
+    read_preference_mode read_preference = read_preference_mode::primary;
+    // Reads only: how fresh the snapshot must be. `local` (the default) sends nothing.
+    // The wire field is `readConcern` -- no dollar sign; `$readConcern` is refused.
+    read_concern_level read_concern = read_concern_level::local;
+    // Writes only: how many nodes must acknowledge. Nothing is sent when unset.
+    write_concern_options write_concern;
+    // Send `lsid` plus `txnNumber` on writes so a transport failure may be retried
+    // once without duplicating the document. A standalone refuses `txnNumber`
+    // outright, so it is only sent when `hello` reported a replica set.
+    bool retryable_writes = true;
+    // Whichever link a retryable write replays on, set before the connection opens.
+    reconnector reconnect;
 };
 
 // A decoded reply to one command.
@@ -56,6 +80,14 @@ struct command_result {
     bson_document reply;
     bool ok = false;
     std::string error_message;
+    // The reply carried a `writeConcernError`: the write ran but the durability
+    // requirement was not met. This is separate from `ok`, which stays true.
+    bool has_write_concern_error = false;
+    std::int32_t write_concern_code = 0;
+    std::string write_concern_message;
+    // A retryable write was sent twice (same lsid and txnNumber) after a transport
+    // failure; the server deduplicated the second, and the caller may want to know.
+    bool retried = false;
 };
 
 // One open cursor. `id` of 0 means the server sent everything in the first batch.
@@ -117,6 +149,23 @@ public:
         return mechanism_used_;
     }
 
+    // Topology learned from the handshake `hello`. On a standalone every field except
+    // `writable_primary` stays empty and `is_replica_set()` is false, which is also
+    // what keeps retryable writes off (a standalone refuses `txnNumber`).
+    [[nodiscard]] const replica_set_topology& topology() const noexcept { return topology_; }
+    [[nodiscard]] bool is_replica_set() const noexcept { return topology_.replica_set; }
+
+    // Logical sessions. A session is a client-generated 16-byte UUID sent as `lsid` on
+    // every command; `start_session` replaces the current one (ending it on the
+    // server), `end_session` sends `endSessions` and forgets it. The id is empty
+    // between `end_session` and the next command's lazy re-creation.
+    [[nodiscard]] bool has_session() const noexcept { return !session_id_.empty(); }
+    [[nodiscard]] const std::vector<std::byte>& session_id() const noexcept {
+        return session_id_;
+    }
+    [[nodiscard]] status start_session();
+    [[nodiscard]] status end_session();
+
 private:
     [[nodiscard]] status perform_handshake();
     [[nodiscard]] status authenticate();
@@ -125,6 +174,12 @@ private:
     [[nodiscard]] status send_message(span<const std::byte> message);
     [[nodiscard]] result<std::vector<std::byte>> read_message();
     void fail(const status& error) noexcept;
+    // Opens a fresh link and re-runs the handshake and authentication on it, so a
+    // retryable write can be replayed with the same lsid and txnNumber.
+    [[nodiscard]] status reconnect();
+    // Creates the session if none exists; every application command has one.
+    [[nodiscard]] status ensure_session();
+    void new_session_id() noexcept;
 
     connection_options options_;
     std::unique_ptr<db::channel> link_;
@@ -133,6 +188,9 @@ private:
     std::int32_t max_bson_size_ = 16 * 1024 * 1024;
     std::string server_version_;
     std::string mechanism_used_;
+    replica_set_topology topology_;
+    std::vector<std::byte> session_id_;
+    std::int64_t txn_number_ = 0;
     bool authenticated_ = false;
     bool open_ = false;
     rpc_error connect_error_;

@@ -189,6 +189,9 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::mongo::find_request`
 - `::crpc::db::mongo::message_header`
 - `::crpc::db::mongo::op_msg_reply`
+- `::crpc::db::mongo::replica_set_topology`
+- `::crpc::db::mongo::topology_member`
+- `::crpc::db::mongo::write_concern_options`
 - `::crpc::db::hbase::row`
 - `::crpc::db::hbase::scan_filter`
 - `::crpc::db::hbase::scan_options`

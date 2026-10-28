@@ -322,6 +322,175 @@ rpc_code map_mongo_error(std::int32_t code) noexcept {
     }
 }
 
+const char* to_string(read_preference_mode mode) noexcept {
+    switch (mode) {
+    case read_preference_mode::primary:
+        return "primary";
+    case read_preference_mode::primary_preferred:
+        return "primaryPreferred";
+    case read_preference_mode::secondary:
+        return "secondary";
+    case read_preference_mode::secondary_preferred:
+        return "secondaryPreferred";
+    case read_preference_mode::nearest:
+        return "nearest";
+    }
+    return "primary";
+}
+
+const char* to_string(read_concern_level level) noexcept {
+    switch (level) {
+    case read_concern_level::local:
+        return "local";
+    case read_concern_level::majority:
+        return "majority";
+    case read_concern_level::snapshot:
+        return "snapshot";
+    case read_concern_level::linearizable:
+        return "linearizable";
+    }
+    return "local";
+}
+
+bool write_concern_options::configured() const noexcept {
+    return has_w || journal || wtimeout_ms > 0;
+}
+
+write_concern_options write_concern_options::majority() {
+    write_concern_options options;
+    options.has_w = true;
+    options.w_majority = true;
+    return options;
+}
+
+write_concern_options write_concern_options::count(std::int32_t value) {
+    write_concern_options options;
+    options.has_w = true;
+    options.w = value;
+    return options;
+}
+
+bson_document make_read_preference_document(read_preference_mode mode) {
+    bson_document document;
+    document.append("mode", bson_value::make_text(to_string(mode)));
+    return document;
+}
+
+bson_document make_read_concern_document(read_concern_level level) {
+    bson_document document;
+    document.append("level", bson_value::make_text(to_string(level)));
+    return document;
+}
+
+bson_document make_write_concern_document(const write_concern_options& options) {
+    bson_document document;
+    if (options.has_w) {
+        if (options.w_majority) {
+            document.append("w", bson_value::make_text("majority"));
+        } else {
+            document.append("w", bson_value::make_int32(options.w));
+        }
+    }
+    if (options.journal) {
+        document.append("j", bson_value::make_boolean(true));
+    }
+    if (options.wtimeout_ms > 0) {
+        document.append("wtimeout", bson_value::make_int32(options.wtimeout_ms));
+    }
+    return document;
+}
+
+// Reads a text-valued list into `members`. A list that is not an array of text is a
+// malformed hello reply, and accepting it would leave the topology silently partial.
+[[nodiscard]] status append_hosts(const bson_document& source, std::string_view key,
+                                  const std::string& primary,
+                                  std::vector<topology_member>& members,
+                                  topology_role fallback_role) {
+    if (source.find(key) == nullptr) {
+        return status{};
+    }
+    const bson_value* value = source.find(key);
+    if (value == nullptr || value->type != bson_type::array) {
+        return status{rpc_code::protocol_error,
+                      "a hello reply names " + std::string(key) + " as a non-array"};
+    }
+    for (const bson_value& host : value->array) {
+        if (host.type != bson_type::text) {
+            return status{rpc_code::protocol_error,
+                          "a hello reply lists a non-text host in " + std::string(key)};
+        }
+        topology_member member;
+        member.host = host.text;
+        // `hosts` never carries arbiters, so the only two roles present are the primary
+        // and secondaries; the primary is the host named by the `primary` field.
+        member.role = member.host == primary ? topology_role::primary : fallback_role;
+        members.push_back(std::move(member));
+    }
+    return status{};
+}
+
+status parse_hello_topology(const bson_document& hello_reply, replica_set_topology& out) {
+    out = replica_set_topology{};
+    std::string set_name;
+    if (hello_reply.get_text("setName", set_name)) {
+        out.replica_set = true;
+        out.set_name = std::move(set_name);
+    }
+    if (!hello_reply.get_boolean("isWritablePrimary", out.writable_primary)) {
+        // Servers before the rename reported the same fact as `ismaster`.
+        (void)hello_reply.get_boolean("ismaster", out.writable_primary);
+    }
+    (void)hello_reply.get_boolean("secondary", out.secondary);
+    (void)hello_reply.get_boolean("arbiterOnly", out.arbiter);
+    (void)hello_reply.get_text("me", out.me);
+    (void)hello_reply.get_text("primary", out.primary);
+    const status hosts = append_hosts(hello_reply, "hosts", out.primary, out.members,
+                                      topology_role::secondary);
+    if (!hosts) {
+        return hosts;
+    }
+    // Hidden members report themselves via `passives`, and are secondaries too.
+    const status passives = append_hosts(hello_reply, "passives", out.primary, out.members,
+                                         topology_role::secondary);
+    if (!passives) {
+        return passives;
+    }
+    // Arbiters are not data-bearing and are listed separately.
+    const status arbiters = append_hosts(hello_reply, "arbiters", std::string{},
+                                         out.members, topology_role::arbiter);
+    if (!arbiters) {
+        return arbiters;
+    }
+    return status{};
+}
+
+topology_role replica_set_topology::self_role() const noexcept {
+    if (arbiter) {
+        return topology_role::arbiter;
+    }
+    if (writable_primary) {
+        return topology_role::primary;
+    }
+    if (secondary) {
+        return topology_role::secondary;
+    }
+    return topology_role::unknown;
+}
+
+bson_document make_end_sessions(const std::vector<std::vector<std::byte>>& session_ids) {
+    std::vector<bson_value> sessions;
+    sessions.reserve(session_ids.size());
+    for (const std::vector<std::byte>& id : session_ids) {
+        bson_document entry;
+        entry.append("id", bson_value::make_binary(id, 4));
+        sessions.push_back(bson_value::make_document(std::move(entry)));
+    }
+    bson_document command;
+    command.append("endSessions", bson_value::make_array(std::move(sessions)));
+    command.append("$db", bson_value::make_text("admin"));
+    return command;
+}
+
 } // namespace mongo
 } // namespace db
 } // namespace crpc

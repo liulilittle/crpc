@@ -162,6 +162,101 @@ struct aggregate_request {
 // namespace-not-found are the ones a caller reacts to differently.
 [[nodiscard]] CRPC_API rpc_code map_mongo_error(std::int32_t code) noexcept;
 
+// --- Distributed (replica set) semantics -------------------------------------
+
+// How a read command prefers its nodes. The names below are the exact strings the
+// wire protocol uses, so they double as the `name` document value. `primary` is the
+// mode that sends no `$readPreference` at all, because it is the server's default.
+enum class read_preference_mode : std::uint8_t {
+    primary,
+    primary_preferred,
+    secondary,
+    secondary_preferred,
+    nearest
+};
+
+[[nodiscard]] CRPC_API const char* to_string(read_preference_mode mode) noexcept;
+
+// How fresh a read must be. `local` is the default and sends no `readConcern`.
+enum class read_concern_level : std::uint8_t {
+    local,
+    majority,
+    snapshot,
+    linearizable
+};
+
+[[nodiscard]] CRPC_API const char* to_string(read_concern_level level) noexcept;
+
+// A write concern. `has_w` distinguishes "w explicitly 0" (unacknowledged, which
+// already changes semantics) from "w not requested" (the server default applies).
+struct CRPC_API write_concern_options {
+    bool has_w = false;
+    // Writes must be acknowledged by a majority; `has_w` is set as well.
+    bool w_majority = false;
+    std::int32_t w = 0;
+    bool journal = false;
+    std::int32_t wtimeout_ms = 0;
+
+    // True when any field differs from "leave it to the server".
+    [[nodiscard]] bool configured() const noexcept;
+
+    [[nodiscard]] static write_concern_options majority();
+    [[nodiscard]] static write_concern_options count(std::int32_t value);
+};
+
+// The value of the `$readPreference` top-level command field: {mode: "..."}.
+[[nodiscard]] CRPC_API bson_document make_read_preference_document(read_preference_mode mode);
+
+// The value of the `readConcern` top-level command field: {level: "..."}. Unlike the
+// read preference the wire field has no leading dollar sign; the server refuses
+// `$readConcern` with "unknown field".
+[[nodiscard]] CRPC_API bson_document make_read_concern_document(read_concern_level level);
+
+// The value of the `writeConcern` top-level command field: {w, j, wtimeout}.
+[[nodiscard]] CRPC_API bson_document make_write_concern_document(
+    const write_concern_options& options);
+
+// The role a node plays in its replica set. Unknown is "the hello reply did not pin
+// it down".
+enum class topology_role : std::uint8_t { unknown, primary, secondary, arbiter };
+
+// One node the hello reply named, with the role inferred from the reply.
+struct CRPC_API topology_member {
+    std::string host;
+    topology_role role = topology_role::unknown;
+};
+
+// What one `hello` reply said about its replica set. A standalone answers without
+// `setName`, which is exactly how `replica_set` stays false and the client knows not
+// to attempt retryable writes (a standalone refuses `txnNumber` outright).
+struct CRPC_API replica_set_topology {
+    bool replica_set = false;
+    std::string set_name;
+    // The reply's own fields.
+    bool writable_primary = false;
+    bool secondary = false;
+    bool arbiter = false;
+    std::string me;
+    std::string primary;
+    // `hosts` (data-bearing, non-hidden, non-arbiter) plus `arbiters`. The host named
+    // by `primary` is the primary; every other host is a secondary.
+    std::vector<topology_member> members;
+
+    // The role of the node this client talked to, from its own flags.
+    [[nodiscard]] topology_role self_role() const noexcept;
+};
+
+// Parses a `hello` reply. A malformed `hosts`/`arbiters` array is a protocol error
+// rather than a silently partial topology.
+[[nodiscard]] CRPC_API status parse_hello_topology(const bson_document& hello_reply,
+                                                   replica_set_topology& out);
+
+// `endSessions` for the given session ids. Each id is exactly sixteen bytes and is
+// sent as binary subtype 4 (UUID), which the server enforces: a session id stored as
+// subtype 0 is refused with "wrong binData type 'general', expected type 'UUID'".
+[[nodiscard]] CRPC_API bson_document make_end_sessions(
+    const std::vector<std::vector<std::byte>>& session_ids);
+
 } // namespace mongo
 } // namespace db
 } // namespace crpc

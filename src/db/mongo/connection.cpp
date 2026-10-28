@@ -2,9 +2,12 @@
 #include <crpc/db/mongo/connection.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <random>
 #include <utility>
 
 #include <crpc/crypto/base64.hpp>
@@ -16,6 +19,83 @@ namespace {
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
+}
+
+// The commands this client can write. Only those may carry `txnNumber`; adding one to
+// a read or to `hello` would make the server refuse the command.
+[[nodiscard]] bool is_write_command(std::string_view name) noexcept {
+    return name == "insert" || name == "update" || name == "delete" ||
+           name == "findAndModify";
+}
+
+// The commands this client can read. They are the ones that may carry $readPreference
+// and readConcern; `writeConcern` is refused on them and the read fields are refused
+// on writes by the strictest parsers.
+[[nodiscard]] bool is_read_command(std::string_view name) noexcept {
+    return name == "find" || name == "aggregate" || name == "getMore";
+}
+
+// A transport failure after the bytes were handed to the transport is unknown_side_effect
+// (the server may have run the write); the other codes say the bytes never went out or
+// the reply never came back. All of them make a retryable write safe to replay, because
+// the txnNumber is the idempotency key.
+[[nodiscard]] bool is_transport_error(rpc_code code) noexcept {
+    switch (code) {
+    case rpc_code::connection_refused:
+    case rpc_code::connection_reset:
+    case rpc_code::broken_pipe:
+    case rpc_code::eof:
+    case rpc_code::unavailable:
+    case rpc_code::not_acknowledged:
+    case rpc_code::unknown_side_effect:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Server codes whose command reply means "this node is not the right one right now",
+// so the same write is worth one replay on a fresh link. The server deduplicates by
+// lsid+txnNumber, so a replay cannot double the document.
+[[nodiscard]] bool is_retryable_server_error(std::int32_t code) noexcept {
+    switch (code) {
+    case 6:      // host unreachable
+    case 7:      // host not found
+    case 89:     // network timeout
+    case 91:     // shutdown in progress
+    case 189:    // primary stepped down
+    case 262:    // not master
+    case 9001:   // socket exception
+    case 10107:  // not writable primary
+    case 11600:  // interrupted at shutdown
+    case 11602:  // interrupted due to replica set change
+    case 13435:  // not primary or secondary
+    case 13436:  // not primary no secondary ok
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The one place that decides where the extra command fields go: the command name stays
+// the first field and `$db` stays the last, matching what the builders and the existing
+// tests expect.
+void insert_command_fields(bson_document& request,
+                           std::vector<bson_document::field> fields) {
+    if (fields.empty()) {
+        return;
+    }
+    std::vector<bson_document::field>& all = request.fields();
+    std::size_t at = all.size();
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        if (all[i].first == "$db") {
+            at = i;
+            break;
+        }
+    }
+    all.insert(all.begin() + static_cast<std::ptrdiff_t>(at),
+               std::make_move_iterator(fields.begin()),
+               std::make_move_iterator(fields.end()));
 }
 
 // A BSON binary value carrying a UTF-8 SASL payload, which is what saslStart/saslContinue
@@ -214,6 +294,13 @@ status connection::perform_handshake() {
                       "the server is too old for OP_MSG; it reports maxWireVersion " +
                           std::to_string(max_wire_version_)};
     }
+    // The topology decides whether retryable writes are even legal later, so a hello
+    // reply that names a malformed node list is a handshake failure, not a silent
+    // half-discovered replica set.
+    const status topology_parsed = parse_hello_topology(body, topology_);
+    if (!topology_parsed) {
+        return topology_parsed;
+    }
     open_ = true;
     return status{};
 }
@@ -315,25 +402,212 @@ status connection::authenticate() {
     return status{};
 }
 
+void connection::new_session_id() noexcept {
+    // A session id must be a version-4 shape 16-byte UUID. The crux is the bytes, not a
+    // specific bit layout the server checks, so 16 bytes of OS entropy in binary subtype
+    // 4 is what the server accepts (it refuses subtype 0 with "wrong binData type
+    // 'general', expected type 'UUID'").
+    std::array<std::byte, 16> raw{};
+    std::random_device device;
+    for (std::byte& byte : raw) {
+        byte = static_cast<std::byte>(device() & 0xffu);
+    }
+    session_id_.assign(raw.begin(), raw.end());
+    txn_number_ = 0;
+}
+
+status connection::ensure_session() {
+    if (!session_id_.empty()) {
+        return status{};
+    }
+    new_session_id();
+    return status{};
+}
+
+status connection::start_session() {
+    if (!session_id_.empty()) {
+        const status ended = end_session();
+        if (!ended) {
+            return ended;
+        }
+    }
+    new_session_id();
+    return status{};
+}
+
+status connection::end_session() {
+    if (session_id_.empty()) {
+        return status{};
+    }
+    std::vector<std::byte> ended_id;
+    ended_id.swap(session_id_);
+    txn_number_ = 0;
+    if (!open_) {
+        // The link is gone; the server expires the session on its own when it times out.
+        return status{};
+    }
+    result<bson_document> reply = round_trip(make_end_sessions({ended_id}));
+    if (!reply) {
+        return reply.error();
+    }
+    if (!reply_ok(reply.value())) {
+        return status{map_mongo_error(0), reply_error_message(reply.value())};
+    }
+    return status{};
+}
+
+status connection::reconnect() {
+    if (!options_.reconnect) {
+        return status{rpc_code::failed_precondition, "the connection has no reconnector"};
+    }
+    if (link_) {
+        link_->close();
+    }
+    link_.reset();
+    open_ = false;
+    authenticated_ = false;
+    result<std::unique_ptr<db::channel>> reopened = options_.reconnect();
+    if (!reopened) {
+        return reopened.error();
+    }
+    link_ = std::move(reopened.value());
+    const status handshake = perform_handshake();
+    if (!handshake) {
+        return handshake;
+    }
+    const status auth = authenticate();
+    if (!auth) {
+        return auth;
+    }
+    return status{};
+}
+
 result<command_result> connection::run_command(const bson_document& command) {
     if (!open_) {
         return rpc_error{rpc_code::shutting_down, "the connection is closed"};
     }
+    bson_document request = command;
+    const std::string command_name =
+        request.empty() ? std::string() : request.fields().front().first;
+    const bool write = is_write_command(command_name);
+    const bool send_txn =
+        write && (options_.retryable_writes && topology_.replica_set);
+    const bool auto_retry = send_txn && options_.reconnect;
+
+    // Every application command runs inside a session. hello and authentication bypass
+    // this path, so the session starts with the first real command.
+    const status session_ready = ensure_session();
+    if (!session_ready) {
+        return session_ready.error();
+    }
+
+    // The command name is the first field and $db the last; everything else lands in
+    // between.
+    std::vector<bson_document::field> extra;
+    if (is_read_command(command_name)) {
+        if (options_.read_concern != read_concern_level::local) {
+            extra.emplace_back("readConcern", bson_value::make_document(
+                                                  make_read_concern_document(options_.read_concern)));
+        }
+        if (options_.read_preference != read_preference_mode::primary) {
+            extra.emplace_back("$readPreference", bson_value::make_document(
+                                                      make_read_preference_document(options_.read_preference)));
+        }
+    }
+    if (write && options_.write_concern.configured()) {
+        extra.emplace_back("writeConcern", bson_value::make_document(
+                                               make_write_concern_document(options_.write_concern)));
+    }
+    if (!session_id_.empty()) {
+        bson_document lsid;
+        lsid.append("id", bson_value::make_binary(session_id_, 4));
+        extra.emplace_back("lsid", bson_value::make_document(std::move(lsid)));
+    }
+    if (send_txn) {
+        // One txnNumber per logical operation: increment here, then reuse the exact
+        // value on the replay. Two different writes must never share a txnNumber or
+        // the server's idempotency key would deduplicate them.
+        const std::int64_t txn = ++txn_number_;
+        extra.emplace_back("txnNumber", bson_value::make_int64(txn));
+    }
+    insert_command_fields(request, std::move(extra));
     // Every OP_MSG request must name a database, and the server refuses one without it:
     // "OP_MSG requests require a $db argument". Adding it here rather than in each builder
     // means a builder that forgets cannot produce a request the server will reject.
-    bson_document request = command;
     if (request.find("$db") == nullptr) {
         request.append("$db", bson_value::make_text(options_.database));
     }
+
+    std::uint32_t attempts = 1;
     result<bson_document> reply = round_trip(request);
-    if (!reply) {
-        return reply.error();
+    if (!reply && auto_retry && is_transport_error(reply.error().code)) {
+        // The write may or may not have run. Replay it on a fresh link with the same
+        // lsid and -- crucially -- the same txnNumber; the server deduplicates.
+        const status reconnected = reconnect();
+        if (reconnected) {
+            // txnNumber must not advance on the replay.
+            result<bson_document> replayed = round_trip(request);
+            if (replayed) {
+                attempts = 2;
+                reply = std::move(replayed);
+            } else {
+                rpc_error error = replayed.error();
+                error.attempts = 2;
+                return error;
+            }
+        } else {
+            rpc_error error = reply.error();
+            error.attempts = 2;
+            return error;
+        }
     }
+    if (!reply) {
+        rpc_error error = reply.error();
+        error.attempts = attempts;
+        return error;
+    }
+    // A command reply that says "wrong node right now" is also worth one replay, but
+    // only for a retryable write: the read path has no idempotency key to replay on.
+    if (auto_retry && attempts == 1 && !reply_ok(reply.value())) {
+        std::int64_t server_code = 0;
+        (void)reply.value().get_int64("code", server_code);
+        if (is_retryable_server_error(static_cast<std::int32_t>(server_code))) {
+            const status reconnected = reconnect();
+            if (reconnected) {
+                result<bson_document> replayed = round_trip(request);
+                if (replayed) {
+                    attempts = 2;
+                    reply = std::move(replayed);
+                } else {
+                    rpc_error error = replayed.error();
+                    error.attempts = 2;
+                    return error;
+                }
+            } else {
+                rpc_error error = reply.error();
+                error.attempts = 2;
+                return error;
+            }
+        }
+    }
+
     command_result out;
+    out.retried = attempts == 2;
     out.ok = reply_ok(reply.value());
     if (!out.ok) {
         out.error_message = reply_error_message(reply.value());
+    }
+    // A write concern failure rides on a successful reply (ok stays 1); it is the
+    // durability arm of the write, reported separately so a caller can decide whether
+    // "w was not met" is the same as "the write did not happen".
+    const bson_value* concern = reply.value().find("writeConcernError");
+    if (concern != nullptr && concern->type == bson_type::document &&
+        concern->document != nullptr) {
+        out.has_write_concern_error = true;
+        std::int64_t code = 0;
+        (void)concern->document->get_int64("code", code);
+        out.write_concern_code = static_cast<std::int32_t>(code);
+        (void)concern->document->get_text("errmsg", out.write_concern_message);
     }
     out.reply = std::move(reply.value());
     return out;
@@ -437,7 +711,12 @@ result<std::int64_t> connection::insert(std::string_view collection,
         return answered.error();
     }
     if (!answered.value().ok) {
-        return rpc_error{map_mongo_error(0), answered.value().error_message};
+        // The server's own code distinguishes a duplicate key from a bad value (such as
+        // an illegal write concern `w`), so it is read rather than replaced.
+        std::int64_t code = 0;
+        (void)answered.value().reply.get_int64("code", code);
+        return rpc_error{map_mongo_error(static_cast<std::int32_t>(code)),
+                         answered.value().error_message};
     }
     // A write command reports a failed document in `writeErrors` while `ok` stays 1: the
     // command succeeded, the write did not. Checking only `ok` would report a duplicate key
@@ -457,17 +736,12 @@ result<std::int64_t> connection::insert(std::string_view collection,
         return rpc_error{map_mongo_error(static_cast<std::int32_t>(code)), message};
     }
     // The same applies to a write concern failure, which is a durability failure rather
-    // than a document failure.
-    const bson_value* concern = answered.value().reply.find("writeConcernError");
-    if (concern != nullptr && concern->type == bson_type::document &&
-        concern->document != nullptr) {
-        std::int64_t code = 0;
-        std::string message;
-        (void)concern->document->get_int64("code", code);
-        (void)concern->document->get_text("errmsg", message);
-        return rpc_error{map_mongo_error(static_cast<std::int32_t>(code)),
-                         message.empty() ? std::string("the write concern was not satisfied")
-                                         : message};
+    // than a document failure. run_command carries it out of band.
+    if (answered.value().has_write_concern_error) {
+        return rpc_error{map_mongo_error(answered.value().write_concern_code),
+                         answered.value().write_concern_message.empty()
+                             ? std::string("the write concern was not satisfied")
+                             : answered.value().write_concern_message};
     }
     std::int64_t count = 0;
     if (!answered.value().reply.get_int64("n", count)) {
