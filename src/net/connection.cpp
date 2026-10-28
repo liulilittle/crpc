@@ -574,15 +574,20 @@ status connection::write(span<const std::byte> data) {
 
 result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
     auto& self = *impl_;
+    // The wait predicate below is "some bytes arrived", while completion needs
+    // `count` bytes. Waiting for the full count before consuming cannot work:
+    // the delivery thread feeds the same mutex this loop holds, so a partial
+    // packet would spin forever with the peer paused on a full buffer. Bytes
+    // are therefore drained into `out` as they arrive; a bail-out puts them
+    // back so the stream position survives the failed read.
+    std::vector<std::byte> out;
     std::unique_lock<std::mutex> lk(self.mutex);
     for (;;) {
-        if (self.buffer.size() >= count) {
-            std::vector<std::byte> out;
-            out.reserve(count);
-            for (std::size_t i = 0; i < count; ++i) {
-                out.push_back(self.buffer.front());
-                self.buffer.pop_front();
-            }
+        while (out.size() < count && !self.buffer.empty()) {
+            out.push_back(self.buffer.front());
+            self.buffer.pop_front();
+        }
+        if (out.size() >= count) {
             std::shared_ptr<impl::link> link;
             if (self.resume_pending()) {
                 self.read_paused = false;
@@ -595,6 +600,10 @@ result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
             return out;
         }
         if (self.closed) {
+            if (!out.empty()) {
+                self.buffer.insert(self.buffer.begin(), out.begin(), out.end());
+                out.clear();
+            }
             if (self.buffer.empty()) {
                 if (self.terminal) {
                     return rpc_error(rpc_code::shutting_down,
@@ -608,7 +617,7 @@ result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
                     // A close-delimited body ends here; reconnecting would hide the close
                     // and leave the reader waiting on a fresh connection.
                     return rpc_error(self.error_code != rpc_code::ok ? self.error_code
-                                                                    : rpc_code::eof,
+                                                                     : rpc_code::eof,
                                      "connection closed");
                 }
                 lk.unlock();
@@ -624,10 +633,23 @@ result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
                                       : rpc_code::eof;
             return rpc_error(code, "connection closed mid-message");
         }
+        if (self.resume_pending()) {
+            std::shared_ptr<impl::link> link = self.active;
+            self.read_paused = false;
+            lk.unlock();
+            if (link != nullptr && link->conn != nullptr) {
+                link->conn->resume_read();
+            }
+            lk.lock();
+            continue;
+        }
         const status waited = self.wait_for_pred(
             lk, [&self] { return !self.buffer.empty() || self.closed; },
             self.cfg.operation_timeout);
         if (!waited.ok()) {
+            if (!out.empty()) {
+                self.buffer.insert(self.buffer.begin(), out.begin(), out.end());
+            }
             return rpc_error(waited.code(), "read wait failed");
         }
     }
@@ -636,8 +658,14 @@ result<std::vector<std::byte>> connection::read_exact(std::size_t count) {
 result<std::vector<std::byte>> connection::read_until(std::byte delim) {
     auto& self = *impl_;
     std::unique_lock<std::mutex> lk(self.mutex);
+    // Bytes already scanned and found delimiter-free must not make the wait
+    // predicate true again: "buffer non-empty" would spin with the mutex held
+    // and starve the delivery thread. Only newly arrived bytes retrigger the
+    // scan.
+    std::size_t scanned = 0;
     for (;;) {
-        const auto it = std::find(self.buffer.begin(), self.buffer.end(), delim);
+        const auto begin = self.buffer.begin() + static_cast<std::ptrdiff_t>(scanned);
+        const auto it = std::find(begin, self.buffer.end(), delim);
         if (it != self.buffer.end()) {
             const std::size_t count =
                 static_cast<std::size_t>(it - self.buffer.begin()) + 1;
@@ -658,6 +686,7 @@ result<std::vector<std::byte>> connection::read_until(std::byte delim) {
             }
             return out;
         }
+        scanned = self.buffer.size();
         if (self.closed) {
             if (self.buffer.empty()) {
                 if (self.terminal) {
@@ -674,6 +703,7 @@ result<std::vector<std::byte>> connection::read_until(std::byte delim) {
                     return rpc_error(re.code(), "reconnect failed");
                 }
                 lk.lock();
+                scanned = 0;
                 continue;
             }
             const rpc_code code = self.error_code != rpc_code::ok
@@ -681,8 +711,18 @@ result<std::vector<std::byte>> connection::read_until(std::byte delim) {
                                       : rpc_code::eof;
             return rpc_error(code, "connection closed before delimiter");
         }
+        if (self.resume_pending()) {
+            std::shared_ptr<impl::link> link = self.active;
+            self.read_paused = false;
+            lk.unlock();
+            if (link != nullptr && link->conn != nullptr) {
+                link->conn->resume_read();
+            }
+            lk.lock();
+            continue;
+        }
         const status waited = self.wait_for_pred(
-            lk, [&self] { return !self.buffer.empty() || self.closed; },
+            lk, [&self, &scanned] { return self.buffer.size() > scanned || self.closed; },
             self.cfg.operation_timeout);
         if (!waited.ok()) {
             return rpc_error(waited.code(), "read wait failed");
