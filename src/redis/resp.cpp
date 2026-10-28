@@ -99,6 +99,16 @@ bool contains_crlf(const std::string& text) noexcept {
 // caught before a single byte is written.
 bool value_has_forbidden_crlf(const resp_value& value,
                               resp_protocol protocol) noexcept {
+    // RESP3 attribute frames are only written under RESP3; a RESP2 encode drops
+    // them, so their content does not reach the wire and needs no check.
+    if (protocol == resp_protocol::resp3 && value.has_attributes()) {
+        for (const auto& entry : value.attributes()) {
+            if (value_has_forbidden_crlf(entry.first, protocol) ||
+                value_has_forbidden_crlf(entry.second, protocol)) {
+                return true;
+            }
+        }
+    }
     switch (value.type()) {
     case resp_type::simple_string:
         return contains_crlf(value.as_simple_string());
@@ -241,9 +251,20 @@ void append_bulk(std::string& out, const std::string& data) {
 // Writes one value in the wire form the negotiated protocol can express. The
 // RESP2 fallback for a type RESP2 has no marker for is the closest RESP2 type:
 // a null becomes `$-1`, a double/big number/verbatim string becomes a bulk
-// string, and a map/set/push becomes an array.
+// string, and a map/set/push becomes an array. A RESP3 attribute prefix comes
+// first; RESP2 has no attribute frame, so the value is written without it.
 void encode_value_text(std::string& out, const resp_value& value,
                        resp_protocol protocol) {
+    if (protocol == resp_protocol::resp3 && value.has_attributes()) {
+        const resp_map& attributes = value.attributes();
+        out += '|';
+        out += std::to_string(attributes.size());
+        append_crlf(out);
+        for (const auto& entry : attributes) {
+            encode_value_text(out, entry.first, protocol);
+            encode_value_text(out, entry.second, protocol);
+        }
+    }
     switch (value.type()) {
     case resp_type::null_value:
         if (protocol == resp_protocol::resp3) {
@@ -472,6 +493,19 @@ bool resp_value::is_push() const noexcept {
     return storage_.index() == 13;
 }
 
+bool resp_value::has_attributes() const noexcept {
+    return has_attributes_;
+}
+
+const resp_map& resp_value::attributes() const noexcept {
+    return attributes_;
+}
+
+void resp_value::set_attributes(resp_map attributes) noexcept {
+    attributes_ = std::move(attributes);
+    has_attributes_ = true;
+}
+
 std::int64_t resp_value::as_integer() const noexcept {
     return std::get<resp_integer>(storage_).value;
 }
@@ -579,6 +613,12 @@ bool operator==(const resp_value& lhs, const resp_value& rhs) noexcept {
     // build keeps a single, consistent linkage.
     const resp_type type = lhs.type();
     if (type != rhs.type()) {
+        return false;
+    }
+    if (lhs.has_attributes() != rhs.has_attributes()) {
+        return false;
+    }
+    if (lhs.has_attributes() && lhs.attributes() != rhs.attributes()) {
         return false;
     }
     switch (type) {
@@ -871,6 +911,58 @@ resp_parser::parse_result resp_parser::parse_value(std::size_t& pos,
         if (line != parse_result::ok) {
             return line;
         }
+        if (marker == '$' && content == "?") {
+            // Streamed string (RESP3, spec section "Streamed strings"). The
+            // wire form is `$?` then `;<len>\r\n<data>\r\n` chunks repeated
+            // any number of times, terminated by `;0\r\n`; the spec spells
+            // "Hello world" as `$? ;4 Hell ;5 o wor ;1 d ;0`. The decoder
+            // materialises it into one bulk string, concatenating with the
+            // same total-length cap that bounds a fixed-length bulk.
+            std::string data;
+            for (;;) {
+                char chunk_marker = 0;
+                std::string chunk_line;
+                const parse_result chunk = read_line(pos, chunk_marker, content);
+                if (chunk != parse_result::ok) {
+                    return chunk;
+                }
+                if (chunk_marker != ';') {
+                    error_ = rpc_code::protocol_error;
+                    return parse_result::error;
+                }
+                std::int64_t chunk_size = 0;
+                if (!parse_i64(content.data(), content.size(), chunk_size) ||
+                    chunk_size < 0) {
+                    error_ = rpc_code::protocol_error;
+                    return parse_result::error;
+                }
+                if (chunk_size == 0) {
+                    break;
+                }
+                if (static_cast<std::uint64_t>(data.size()) +
+                        static_cast<std::uint64_t>(chunk_size) >
+                    static_cast<std::uint64_t>(max_value_size_)) {
+                    error_ = rpc_code::resource_exhausted;
+                    return parse_result::error;
+                }
+                const std::size_t count = static_cast<std::size_t>(chunk_size);
+                if (count > buffer_.size() - pos ||
+                    buffer_.size() - pos - count < 2) {
+                    return parse_result::need_more;
+                }
+                const std::size_t data_end = pos + count;
+                if (buffer_[data_end] != cr_byte ||
+                    buffer_[data_end + 1] != lf_byte) {
+                    error_ = rpc_code::protocol_error;
+                    return parse_result::error;
+                }
+                data.append(reinterpret_cast<const char*>(buffer_.data() + pos),
+                            count);
+                pos = data_end + 2;
+            }
+            out = resp_value{resp_bulk_string{std::move(data)}};
+            return parse_result::ok;
+        }
         std::int64_t length = 0;
         if (!parse_i64(content.data(), content.size(), length) || length < -1) {
             error_ = rpc_code::protocol_error;
@@ -927,6 +1019,85 @@ resp_parser::parse_result resp_parser::parse_value(std::size_t& pos,
         const parse_result line = read_line(pos, marker, content);
         if (line != parse_result::ok) {
             return line;
+        }
+        if (content == "?") {
+            // Streamed aggregate (RESP3, spec section "Streamed aggregated
+            // data types"): `*?`/`~?`/`%?` then elements, then a lone `.`
+            // line as the END type. The map form must pair elements up, so a
+            // terminator mid-pair is a protocol error. The decoder
+            // materialises the aggregate into the ordinary concrete value.
+            if (marker == '>') {
+                error_ = rpc_code::protocol_error;
+                return parse_result::error;
+            }
+            if (marker == '%') {
+                resp_map entries;
+                for (;;) {
+                    if (pos >= buffer_.size()) {
+                        return parse_result::need_more;
+                    }
+                    if (static_cast<char>(buffer_[pos]) == '.') {
+                        break;
+                    }
+                    resp_value key;
+                    const parse_result key_result =
+                        parse_value(pos, depth + 1, key);
+                    if (key_result != parse_result::ok) {
+                        return key_result;
+                    }
+                    resp_value value;
+                    const parse_result value_result =
+                        parse_value(pos, depth + 1, value);
+                    if (value_result != parse_result::ok) {
+                        return value_result;
+                    }
+                    entries.emplace_back(std::move(key), std::move(value));
+                }
+                std::string end_line;
+                char end_marker = 0;
+                const parse_result end = read_line(pos, end_marker, end_line);
+                if (end != parse_result::ok) {
+                    return end;
+                }
+                if (end_marker != '.' || !end_line.empty()) {
+                    error_ = rpc_code::protocol_error;
+                    return parse_result::error;
+                }
+                out = resp_value{resp_map_value{std::move(entries)}};
+                return parse_result::ok;
+            }
+            resp_array items;
+            for (;;) {
+                if (pos >= buffer_.size()) {
+                    return parse_result::need_more;
+                }
+                if (static_cast<char>(buffer_[pos]) == '.') {
+                    break;
+                }
+                resp_value item;
+                const parse_result item_result =
+                    parse_value(pos, depth + 1, item);
+                if (item_result != parse_result::ok) {
+                    return item_result;
+                }
+                items.push_back(std::move(item));
+            }
+            std::string end_line;
+            char end_marker = 0;
+            const parse_result end = read_line(pos, end_marker, end_line);
+            if (end != parse_result::ok) {
+                return end;
+            }
+            if (end_marker != '.' || !end_line.empty()) {
+                error_ = rpc_code::protocol_error;
+                return parse_result::error;
+            }
+            if (marker == '*') {
+                out = resp_value{resp_array_value{std::move(items)}};
+            } else {
+                out = resp_value{resp_set_value{std::move(items)}};
+            }
+            return parse_result::ok;
         }
         std::int64_t count = 0;
         if (!parse_i64(content.data(), content.size(), count) || count < -1) {
@@ -986,6 +1157,57 @@ resp_parser::parse_result resp_parser::parse_value(std::size_t& pos,
         }
         return parse_result::ok;
     }
+    case '|': {
+        // RESP3 attribute (spec section "Attribute type"): exactly like a map
+        // (`|<count>` then count key/value pairs) but it is metadata that
+        // precedes -- and augments -- the value that follows, which may itself
+        // be any value, inside or outside an aggregate. The attribute is not a
+        // value: it is folded onto the following value, and a caller that does
+        // not care reads the reply as if it were never there.
+        const parse_result line = read_line(pos, marker, content);
+        if (line != parse_result::ok) {
+            return line;
+        }
+        std::int64_t count = 0;
+        if (!parse_i64(content.data(), content.size(), count) || count < 0) {
+            error_ = rpc_code::protocol_error;
+            return parse_result::error;
+        }
+        if (static_cast<std::uint64_t>(count) >
+            static_cast<std::uint64_t>(max_value_size_)) {
+            error_ = rpc_code::resource_exhausted;
+            return parse_result::error;
+        }
+        const std::size_t elements = static_cast<std::size_t>(count);
+        resp_map attributes;
+        if (elements <= 4096u) {
+            attributes.reserve(elements);
+        }
+        for (std::size_t i = 0; i < elements; ++i) {
+            resp_value key;
+            const parse_result key_result = parse_value(pos, depth + 1, key);
+            if (key_result != parse_result::ok) {
+                return key_result;
+            }
+            resp_value value;
+            const parse_result value_result = parse_value(pos, depth + 1, value);
+            if (value_result != parse_result::ok) {
+                return value_result;
+            }
+            attributes.emplace_back(std::move(key), std::move(value));
+        }
+        // The attribute augments the value that immediately follows it. The
+        // augmented value is parsed at the same depth the attribute occupies.
+        resp_value augmented;
+        const parse_result augmented_result =
+            parse_value(pos, depth, augmented);
+        if (augmented_result != parse_result::ok) {
+            return augmented_result;
+        }
+        augmented.set_attributes(std::move(attributes));
+        out = std::move(augmented);
+        return parse_result::ok;
+    }
     default:
         error_ = rpc_code::protocol_error;
         return parse_result::error;
@@ -1001,6 +1223,20 @@ void resp_encoder::protocol(resp_protocol value) noexcept { protocol_ = value; }
 resp_protocol resp_encoder::protocol() const noexcept { return protocol_; }
 
 std::size_t resp_encoder::value_size(const resp_value& value) const noexcept {
+    // The attribute prefix is RESP3-only. It must be counted exactly as
+    // encode_value_text writes it, or the size/encode agreement check fails.
+    std::size_t attribute_size = 0;
+    if (protocol_ == resp_protocol::resp3 && value.has_attributes()) {
+        const resp_map& attributes = value.attributes();
+        attribute_size = digit_count(attributes.size()) + 3u;
+        for (const auto& entry : attributes) {
+            attribute_size += value_size(entry.first) + value_size(entry.second);
+        }
+    }
+    return attribute_size + value_body_size(value);
+}
+
+std::size_t resp_encoder::value_body_size(const resp_value& value) const noexcept {
     switch (value.type()) {
     case resp_type::null_value:
         // RESP3 `_` + CRLF is 3 bytes; the RESP2 fallback `$-1` + CRLF is 5.

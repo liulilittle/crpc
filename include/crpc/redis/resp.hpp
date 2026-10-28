@@ -18,10 +18,22 @@
 //   '%'                          map
 //   '~'                          set
 //   '>'                          push
+//   '|'                          attribute (RESP3 only; NOT a value -- it is a
+//                                map that precedes and augments the value that
+//                                follows, and the parser folds it onto that
+//                                value; see `resp_value::attributes()`)
+//   '$?' / '*?' / '~?' / '%?'    streamed string / streamed aggregates
+//                                (RESP3 only)
 //
 // All line-oriented frames end in CRLF. Bulk-like frames (`$`, `!`, `=`) carry
 // a byte length instead and are followed by exactly that many bytes plus CRLF,
-// so binary payloads that contain CR or LF round-trip.
+// so binary payloads that contain CR or LF round-trip. The streamed forms are
+// how RESP3 carries a string or aggregate whose length is not known in advance:
+// a streamed string (`$?`) is `;<len>\r\n<data>\r\n` chunks terminated by
+// `;0\r\n`; a streamed aggregate (`*?`, `~?`, `%?`) is elements followed by a
+// lone `.` line. The parser materialises both into an ordinary bulk string /
+// array / set / map, which is the behaviour the RESP3 specification prescribes
+// for clients ("the client should just keep reading").
 //
 // The parser auto-detects the protocol version from the marker it reads, so a
 // single stream can carry both RESP2 and RESP3 frames. The encoder is
@@ -78,7 +90,9 @@ enum class resp_protocol : u8 { resp2, resp3 };
 
 // A decoded RESP value. It owns every byte it carries: bulk strings, maps and
 // arrays are copied out of the wire, so a value outlives the parser and the
-// buffer it came from.
+// buffer it came from. A RESP3 attribute (`|`) is not a value of its own: the
+// parser folds it onto the value it precedes, and the caller can read it
+// (`attributes()`) or ignore it (the value itself is unchanged).
 class resp_value;
 
 using resp_array = std::vector<resp_value>;
@@ -174,6 +188,18 @@ public:
     [[nodiscard]] bool is_set() const noexcept;
     [[nodiscard]] bool is_push() const noexcept;
 
+    // RESP3 attributes. An attribute frame (`|<count>` then key/value pairs)
+    // precedes the value it augments on the wire; the parser detaches the map
+    // from the stream and attaches it here, so a caller that reads the reply
+    // spends no energy on metadata it does not want. An empty attribute map is
+    // valid (`|0`), which is why `has_attributes()` -- not
+    // `attributes().empty()` -- is the "was there an attribute" test.
+    [[nodiscard]] bool has_attributes() const noexcept;
+    [[nodiscard]] const resp_map& attributes() const noexcept;
+    // Replaces the attached attributes (used by the parser and by tests). A
+    // RESP2 encode drops attributes, since RESP2 has no frame for them.
+    void set_attributes(resp_map attributes) noexcept;
+
     // Precondition: the corresponding is_*() is true. Reading a member of the
     // wrong alternative is a programming error: std::get throws
     // std::bad_variant_access and, because the accessors are noexcept, that
@@ -195,6 +221,8 @@ public:
 
 private:
     storage storage_;
+    bool has_attributes_ = false;
+    resp_map attributes_;
 };
 
 [[nodiscard]] CRPC_API bool operator==(const resp_value& lhs,
@@ -354,7 +382,11 @@ public:
         const resp_command& command) const;
 
 private:
+    // Wire size of `value` including its RESP3 attribute prefix. The
+    // attribute prefix is only emitted under RESP3; a RESP2 encode drops it.
     std::size_t value_size(const resp_value& value) const noexcept;
+    // Wire size of the value body only (no attribute prefix).
+    std::size_t value_body_size(const resp_value& value) const noexcept;
 
     resp_protocol protocol_ = resp_protocol::resp2;
 };
