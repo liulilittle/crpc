@@ -68,16 +68,23 @@ astar_impl(const Node& start, const Node& goal, FNeighbors neighbors,
         return std::vector<Node>{start};
     }
 
-    // The open set is a min-heap keyed by f = g + h. `counter` breaks ties so
+    // The open set is a min-heap keyed by f = g + h. `order` breaks ties so
     // two entries with equal f are ordered deterministically without requiring
-    // Node to support `<`.
-    using queue_entry = std::pair<Cost, std::pair<std::size_t, Node>>;
+    // Node to support `<`. The entry carries its own g: the staleness check on
+    // pop compares that against `best_g`, which avoids recomputing the
+    // heuristic for every popped (and often stale) entry.
+    struct queue_entry {
+        Cost f;
+        Cost g;
+        std::size_t order;
+        Node node;
+    };
     struct lower_f {
         bool operator()(const queue_entry& a, const queue_entry& b) const {
-            if (a.first != b.first) {
-                return a.first > b.first;
+            if (a.f != b.f) {
+                return a.f > b.f;
             }
-            return a.second.first > b.second.first;
+            return a.order > b.order;
         }
     };
 
@@ -87,22 +94,22 @@ astar_impl(const Node& start, const Node& goal, FNeighbors neighbors,
 
     const Cost start_h = static_cast<Cost>(heuristic(start, goal));
     best_g.emplace(start, Cost{0});
-    open.push({start_h, {0, start}});
+    open.push({start_h, Cost{0}, 0, start});
 
     std::size_t counter = 1;
     std::size_t expanded = 0;
     std::vector<Node> nbrs;
 
     while (!open.empty()) {
-        const Cost f = open.top().first;
-        const Node node = open.top().second.second;
+        const Cost g = open.top().g;
+        const Node node = open.top().node;
         open.pop();
 
         const auto found = best_g.find(node);
-        if (found == best_g.end() || found->second + static_cast<Cost>(heuristic(node, goal)) < f) {
+        if (found == best_g.end() || g < found->second ||
+            found->second < g) {
             continue; // a stale open-set entry for an already-improved node
         }
-        const Cost g = found->second;
 
         if (node == goal) {
             std::vector<Node> path;
@@ -132,13 +139,17 @@ astar_impl(const Node& start, const Node& goal, FNeighbors neighbors,
             const Cost step = static_cast<Cost>(edge_cost(node, next));
             const Cost tentative = g + step;
             const auto existing = best_g.find(next);
-            if (existing != best_g.end() && !(tentative < existing->second)) {
-                continue;
+            if (existing != best_g.end()) {
+                if (!(tentative < existing->second)) {
+                    continue;
+                }
+                existing->second = tentative;
+            } else {
+                best_g.emplace(next, tentative);
             }
-            best_g[next] = tentative;
-            came_from[next] = node;
+            came_from.insert_or_assign(next, node);
             open.push({tentative + static_cast<Cost>(heuristic(next, goal)),
-                       {counter++, next}});
+                       tentative, counter++, next});
         }
     }
 
