@@ -489,9 +489,29 @@ CRPC_TEST(get_distinguishes_invalid_handle) {
                std::string::npos);
 }
 
+// Whether this build can produce the loop-mode park() that the next case is
+// about. Constructing a runtime is cheap and does not start a thread.
+[[nodiscard]] bool shard_supports_loop_mode() {
+    crpc::runtime_options ro;
+    ro.start_handler_pool = false;
+    crpc::runtime probe(ro);
+    return probe.loop_mode();
+}
+
 CRPC_TEST(get_outside_a_coroutine_is_failed_precondition) {
     // The other side of the C7 distinction: a wait on a shard thread that is not
     // inside a coroutine is `failed_precondition`, not `invalid_argument`.
+    //
+    // This only holds in corocc LOOP mode, where a pump owns worker[0] and
+    // `park()` can answer "you are not in a coroutine". Without corocc the shard
+    // falls back to thread-per-shard, `loop_mode()` is false, and `park()` is
+    // never reached at all -- the plain-thread bound answers `deadline_exceeded`
+    // instead. Both are correct for their own configuration, so the case is
+    // skipped rather than asserting a behaviour the build cannot have.
+    if (!shard_supports_loop_mode()) {
+        crpc_test::skip("corocc is not enabled: the shard runs thread-per-shard, "
+                        "so there is no loop-mode park() to reject");
+    }
     stalled_backend backend;
     crpc::runtime_options ro;
     ro.start_handler_pool = false;
