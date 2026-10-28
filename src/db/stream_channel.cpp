@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 #include <crpc/error.hpp>
@@ -311,6 +312,38 @@ bool stream_channel::is_open() const noexcept {
 
 std::string stream_channel::tls_server_name() const {
     return tls_ != nullptr ? tls_->server_name() : std::string();
+}
+
+status stream_channel::wait_handshake(std::chrono::milliseconds budget) {
+    const auto deadline = budget.count() > 0
+                              ? std::chrono::steady_clock::now() + budget
+                              : std::chrono::steady_clock::time_point::max();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (closed_) {
+                return status{rpc_code::shutting_down, "the stream channel is closed"};
+            }
+            if (eof_) {
+                return failure(err_);
+            }
+        }
+        if (tls_ == nullptr) {
+            // A cleartext channel has no handshake to wait for.
+            return status{};
+        }
+        if (tls_->handshake_complete()) {
+            return status{};
+        }
+        if (tls_->handshake_failed()) {
+            return failure(tls_->error());
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return status{rpc_code::deadline_exceeded,
+                          "the TLS handshake did not settle in time"};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 std::string stream_channel::tls_alpn_protocol() const {
