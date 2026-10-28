@@ -64,6 +64,68 @@ const auto values = cache.get({"user:1", "user:2", "user:3"});
 The server `name` is the string the ring hashes. Every client in the deployment
 must use the same spelling (`host:port`), or placement differs between clients.
 
+## Node health, ejection and failover
+
+A single `client` has no retry policy. A `router` does: it tracks one health
+record per endpoint so one dead server does not take the whole cache down.
+
+```cpp
+crpc::memcached::failover_options failover;
+failover.failure_threshold = 3;                     // consecutive transport failures
+failover.retry_cooldown = std::chrono::seconds(30); // dead time before a probe
+failover.retry_reads = false;                       // keep the safe default
+
+crpc::memcached::router cache(std::move(servers), {}, failover);
+
+for (const auto& node : cache.health()) {
+    // node.name, node.condition (alive/dead), node.consecutive_failures,
+    // node.last_error, node.last_error_message, node.retry_in
+}
+
+// Force a recovery check now instead of waiting for the cooldown.
+const auto recovered = cache.probe_node(1);
+```
+
+Only transport-level failures count: `connection_refused`, `connection_reset`,
+`broken_pipe`, `eof`, `deadline_exceeded` and `unavailable`. Any reply resets
+`consecutive_failures` to zero, because even `SERVER_ERROR` proves the process is
+answering. A malformed request or a routine `NOT_FOUND` is not a node failure.
+
+After `failure_threshold` consecutive transport failures the node is marked dead
+and removed from the ketama ring. After `retry_cooldown` the next public router
+call (or `probe_node`) sends one `version` command to it. A reply re-admits it to
+the ring; a failure keeps it dead and restarts the cooldown. Setting
+`failure_threshold` to 0 disables ejection while still updating `health()`.
+
+**Keys move when a node is ejected or re-admitted.** This is deliberate and
+important: removing a node changes ring ownership, so a key previously owned by
+the dead node is now placed on a different live node, and it moves back when the
+node recovers. memcached nodes do not replicate or share data, so the key is a
+miss at its new location until it is written there again. That is a consistency
+consequence of failover, not something the router can hide.
+
+**Reads are not retried on another node by default.** `retry_reads = false` is a
+correctness decision: a cross-node retry can return a different value stored
+under the same key on another node, or a miss even though the value exists on the
+unreachable owner. Either answer looks normal to the caller, so the failure would
+turn into wrong data. Keep it off unless the deployment guarantees that a key
+exists on at most one node and a miss is acceptable after a failed owner (for
+example a pure sharding key space with no collisions, or a replication layer the
+client does not know about). When enabled, a failed read is retried on the next
+live node in ring order and the call still fails if no live node can answer.
+This flag only governs retrying the failing call: once the owner is ejected,
+later calls follow the rebuilt ring and therefore the remapping described above.
+
+**Writes are never retried.** Sending a write to another node would place the
+value at the wrong hash position and make the next read inconsistent, so a write
+failure is reported as-is. A later write is a new operation and follows whatever
+ring exists at that time.
+
+**Every node dead.** Keyed operations return `rpc_code::unavailable` (unless no
+server is configured at all, which stays `failed_precondition`), `owner_of()`
+returns -1, and no network call is attempted once every cooldown has not yet
+expired. The router never spins looking for a live node.
+
 ## Outcomes that are not errors
 
 memcached answers routine situations with a word that is not a failure. The

@@ -2,6 +2,7 @@
 #include <crpc/memcached/client.hpp>
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,17 @@ namespace {
         break;
     }
     return rpc_code::protocol_error;
+}
+
+// A retrieval may legitimately answer with a bare `END` (no key matched). The
+// transport parses the reply without knowing the command, so it derives this
+// from the request bytes: every other command treats a bare END as a stray line.
+[[nodiscard]] bool is_retrieval_request(span<const std::byte> request) noexcept {
+    const std::string_view text(reinterpret_cast<const char*>(request.data()),
+                                request.size());
+    const std::string_view command = text.substr(0, text.find(' '));
+    return command == "get" || command == "gets" || command == "gat" ||
+           command == "gats";
 }
 
 } // namespace
@@ -91,7 +103,9 @@ result<text_reply> connection_transport::exchange(span<const std::byte> request)
         return discard(written.error());
     }
 
-    text_parser parser(impl_->config.max_value_size, impl_->config.max_line_size);    for (;;) {
+    text_parser parser(impl_->config.max_value_size, impl_->config.max_line_size);
+    parser.set_allow_bare_end(is_retrieval_request(request));
+    for (;;) {
         text_reply reply;
         const text_parser::result step = parser.next(reply);
         if (step == text_parser::result::reply_ready) {

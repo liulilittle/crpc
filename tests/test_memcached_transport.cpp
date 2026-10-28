@@ -145,6 +145,43 @@ CRPC_TEST(transport_round_trip_store_and_get) {
     }
 }
 
+CRPC_TEST(transport_get_miss_is_empty_value_list) {
+    auto pair = crpc::inproc_pair::make_typed();
+    recording_source server;
+    pair.second->bind_source(&server);
+    pair_backend backend(std::move(pair.first));
+
+    crpc::memcached::connection_transport_config config;
+    config.pool.max_size = 1;
+    config.pool.connection.ep = crpc::endpoint::inproc("crpc-memcached-miss");
+    crpc::memcached::connection_transport transport(std::move(config), backend);
+
+    // A real get miss is exactly this: a bare END with no VALUE block. The
+    // transport knows the request was a retrieval, so it must decode as an empty
+    // value list instead of a protocol violation.
+    const std::vector<std::byte> request = to_bytes("get absent\r\n");
+    std::optional<crpc::result<crpc::memcached::text_reply>> outcome;
+    std::thread caller([&] {
+        outcome = transport.exchange(crpc::span<const std::byte>(request.data(), request.size()));
+    });
+    CRPC_CHECK(server.wait_for(request.size(), 5000));
+    noop_completion done;
+    const std::vector<std::byte> miss = to_bytes("END\r\n");
+    pair.second->sink().push(crpc::span<const std::byte>(miss.data(), miss.size()), &done);
+    caller.join();
+    CRPC_CHECK(outcome.has_value());
+    if (!outcome.has_value()) {
+        return;
+    }
+    const auto& reply = *outcome;
+    CRPC_CHECK(reply.ok());
+    if (reply.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::text_reply::kind::values),
+                      static_cast<int>(reply.value().type));
+        CRPC_CHECK(reply.value().entries.empty());
+    }
+}
+
 CRPC_TEST(transport_reassembles_fragmented_value) {
     auto pair = crpc::inproc_pair::make_typed();
     recording_source server;

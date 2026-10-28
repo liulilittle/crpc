@@ -5,6 +5,7 @@
 // silent miss.
 #include "test_framework.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -49,9 +50,23 @@ class recording_transport final : public transport {
 public:
     std::vector<std::string> requests;
     std::deque<std::string> replies;
+    // One-shot failures, consumed before the scripted replies.
+    std::deque<crpc::rpc_code> failures;
+    // When set every exchange fails; used to model a node that is down.
+    bool fail_always = false;
+    crpc::rpc_code fail_code = crpc::rpc_code::connection_refused;
+    std::string fail_message = "scripted transport failure";
 
     crpc::result<text_reply> exchange(crpc::span<const std::byte> request) override {
         requests.emplace_back(reinterpret_cast<const char*>(request.data()), request.size());
+        if (fail_always) {
+            return crpc::rpc_error{fail_code, fail_message};
+        }
+        if (!failures.empty()) {
+            const crpc::rpc_code code = failures.front();
+            failures.pop_front();
+            return crpc::rpc_error{code, fail_message};
+        }
         if (replies.empty()) {
             return crpc::rpc_error{crpc::rpc_code::internal, "no scripted reply left"};
         }
@@ -69,7 +84,9 @@ struct rig {
     std::vector<std::shared_ptr<recording_transport>> endpoints;
     std::unique_ptr<router> instance;
 
-    rig() {
+    rig() : rig(crpc::memcached::failover_options{}) {}
+
+    explicit rig(crpc::memcached::failover_options failover) {
         std::vector<router::server> servers;
         const char* names[] = {"10.0.0.1:11211", "10.0.0.2:11211", "10.0.0.3:11211"};
         for (const char* name : names) {
@@ -77,7 +94,7 @@ struct rig {
             endpoints.push_back(endpoint);
             servers.push_back(router::server{name, endpoint, 1});
         }
-        instance.reset(new router(std::move(servers)));
+        instance.reset(new router(std::move(servers), {}, failover));
     }
 
     // Routes `key` the way the router does, so a case can script the right
@@ -96,6 +113,35 @@ struct rig {
         return total;
     }
 };
+
+// Finds a key the ring currently places on `server`, without duplicating the
+// ketama implementation in the test.
+[[nodiscard]] std::string key_owned_by(const rig& r, std::size_t server,
+                                       const char* prefix) {
+    for (int i = 0; i < 20000; ++i) {
+        std::string candidate = std::string(prefix) + std::to_string(i);
+        const std::ptrdiff_t owner = r.instance->owner_of(candidate);
+        if (owner >= 0 && static_cast<std::size_t>(owner) == server) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] std::string value_reply(const std::string& key, const std::string& value) {
+    return "VALUE " + key + " 0 " + std::to_string(value.size()) + "\r\n" + value +
+           "\r\nEND\r\n";
+}
+
+[[nodiscard]] crpc::memcached::failover_options failover(std::uint32_t threshold,
+                                                         std::chrono::milliseconds cooldown,
+                                                         bool retry_reads = false) {
+    crpc::memcached::failover_options options;
+    options.failure_threshold = threshold;
+    options.retry_cooldown = cooldown;
+    options.retry_reads = retry_reads;
+    return options;
+}
 
 } // namespace
 
@@ -301,6 +347,303 @@ CRPC_TEST(router_without_servers_reports_precondition) {
     CRPC_CHECK_FALSE(values.ok());
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
                   static_cast<int>(values.error().code));
+}
+
+// --- Node health, ejection and recovery -------------------------------------
+
+CRPC_TEST(router_ejects_node_after_consecutive_failures) {
+    rig r(failover(2, std::chrono::seconds(60)));
+    const std::string key = key_owned_by(r, 1, "eject");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+
+    const auto first = r.instance->store(store_kind::set, key, "v");
+    CRPC_CHECK_FALSE(first.ok());
+    if (!first.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                      static_cast<int>(first.error().code));
+    }
+    std::vector<crpc::memcached::node_health> health = r.instance->health();
+    CRPC_CHECK_EQ(std::size_t{3}, health.size());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::alive),
+                  static_cast<int>(health[1].condition));
+    CRPC_CHECK_EQ(std::uint32_t{1}, health[1].consecutive_failures);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                  static_cast<int>(health[1].last_error));
+
+    const auto second = r.instance->store(store_kind::set, key, "v");
+    CRPC_CHECK_FALSE(second.ok());
+    health = r.instance->health();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                  static_cast<int>(health[1].condition));
+    CRPC_CHECK_EQ(std::uint32_t{2}, health[1].consecutive_failures);
+    CRPC_CHECK_EQ(std::string("10.0.0.2:11211"), health[1].name);
+    CRPC_CHECK(!health[1].last_error_message.empty());
+    CRPC_CHECK(health[1].retry_in.count() > 0);
+    // The failed writes are reported, never silently retried on another node.
+    CRPC_CHECK_EQ(2, static_cast<int>(r.at(1).requests.size()));
+    // ... and after the eject, the ring no longer contains that node at all.
+    const std::ptrdiff_t owner = r.instance->owner_of(key);
+    CRPC_CHECK(owner >= 0);
+    CRPC_CHECK(owner != 1);
+    for (int i = 0; i < 500; ++i) {
+        CRPC_CHECK(r.instance->owner_of("post-eject-" + std::to_string(i)) != 1);
+    }
+}
+
+CRPC_TEST(router_does_not_retry_reads_by_default) {
+    rig r(failover(5, std::chrono::seconds(60)));
+    const std::string key = key_owned_by(r, 1, "noretry");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    const auto values = r.instance->get({key});
+    CRPC_CHECK_FALSE(values.ok());
+    if (!values.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                      static_cast<int>(values.error().code));
+    }
+    // Exactly one request: the failing owner. No other node was asked, because
+    // a hit on another node would not be the value that was stored here.
+    CRPC_CHECK_EQ(1, r.requests_sent());
+    CRPC_CHECK_EQ(std::size_t{1}, r.at(1).requests.size());
+    const auto health = r.instance->health();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::alive),
+                  static_cast<int>(health[1].condition));
+    CRPC_CHECK_EQ(std::uint32_t{1}, health[1].consecutive_failures);
+}
+
+CRPC_TEST(router_retries_reads_to_next_live_node_when_enabled) {
+    rig r(failover(5, std::chrono::seconds(60), true));
+    const std::string key = key_owned_by(r, 1, "retry");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    for (std::size_t i = 0; i < r.endpoints.size(); ++i) {
+        if (i != 1) {
+            r.at(i).replies.push_back(value_reply(key, "v"));
+        }
+    }
+
+    const auto values = r.instance->get({key});
+    CRPC_CHECK(values.ok());
+    if (values.ok()) {
+        CRPC_CHECK_EQ(std::size_t{1}, values.value().size());
+        if (values.value().size() == 1) {
+            CRPC_CHECK_EQ(std::string("v"), values.value()[0].data);
+        }
+    }
+    CRPC_CHECK_EQ(2, r.requests_sent());
+    CRPC_CHECK_EQ(std::size_t{1}, r.at(1).requests.size());
+    int retried_on = 0;
+    for (std::size_t i = 0; i < r.endpoints.size(); ++i) {
+        if (i != 1 && r.at(i).requests.size() == 1) {
+            ++retried_on;
+            CRPC_CHECK_EQ(std::string("get " + key + "\r\n"), r.at(i).requests[0]);
+        }
+    }
+    CRPC_CHECK_EQ(1, retried_on);
+}
+
+CRPC_TEST(router_write_failure_is_reported_and_not_retried) {
+    rig r(failover(1, std::chrono::seconds(60)));
+    const std::string key = key_owned_by(r, 1, "write");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    const auto failed = r.instance->store(store_kind::set, key, "v");
+    CRPC_CHECK_FALSE(failed.ok());
+    CRPC_CHECK_EQ(1, r.requests_sent());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                  static_cast<int>(r.instance->health()[1].condition));
+
+    // A later write is a new operation and follows the new ring: it is not a
+    // retry of the failed one, and the remapping is the documented consequence
+    // of ejecting a node.
+    const std::ptrdiff_t remapped = r.instance->owner_of(key);
+    CRPC_CHECK(remapped >= 0);
+    CRPC_CHECK(remapped != 1);
+    if (remapped >= 0 && remapped != 1) {
+        r.at(static_cast<std::size_t>(remapped)).replies.push_back("STORED\r\n");
+        const auto stored = r.instance->store(store_kind::set, key, "v");
+        CRPC_CHECK(stored.ok());
+    }
+}
+
+CRPC_TEST(router_explicit_probe_recovers_a_dead_node) {
+    rig r(failover(1, std::chrono::milliseconds(0)));
+    const std::string key = key_owned_by(r, 1, "probe");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    CRPC_CHECK_FALSE(r.instance->store(store_kind::set, key, "v").ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                  static_cast<int>(r.instance->health()[1].condition));
+
+    r.at(1).fail_always = false;
+    r.at(1).replies.push_back("VERSION 1.6.24\r\n");
+    const auto probed = r.instance->probe_node(1);
+    CRPC_CHECK(probed.ok());
+    if (probed.ok()) {
+        CRPC_CHECK(probed.value());
+    }
+    const auto health = r.instance->health();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::alive),
+                  static_cast<int>(health[1].condition));
+    CRPC_CHECK_EQ(std::uint32_t{0}, health[1].consecutive_failures);
+    CRPC_CHECK_EQ(std::string("version\r\n"), r.at(1).requests.back());
+}
+
+CRPC_TEST(router_auto_probes_a_dead_node_after_cooldown) {
+    rig r(failover(1, std::chrono::milliseconds(0)));
+    const std::string key = key_owned_by(r, 1, "auto");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    CRPC_CHECK_FALSE(r.instance->store(store_kind::set, key, "v").ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                  static_cast<int>(r.instance->health()[1].condition));
+
+    // The cooldown is zero, so the next public call probes first. The probe
+    // consumes one VERSION on the recovered node; versions() then asks each
+    // node once.
+    r.at(1).fail_always = false;
+    for (std::size_t i = 0; i < r.endpoints.size(); ++i) {
+        r.at(i).replies.push_back("VERSION 1.6.24\r\n");
+    }
+    r.at(1).replies.push_back("VERSION 1.6.24\r\n");
+    const auto versions = r.instance->versions();
+    CRPC_CHECK(versions.ok());
+    if (versions.ok()) {
+        CRPC_CHECK_EQ(std::size_t{3}, versions.value().size());
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::alive),
+                  static_cast<int>(r.instance->health()[1].condition));
+    // Request 0 is the failing set that ejected the node; request 1 is the
+    // automatic probe, before versions() asks it again.
+    CRPC_CHECK(r.at(1).requests.size() >= 2);
+    if (r.at(1).requests.size() >= 2) {
+        CRPC_CHECK_EQ(std::string("version\r\n"), r.at(1).requests[1]);
+    }
+}
+
+CRPC_TEST(router_failed_probe_keeps_node_dead) {
+    rig r(failover(1, std::chrono::milliseconds(0)));
+    const std::string key = key_owned_by(r, 1, "stilldead");
+    CRPC_CHECK(!key.empty());
+    if (key.empty()) {
+        return;
+    }
+
+    r.at(1).fail_always = true;
+    CRPC_CHECK_FALSE(r.instance->store(store_kind::set, key, "v").ok());
+    const auto probed = r.instance->probe_node(1);
+    CRPC_CHECK(probed.ok());
+    if (probed.ok()) {
+        CRPC_CHECK_FALSE(probed.value());
+    }
+    const auto health = r.instance->health();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                  static_cast<int>(health[1].condition));
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                  static_cast<int>(health[1].last_error));
+    // The cooldown restarts after a failed probe, so a probe of a still-down
+    // node cannot spin.
+    CRPC_CHECK(health[1].retry_in.count() >= 0);
+    const std::ptrdiff_t owner = r.instance->owner_of(key);
+    CRPC_CHECK(owner >= 0);
+    CRPC_CHECK(owner != 1);
+}
+
+CRPC_TEST(router_probe_with_ejection_disabled_reports_failure_but_keeps_alive) {
+    // failure_threshold 0 means "observe, never eject". A failed probe must still
+    // be reported as a failure even though the node stays in the ring.
+    rig r(failover(0, std::chrono::seconds(60)));
+    r.at(0).fail_always = true;
+    const auto probed = r.instance->probe_node(0);
+    CRPC_CHECK(probed.ok());
+    if (probed.ok()) {
+        CRPC_CHECK_FALSE(probed.value());
+    }
+    const auto health = r.instance->health();
+    CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::alive),
+                  static_cast<int>(health[0].condition));
+    CRPC_CHECK_EQ(std::uint32_t{1}, health[0].consecutive_failures);
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::connection_refused),
+                  static_cast<int>(health[0].last_error));
+}
+
+CRPC_TEST(router_probe_rejects_an_out_of_range_index) {
+    rig r;
+    const auto probed = r.instance->probe_node(7);
+    CRPC_CHECK_FALSE(probed.ok());
+    if (!probed.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(probed.error().code));
+    }
+    CRPC_CHECK_EQ(0, r.requests_sent());
+}
+
+CRPC_TEST(router_all_dead_reports_unavailable_without_looping) {
+    // A long cooldown keeps the automatic probes out of this case: every node
+    // is ejected and the router must return a definite error, not spin.
+    rig r(failover(1, std::chrono::seconds(60)));
+    for (auto& endpoint : r.endpoints) {
+        endpoint->fail_always = true;
+    }
+
+    for (std::size_t server = 0; server < r.endpoints.size(); ++server) {
+        const std::string key = key_owned_by(r, server, "alldead");
+        CRPC_CHECK(!key.empty());
+        if (key.empty()) {
+            return;
+        }
+        const auto stored = r.instance->store(store_kind::set, key, "v");
+        CRPC_CHECK_FALSE(stored.ok());
+    }
+
+    const auto health = r.instance->health();
+    CRPC_CHECK_EQ(std::size_t{3}, health.size());
+    for (const auto& node : health) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::memcached::node_condition::dead),
+                      static_cast<int>(node.condition));
+    }
+    CRPC_CHECK_EQ(std::ptrdiff_t{-1}, r.instance->owner_of("any-key"));
+
+    const auto values = r.instance->get({"any-key"});
+    CRPC_CHECK_FALSE(values.ok());
+    if (!values.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                      static_cast<int>(values.error().code));
+    }
+    const std::size_t before = static_cast<std::size_t>(r.requests_sent());
+    const auto stored = r.instance->store(store_kind::set, "any-key", "v");
+    CRPC_CHECK_FALSE(stored.ok());
+    if (!stored.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::unavailable),
+                      static_cast<int>(stored.error().code));
+    }
+    // With every node dead and no probe due, neither call touched the network.
+    CRPC_CHECK_EQ(before, static_cast<std::size_t>(r.requests_sent()));
 }
 
 CRPC_TEST_MAIN()
