@@ -4,6 +4,37 @@
 
 ## 未发布
 
+### HTTP/2 客户端：ALPN 协商、h2c 先验知识与多路复用
+
+- `http::client` 现在会在连接协商出 HTTP/2 时说 HTTP/2。TLS 下由 ALPN 结果决定：默认提供
+  `{"h2", "http/1.1"}`，对端选择 h2 即走 h2（`response::version` 为
+  `http_version::http_2`）；选择 http/1.1 —— 或完全没有 ALPN —— 则保持 HTTP/1.1 客户端。
+  明文下通过新增的 `client_options::h2c` 使用 h2c 先验知识（RFC 9113 3.4），默认关闭：
+  发出连接前导后不存在回退路径。
+- **ABI 破坏：** `http::client_options::tls_alpn` 从 `std::string` 改为
+  `std::vector<std::string>`（偏好列表），`client_options` 新增 `bool h2c`。两者都是布局变更
+  （[abi.md](abi.md) §1），消费者必须重编；本未发布周期已是 MAJOR。
+- 新增 `http/h2_client.hpp`：`http::h2_client` 保持一条连接并多路复用流 —— `begin`
+  把整个请求写上线而不等待，`finish` 泵帧直到该流响应完成（其他流的响应与失败按流
+  暂存、由各自的 `finish` 取回），`send`/`send_text` 覆盖一次性场景。伪头先发
+  （`:method`/`:scheme`/`:path`/`:authority`），字段名小写，连接专用字段
+  （`Connection`、`Keep-Alive`、`Proxy-Connection`、`Transfer-Encoding`、`Upgrade`）、`Host`
+  以及非 `trailers` 的 `TE` 一律丢弃。`make_h2_client` 基于 TCP（h2c 先验知识）或 TLS
+  （要求协商出 "h2"；其他结果以 `failed_precondition` 上报，由调用方回退到
+  `http::make_client`）。响应侧：`:status` 决定状态码，trailer 进入 `response::trailers`，
+  `content-length` 与实际正文不符时以 `protocol_error` 明确报错，绝不静默截断。
+- **未实现：** 服务端推送（客户端通告 `SETTINGS_ENABLE_PUSH=0`，对端仍推送则连接失败）
+  与 CONNECT。二者在此记录，不做静默。
+- `http::http_version` 追加 `http_2`（按 [abi.md](abi.md) §1 追加在末尾）。
+- `db::stream_channel::wait_handshake` 有界等待 TLS 握手完成；ALPN 结果在握手后才存在，
+  工厂据此在所选协议的首个字节上线前完成决策。
+- 两处 HTTP/2 连接层缺陷修复，由客户端角色对本库自身服务端的实测暴露
+  （`src/http2/connection.cpp`）：
+  - client 角色连接不再把对端 `SETTINGS_ENABLE_PUSH=0` 当协议错误（RFC 7540 6.5.2 只约束
+    取值、不约束方向；两种角色均记录该值）；
+  - 已关闭流上收到的 `WINDOW_UPDATE` 按规范忽略，不再以 `STREAM_CLOSED` 回敬
+    （RFC 7540 5.1 closed 态）。
+
 ### ABI 破坏：ADO 式参数方向与 ORM 列元数据
 
 - `db::parameter` 新增 `std::string name` 与 `parameter_direction direction`

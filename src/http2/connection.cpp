@@ -728,11 +728,6 @@ h2_error connection::receive_settings(const frame_header& header,
         if (!valid) {
             return connection_error(error_code::protocol_error);
         }
-        if (static_cast<setting_id>(item.id) == setting_id::enable_push &&
-            role_ == connection_role::client) {
-            // ENABLE_PUSH is client-to-server only.
-            return connection_error(error_code::protocol_error);
-        }
     }
     for (const setting& item : parsed) {
         switch (static_cast<setting_id>(item.id)) {
@@ -745,6 +740,11 @@ h2_error connection::receive_settings(const frame_header& header,
             break;
         }
         case setting_id::enable_push:
+            // The setting is meaningful in the client-to-server direction, but
+            // either endpoint may send it: a server advertising ENABLE_PUSH=0
+            // ("I will not push") must not fail a client-role connection, and
+            // the value is recorded symmetrically (RFC 7540 6.5.2 bounds the
+            // value, not the direction).
             remote_settings_.enable_push = item.value != 0;
             break;
         case setting_id::max_concurrent_streams:
@@ -852,7 +852,10 @@ h2_error connection::receive_window_update(const frame_header& header,
         return connection_error(error_code::protocol_error);
     }
     if (entry->state == stream_state::closed) {
-        return stream_error(header.stream_id, error_code::stream_closed);
+        // A peer may still be draining its send path for a moment after the
+        // END_STREAM race: RFC 7540 5.1 (closed) says WINDOW_UPDATE frames
+        // received in this state MUST be ignored, not answered with an error.
+        return h2_error{};
     }
     if (entry->send_window > static_cast<i64>(max_window_size - increment)) {
         return stream_error(header.stream_id, error_code::flow_control_error);

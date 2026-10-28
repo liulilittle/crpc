@@ -51,6 +51,7 @@
 | 头文件 | 关键类型 | 说明 |
 |---|---|---|
 | [`http/server.hpp`](../../include/crpc/http/server.hpp) | `http::http_server`、`http_server::builder` | 基于任意后端监听的 HTTP/1.1 + HTTP/2（h2c/h2）+ HTTPS 服务器门面。 |
+| [`http/h2_client.hpp`](../../include/crpc/http/h2_client.hpp) | `http::h2_client`, `h2_client_options` | HTTP/2 多路复用客户端：同一连接上的并发流（h2c 或 TLS+ALPN h2）|
 | [`http/message.hpp`](../../include/crpc/http/message.hpp) | `http::request`、`http::response` | HTTP/1.1 报文模型、增量解析器与序列化器。 |
 | [`http2/frame.hpp`](../../include/crpc/http2/frame.hpp) | `h2::frame`、`h2::frame_header` | HTTP/2 帧层。 |
 | [`http2/hpack.hpp`](../../include/crpc/http2/hpack.hpp) | `h2::hpack_encoder`、`h2::hpack_decoder` | HPACK 头压缩。 |

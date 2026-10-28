@@ -4,6 +4,49 @@
 
 ## Unreleased
 
+### HTTP/2 client: ALPN negotiation, h2c prior knowledge, multiplexing
+
+- `http::client` now speaks HTTP/2 when the connection negotiates it. Over TLS
+  the ALPN result decides: the default offer is `{"h2", "http/1.1"}`, so an
+  origin that selects h2 gets h2 (`response::version` is
+  `http_version::http_2`) and an origin that selects http/1.1 -- or no ALPN at
+  all -- keeps the HTTP/1.1 client. Over cleartext, h2c with prior knowledge
+  (RFC 9113 3.4) is available through the new `client_options::h2c` flag, off
+  by default because no fallback exists after the preface.
+- **ABI breaking:** `http::client_options::tls_alpn` changed from
+  `std::string` to `std::vector<std::string>` (the preference list), and
+  `client_options` gained `bool h2c`. Both are layout changes ([abi.md](abi.md)
+  §1); a consumer must be rebuilt. The unreleased cycle is already MAJOR.
+- New `http/h2_client.hpp`: `http::h2_client` keeps one connection open and
+  multiplexes streams -- `begin` puts a whole request on the wire without
+  waiting, `finish` pumps frames until that stream's response is complete
+  (other streams' responses and failures are parked and returned by their own
+  `finish`), and `send`/`send_text` cover the one-shot case. Pseudo-headers
+  are emitted first (`:method`/`:scheme`/`:path`/`:authority`), field names
+  are lower-cased, and connection-specific fields (`Connection`, `Keep-Alive`,
+  `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`), `Host`, and `TE`
+  values other than `trailers` are dropped. `make_h2_client` builds one over
+  TCP (h2c prior knowledge) or TLS (requires a negotiated "h2"; anything else
+  is reported as `failed_precondition` so the caller can fall back to
+  `http::make_client`). Response side: `:status` selects the code, trailers
+  land in `response::trailers`, and a `content-length` that disagrees with the
+  received body fails with `protocol_error` instead of truncating.
+- **Not implemented:** server push (the client advertises
+  `SETTINGS_ENABLE_PUSH=0` and a server that pushes anyway fails the
+  connection) and CONNECT. Both are recorded here rather than silent.
+- `http::http_version` gained `http_2` (appended at the end, per
+  [abi.md](abi.md) §1).
+- `db::stream_channel::wait_handshake` waits (bounded) for the TLS handshake
+  to settle; the ALPN result only exists after it, so the factories consult it
+  before the first byte of the selected protocol goes out.
+- Two HTTP/2 connection-layer fixes surfaced by exercising the client role
+  against the library's own server (`src/http2/connection.cpp`):
+  - a client-role connection no longer treats a peer's
+    `SETTINGS_ENABLE_PUSH=0` as a protocol error (RFC 7540 6.5.2 bounds the
+    value, not the direction; the value is recorded either way);
+  - a `WINDOW_UPDATE` received for a closed stream is ignored instead of
+    answered with `STREAM_CLOSED` (RFC 7540 5.1, closed state).
+
 ### ABI breaking: ADO-style parameter direction and ORM column metadata
 
 - `db::parameter` gained `std::string name` and `parameter_direction direction`
