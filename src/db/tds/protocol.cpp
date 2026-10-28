@@ -56,6 +56,46 @@ constexpr std::int64_t tds_epoch_offset_days = 719162;
 
 } // namespace
 
+db_type tds_column_type(std::uint8_t wire) noexcept {
+    switch (wire) {
+    case 0x30: // INT1
+    case 0x34: // INT2
+    case 0x38: // INT4
+    case 0x7F: // INT8
+    case 0x26: // INTN
+        return db_type::int64;
+    case 0x32: // BIT
+    case 0x68: // BITN
+        return db_type::boolean;
+    case 0x3B: // FLT4
+    case 0x3E: // FLT8
+    case 0x6D: // FLTN
+        return db_type::real;
+    case 0x6A: // DECIMALN
+    case 0x6C: // NUMERICN
+        return db_type::decimal;
+    case 0x24: // GUID
+        return db_type::uuid;
+    case 0x28: // DATE
+        return db_type::date;
+    case 0x29: // TIME
+        return db_type::time;
+    case 0x2A: // DATETIME2
+    case 0x3D: // DATETIME
+        return db_type::timestamp;
+    case 0xA5: // BIGVARBINARY
+    case 0xAD: // BIGBINARY
+        return db_type::blob;
+    case 0xA7: // BIGVARCHAR
+    case 0xAF: // BIGCHAR
+    case 0xE7: // NVARCHAR
+    case 0xEF: // NCHAR
+        return db_type::text;
+    default:
+        return db_type::unknown;
+    }
+}
+
 // --- Framing -----------------------------------------------------------------
 
 status encode_header(span<std::byte> out, const packet_header& header,

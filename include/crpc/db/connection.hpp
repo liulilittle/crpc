@@ -96,7 +96,40 @@ public:
     // DELETE), or -1 when the backend does not report it.
     [[nodiscard]] virtual std::int64_t affected_rows() const noexcept = 0;
 
-    // Releases the server-side cursor. Idempotent; called by the destructor.
+    // Advances to the next result set of this batch, when the backend produced
+    // more than one. Returns true when the cursor now exposes a fresh result set
+    // whose columns are readable immediately and whose rows come from `next()`.
+    // Returns false when there are no further result sets; the cursor is then at
+    // end and every accessor reports NULL / 0 as before.
+    //
+    // A cursor that already decoded every set (a materialised one) switches
+    // instantly; a streaming one drains the remainder of the current set first, so
+    // a caller that wants a set's remaining rows must read them before calling
+    // `next_result()`. The default returns false: one result per cursor.
+    [[nodiscard]] virtual bool next_result() { return false; }
+
+    // True when this cursor is fed lazily from the channel instead of from a
+    // materialised copy. A streaming cursor keeps the connection busy until it is
+    // consumed to the end or closed (closing drains the rest), so it must not be
+    // read at the same time as another statement on its connection.
+    [[nodiscard]] virtual bool is_streaming() const noexcept { return false; }
+
+    // When `next()` ends, the failure that stopped the read, or `ok` when the
+    // cursor ended on its own (last row of the last set). Materialised cursors
+    // always report `ok`; a streaming read that lost the socket or was cancelled
+    // reports it here so `next() == false` can be told apart from "no more rows".
+    [[nodiscard]] virtual rpc_error last_error() const noexcept { return {}; }
+
+    // Streaming diagnostics. `rows_decoded` counts every row this cursor has taken
+    // from the channel; `rows_buffered` how many it holds at rest. A materialised
+    // cursor buffers its whole result, a streaming one never more than the current
+    // row -- which is how a caller proves a large result is not being materialised.
+    [[nodiscard]] virtual std::size_t rows_decoded() const noexcept { return 0; }
+    [[nodiscard]] virtual std::size_t rows_buffered() const noexcept { return 0; }
+
+    // Releases the server-side cursor. Idempotent; called by the destructor. For a
+    // streaming cursor this also drains any reply still in flight, so the
+    // connection stays aligned for the next statement.
     virtual void close() noexcept = 0;
 
 protected:
@@ -127,6 +160,30 @@ public:
     [[nodiscard]] virtual status commit() = 0;
     [[nodiscard]] virtual status rollback() = 0;
 
+    // Starts a transaction at a requested isolation level. The default forwards to
+    // `begin()` for `unspecified` and reports `no_such_method` otherwise, so a
+    // backend that does not model isolation levels keeps compiling and working
+    // without knowing the extension exists.
+    [[nodiscard]] virtual status begin(isolation_level level) {
+        if (level == isolation_level::unspecified) {
+            return begin();
+        }
+        return status{rpc_code::no_such_method,
+                      "this backend does not support transaction isolation levels"};
+    }
+
+    // The longest a command may run before the backend interrupts it server-side.
+    // Zero (the default) means no client-side bound. Backends that can stop the
+    // server really do; a backend that cannot interrupt does not fake success,
+    // `set_command_timeout` reports `no_such_method` for a non-zero value instead.
+    [[nodiscard]] virtual status set_command_timeout(std::chrono::milliseconds timeout) noexcept {
+        command_timeout_ = timeout;
+        return status{};
+    }
+    [[nodiscard]] virtual std::chrono::milliseconds command_timeout() const noexcept {
+        return command_timeout_;
+    }
+
     // Runs `sql` with `params` and, on success, stores a new cursor in `*out`.
     // The caller owns it and must delete it (or use `statement_guard`).
     //
@@ -140,6 +197,27 @@ public:
     // A statement with no result cursor (DDL, or a DML the caller does not need
     // to read). Implemented in terms of `query` so a backend only writes one.
     [[nodiscard]] status execute(std::string_view sql, span<const parameter> params);
+
+    // Runs `sql` and returns a cursor that is NOT materialised: `next()` pulls
+    // rows from the channel as the caller reads them, so a large result never
+    // lives in memory at once. A streaming cursor keeps the connection busy until
+    // it is drained or closed, so it must be driven to the end before the
+    // connection is reused.
+    //
+    // The default reports `no_such_method`: a backend opts in, so a caller that
+    // asks for streaming never silently gets a materialised copy (which is exactly
+    // what streaming exists to avoid).
+    [[nodiscard]] virtual status query_streaming(std::string_view sql,
+                                                 span<const parameter> params,
+                                                 result_set** out) {
+        (void)sql;
+        (void)params;
+        if (out != nullptr) {
+            *out = nullptr;
+        }
+        return status{rpc_code::no_such_method,
+                      "this backend does not support streaming result sets"};
+    }
 
     // Runs a stored procedure, writing OUT/INOUT values back into `params`.
     //
@@ -168,6 +246,10 @@ public:
 
 protected:
     connection() = default;
+    // Read by a backend's request path to arm its timeout watchdog. Stored in the
+    // base so the pool layer has one way to discover what a connection was asked
+    // for; a backend that overrides `set_command_timeout` may keep its own copy.
+    std::chrono::milliseconds command_timeout_{0};
 };
 
 // Owns a cursor and deletes it, so a caller can return early without leaking.

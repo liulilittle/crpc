@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <crpc/config.hpp>
+#include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
 #include <crpc/span.hpp>
 
@@ -474,6 +475,10 @@ inline constexpr std::size_t transaction_descriptor_size = 8;
 // Maps a TDS error number to the library code. SQL Server numbers are grouped:
 // 2xx/5xx are permission and object errors, 1205 deadlock, 2601/2627 duplicate key.
 [[nodiscard]] CRPC_API rpc_code map_error_number(std::uint32_t number) noexcept;
+
+// Maps a COLMETADATA wire type byte to the library type family, for ORM metadata
+// and for the streaming reader. Shared by every result decoder.
+[[nodiscard]] CRPC_API db_type tds_column_type(std::uint8_t wire) noexcept;
 
 } // namespace tds
 } // namespace db

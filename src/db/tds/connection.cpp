@@ -11,6 +11,7 @@
 #include <utility>
 
 #include <crpc/db/memory_result_set.hpp>
+#include <crpc/db/result_set_list.hpp>
 
 #include "tls_channel.hpp"
 
@@ -37,47 +38,6 @@ namespace {
         out.clear();
     }
     return out;
-}
-
-// COLMETADATA's wire type byte to the library's type family, for ORM metadata.
-[[nodiscard]] db_type type_of(std::uint8_t wire) noexcept {
-    switch (wire) {
-    case 0x30: // INT1
-    case 0x34: // INT2
-    case 0x38: // INT4
-    case 0x7F: // INT8
-    case 0x26: // INTN
-        return db_type::int64;
-    case 0x32: // BIT
-    case 0x68: // BITN
-        return db_type::boolean;
-    case 0x3B: // FLT4
-    case 0x3E: // FLT8
-    case 0x6D: // FLTN
-        return db_type::real;
-    case 0x6A: // DECIMALN
-    case 0x6C: // NUMERICN
-        return db_type::decimal;
-    case 0x24: // GUID
-        return db_type::uuid;
-    case 0x28: // DATE
-        return db_type::date;
-    case 0x29: // TIME
-        return db_type::time;
-    case 0x2A: // DATETIME2
-    case 0x3D: // DATETIME
-        return db_type::timestamp;
-    case 0xA5: // BIGVARBINARY
-    case 0xAD: // BIGBINARY
-        return db_type::blob;
-    case 0xA7: // BIGVARCHAR
-    case 0xAF: // BIGCHAR
-    case 0xE7: // NVARCHAR
-    case 0xEF: // NCHAR
-        return db_type::text;
-    default:
-        return db_type::unknown;
-    }
 }
 
 [[nodiscard]] constexpr std::uint32_t bit(login_option option) noexcept {
@@ -452,12 +412,11 @@ status connection::perform_handshake() {
 // --- batches -----------------------------------------------------------------
 
 // The reply loop shared by batches and RPCs. It reads until a DONE without the
-// "more results" bit, collecting the first result set and any values the server wrote
-// back. Anything after the first result set is decoded and discarded so the stream
-// stays aligned for the next request -- a reply that is not fully drained
-// desynchronises the session permanently.
+// "more results" bit, collecting every result set and any values the server wrote
+// back. The reply is fully drained so the stream stays aligned for the next request
+// -- a reply that is not fully drained desynchronises the session permanently.
 status connection::read_reply(result_set** out, std::vector<return_value>* written) {
-    std::unique_ptr<memory_result_set> first;
+    std::vector<std::unique_ptr<memory_result_set>> results;
     std::unique_ptr<memory_result_set> current;
     std::int64_t affected = -1;
     rpc_error server_error{rpc_code::ok, {}};
@@ -495,7 +454,7 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 for (const column_meta& source : item.columns) {
                     column_info info;
                     info.name = source.name;
-                    info.type = type_of(source.type);
+                    info.type = tds_column_type(source.type);
                     info.precision = source.precision;
                     info.scale = source.scale;
                     info.nullable = source.nullable;
@@ -548,32 +507,35 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 }
                 break;
             case token::kind::done: {
-                if (item.done.attention()) {
+                const bool stray_ack = item.done.attention() && !attention_pending_.load();
+                if (item.done.attention() && attention_pending_.load()) {
                     // The server acknowledged the ATTENTION: the request was stopped.
                     // Reporting `canceled` is the honest answer even if rows arrived
                     // before it, because the caller asked to stop.
                     attention_seen_ = true;
                 }
-                // Counts accumulate across the statements of one request, and DONE_PROC --
-                // the terminal token of an RPC -- always reports zero. Taking the last
-                // count would therefore report 0 rows for every successful INSERT.
-                if (item.done.has_row_count &&
-                    item.raw_type != static_cast<std::uint8_t>(token_type::done_proc)) {
-                    if (affected < 0) {
-                        affected = 0;
+                if (!stray_ack) {
+                    // Counts accumulate across the statements of one request, and
+                    // DONE_PROC -- the terminal token of an RPC -- always reports zero.
+                    // Taking the last count would therefore report 0 rows for every
+                    // successful INSERT.
+                    if (item.done.has_row_count &&
+                        item.raw_type != static_cast<std::uint8_t>(token_type::done_proc)) {
+                        if (affected < 0) {
+                            affected = 0;
+                        }
+                        affected += static_cast<std::int64_t>(std::min<std::uint64_t>(
+                            item.done.row_count,
+                            static_cast<std::uint64_t>(
+                                std::numeric_limits<std::int64_t>::max())));
                     }
-                    affected += static_cast<std::int64_t>(std::min<std::uint64_t>(
-                        item.done.row_count,
-                        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
-                }
-                if (current) {
-                    current->set_affected_rows(affected);
-                    if (!first) {
-                        first = std::move(current);
+                    if (current) {
+                        current->set_affected_rows(affected);
+                        results.push_back(std::move(current));
                     }
+                    current.reset();
                 }
-                current.reset();
-                if (!item.done.more_results()) {
+                if (!item.done.more_results() && !stray_ack) {
                     // A cancellation is acknowledged in its own message. Stopping at the
                     // first final DONE would leave that acknowledgement in the stream,
                     // and the next request would read it as its own reply -- which is
@@ -607,6 +569,8 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 break;
             }
         }
+        // A stray acknowledgement consumed this message without finishing the reply;
+        // keep reading, the actual reply follows in its own message.
         if (finished) {
             break;
         }
@@ -624,13 +588,52 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
         return server_error;
     }
     if (out != nullptr) {
-        if (first) {
-            *out = first.release();
-        } else {
+        if (results.empty()) {
             // A request with no result set (INSERT, DDL, BEGIN) still reports how many
             // rows it touched, so it gets a cursor with no columns.
-            *out = new memory_result_set({}, affected);
+            results.push_back(std::unique_ptr<memory_result_set>(
+                new memory_result_set({}, affected)));
         }
+        std::unique_ptr<result_set_list> list(new result_set_list());
+        for (std::unique_ptr<memory_result_set>& set : results) {
+            list->add(std::move(set));
+        }
+        *out = list.release();
+    }
+    return status{};
+}
+
+status connection::send_batch(std::string_view sql) {
+    if (in_request_.exchange(true)) {
+        return status{rpc_code::failed_precondition,
+                      "a statement is already running or unread on this connection"};
+    }
+    const std::vector<std::byte> encoded = utf16le(sql);
+    const status sent =
+        send_message(packet_type::sql_batch, span<const std::byte>(encoded.data(), encoded.size()));
+    if (!sent) {
+        in_request_.store(false);
+        return sent;
+    }
+    return status{};
+}
+
+status connection::send_rpc(const rpc_request& request) {
+    if (in_request_.exchange(true)) {
+        return status{rpc_code::failed_precondition,
+                      "a statement is already running or unread on this connection"};
+    }
+    std::vector<std::byte> body;
+    const status encoded = encode_rpc(body, request);
+    if (!encoded) {
+        in_request_.store(false);
+        return encoded;
+    }
+    const status sent =
+        send_message(packet_type::rpc, span<const std::byte>(body.data(), body.size()));
+    if (!sent) {
+        in_request_.store(false);
+        return sent;
     }
     return status{};
 }
@@ -639,10 +642,17 @@ status connection::run_batch(std::string_view sql, result_set** out) {
     if (out != nullptr) {
         *out = nullptr;
     }
+    if (in_request_.exchange(true)) {
+        return status{rpc_code::failed_precondition,
+                      "a statement is already running or unread on this connection"};
+    }
     const std::vector<std::byte> encoded = utf16le(sql);
+    request_timer timer(command_timeout_);
+    timer.arm(*this);
     // Marked before the bytes go out: a cancel arriving between the write and the flag
     // would otherwise see an idle session, skip waiting for the acknowledgement, and
-    // leave it to be read as the next reply.
+    // leave it to be read as the next reply. (The exchange above already claimed the
+    // slot; the flag that `cancel()` reads is this one.)
     in_request_.store(true);
     const status sent =
         send_message(packet_type::sql_batch, span<const std::byte>(encoded.data(), encoded.size()));
@@ -651,7 +661,10 @@ status connection::run_batch(std::string_view sql, result_set** out) {
         return sent;
     }
     const status done = read_reply(out, nullptr);
+    // Clear the in-flight marker before stopping the watchdog, so a watchdog that
+    // fires in the same instant sees an idle session and sends nothing.
     in_request_.store(false);
+    timer.disarm();
     return done;
 }
 
@@ -660,11 +673,18 @@ status connection::run_rpc(const rpc_request& request, result_set** out,
     if (out != nullptr) {
         *out = nullptr;
     }
+    if (in_request_.exchange(true)) {
+        return status{rpc_code::failed_precondition,
+                      "a statement is already running or unread on this connection"};
+    }
     std::vector<std::byte> body;
     const status encoded = encode_rpc(body, request);
     if (!encoded) {
+        in_request_.store(false);
         return encoded;
     }
+    request_timer timer(command_timeout_);
+    timer.arm(*this);
     in_request_.store(true);
     const status sent =
         send_message(packet_type::rpc, span<const std::byte>(body.data(), body.size()));
@@ -674,6 +694,7 @@ status connection::run_rpc(const rpc_request& request, result_set** out,
     }
     const status done = read_reply(out, written);
     in_request_.store(false);
+    timer.disarm();
     return done;
 }
 
@@ -751,6 +772,69 @@ status connection::rollback() {
     }
     in_transaction_ = false;
     return status{};
+}
+
+status connection::begin(isolation_level level) {
+    if (level == isolation_level::unspecified) {
+        return begin();
+    }
+    // One batch keeps the level and the transaction coherent: the SET applies to a
+    // transaction started afterwards, so it must precede BEGIN.
+    const std::string sql = std::string("SET TRANSACTION ISOLATION LEVEL ") +
+                            to_string(level) + "; BEGIN TRANSACTION";
+    result_set* set = nullptr;
+    const status ran = query(sql, {}, &set);
+    statement_guard guard(set);
+    if (!ran) {
+        return ran;
+    }
+    in_transaction_ = true;
+    return status{};
+}
+
+// --- request timeout ---------------------------------------------------------
+
+connection::request_timer::~request_timer() { disarm(); }
+
+void connection::request_timer::arm(connection& owner) {
+    if (timeout_ <= std::chrono::milliseconds::zero() || armed_.load()) {
+        return;
+    }
+    owner_ = &owner;
+    armed_.store(true);
+    worker_ = std::thread([this] {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const bool timed_out = !cv_.wait_for(lock, timeout_, [this] { return stopped_; });
+        if (timed_out && !stopped_ && owner_ != nullptr) {
+            fired_.store(true);
+            (void)owner_->cancel_inflight();
+        }
+    });
+}
+
+void connection::request_timer::disarm() noexcept {
+    if (!armed_.load()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopped_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+    armed_.store(false);
+}
+
+status connection::cancel_inflight() {
+    if (!in_request_.load()) {
+        // The request ended before the watchdog fired; there is nothing to stop and,
+        // crucially, nothing to wait for. Writing an ATTENTION here would leave an
+        // orphaned acknowledgement that the next reply would have to swallow.
+        return status{};
+    }
+    return cancel();
 }
 
 namespace {
@@ -1021,6 +1105,90 @@ void put_le64_bytes(std::vector<std::byte>& out, std::uint64_t value) {
     return status{};
 }
 
+// TDS addresses parameters by name; a caller's "sum" means "@sum" on the wire.
+[[nodiscard]] std::string_view strip_at(std::string_view name) noexcept {
+    return !name.empty() && name.front() == '@' ? name.substr(1) : name;
+}
+
+[[nodiscard]] char ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+[[nodiscard]] bool is_identifier_char(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '#' || c == '$';
+}
+
+// Collects the `@name` tokens that appear outside strings and comments, lowercased
+// and without the leading `@`. A `@@` pair (a system variable such as @@SPID) is
+// not a bound parameter and is skipped. This is what lets a named parameter bind
+// to the exact marker the caller wrote, case-insensitively, without rewriting the
+// statement.
+[[nodiscard]] std::vector<std::string> collect_at_identifiers(std::string_view sql) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < sql.size()) {
+        const char c = sql[i];
+        if (c == '\'' || c == '"' || c == '[') {
+            const char closing = c == '[' ? ']' : c;
+            ++i;
+            while (i < sql.size()) {
+                if (c != '[' && sql[i] == '\\' && i + 1 < sql.size()) {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == closing) {
+                    if (i + 1 < sql.size() && sql[i + 1] == closing) {
+                        i += 2;
+                        continue;
+                    }
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            while (i < sql.size() && sql[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                ++i;
+            }
+            i = i + 2 <= sql.size() ? i + 2 : sql.size();
+            continue;
+        }
+        if (c == '@') {
+            if (i + 1 >= sql.size() || !is_identifier_char(sql[i + 1])) {
+                ++i;
+                continue;
+            }
+            // @@system is not a bound parameter.
+            if (i + 2 < sql.size() && sql[i + 1] == '@') {
+                ++i;
+                continue;
+            }
+            ++i;
+            std::string name;
+            while (i < sql.size() && is_identifier_char(sql[i])) {
+                name.push_back(ascii_lower(sql[i]));
+                ++i;
+            }
+            if (!name.empty()) {
+                out.push_back(std::move(name));
+            }
+            continue;
+        }
+        ++i;
+    }
+    return out;
+}
+
 // Applies a value the server wrote back to the caller's parameter, in the type the
 // caller declared.
 void apply_return_value(const return_value& value, parameter& target) {
@@ -1056,9 +1224,9 @@ void apply_return_value(const return_value& value, parameter& target) {
 
 } // namespace
 
-status connection::call_impl(std::string_view sql, span<const parameter> params,
-                             result_set** out, bool procedure,
-                             std::vector<return_value>& written) {
+status connection::build_request(std::string_view sql, span<const parameter> params,
+                                 bool procedure, rpc_request& request) {
+    request = rpc_request{};
     std::vector<encoded_parameter> encoded;
     encoded.reserve(params.size());
     for (const parameter& param : params) {
@@ -1069,7 +1237,6 @@ status connection::call_impl(std::string_view sql, span<const parameter> params,
         encoded.push_back(std::move(one.value()));
     }
 
-    rpc_request request;
     if (procedure) {
         request.proc_name = std::string(sql);
         for (std::size_t i = 0; i < encoded.size(); ++i) {
@@ -1087,24 +1254,57 @@ status connection::call_impl(std::string_view sql, span<const parameter> params,
             request.params.push_back(std::move(wire));
         }
     } else {
-        // sp_executesql: @stmt, @params, then the bound values. The statement's `?`
-        // markers become @P1..@Pn so the text and the declaration agree.
+        // sp_executesql: @stmt, @params, then the bound values. Positional `?`
+        // markers become @P1..@Pn so the text and the declaration agree; a named
+        // parameter's `@name` is left where the caller wrote it and declared under
+        // the same name, so the text and the declaration agree the other way.
+        const bool named = !params.empty() && !params[0].name.empty();
         std::string statement;
-        const status bound = bind_placeholders(sql, params.size(), statement);
-        if (!bound) {
-            return bound;
-        }
         std::string declaration;
-        for (std::size_t i = 0; i < encoded.size(); ++i) {
-            if (i != 0) {
-                declaration.push_back(',');
+        if (named) {
+            statement.assign(sql);
+            // Every declared parameter must actually appear in the text, or the
+            // declaration binds a value to nothing and the server errors out halfway
+            // through. Case-insensitive: T-SQL parameters are case-insensitive.
+            const std::vector<std::string> used = collect_at_identifiers(sql);
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                std::string key(strip_at(params[i].name));
+                for (char& ch : key) {
+                    ch = ascii_lower(ch);
+                }
+                const bool found = std::find(used.begin(), used.end(), key) != used.end();
+                if (!found) {
+                    return status{rpc_code::invalid_argument,
+                                  "named parameter @" + key +
+                                      " does not appear in the statement"};
+                }
+                if (i != 0) {
+                    declaration.push_back(',');
+                }
+                declaration.push_back('@');
+                declaration += key;
+                declaration.push_back(' ');
+                declaration += encoded[i].declaration;
+                if (params[i].is_output()) {
+                    declaration += " OUTPUT";
+                }
             }
-            declaration += "@P";
-            declaration += std::to_string(i + 1);
-            declaration.push_back(' ');
-            declaration += encoded[i].declaration;
-            if (params[i].is_output()) {
-                declaration += " OUTPUT";
+        } else {
+            const status bound = bind_placeholders(sql, params.size(), statement);
+            if (!bound) {
+                return bound;
+            }
+            for (std::size_t i = 0; i < encoded.size(); ++i) {
+                if (i != 0) {
+                    declaration.push_back(',');
+                }
+                declaration += "@P";
+                declaration += std::to_string(i + 1);
+                declaration.push_back(' ');
+                declaration += encoded[i].declaration;
+                if (params[i].is_output()) {
+                    declaration += " OUTPUT";
+                }
             }
         }
 
@@ -1126,7 +1326,11 @@ status connection::call_impl(std::string_view sql, span<const parameter> params,
 
         for (std::size_t i = 0; i < encoded.size(); ++i) {
             rpc_parameter wire;
-            wire.name = "@P" + std::to_string(i + 1);
+            if (named) {
+                wire.name = "@" + std::string(strip_at(params[i].name));
+            } else {
+                wire.name = "@P" + std::to_string(i + 1);
+            }
             wire.status = params[i].is_output() ? 0x01 : 0x00;
             wire.info = encoded[i].info;
             wire.value = std::move(encoded[i].value);
@@ -1135,6 +1339,17 @@ status connection::call_impl(std::string_view sql, span<const parameter> params,
         }
     }
 
+    return status{};
+}
+
+status connection::call_impl(std::string_view sql, span<const parameter> params,
+                             result_set** out, bool procedure,
+                             std::vector<return_value>& written) {
+    rpc_request request;
+    const status built = build_request(sql, params, procedure, request);
+    if (!built) {
+        return built;
+    }
     return run_rpc(request, out, &written);
 }
 
@@ -1287,6 +1502,24 @@ status connection::query(std::string_view sql, span<const parameter> params, res
             return status{rpc_code::invalid_argument,
                           "query() cannot return an output parameter; use call()"};
         }
+    }
+    // Named and positional binding are two different agreements with the server:
+    // `@name` stays in the text and is declared by name, `?` is rewritten to
+    // @P1..@Pn. Mixing them binds a value to a marker the caller never wrote, so
+    // it is refused before anything reaches the wire.
+    bool any_named = false;
+    bool all_named = true;
+    for (const parameter& param : params) {
+        if (param.name.empty()) {
+            all_named = false;
+        } else {
+            any_named = true;
+        }
+    }
+    if (any_named && !all_named) {
+        return status{rpc_code::invalid_argument,
+                      "cannot mix named and positional parameters; "
+                      "name every parameter or leave every name empty"};
     }
     std::vector<return_value> ignored;
     return call_impl(sql, params, out, false, ignored);
