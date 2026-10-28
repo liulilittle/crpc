@@ -1,6 +1,7 @@
 // CRPC Redis -- asynchronous client facade.
 #include <crpc/redis/client.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,12 +46,38 @@ private:
 };
 
 // Returns a pooled connection to its pool when the enclosing scope ends, so an
-// early return cannot leak a checked-out connection.
+// early return cannot leak a checked-out connection. The release thunk is a
+// function pointer into `client::impl`, which is private; the guard itself
+// therefore never names the type.
 struct pooled_connection {
-    connection_pool& pool;
     std::shared_ptr<connection> conn;
-    ~pooled_connection() { pool.release(std::move(conn)); }
+    void (*release_fn)(void* ctx, std::shared_ptr<connection>) = nullptr;
+    void* ctx = nullptr;
+    ~pooled_connection() {
+        if (conn != nullptr && release_fn != nullptr) {
+            release_fn(ctx, std::move(conn));
+        }
+    }
 };
+
+// True for the transport-level failures that mean "the current master endpoint
+// did not answer": connection refused/reset, broken pipe, EOF, deadline and
+// `unavailable`. They are the codes mapped to `unavailable` while the pool is
+// mid-switch. A Redis error reply is a successful `result`, so it never
+// reaches this predicate.
+bool is_master_unreachable(rpc_code code) noexcept {
+    switch (code) {
+    case rpc_code::connection_refused:
+    case rpc_code::connection_reset:
+    case rpc_code::broken_pipe:
+    case rpc_code::eof:
+    case rpc_code::deadline_exceeded:
+    case rpc_code::unavailable:
+        return true;
+    default:
+        return false;
+    }
+}
 
 // Turns a command reply into a health status: a transport failure or a Redis
 // error reply is a failure, a well-formed reply is success.
@@ -137,10 +164,47 @@ result<hello_info> negotiate_resp3(connection& conn) {
 } // namespace
 
 struct client::impl {
+    // One pool generation: the connections aimed at one master endpoint. A
+    // generation is immutable once created; a master switch swaps in a fresh one
+    // and retires the old (its pool is closed, so further acquires are refused
+    // and a later release drops the connection instead of re-lending it).
+    struct pool_state {
+        connection_pool pool;
+        endpoint ep;
+        // Set when this generation was replaced by a newer one.
+        std::atomic<bool> retired{false};
+        // False from creation (a redirect) until the master answers one command,
+        // i.e. while the pool is "switching" and the new master is unconfirmed.
+        std::atomic<bool> ready{true};
+
+        pool_state(const pool_config& cfg, crpc::backend_factory& backend,
+                   runtime* rt, endpoint target)
+            : pool(pool_config_for(cfg, target), backend, rt),
+              ep(std::move(target)) {}
+    };
+
+    // A checked-out connection plus the generation that lent it. Release routes
+    // the connection through its own generation, so a switch can never make an
+    // old-master link available again.
+    struct acquire_result {
+        std::shared_ptr<connection> conn;
+        std::shared_ptr<pool_state> state;
+    };
+
     options opts;
     crpc::backend_factory& backend;
     runtime* shard;
-    connection_pool pool;
+
+    // Guards `active`, the ownership map and the switch counters.
+    mutable std::mutex pool_mutex;
+    std::shared_ptr<pool_state> active;
+    // Lent connection -> owning generation. Only touched under `pool_mutex`.
+    std::unordered_map<const connection*, std::shared_ptr<pool_state>> owners;
+
+    std::uint64_t switch_count = 0;
+    std::uint64_t rejected_during_switch = 0;
+    std::chrono::steady_clock::time_point last_switch{};
+    std::atomic<bool> closed{false};
 
     // RESP3 negotiation state. `negotiated` maps a live connection to the link
     // generation at which `HELLO 3` was last sent; the weak_ptr guard tells a
@@ -155,18 +219,55 @@ struct client::impl {
 
     impl(options o, crpc::backend_factory& b, runtime* rt)
         : opts(std::move(o)), backend(b), shard(rt),
-          pool(opts.pool, backend, shard) {}
+          active(std::make_shared<pool_state>(opts.pool, backend, shard,
+                                              opts.pool.connection.ep)) {}
 
-    // Ensures `conn` runs the requested RESP dialect. RESP2 needs no handshake
-    // and is a no-op. RESP3 sends `HELLO 3` once per connection link
-    // generation; a later acquire of the same live link skips the round trip.
+    static pool_config pool_config_for(const pool_config& base,
+                                       const endpoint& target) {
+        pool_config cfg = base;
+        cfg.connection.ep = target;
+        return cfg;
+    }
+
+    static sentinel_address address_of(const endpoint& ep) {
+        if (ep.type() == endpoint::kind::tcp) {
+            return sentinel_address{ep.host(), ep.port()};
+        }
+        if (ep.type() == endpoint::kind::inproc) {
+            return sentinel_address{ep.name(), 0};
+        }
+        return sentinel_address{};
+    }
+
+    // Lends a connection from the active generation. When the generation this
+    // call read was retired before (or while) it acquired -- a request that
+    // arrived inside the switch window -- the acquire retries once on the newest
+    // generation, so the request is served from the new master or fails, never
+    // from the old master.
+    result<acquire_result> acquire_pooled();
+
+    void release_connection(std::shared_ptr<connection> conn);
+
+    // The redirect implementation: repoints the pool. Public `client::redirect`
+    // delegates here; the Sentinel-handler lambda in `follow()` calls the
+    // `sentinel_address` overload directly.
+    status redirect(const sentinel_address& new_master);
+    status redirect(const endpoint& new_endpoint);
+
+    static void release_thunk(void* ctx, std::shared_ptr<connection> conn) {
+        static_cast<impl*>(ctx)->release_connection(std::move(conn));
+    }
+
+    // Post-command bookkeeping. A round trip proves the master answered, so the
+    // generation becomes ready (the switch window closes). While a generation is
+    // unconfirmed, a transport failure is a switch rejection -- counted and
+    // surfaced as `unavailable`, never served from the old master.
+    status settle_switch(result<resp_value>& reply,
+                         const std::shared_ptr<pool_state>& state);
+
     result<hello_info> ensure_negotiated(const std::shared_ptr<connection>& conn,
                                          resp_protocol protocol);
-    // Acquires a pooled connection and, for RESP3, negotiates it before handing
-    // it out. A negotiation failure closes the acquired connection and returns
-    // it to the pool (which drops a closed link), so a refused session cannot
-    // linger as a silent RESP2 fallback.
-    result<std::shared_ptr<connection>> acquire_negotiated(resp_protocol protocol);
+    result<acquire_result> acquire_negotiated(resp_protocol protocol);
     result<resp_value> execute_over_pool(resp_protocol protocol,
                                          const resp_command& cmd);
     result<std::vector<resp_value>> execute_batch_over_pool(
@@ -204,16 +305,112 @@ result<hello_info> client::impl::ensure_negotiated(
     return info;
 }
 
-result<std::shared_ptr<connection>> client::impl::acquire_negotiated(
-    resp_protocol protocol) {
-    result<std::shared_ptr<connection>> acquired = pool.acquire();
+result<client::impl::acquire_result> client::impl::acquire_pooled() {
+    std::shared_ptr<pool_state> state;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (closed.load(std::memory_order_acquire)) {
+            return rpc_error{rpc_code::shutting_down, "client is closed"};
+        }
+        state = active;
+    }
+
+    result<std::shared_ptr<connection>> acquired = state->pool.acquire();
+    if (!acquired && acquired.code() == rpc_code::shutting_down &&
+        state->retired.load(std::memory_order_acquire)) {
+        // The generation was retired while this call was in flight: the request
+        // arrived inside the switch window. Re-read the active generation and
+        // lend from it, so the request lands on the new master instead of
+        // failing -- or reports `unavailable` when the new pool cannot help.
+        std::shared_ptr<pool_state> current;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            if (closed.load(std::memory_order_acquire)) {
+                return rpc_error{rpc_code::shutting_down, "client is closed"};
+            }
+            current = active;
+        }
+        if (current == state) {
+            // No newer generation exists: this is client shutdown, not a switch.
+            return acquired.error();
+        }
+        state = current;
+        acquired = state->pool.acquire();
+        if (!acquired) {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            ++rejected_during_switch;
+            return rpc_error{rpc_code::unavailable,
+                             "request rejected during master switch: the new "
+                                 "master pool could not lend a connection"};
+        }
+    }
     if (!acquired) {
         return acquired.error();
     }
-    result<hello_info> handshake = ensure_negotiated(acquired.value(), protocol);
+
+    std::shared_ptr<connection> conn = std::move(acquired).value();
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    owners[conn.get()] = state;
+    return acquire_result{std::move(conn), state};
+}
+
+void client::impl::release_connection(std::shared_ptr<connection> conn) {
+    if (!conn) {
+        return;
+    }
+    std::shared_ptr<pool_state> owner;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        const auto it = owners.find(conn.get());
+        if (it != owners.end()) {
+            owner = it->second;
+            owners.erase(it);
+        }
+    }
+    if (owner == nullptr) {
+        // Not lent by this client (a foreign handle or an unknown link). Close
+        // it rather than risk a stale connection leaking into a generation.
+        conn->close();
+        return;
+    }
+    // A retired generation's pool is closed, so `release` drops the connection
+    // (closing it) instead of re-lending it; the active generation pools it.
+    owner->pool.release(std::move(conn));
+}
+
+status client::impl::settle_switch(
+    result<resp_value>& reply, const std::shared_ptr<pool_state>& state) {
+    if (reply.ok()) {
+        state->ready.store(true, std::memory_order_release);
+        return status{};
+    }
+    if (!state->ready.load(std::memory_order_acquire) &&
+        is_master_unreachable(reply.code())) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        ++rejected_during_switch;
+        return status{rpc_code::unavailable,
+                      "request rejected during master switch: new master "
+                          + state->ep.to_string() + " did not answer ("
+                          + reply.error().message + ")"};
+    }
+    // A non-transport failure (for example a refused RESP3 handshake) proves the
+    // endpoint answered, so the switch window is over.
+    state->ready.store(true, std::memory_order_release);
+    return status{reply.code(), reply.error().message};
+}
+
+result<client::impl::acquire_result> client::impl::acquire_negotiated(
+    resp_protocol protocol) {
+    result<acquire_result> acquired = acquire_pooled();
+    if (!acquired) {
+        return acquired.error();
+    }
+    result<hello_info> handshake =
+        ensure_negotiated(acquired.value().conn, protocol);
     if (!handshake) {
-        acquired.value()->close();
-        pool.release(acquired.value());
+        std::shared_ptr<connection> refused = std::move(acquired.value().conn);
+        refused->close();
+        release_connection(std::move(refused));
         return handshake.error();
     }
     return acquired;
@@ -221,14 +418,20 @@ result<std::shared_ptr<connection>> client::impl::acquire_negotiated(
 
 result<resp_value> client::impl::execute_over_pool(resp_protocol protocol,
                                                    const resp_command& cmd) {
-    result<std::shared_ptr<connection>> acquired = acquire_negotiated(protocol);
+    result<acquire_result> acquired = acquire_negotiated(protocol);
     if (!acquired) {
         return acquired.error();
     }
-    pooled_connection guard{pool, std::move(acquired).value()};
+    std::shared_ptr<pool_state> state = acquired.value().state;
+    pooled_connection guard{std::move(acquired).value().conn, &client::impl::release_thunk, this};
     command_channel channel(*guard.conn);
     channel.set_protocol(protocol);
-    return channel.execute(cmd);
+    result<resp_value> reply = channel.execute(cmd);
+    const status settled = settle_switch(reply, state);
+    if (!settled.ok()) {
+        return rpc_error{settled.code(), settled.message()};
+    }
+    return reply;
 }
 
 result<std::vector<resp_value>> client::impl::execute_batch_over_pool(
@@ -236,37 +439,59 @@ result<std::vector<resp_value>> client::impl::execute_batch_over_pool(
     if (commands.empty()) {
         return std::vector<resp_value>{};
     }
-    result<std::shared_ptr<connection>> acquired = acquire_negotiated(protocol);
+    result<acquire_result> acquired = acquire_negotiated(protocol);
     if (!acquired) {
         return acquired.error();
     }
-    pooled_connection guard{pool, std::move(acquired).value()};
+    std::shared_ptr<pool_state> state = acquired.value().state;
+    pooled_connection guard{std::move(acquired).value().conn, &client::impl::release_thunk, this};
     command_channel channel(*guard.conn);
     channel.set_protocol(protocol);
-    return channel.execute_batch(commands);
+    result<std::vector<resp_value>> replies = channel.execute_batch(commands);
+    if (!replies.ok()) {
+        result<resp_value> folded =
+            rpc_error{replies.code(), replies.error().message};
+        const status settled = settle_switch(folded, state);
+        return rpc_error{settled.code(), settled.message()};
+    }
+    state->ready.store(true, std::memory_order_release);
+    return replies;
 }
 
 client::client(options opts, crpc::backend_factory& backend, runtime* shard)
-    : impl_(std::make_unique<impl>(std::move(opts), backend, shard)) {}
+    : impl_(std::make_shared<impl>(std::move(opts), backend, shard)) {}
 
 client::~client() = default;
 
 status client::connect() {
-    result<std::shared_ptr<connection>> acquired =
+    result<impl::acquire_result> acquired =
         impl_->acquire_negotiated(impl_->opts.protocol);
     if (!acquired) {
         return status{acquired.error()};
     }
-    std::shared_ptr<connection> conn = std::move(acquired).value();
+    std::shared_ptr<impl::pool_state> state = acquired.value().state;
+    std::shared_ptr<connection> conn = std::move(acquired).value().conn;
     command_channel channel(*conn);
     channel.set_protocol(impl_->opts.protocol);
     result<resp_value> reply = channel.execute(resp_command{"PING"});
-    impl_->pool.release(std::move(conn));
+    impl_->release_connection(std::move(conn));
+    const status settled = impl_->settle_switch(reply, state);
+    if (!settled.ok()) {
+        return settled;
+    }
     return classify(reply);
 }
 
 void client::close() noexcept {
-    impl_->pool.close();
+    std::shared_ptr<impl::pool_state> current;
+    {
+        std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+        impl_->closed.store(true, std::memory_order_release);
+        current = impl_->active;
+    }
+    if (current != nullptr) {
+        current->pool.close();
+    }
     try {
         std::lock_guard<std::mutex> lock(impl_->negotiate_mutex);
         impl_->negotiated.clear();
@@ -276,16 +501,24 @@ void client::close() noexcept {
     }
 }
 
-bool client::is_open() const noexcept { return impl_->pool.total() > 0; }
+bool client::is_open() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    return impl_->active != nullptr && impl_->active->pool.total() > 0;
+}
 
 status client::health_check() { return classify(ping()); }
 
 result<std::shared_ptr<connection>> client::acquire() {
-    return impl_->acquire_negotiated(impl_->opts.protocol);
+    result<impl::acquire_result> acquired =
+        impl_->acquire_negotiated(impl_->opts.protocol);
+    if (!acquired) {
+        return acquired.error();
+    }
+    return std::move(acquired).value().conn;
 }
 
 void client::release(std::shared_ptr<connection> conn) {
-    impl_->pool.release(std::move(conn));
+    impl_->release_connection(std::move(conn));
 }
 
 hello_info client::hello() const {
@@ -293,11 +526,104 @@ hello_info client::hello() const {
     return impl_->last_hello;
 }
 
-std::size_t client::idle() const noexcept { return impl_->pool.idle(); }
+std::size_t client::idle() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    return impl_->active != nullptr ? impl_->active->pool.idle() : std::size_t{0};
+}
 
-std::size_t client::in_use() const noexcept { return impl_->pool.in_use(); }
+std::size_t client::in_use() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    return impl_->active != nullptr ? impl_->active->pool.in_use()
+                                    : std::size_t{0};
+}
 
-std::size_t client::total() const noexcept { return impl_->pool.total(); }
+std::size_t client::total() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    return impl_->active != nullptr ? impl_->active->pool.total() : std::size_t{0};
+}
+
+status client::impl::redirect(const sentinel_address& new_master) {
+    if (!new_master.valid()) {
+        return status{rpc_code::invalid_argument,
+                      "redirect requires a host and a non-zero port"};
+    }
+    return redirect(endpoint::tcp(new_master.host, new_master.port));
+}
+
+status client::impl::redirect(const endpoint& new_endpoint) {
+    if (!new_endpoint.valid()) {
+        return status{rpc_code::invalid_argument,
+                      "redirect requires a valid endpoint"};
+    }
+    std::shared_ptr<pool_state> retired_gen;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (closed.load(std::memory_order_acquire)) {
+            return status{rpc_code::shutting_down, "client is closed"};
+        }
+        // Idempotent: the address the pool already points at is not a switch.
+        if (active->ep == new_endpoint) {
+            return status{};
+        }
+        retired_gen = std::move(active);
+        active = std::make_shared<pool_state>(opts.pool, backend, shard,
+                                              new_endpoint);
+        // The new master is unconfirmed until it answers a command: the switch
+        // window is open from here on, so transport failures are surfaced as
+        // `unavailable` instead of being served from the old master.
+        active->ready.store(false, std::memory_order_release);
+        ++switch_count;
+        last_switch = std::chrono::steady_clock::now();
+        retired_gen->retired.store(true, std::memory_order_release);
+        // Stop lending old-master connections now: every idle link is closed and
+        // a connection returned later is dropped by the closed pool.
+        retired_gen->pool.close();
+    }
+    return status{};
+}
+
+status client::redirect(const sentinel_address& new_master) {
+    return impl_->redirect(new_master);
+}
+
+status client::redirect(const endpoint& new_endpoint) {
+    return impl_->redirect(new_endpoint);
+}
+
+bool client::follow(sentinel& target, const std::string& master_name) {
+    if (master_name.empty()) {
+        return false;
+    }
+    const std::weak_ptr<impl> weak = impl_;
+    target.set_event_handler([weak, master_name](const sentinel_event& event) {
+        if (event.type != sentinel_event_type::master_switch ||
+            event.master_name != master_name) {
+            return;
+        }
+        if (const std::shared_ptr<impl> state = weak.lock()) {
+            (void)state->redirect(event.master);
+        }
+    });
+    return true;
+}
+
+switch_stats client::stats() const {
+    std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+    switch_stats out;
+    if (impl_->active != nullptr) {
+        out.master = impl::address_of(impl_->active->ep);
+        out.switching =
+            !impl_->active->ready.load(std::memory_order_acquire);
+    }
+    out.switch_count = impl_->switch_count;
+    out.rejected_during_switch = impl_->rejected_during_switch;
+    out.last_switch = impl_->last_switch;
+    return out;
+}
+
+sentinel_address client::master() const { return stats().master; }
+
+bool client::switching() const noexcept { return stats().switching; }
 
 result<resp_value> client::execute(const resp_command& cmd) {
     return impl_->execute_over_pool(impl_->opts.protocol, cmd);
@@ -531,3 +857,4 @@ result<resp_value> client::zscore(std::string key, std::string member) {
 
 } // namespace redis
 } // namespace crpc
+

@@ -34,6 +34,7 @@
 #include <crpc/redis/connection.hpp>
 #include <crpc/redis/pipeline.hpp>
 #include <crpc/redis/resp.hpp>
+#include <crpc/redis/sentinel.hpp>
 
 namespace crpc {
 namespace redis {
@@ -49,6 +50,29 @@ struct hello_info {
     std::int64_t proto = 0;
     std::string mode;
     std::string role;
+};
+
+// A point-in-time view of the pool's master-tracking state: where the pool is
+// pointed, whether a master switch is pending, and the counters a switch
+// produces. `master` mirrors `sentinel_address` of the current endpoint (a TCP
+// host/port, or the in-process transport name with port 0). Returned by value
+// like `hello_info`, so the layout comes from this header on both sides of a
+// shared boundary.
+struct switch_stats {
+    sentinel_address master;
+    // True while the pool is mid-switch: `redirect()` has repointed the pool and
+    // the new master has not yet answered a command. Requests that fail at the
+    // transport level during this window return `unavailable` and bump
+    // `rejected_during_switch`; they are never served from the old master.
+    bool switching = false;
+    // Successful redirects (an identical re-notification is not a switch).
+    std::uint64_t switch_count = 0;
+    // Requests rejected because they arrived during a switch window and the new
+    // master did not answer.
+    std::uint64_t rejected_during_switch = 0;
+    // Time of the most recent redirect, or the default time point when no
+    // redirect has happened yet.
+    std::chrono::steady_clock::time_point last_switch{};
 };
 
 // A high-level asynchronous Redis client: a connection pool plus a typed
@@ -114,6 +138,55 @@ public:
     // this endpoint's connections. Empty until a RESP3 client negotiates; see
     // `hello_info`.
     [[nodiscard]] hello_info hello() const;
+
+    // --- Sentinel-aware master redirection -----------------------------------
+
+    // Repoints the whole pool at `new_master`. This is the receiving half of
+    // the Sentinel bridge: wire a `sentinel::master_switch` event handler (or
+    // use `follow()`) to call it with the new master address.
+    //
+    // Semantics of a switch:
+    //   * the generation of connections aimed at the old master is retired
+    //     immediately -- its idle connections are closed and a connection a
+    //     caller returns afterwards is closed, never re-lent, so no new request
+    //     observes an old-master link;
+    //   * commands already in flight on a connection the caller holds complete
+    //     normally (they were accepted before the switch);
+    //   * the next acquire builds a fresh connection to the new endpoint, and a
+    //     RESP3 client negotiates `HELLO 3` on it before use;
+    //   * until the new master answers one command, the pool is "switching": a
+    //     request that fails at the transport level returns `unavailable` and
+    //     is counted in `switch_stats::rejected_during_switch`. It is never
+    //     silently served from the old master.
+    // Idempotent: a redirect to the endpoint already in use is a no-op and does
+    // not rebuild the pool. Thread-safe and non-blocking. An empty host/port is
+    // `invalid_argument`; a redirect after `close()` is `shutting_down`.
+    status redirect(const sentinel_address& new_master);
+
+    // Same as above, speaking the transport's own endpoint type. The Sentinel
+    // overload is sugar for `endpoint::tcp(host, port)`; a caller that manages
+    // endpoints directly (for example the in-process test transport) uses this.
+    status redirect(const endpoint& new_endpoint);
+
+    // Registers this client as the Sentinel `master_switch` handler for
+    // `master_name`: every such event emitted by `target` calls
+    // `redirect(event.master)`. It takes over the sentinel's single handler
+    // slot (see `sentinel::set_event_handler`), so a second `follow` on the
+    // same sentinel replaces the first. The handler keeps a weak reference to
+    // the client, so destroying the client before the sentinel is safe; the
+    // sentinel must outlive the client's use of `follow` (a destroyed sentinel
+    // simply stops emitting). Returns false when `target` cannot receive a
+    // handler (null) or `master_name` is empty.
+    bool follow(sentinel& target, const std::string& master_name = "mymaster");
+
+    // Snapshot of the master-tracking state (address, switch counters).
+    [[nodiscard]] switch_stats stats() const;
+
+    // The endpoint the pool currently points at (`stats().master`).
+    [[nodiscard]] sentinel_address master() const;
+
+    // True while a redirect is pending confirmation (`stats().switching`).
+    [[nodiscard]] bool switching() const noexcept;
 
     // Pool observability.
     [[nodiscard]] std::size_t idle() const noexcept;
@@ -203,8 +276,12 @@ public:
     [[nodiscard]] result<resp_value> zscore(std::string key, std::string member);
 
 private:
+    // Shared, not unique: `follow()` hands the Sentinel a weak reference so an
+    // event that fires after the client is destroyed is dropped instead of
+    // dereferencing a dead object. The client is non-copyable/non-movable, so
+    // the shared_ptr cannot be duplicated through the public interface.
     struct impl;
-    std::unique_ptr<impl> impl_;
+    std::shared_ptr<impl> impl_;
 };
 
 } // namespace redis
