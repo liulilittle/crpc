@@ -377,6 +377,7 @@ is guarded.
 - `::crpc::redis::zset_type`
 - `::crpc::resilience::call_traits`
 - `::crpc::resilience::instance`
+- `::crpc::resilience::retry_policy`
 - `::crpc::resilience::smart_policy`
 
 These records are governed only by the policy in section 7 (any change to a
