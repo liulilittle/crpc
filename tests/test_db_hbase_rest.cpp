@@ -185,6 +185,103 @@ CRPC_TEST(hbase_path_segment_escapes_everything_but_unreserved) {
                   crpc::db::hbase::encode_path_segment(view_of(bytes_of("A-z_0.9~"))));
 }
 
+// The gateway's ScannerModel takes `filter` as a *string* whose contents are themselves a
+// JSON document (see the probe recorded in rest.cpp). These cases pin the exact bytes, because
+// a nested object or an unescaped string is refused by the server with a bare 400/500.
+CRPC_TEST(hbase_scan_filter_encodes_the_gateway_string_form) {
+    using crpc::db::hbase::compare_operator;
+    using crpc::db::hbase::scan_filter;
+
+    const auto row = scan_filter::row_prefix(view_of(bytes_of("f03")));
+    const auto row_json = crpc::db::hbase::encode_scan_filter(row);
+    CRPC_CHECK(static_cast<bool>(row_json));
+    if (row_json) {
+        CRPC_CHECK_EQ(std::string("{\"type\":\"PrefixFilter\",\"value\":\"ZjAz\"}"),
+                      row_json.value());
+    }
+
+    const auto column = scan_filter::column_prefix("name");
+    const auto column_json = crpc::db::hbase::encode_scan_filter(column);
+    CRPC_CHECK(static_cast<bool>(column_json));
+    if (column_json) {
+        CRPC_CHECK_EQ(std::string("{\"type\":\"ColumnPrefixFilter\",\"value\":\"bmFtZQ==\"}"),
+                      column_json.value());
+    }
+
+    // The field names are `op` and `ifMissing`, not `compareOp`/`filterIfMissing`: the
+    // gateway answers 400 for the latter, which was the first shape tried against it.
+    const auto value = scan_filter::column_value("cf", "n", compare_operator::greater_or_equal,
+                                                 view_of(bytes_of("7")), false);
+    const auto value_json = crpc::db::hbase::encode_scan_filter(value);
+    CRPC_CHECK(static_cast<bool>(value_json));
+    if (value_json) {
+        CRPC_CHECK_EQ(
+            std::string("{\"type\":\"SingleColumnValueFilter\",\"family\":\"Y2Y=\","
+                        "\"qualifier\":\"bg==\",\"op\":\"GREATER_OR_EQUAL\","
+                        "\"comparator\":{\"type\":\"BinaryComparator\",\"value\":\"Nw==\"},"
+                        "\"ifMissing\":false}"),
+            value_json.value());
+    }
+
+    // A family is mandatory for a column-value filter; an empty one would silently compare
+    // against every family the server knows.
+    const auto no_family = scan_filter::column_value("", "n", compare_operator::equal,
+                                                     view_of(bytes_of("7")));
+    CRPC_CHECK_FALSE(static_cast<bool>(crpc::db::hbase::encode_scan_filter(no_family)));
+}
+
+CRPC_TEST(hbase_scanner_request_carries_rows_filter_and_options) {
+    using crpc::db::hbase::compare_operator;
+    using crpc::db::hbase::scan_filter;
+    using crpc::db::hbase::scan_options;
+
+    scan_options options;
+    options.start_row = bytes_of("k02");
+    options.end_row = bytes_of("k05");
+    options.limit = 7;
+    options.batch = 3;
+    options.max_versions = 2;
+    options.where = scan_filter::row_prefix(view_of(bytes_of("f03")));
+
+    const auto body = crpc::db::hbase::encode_scanner_request(options);
+    CRPC_CHECK(static_cast<bool>(body));
+    if (body) {
+        CRPC_CHECK_EQ(
+            std::string("{\"batch\":3,\"startRow\":\"azAy\",\"endRow\":\"azA1\","
+                        "\"maxVersions\":2,\"filter\":\"{\\\"type\\\":\\\"PrefixFilter\\\","
+                        "\\\"value\\\":\\\"ZjAz\\\"}\"}"),
+            body.value());
+    }
+
+    // With no filter the member is absent, not null and not an empty string: the gateway
+    // parses an empty string as a filter document and refuses it.
+    scan_options plain;
+    plain.limit = 5;
+    const auto plain_body = crpc::db::hbase::encode_scanner_request(plain);
+    CRPC_CHECK(static_cast<bool>(plain_body));
+    if (plain_body) {
+        CRPC_CHECK_EQ(std::string("{\"batch\":5}"), plain_body.value());
+        CRPC_CHECK(plain_body.value().find("filter") == std::string::npos);
+    }
+
+    // Batch defaults preserve the behaviour of the old `scan(start, limit)`: the limit is the
+    // batch when it is set, and a plain scan still asks for a bounded page.
+    scan_options unlimited;
+    const auto unlimited_body = crpc::db::hbase::encode_scanner_request(unlimited);
+    CRPC_CHECK(static_cast<bool>(unlimited_body));
+    if (unlimited_body) {
+        CRPC_CHECK_EQ(std::string("{\"batch\":1000}"), unlimited_body.value());
+    }
+    scan_options explicit_batch;
+    explicit_batch.limit = 9;
+    explicit_batch.batch = 2;
+    const auto explicit_body = crpc::db::hbase::encode_scanner_request(explicit_batch);
+    CRPC_CHECK(static_cast<bool>(explicit_body));
+    if (explicit_body) {
+        CRPC_CHECK_EQ(std::string("{\"batch\":2}"), explicit_body.value());
+    }
+}
+
 CRPC_TEST(hbase_http_status_maps_to_library_codes) {
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
                   static_cast<int>(crpc::db::hbase::map_http_status(200)));

@@ -271,6 +271,154 @@ CRPC_TEST(hbase_it_scan_reads_a_range) {
     CRPC_CHECK(static_cast<bool>(again));
 }
 
+CRPC_TEST(hbase_it_scan_filters_run_on_the_server) {
+    (void)require_gateway();
+    it_session it;
+    (void)it.session->delete_table("crpc_filter");
+    const std::vector<std::string> families{"cf"};
+    const crpc::status created =
+        it.session->create_table("crpc_filter", crpc::span<const std::string>(families.data(), 1));
+    if (!created) {
+        report("create table", created.error());
+    }
+    CRPC_CHECK(static_cast<bool>(created));
+
+    // Ten rows share the family. The first five also carry a `name` qualifier, so a column
+    // prefix filter has something to remove: if it ran on the client after a full read, all
+    // ten rows would still arrive and the count below would not drop.
+    for (int i = 0; i < 10; ++i) {
+        crpc::db::hbase::row value;
+        char key[16];
+        std::snprintf(key, sizeof(key), "f%02d", i);
+        value.key = key_of(key);
+        crpc::db::hbase::cell number;
+        number.family = "cf";
+        number.qualifier = "n";
+        number.value = value_of(std::to_string(i));
+        value.cells.push_back(number);
+        if (i < 5) {
+            crpc::db::hbase::cell name;
+            name.family = "cf";
+            name.qualifier = "name";
+            name.value = value_of("user" + std::to_string(i));
+            value.cells.push_back(name);
+        }
+        const crpc::status wrote = it.session->put_row("crpc_filter", value);
+        CRPC_CHECK(static_cast<bool>(wrote));
+    }
+
+    crpc::db::hbase::scan_options all;
+    const auto all_rows = it.session->scan("crpc_filter", all);
+    if (!all_rows) {
+        report("unfiltered scan", all_rows.error());
+    }
+    CRPC_CHECK(static_cast<bool>(all_rows));
+    if (all_rows) {
+        CRPC_CHECK_EQ(std::size_t{10}, all_rows.value().size());
+    }
+
+    // A row-key prefix filter must remove nine of the ten rows on the server. The returned
+    // row is checked as well, so a filter that returns the wrong one cannot pass on count.
+    crpc::db::hbase::scan_options prefixed;
+    prefixed.where =
+        crpc::db::hbase::scan_filter::row_prefix(view_of(key_of("f03")));
+    const auto prefixed_rows = it.session->scan("crpc_filter", prefixed);
+    if (!prefixed_rows) {
+        report("row prefix scan", prefixed_rows.error());
+    }
+    CRPC_CHECK(static_cast<bool>(prefixed_rows));
+    if (prefixed_rows) {
+        CRPC_CHECK_EQ(std::size_t{1}, prefixed_rows.value().size());
+        if (prefixed_rows.value().size() == 1) {
+            CRPC_CHECK_EQ(std::string("f03"),
+                          std::string(reinterpret_cast<const char*>(
+                                          prefixed_rows.value()[0].key.data()),
+                                      prefixed_rows.value()[0].key.size()));
+        }
+    }
+
+    // A single-column value filter: f07 holds cf:n == 7, and no other row does.
+    crpc::db::hbase::scan_options equal_seven;
+    equal_seven.where = crpc::db::hbase::scan_filter::column_value(
+        "cf", "n", crpc::db::hbase::compare_operator::equal, view_of(value_of("7")));
+    const auto seven = it.session->scan("crpc_filter", equal_seven);
+    if (!seven) {
+        report("column value scan", seven.error());
+    }
+    CRPC_CHECK(static_cast<bool>(seven));
+    if (seven) {
+        CRPC_CHECK_EQ(std::size_t{1}, seven.value().size());
+        if (seven.value().size() == 1) {
+            CRPC_CHECK_EQ(std::string("f07"),
+                          std::string(reinterpret_cast<const char*>(
+                                          seven.value()[0].key.data()),
+                                      seven.value()[0].key.size()));
+            bool saw_n = false;
+            for (const crpc::db::hbase::cell& item : seven.value()[0].cells) {
+                if (item.qualifier == "n") {
+                    CRPC_CHECK_EQ(std::string("7"),
+                                  std::string(reinterpret_cast<const char*>(item.value.data()),
+                                              item.value.size()));
+                    saw_n = true;
+                }
+            }
+            CRPC_CHECK(saw_n);
+        }
+    }
+
+    // A column prefix filter keeps only the `name` cells; the five rows without one are gone,
+    // which makes the row count drop even though the filter is about a column.
+    crpc::db::hbase::scan_options named;
+    named.where = crpc::db::hbase::scan_filter::column_prefix("name");
+    const auto named_rows = it.session->scan("crpc_filter", named);
+    if (!named_rows) {
+        report("column prefix scan", named_rows.error());
+    }
+    CRPC_CHECK(static_cast<bool>(named_rows));
+    if (named_rows) {
+        CRPC_CHECK_EQ(std::size_t{5}, named_rows.value().size());
+        for (const crpc::db::hbase::row& item : named_rows.value()) {
+            CRPC_CHECK_EQ(std::size_t{1}, item.cells.size());
+            if (item.cells.size() == 1) {
+                CRPC_CHECK_EQ(std::string("name"), item.cells[0].qualifier);
+            }
+        }
+    }
+
+    // Scan options are part of the same request. endRow is exclusive, and a batch smaller
+    // than the result set forces more than one scanner round trip, so the drain loop is
+    // exercised with a filter-independent option.
+    crpc::db::hbase::scan_options bounded;
+    bounded.start_row = key_of("f02");
+    bounded.end_row = key_of("f05");
+    const auto bounded_rows = it.session->scan("crpc_filter", bounded);
+    if (!bounded_rows) {
+        report("bounded scan", bounded_rows.error());
+    }
+    CRPC_CHECK(static_cast<bool>(bounded_rows));
+    if (bounded_rows) {
+        CRPC_CHECK_EQ(std::size_t{3}, bounded_rows.value().size());
+        if (bounded_rows.value().size() == 3) {
+            CRPC_CHECK_EQ(std::string("f02"),
+                          std::string(reinterpret_cast<const char*>(
+                                          bounded_rows.value()[0].key.data()),
+                                      bounded_rows.value()[0].key.size()));
+            CRPC_CHECK_EQ(std::string("f04"),
+                          std::string(reinterpret_cast<const char*>(
+                                          bounded_rows.value()[2].key.data()),
+                                      bounded_rows.value()[2].key.size()));
+        }
+    }
+
+    crpc::db::hbase::scan_options paged;
+    paged.batch = 2;
+    const auto paged_rows = it.session->scan("crpc_filter", paged);
+    CRPC_CHECK(static_cast<bool>(paged_rows));
+    if (paged_rows) {
+        CRPC_CHECK_EQ(std::size_t{10}, paged_rows.value().size());
+    }
+}
+
 CRPC_TEST(hbase_it_missing_table_is_not_found) {
     (void)require_gateway();
     it_session it;

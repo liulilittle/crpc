@@ -566,6 +566,151 @@ rpc_code map_http_status(int status) noexcept {
     }
 }
 
+scan_filter scan_filter::row_prefix(span<const std::byte> prefix) {
+    scan_filter out;
+    out.which = kind::row_prefix;
+    out.value.assign(prefix.begin(), prefix.end());
+    return out;
+}
+
+scan_filter scan_filter::column_prefix(std::string_view prefix) {
+    scan_filter out;
+    out.which = kind::column_prefix;
+    out.qualifier.assign(prefix.data(), prefix.size());
+    return out;
+}
+
+scan_filter scan_filter::column_value(std::string family, std::string qualifier,
+                                      compare_operator op, span<const std::byte> value,
+                                      bool if_missing) {
+    scan_filter out;
+    out.which = kind::column_value;
+    out.family = std::move(family);
+    out.qualifier = std::move(qualifier);
+    out.op = op;
+    out.value.assign(value.begin(), value.end());
+    out.if_missing = if_missing;
+    return out;
+}
+
+namespace {
+
+// The gateway's `CompareOperator.valueOf` spelling, not the Java enum's `CompareOp` names.
+[[nodiscard]] const char* compare_operator_name(compare_operator op) noexcept {
+    switch (op) {
+    case compare_operator::less:
+        return "LESS";
+    case compare_operator::less_or_equal:
+        return "LESS_OR_EQUAL";
+    case compare_operator::equal:
+        return "EQUAL";
+    case compare_operator::not_equal:
+        return "NOT_EQUAL";
+    case compare_operator::greater_or_equal:
+        return "GREATER_OR_EQUAL";
+    case compare_operator::greater:
+        return "GREATER";
+    case compare_operator::no_op:
+        return "NO_OP";
+    }
+    return "EQUAL";
+}
+
+} // namespace
+
+result<std::string> encode_scan_filter(const scan_filter& filter) {
+    // A filter document is plain JSON text here. The escaping into a JSON string happens in
+    // `encode_scanner_request`, because the gateway's ScannerModel stores `filter` as a
+    // string and parses that string again. A nested object is answered with 400.
+    std::string out;
+    switch (filter.which) {
+    case scan_filter::kind::none:
+        return rpc_error{rpc_code::invalid_argument, "a scan filter has no kind"};
+    case scan_filter::kind::row_prefix:
+        // Probed shape: {"type":"PrefixFilter","value":"<base64 prefix>"}.
+        out += "{\"type\":\"PrefixFilter\",\"value\":";
+        put_json_string(out, base64_of(span<const std::byte>(filter.value.data(),
+                                                             filter.value.size())));
+        out += "}";
+        return out;
+    case scan_filter::kind::column_prefix:
+        // Probed shape: {"type":"ColumnPrefixFilter","value":"<base64 qualifier prefix>"}.
+        out += "{\"type\":\"ColumnPrefixFilter\",\"value\":";
+        put_json_string(out, base64_of(filter.qualifier));
+        out += "}";
+        return out;
+    case scan_filter::kind::column_value:
+        // Probed shape: family and qualifier are base64, the comparison is `op` (not
+        // `compareOp`) and the missing-column switch is `ifMissing` (not `filterIfMissing`).
+        // Both wrong spellings were answered with 400 by this gateway.
+        if (filter.family.empty()) {
+            return rpc_error{rpc_code::invalid_argument,
+                             "a column-value filter needs a column family"};
+        }
+        out += "{\"type\":\"SingleColumnValueFilter\",\"family\":";
+        put_json_string(out, base64_of(filter.family));
+        // A qualifier-less filter compares against the family as a whole, which is what the
+        // server does when the member is absent; emitting an empty one is not the same.
+        if (!filter.qualifier.empty()) {
+            out += ",\"qualifier\":";
+            put_json_string(out, base64_of(filter.qualifier));
+        }
+        out += ",\"op\":";
+        put_json_string(out, compare_operator_name(filter.op));
+        out += ",\"comparator\":{\"type\":\"BinaryComparator\",\"value\":";
+        put_json_string(out, base64_of(span<const std::byte>(filter.value.data(),
+                                                             filter.value.size())));
+        out += "},\"ifMissing\":";
+        out += filter.if_missing ? "true" : "false";
+        out += "}";
+        return out;
+    }
+    return rpc_error{rpc_code::invalid_argument, "a scan filter has an unknown kind"};
+}
+
+result<std::string> encode_scanner_request(const scan_options& options) {
+    // The scanner request is a ScannerModel. Probed against the deployment's Stargate
+    // (HBase 2.5.10) with:
+    //   PUT /crpc_scan/scanner
+    //   {"batch":10,"filter":"{\"type\":\"PrefixFilter\",\"value\":\"azAz\"}"}
+    //   -> 201 + Location; GET Location -> one row, "k03".
+    // Sending the filter as an object instead of a string is a 400, and the field spellings
+    // `compareOp`/`filterIfMissing` are also a 400. Unknown members such as `limit` or
+    // `reversed` are a 500, so only these members are emitted.
+    const std::size_t batch =
+        options.batch != 0 ? options.batch : (options.limit == 0 ? 1000 : options.limit);
+    std::string out;
+    out.reserve(96);
+    out += "{\"batch\":";
+    out += std::to_string(batch);
+    if (!options.start_row.empty()) {
+        out += ",\"startRow\":";
+        put_json_string(out, base64_of(span<const std::byte>(options.start_row.data(),
+                                                             options.start_row.size())));
+    }
+    if (!options.end_row.empty()) {
+        // `endRow` is exclusive on the server; probed with startRow=azAx, endRow=azAz, which
+        // returned k01 and k02.
+        out += ",\"endRow\":";
+        put_json_string(out, base64_of(span<const std::byte>(options.end_row.data(),
+                                                             options.end_row.size())));
+    }
+    if (options.max_versions != 0) {
+        out += ",\"maxVersions\":";
+        out += std::to_string(options.max_versions);
+    }
+    if (options.where.which != scan_filter::kind::none) {
+        result<std::string> filter = encode_scan_filter(options.where);
+        if (!filter) {
+            return filter.error();
+        }
+        out += ",\"filter\":";
+        put_json_string(out, filter.value());
+    }
+    out += "}";
+    return out;
+}
+
 client::client(client_options options, opener open)
     : options_(std::move(options)), open_(std::move(open)) {}
 
@@ -653,7 +798,7 @@ result<std::vector<std::string>> client::list_tables() {
             }
             if (!reader.consume(']')) {
                 for (;;) {
-                    // The gateway answers `{"table":[{"name":"t"}]}` — an object per table,
+                    // The gateway answers `{"table":[{"name":"t"}]}` 鈥?an object per table,
                     // not a bare string. A parser that expects a string fails with a decode
                     // error on a perfectly good reply, which is what happened first.
                     if (reader.peek('{')) {
@@ -828,7 +973,7 @@ status client::delete_table(std::string_view table) {
         return status{map_http_status(code), "the gateway refused to delete the table"};
     }
     // HBase deletes asynchronously. Returning before the table is gone makes the obvious
-    // next call — create it again — fail against a table that is still being removed.
+    // next call 鈥?create it again 鈥?fail against a table that is still being removed.
     return wait_for_table(table, false);
 }
 
@@ -904,22 +1049,26 @@ status client::delete_row(std::string_view table, span<const std::byte> key) {
 
 result<std::vector<row>> client::scan(std::string_view table, span<const std::byte> start,
                                       std::size_t limit) {
+    scan_options options;
+    options.start_row.assign(start.begin(), start.end());
+    options.limit = limit;
+    return scan(table, options);
+}
+
+result<std::vector<row>> client::scan(std::string_view table, const scan_options& options) {
     std::string table_path("/");
     table_path += encode_path_segment(span<const std::byte>(
         reinterpret_cast<const std::byte*>(table.data()), table.size()));
 
-    // A scanner is opened with a filter document, then drained with GETs. The batch size
-    // bounds each reply, which is what keeps a large table from arriving in one message.
-    std::string request;
-    request += "{\"batch\":";
-    request += std::to_string(limit == 0 ? 1000 : limit);
-    if (!start.empty()) {
-        request += ",\"startRow\":";
-        put_json_string(request, base64_of(start));
+    // A scanner is opened with the options document, then drained with GETs. The filter
+    // travels in this one request and is applied by the region servers; the rows that arrive
+    // are already the answer.
+    result<std::string> request = encode_scanner_request(options);
+    if (!request) {
+        return request.error();
     }
-    request += "}";
     result<http::response> opened =
-        call(http::method::put, table_path + "/scanner", request, "application/json");
+        call(http::method::put, table_path + "/scanner", request.value(), "application/json");
     if (!opened) {
         return opened.error();
     }
@@ -972,11 +1121,11 @@ result<std::vector<row>> client::scan(std::string_view table, span<const std::by
         }
         for (row& item : rows.value()) {
             out.push_back(std::move(item));
-            if (limit != 0 && out.size() >= limit) {
+            if (options.limit != 0 && out.size() >= options.limit) {
                 break;
             }
         }
-        if (limit != 0 && out.size() >= limit) {
+        if (options.limit != 0 && out.size() >= options.limit) {
             break;
         }
     }

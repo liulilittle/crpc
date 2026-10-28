@@ -65,6 +65,85 @@ struct row {
 // set is escaped; leaving `/` or `?` unescaped would change which resource is addressed.
 [[nodiscard]] CRPC_API std::string encode_path_segment(span<const std::byte> data);
 
+// The comparison the gateway applies in a `SingleColumnValueFilter`. The spelling is the
+// server's (`GREATER_OR_EQUAL`), not `CompareFilter::CompareOp`'s Java name, because the
+// JSON model is parsed with `CompareOperator.valueOf`.
+enum class compare_operator {
+    less,
+    less_or_equal,
+    equal,
+    not_equal,
+    greater_or_equal,
+    greater,
+    no_op,
+};
+
+// One server-side filter for a scan.
+//
+// Only filters that the gateway models as flat JSON objects are here: a prefix on the row
+// key, a prefix on the qualifier, and a comparison against one column's value. A filter
+// document is sent as a *string* inside the scanner request (see `encode_scan_filter`), and
+// its row keys, column names and values are base64.
+struct scan_filter {
+    enum class kind {
+        none,
+        row_prefix,
+        column_prefix,
+        column_value,
+    };
+
+    kind which = kind::none;
+    // `row_prefix`: the key prefix. `column_value`: the compared value. Base64 in JSON.
+    std::vector<std::byte> value;
+    // `column_prefix`: the qualifier prefix, as plain text.
+    std::string qualifier;
+    // `column_value`: the family and qualifier of the compared column.
+    std::string family;
+    compare_operator op = compare_operator::equal;
+    // `column_value`: whether a row that lacks the column is filtered out. The HBase default
+    // is true; a false here keeps such rows, which is what a caller asking "not equal to X"
+    // usually means.
+    bool if_missing = true;
+
+    // Matches rows whose key starts with `prefix`.
+    [[nodiscard]] static scan_filter row_prefix(span<const std::byte> prefix);
+    // Matches cells whose qualifier starts with `prefix`, and keeps the rows that have one.
+    [[nodiscard]] static scan_filter column_prefix(std::string_view prefix);
+    // Compares the bytes of `family:qualifier` against `value`.
+    [[nodiscard]] static scan_filter column_value(std::string family, std::string qualifier,
+                                                  compare_operator op,
+                                                  span<const std::byte> value,
+                                                  bool if_missing = true);
+};
+
+// The options a scan request carries. `scan(table, options)` is the general form; the older
+// `scan(table, start, limit)` is kept and forwards to it.
+struct scan_options {
+    // First row to return (inclusive). Empty means the first row of the table.
+    std::vector<std::byte> start_row;
+    // Row to stop before (exclusive). Empty means no upper bound.
+    std::vector<std::byte> end_row;
+    // Rows the caller wants. 0 means "as many as the server sends".
+    std::size_t limit = 0;
+    // Rows per reply. 0 means "the limit, or 1000 when the limit is 0". A small batch makes
+    // the client drain the scanner over several round trips, which is what bounds memory.
+    std::size_t batch = 0;
+    // Versions per cell. 0 leaves the server default.
+    std::uint32_t max_versions = 0;
+    // Applied by the server. `kind::none` sends no `filter` member at all.
+    scan_filter where;
+};
+
+// The `filter` member's value: the filter document as compact JSON text. The scanner request
+// carries it as a *string*, so the caller does not escape it; `encode_scanner_request` does.
+// Returns an error for `kind::none` or an incomplete filter (a column-value filter needs a
+// family).
+[[nodiscard]] CRPC_API result<std::string> encode_scan_filter(const scan_filter& filter);
+
+// The scanner request body (`PUT /<table>/scanner`). Exposed so the exact bytes, including
+// the double encoding of the filter document, can be pinned without a server.
+[[nodiscard]] CRPC_API result<std::string> encode_scanner_request(const scan_options& options);
+
 struct client_options {
     // The gateway's host and port. HBase REST defaults to 8080; this deployment uses 18080.
     std::string host;
@@ -136,6 +215,12 @@ public:
     [[nodiscard]] result<std::vector<row>> scan(std::string_view table,
                                                 span<const std::byte> start,
                                                 std::size_t limit);
+
+    // The general form: a row range, a page size and a server-side filter. The filter is
+    // evaluated by the region servers, so the reply is already narrowed; nothing is filtered
+    // after it arrives.
+    [[nodiscard]] result<std::vector<row>> scan(std::string_view table,
+                                                const scan_options& options);
 
 private:
     // Polls `table_exists` until it matches `present` or the timeout expires.

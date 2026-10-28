@@ -293,6 +293,8 @@ is guarded.
 - `::crpc::db::mongo::message_header`
 - `::crpc::db::mongo::op_msg_reply`
 - `::crpc::db::hbase::row`
+- `::crpc::db::hbase::scan_filter`
+- `::crpc::db::hbase::scan_options`
 - `::crpc::http::client_options`
 - `::crpc::db::tds::login7`
 - `::crpc::db::tds::packet_header`
