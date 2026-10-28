@@ -1429,11 +1429,30 @@ std::unique_ptr<listener> iocp_backend::impl::do_listen(
         if (s == INVALID_SOCKET) {
             continue;
         }
-        if (lo.reuse_port) {
-            BOOL yes = TRUE;
-            (void)::setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
-                               reinterpret_cast<const char*>(&yes),
-                               static_cast<int>(sizeof(yes)));
+        // A listener gets SO_EXCLUSIVEADDRUSE, never SO_REUSEADDR.
+        //
+        // On Windows SO_REUSEADDR does not mean "reuse an address in TIME_WAIT" the
+        // way it does on BSD; it means "let another socket take this port". Two
+        // listeners with it both bind successfully and the connections keep going to
+        // the first one, so the second listener accepts nothing at all -- measured:
+        // both binds succeed, and a burst of 500 connects produced 0 accepts. The
+        // failure is silent, which is what makes it dangerous: the caller believes it
+        // is listening.
+        //
+        // SO_EXCLUSIVEADDRUSE makes the conflicting bind fail with WSAEADDRINUSE
+        // instead, which is the loud answer a caller can act on. It does not break
+        // restart: binding the same port right after the previous listener closed was
+        // measured to succeed on three consecutive rounds, including after a real
+        // connection had been made to the port.
+        //
+        // `reuse_port` therefore cannot be honoured here. On Linux SO_REUSEPORT is a
+        // real load-balancing feature; on Windows the nearest equivalent is the
+        // hijacking behaviour above, which no server wants by default.
+        {
+            BOOL exclusive = TRUE;
+            (void)::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                               reinterpret_cast<const char*>(&exclusive),
+                               static_cast<int>(sizeof(exclusive)));
         }
         if (::bind(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
             lsock = s;

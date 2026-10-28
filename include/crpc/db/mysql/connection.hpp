@@ -46,12 +46,14 @@ struct connection_options {
 
     // Client capabilities to request, intersected with what the server offers.
     // The defaults are what a modern client needs; a caller should not normally
-    // touch this.
+    // touch this. `multi_statements`/`multi_results` let one COM_QUERY answer with
+    // several result sets, which `next_result()` walks.
     std::uint32_t capabilities =
         mask(capability::protocol_41) | mask(capability::long_password) |
         mask(capability::secure_connection) | mask(capability::plugin_auth) |
         mask(capability::plugin_auth_lenenc_data) | mask(capability::transactions) |
-        mask(capability::multi_results) | mask(capability::deprecate_eof);
+        mask(capability::multi_results) | mask(capability::multi_statements) |
+        mask(capability::deprecate_eof);
 };
 
 // Client-supplied bytes for `LOAD DATA LOCAL INFILE`.
@@ -105,8 +107,15 @@ public:
     [[nodiscard]] bool in_transaction() const noexcept override;
 
     [[nodiscard]] status begin() override;
+    [[nodiscard]] status begin(isolation_level level) override;
     [[nodiscard]] status commit() override;
     [[nodiscard]] status rollback() override;
+
+    // MySQL's classic protocol has no client-side cancel; interrupting a running
+    // statement requires `KILL QUERY <id>` from a second session, which cannot be
+    // opened from an injected channel. A non-zero timeout is refused rather than
+    // silently ignored (a timeout that does not interrupt would be worse than none).
+    [[nodiscard]] status set_command_timeout(std::chrono::milliseconds timeout) noexcept override;
 
     [[nodiscard]] status query(std::string_view sql, span<const parameter> params,
                                result_set** out) override;

@@ -22,14 +22,17 @@
 #define CRPC_DB_TDS_CONNECTION_HPP
 
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <atomic>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <crpc/config.hpp>
@@ -97,6 +100,7 @@ public:
     [[nodiscard]] bool in_transaction() const noexcept override;
 
     [[nodiscard]] status begin() override;
+    [[nodiscard]] status begin(isolation_level level) override;
     [[nodiscard]] status commit() override;
     [[nodiscard]] status rollback() override;
 
@@ -106,13 +110,23 @@ public:
     // Parameters are bound by RPC, never spliced into the text: the statement goes as
     // the first argument, the parameter declarations as the second, and the values
     // follow as typed parameters. A `?` in `sql` is replaced by `@P<n>` in order,
-    // because TDS addresses parameters by name.
+    // because TDS addresses parameters by name; a parameter that carries a `name`
+    // binds to `@name` in the text directly and must not be mixed with `?` markers.
     //
-    // `*out` receives the first result set, or a cursor with an affected-row count
-    // and no columns. Further result sets are drained and discarded — a reply that
-    // is not drained desynchronises the stream.
+    // `*out` receives a cursor over the batch's result sets. A statement with no
+    // result set (INSERT, DDL, BEGIN) gets a cursor with an affected-row count and
+    // no columns; a batch with several result sets exposes them through
+    // `result_set::next_result()`. Everything is decoded before returning, so the
+    // reply is always drained and the stream stays aligned.
     [[nodiscard]] status query(std::string_view sql, span<const parameter> params,
                                result_set** out) override;
+
+    // A batch whose reply is NOT materialised: rows are decoded from the socket as
+    // `next()` advances, so a large result never lives in memory at once. The
+    // cursor keeps the connection busy until it is drained or closed.
+    [[nodiscard]] status query_streaming(std::string_view sql,
+                                         span<const parameter> params,
+                                         result_set** out) override;
 
     // Inserts `rows` with batched `INSERT ... VALUES (...), (...)` statements whose
     // values are all bound.
@@ -169,12 +183,20 @@ private:
     [[nodiscard]] std::vector<std::byte> all_headers() const;
     [[nodiscard]] status send_message(packet_type type, span<const std::byte> payload);
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
-    // Sends one batch and decodes the whole reply, returning the first result set.
+    // Sends one batch and decodes the whole reply, returning every result set.
     [[nodiscard]] status run_batch(std::string_view sql, result_set** out);
     // Sends one RPC and decodes the whole reply. `results` is the first result set;
     // `written` receives the OUT/INOUT values, addressed by parameter name.
     [[nodiscard]] status run_rpc(const rpc_request& request, result_set** out,
                                  std::vector<return_value>* written);
+    // Sends a batch / one RPC without reading the reply; the streaming cursor owns
+    // the read. The request slot stays claimed until the cursor finishes.
+    [[nodiscard]] status send_batch(std::string_view sql);
+    [[nodiscard]] status send_rpc(const rpc_request& request);
+    // Builds the RPC for a batch over sp_executesql (or a procedure call) so the
+    // eager and the streaming path share one encoder.
+    [[nodiscard]] status build_request(std::string_view sql, span<const parameter> params,
+                                       bool procedure, rpc_request& request);
     // The shared token loop for batch and RPC replies.
     [[nodiscard]] status read_reply(result_set** out, std::vector<return_value>* written);
     // For a query, ? placeholders become @P<n> in an sp_executesql call; for a
@@ -182,7 +204,45 @@ private:
     [[nodiscard]] status call_impl(std::string_view sql, span<const parameter> params,
                                    result_set** out, bool procedure,
                                    std::vector<return_value>& written);
+    // Cancels only when a request is actually in flight. The public `cancel()` also
+    // writes an ATTENTION on an idle session (the scripted suite exercises that
+    // shape); a timeout watchdog must not, or a request that finished just at the
+    // deadline would leave a stray acknowledgement in the stream.
+    [[nodiscard]] status cancel_inflight();
     void fail(const status& error) noexcept;
+
+    // One-shot timeout watchdog over one request. Arms on `arm()`, cancels the
+    // owner after the timeout unless `disarm()` runs first, and joins its worker on
+    // destruction.
+    class request_timer {
+    public:
+        explicit request_timer(std::chrono::milliseconds timeout) noexcept
+            : timeout_(timeout) {}
+        ~request_timer();
+
+        request_timer(const request_timer&) = delete;
+        request_timer& operator=(const request_timer&) = delete;
+
+        void arm(connection& owner);
+        void disarm() noexcept;
+        [[nodiscard]] bool armed() const noexcept { return armed_.load(); }
+        [[nodiscard]] bool fired() const noexcept { return fired_.load(); }
+
+    private:
+        std::chrono::milliseconds timeout_;
+        std::thread worker_;
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool stopped_ = false;
+        std::atomic<bool> armed_{false};
+        std::atomic<bool> fired_{false};
+        connection* owner_ = nullptr;
+    };
+
+    // The pull-driven decoder behind `query_streaming`. Defined in streaming.cpp;
+    // a nested class keeps it next to the private read path it drives.
+    class streaming_cursor;
+    friend class streaming_cursor;
 
     connection_options options_;
     std::unique_ptr<db::channel> link_;

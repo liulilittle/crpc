@@ -20,6 +20,7 @@
 
 #include "test_framework.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,7 +30,9 @@
 #include <string_view>
 #include <vector>
 
+#include <crpc/db/channel.hpp>
 #include <crpc/db/client.hpp>
+#include <crpc/db/connection.hpp>
 #include <crpc/db/mysql/connection.hpp>
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
@@ -198,6 +201,154 @@ CRPC_TEST(mysql_it_bulk_insert) {
         CRPC_CHECK_EQ(static_cast<std::int64_t>(5), guard->get_int64(0).value());
     }
     CRPC_CHECK(session.db->execute("DROP TABLE IF EXISTS it_bulk").ok());
+}
+
+CRPC_TEST(mysql_it_multiple_result_sets_in_one_command) {
+    (void)require_server();
+    it_session session;
+    auto rows = session.db->query("SELECT 1 AS a; SELECT 2 AS b");
+    CRPC_CHECK(rows.ok());
+    if (!rows.ok()) {
+        std::printf("  multi-result error: %s\n", rows.error().message.c_str());
+        return;
+    }
+    std::unique_ptr<crpc::db::result_set> guard(rows.value());
+    CRPC_CHECK(guard != nullptr);
+    if (guard == nullptr) {
+        return;
+    }
+    CRPC_CHECK_EQ(std::string("a"), guard->column(0).name);
+    CRPC_CHECK(guard->next());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(1), guard->get_int64(0).value());
+    CRPC_CHECK_FALSE(guard->next());
+
+    CRPC_CHECK(guard->next_result());
+    CRPC_CHECK_EQ(std::string("b"), guard->column(0).name);
+    CRPC_CHECK(guard->next());
+    CRPC_CHECK_EQ(static_cast<std::int64_t>(2), guard->get_int64(0).value());
+    CRPC_CHECK_FALSE(guard->next());
+    CRPC_CHECK_FALSE(guard->next_result());
+
+    // The whole reply was consumed; the pooled connection is usable again.
+    auto again = session.db->query("SELECT 9 AS n");
+    CRPC_CHECK(again.ok());
+    if (again.ok()) {
+        std::unique_ptr<crpc::db::result_set> again_guard(again.value());
+        CRPC_CHECK(again_guard->next());
+        CRPC_CHECK_EQ(static_cast<std::int64_t>(9), again_guard->get_int64(0).value());
+    }
+}
+
+CRPC_TEST(mysql_it_named_parameters) {
+    (void)require_server();
+    it_session session;
+    std::vector<crpc::db::parameter> params;
+    crpc::db::parameter hi = crpc::db::parameter::from_text("héllo");
+    hi.name = "hi";
+    crpc::db::parameter lo = crpc::db::parameter::from_int64(40);
+    lo.name = "lo";
+    params.push_back(lo);
+    params.push_back(hi);
+    auto rows = session.db->query("SELECT @lo + 2 AS n, @hi AS s", params);
+    CRPC_CHECK(rows.ok());
+    if (!rows.ok()) {
+        std::printf("  named parameter error: %s\n", rows.error().message.c_str());
+        return;
+    }
+    std::unique_ptr<crpc::db::result_set> guard(rows.value());
+    CRPC_CHECK(guard != nullptr);
+    if (guard != nullptr) {
+        CRPC_CHECK(guard->next());
+        CRPC_CHECK_EQ(static_cast<std::int64_t>(42), guard->get_int64(0).value());
+        CRPC_CHECK_EQ(std::string("héllo"), std::string(guard->get_text(1).value()));
+    }
+
+    // A `@name` that is not bound is a session variable and is left untouched by
+    // the rewrite, even inside a multi-statement command.
+    std::vector<crpc::db::parameter> empty;
+    auto vars = session.db->query("SET @x := 3; SELECT @x AS n", empty);
+    CRPC_CHECK(vars.ok());
+    if (vars.ok() && vars.value() != nullptr) {
+        std::unique_ptr<crpc::db::result_set> vars_guard(vars.value());
+        if (vars_guard->next_result()) {
+            CRPC_CHECK(vars_guard->next());
+            CRPC_CHECK_EQ(static_cast<std::int64_t>(3), vars_guard->get_int64(0).value());
+        }
+    }
+}
+
+CRPC_TEST(mysql_it_mixing_named_and_positional_is_rejected) {
+    (void)require_server();
+    it_session session;
+    std::vector<crpc::db::parameter> params;
+    crpc::db::parameter named = crpc::db::parameter::from_int64(1);
+    named.name = "a";
+    crpc::db::parameter positional = crpc::db::parameter::from_int64(2);
+    params.push_back(named);
+    params.push_back(positional);
+    auto rows = session.db->query("SELECT @a + ? AS n", params);
+    CRPC_CHECK_FALSE(rows.ok());
+    if (!rows.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
+                      static_cast<int>(rows.error().code));
+    }
+}
+
+CRPC_TEST(mysql_it_isolation_level_and_command_timeout_surface) {
+    (void)require_server();
+    // The pool facade has no transaction entry point, so these run over one raw
+    // connection, exactly like the scripted cases they complement.
+    crpc::db::mysql::connection_options options;
+    options.user = env_or("CRPC_MYSQL_USER", "crpc");
+    options.password = env_or("CRPC_MYSQL_PASSWORD", "crpc_pw");
+    options.database = env_or("CRPC_MYSQL_DB", "crpc_it");
+    const std::string host = env_or("CRPC_MYSQL_HOST", "127.0.0.1");
+    const std::string port = env_or("CRPC_MYSQL_PORT", "3306");
+    crpc::iocp_backend backend;
+    crpc::net::connection_config config;
+    config.ep = crpc::endpoint::tcp(host, static_cast<std::uint16_t>(std::stoi(port)));
+    config.operation_timeout = std::chrono::seconds(15);
+    auto link = std::make_unique<crpc::db::socket_channel>(std::move(config), backend);
+    std::unique_ptr<crpc::db::mysql::connection> conn(
+        new crpc::db::mysql::connection(options, std::move(link)));
+    CRPC_CHECK(conn->is_open());
+    if (!conn->is_open()) {
+        return;
+    }
+
+    // SERIALIZABLE is the strongest level; the server echoes it back from its own
+    // session state.
+    const crpc::status began =
+        conn->begin(crpc::db::isolation_level::serializable);
+    CRPC_CHECK(began.ok());
+    if (!began.ok()) {
+        std::printf("  begin(serializable): %s\n", began.message().c_str());
+        return;
+    }
+    CRPC_CHECK(conn->in_transaction());
+    crpc::db::result_set* state = nullptr;
+    const crpc::status inspected =
+        conn->query("SELECT @@transaction_isolation", {}, &state);
+    crpc::db::statement_guard state_guard(state);
+    CRPC_CHECK(inspected.ok());
+    if (state != nullptr && state->next()) {
+        CRPC_CHECK_EQ(std::string("SERIALIZABLE"), std::string(state->get_text(0).value()));
+    }
+    const crpc::status rolled = conn->rollback();
+    CRPC_CHECK(rolled.ok());
+    CRPC_CHECK_FALSE(conn->in_transaction());
+
+    // MySQL cannot interrupt a running statement without a second session (KILL
+    // QUERY), so a non-zero timeout is refused explicitly rather than silently
+    // ignored.
+    const crpc::status zero = conn->set_command_timeout(std::chrono::milliseconds(0));
+    CRPC_CHECK(zero.ok());
+    const crpc::status refused = conn->set_command_timeout(std::chrono::seconds(1));
+    CRPC_CHECK_FALSE(refused.ok());
+    if (!refused.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::no_such_method),
+                      static_cast<int>(refused.error().code));
+    }
 }
 
 CRPC_TEST_MAIN()

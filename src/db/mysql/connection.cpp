@@ -9,6 +9,7 @@
 #include <utility>
 
 #include <crpc/db/memory_result_set.hpp>
+#include <crpc/db/result_set_list.hpp>
 #include <crpc/db/mysql/auth.hpp>
 #include <crpc/io.hpp>
 
@@ -39,6 +40,152 @@ namespace {
         failure.metadata.set("sql_state", err.sql_state);
     }
     return failure;
+}
+
+[[nodiscard]] bool is_mysql_ident_char(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '$';
+}
+
+[[nodiscard]] char mysql_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Rewrites the `@name` markers that correspond to a bound parameter into `?`, so
+// a named-parameter statement can ride the prepared-statement protocol (MySQL
+// prepares against `?` only). Parameters are re-ordered by first use and, if a
+// name is used more than once, repeated for each use so the placeholder count and
+// the binding list always agree. A `@name` that matches no bound parameter is a
+// session variable and is left untouched; a bound parameter that never appears in
+// the text is a caller bug and refused.
+[[nodiscard]] status rewrite_named_parameters(std::string_view sql,
+                                              span<const parameter> params,
+                                              std::string& out_sql,
+                                              std::vector<parameter>& out_params) {
+    out_sql.clear();
+    out_sql.reserve(sql.size() + 8);
+    out_params.clear();
+    out_params.reserve(params.size());
+
+    // A name (without the `@`) to the first parameter slot carrying it. Duplicate
+    // slots for one name would be ambiguous: which one does `@x` bind?
+    std::vector<std::pair<std::string, std::size_t>> slots;
+    slots.reserve(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        std::string name(params[i].name);
+        if (!name.empty() && name.front() == '@') {
+            name.erase(name.begin());
+        }
+        for (char& ch : name) {
+            ch = mysql_lower(ch);
+        }
+        const auto found = std::find_if(slots.begin(), slots.end(),
+                                        [&](const std::pair<std::string, std::size_t>& slot) {
+                                            return slot.first == name;
+                                        });
+        if (found != slots.end()) {
+            return status{rpc_code::invalid_argument,
+                          "named parameter @" + name + " is bound more than once"};
+        }
+        slots.emplace_back(std::move(name), i);
+    }
+
+    std::vector<bool> used(params.size(), false);
+    std::size_t i = 0;
+    while (i < sql.size()) {
+        const char c = sql[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            const char quote = c;
+            out_sql.push_back(c);
+            ++i;
+            while (i < sql.size()) {
+                out_sql.push_back(sql[i]);
+                if (quote != '`' && sql[i] == '\\' && i + 1 < sql.size()) {
+                    ++i;
+                    out_sql.push_back(sql[i]);
+                } else if (sql[i] == quote) {
+                    if (i + 1 < sql.size() && sql[i + 1] == quote) {
+                        ++i;
+                        out_sql.push_back(sql[i]);
+                    } else {
+                        ++i;
+                        break;
+                    }
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            while (i < sql.size() && sql[i] != '\n') {
+                out_sql.push_back(sql[i]);
+                ++i;
+            }
+            continue;
+        }
+        if (c == '#') {
+            while (i < sql.size() && sql[i] != '\n') {
+                out_sql.push_back(sql[i]);
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            out_sql += "/*";
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                out_sql.push_back(sql[i]);
+                ++i;
+            }
+            if (i + 1 < sql.size()) {
+                out_sql += "*/";
+                ++i;
+            }
+            continue;
+        }
+        if (c == '@' && i + 1 < sql.size() && is_mysql_ident_char(sql[i + 1])) {
+            ++i;
+            std::string name;
+            while (i < sql.size() && is_mysql_ident_char(sql[i])) {
+                name.push_back(mysql_lower(sql[i]));
+                ++i;
+            }
+            // @@system is not a bound parameter.
+            if (!name.empty() && name[0] == '@') {
+                out_sql += "@@";
+                out_sql += name.substr(1);
+                continue;
+            }
+            const auto found = std::find_if(slots.begin(), slots.end(),
+                                            [&](const std::pair<std::string, std::size_t>& slot) {
+                                                return slot.first == name;
+                                            });
+            if (found != slots.end()) {
+                out_sql.push_back('?');
+                out_params.push_back(params[found->second]);
+                used[found->second] = true;
+                continue;
+            }
+            // A session variable the caller manages itself.
+            out_sql.push_back('@');
+            out_sql += name;
+            continue;
+        }
+        out_sql.push_back(c);
+        ++i;
+    }
+
+    for (std::size_t index = 0; index < params.size(); ++index) {
+        if (!used[index]) {
+            std::string name(params[index].name);
+            if (!name.empty() && name.front() == '@') {
+                name.erase(name.begin());
+            }
+            return status{rpc_code::invalid_argument,
+                          "named parameter @" + name + " does not appear in the statement"};
+        }
+    }
+    return status{};
 }
 
 } // namespace
@@ -385,6 +532,42 @@ status connection::begin() {
     return status{};
 }
 
+status connection::begin(isolation_level level) {
+    if (level == isolation_level::unspecified) {
+        return begin();
+    }
+    if (level == isolation_level::snapshot) {
+        return status{rpc_code::no_such_method,
+                      "mysql has no snapshot isolation level"};
+    }
+    // The SET scopes to the next transaction and may only run before START, so the
+    // two statements ride in one COM_QUERY.
+    const std::string sql = std::string("SET TRANSACTION ISOLATION LEVEL ") +
+                            to_string(level) + "; START TRANSACTION";
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    if (in_transaction_) {
+        return status{rpc_code::failed_precondition, "a transaction is already open"};
+    }
+    const status started = run_query(sql, nullptr);
+    if (!started) {
+        return started;
+    }
+    in_transaction_ = true;
+    return status{};
+}
+
+status connection::set_command_timeout(std::chrono::milliseconds timeout) noexcept {
+    if (timeout > std::chrono::milliseconds::zero()) {
+        return status{rpc_code::no_such_method,
+                      "mysql cannot interrupt a running statement without a second "
+                      "session (KILL QUERY); command timeouts are not supported"};
+    }
+    command_timeout_ = std::chrono::milliseconds::zero();
+    return status{};
+}
+
 status connection::commit() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
@@ -422,12 +605,45 @@ status connection::query(std::string_view sql, span<const parameter> params, res
     // into the SQL text is how injection happens, so there is no fallback that
     // "works" without it.
     if (!params.empty()) {
-        result<prepared_statement> prepared = prepare(sql);
+        // Named parameters rewrite to `?` in first-use order so the prepared
+        // statement (which binds positionally) still binds the right values. A
+        // mix of named and positional parameters is refused: the two agreements
+        // cannot be reconciled in one statement.
+        bool any_named = false;
+        bool all_named = true;
+        for (const parameter& param : params) {
+            if (param.name.empty()) {
+                all_named = false;
+            } else {
+                any_named = true;
+            }
+        }
+        if (any_named && !all_named) {
+            return status{rpc_code::invalid_argument,
+                          "cannot mix named and positional parameters; "
+                          "name every parameter or leave every name empty"};
+        }
+
+        std::string effective_sql;
+        std::vector<parameter> effective_params;
+        if (all_named) {
+            const status rewritten =
+                rewrite_named_parameters(sql, params, effective_sql, effective_params);
+            if (!rewritten) {
+                return rewritten;
+            }
+        } else {
+            effective_sql.assign(sql);
+            effective_params.assign(params.begin(), params.end());
+        }
+
+        result<prepared_statement> prepared = prepare(effective_sql);
         if (!prepared) {
             return prepared.error();
         }
         prepared_statement handle = std::move(prepared.value());
-        result<result_set*> executed = handle.execute(params);
+        result<result_set*> executed =
+            handle.execute(span<const parameter>(effective_params.data(), effective_params.size()));
         if (!executed) {
             return executed.error();
         }
@@ -454,174 +670,186 @@ status connection::run_query(std::string_view sql, result_set** out) {
         return sent;
     }
 
-    std::vector<std::byte> reply;
-    const status read = read_message(reply);
-    if (!read) {
-        fail(read);
-        return read;
-    }
-    const span<const std::byte> payload(reply.data(), reply.size());
-
-    if (classify(payload, false) == packet_kind::err) {
-        err_packet err;
-        const status decoded = decode_err(payload, err);
-        if (!decoded) {
-            return decoded;
-        }
-        return status{server_failure(err)};
-    }
-    if (classify(payload, false) == packet_kind::local_infile) {
-        // LOAD DATA LOCAL INFILE asks the *client* for a file. A database client
-        // that serves arbitrary local files to a server is a security hole, so it
-        // is refused before any file is opened.
-        return status{rpc_code::no_such_method,
-                      "mysql LOAD DATA LOCAL INFILE is not supported"};
-    }
-    if (classify(payload, false) == packet_kind::ok) {
-        ok_packet ok;
-        const status decoded = decode_ok(payload, capabilities_, ok);
-        if (!decoded) {
-            return decoded;
-        }
-        status_flags_ = ok.status_flags;
-        if (out != nullptr) {
-            auto* set = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
-            *out = set;
-        }
-        return status{};
-    }
-
-    // A result set: column count, then the definitions, then rows.
-    std::size_t offset = 0;
-    std::uint64_t column_count = 0;
-    bool is_null = false;
-    const status count_read = read_lenenc_int(payload, offset, false, column_count, is_null);
-    if (!count_read) {
-        return count_read;
-    }
-    if (column_count == 0 || column_count > 4096) {
-        return status{rpc_code::protocol_error, "mysql result set column count is implausible"};
-    }
-
-    std::vector<column_info> columns;
-    std::vector<std::string> names;
-    columns.reserve(static_cast<std::size_t>(column_count));
-    for (std::uint64_t index = 0; index < column_count; ++index) {
-        std::vector<std::byte> definition_payload;
-        const status defined = read_message(definition_payload);
-        if (!defined) {
-            fail(defined);
-            return defined;
-        }
-        column_definition definition;
-        const status decoded = decode_column(
-            span<const std::byte>(definition_payload.data(), definition_payload.size()),
-            definition);
-        if (!decoded) {
-            return decoded;
-        }
-        names.push_back(definition.name);
-        columns.push_back(mysql::to_column_info(definition));
-    }
-    const std::int64_t affected = -1;
-    std::unique_ptr<memory_result_set> set(
-        new memory_result_set(std::move(columns), affected));
-
-    // Without CLIENT_DEPRECATE_EOF an EOF packet closes the column definitions; with
-    // it the server omits that terminator.
-    if ((capabilities_ & mask(capability::deprecate_eof)) == 0) {
-        std::vector<std::byte> eof_payload;
-        const status eof_read = read_message(eof_payload);
-        if (!eof_read) {
-            fail(eof_read);
-            return eof_read;
-        }
-    }
-
-    std::size_t rows = 0;
-    std::size_t bytes = 0;
+    // A multi-statement command answers with a sequence of result chunks, each
+    // flagged by SERVER_MORE_RESULTS_EXISTS. Every chunk is decoded here so the
+    // stream is drained; the caller walks them with `next_result()`.
+    std::unique_ptr<result_set_list> list(new result_set_list());
     for (;;) {
-        std::vector<std::byte> row_payload;
-        const status row_read = read_message(row_payload);
-        if (!row_read) {
-            fail(row_read);
-            return row_read;
+        std::vector<std::byte> reply;
+        const status read = read_message(reply);
+        if (!read) {
+            fail(read);
+            return read;
         }
-        const span<const std::byte> row_view(row_payload.data(), row_payload.size());
-        if (row_view.empty()) {
-            return status{rpc_code::protocol_error, "empty mysql row packet"};
-        }
-        const std::uint8_t first = byte_at(row_view, 0);
-        // A short 0xfe packet ends the row stream (EOF); with DEPRECATE_EOF the
-        // terminator is an OK packet whose header is 0xfe and carries a status.
-        if (first == 0xfe && row_view.size() < 9) {
-            eof_packet eof;
-            (void)decode_eof(row_view, eof);
-            status_flags_ = eof.status_flags;
-            break;
-        }
-        // With CLIENT_DEPRECATE_EOF the row stream ends with an OK packet whose
-        // header byte is 0xfe. Its layout is the OK layout, so the status word sits
-        // after two length-encoded integers rather than at a fixed offset.
-        if ((capabilities_ & mask(capability::deprecate_eof)) != 0 && first == 0xfe) {
-            std::size_t ok_offset = 1;
-            std::uint64_t ignored = 0;
-            bool ignored_null = false;
-            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-            if (ok_offset + 4 <= row_view.size()) {
-                status_flags_ = read_u16(row_view, ok_offset);
-            }
-            break;
-        }
-        if (first == 0xff) {
+        const span<const std::byte> payload(reply.data(), reply.size());
+        const packet_kind kind = classify(payload, false);
+
+        if (kind == packet_kind::err) {
             err_packet err;
-            const status decoded = decode_err(row_view, err);
+            const status decoded = decode_err(payload, err);
             if (!decoded) {
                 return decoded;
             }
             // A mid-result-set error is the server's answer; the partial rows are
-            // discarded rather than returned as if complete.
+            // discarded rather than returned as if complete. `server_failure` keeps the
+            // raw provider code and SQLSTATE, which is what distinguishes TiDB 9007
+            // (optimistic write conflict) from MySQL 1205 (lock wait timeout).
             return status{server_failure(err)};
         }
-
-        text_row row;
-        const status decoded = decode_text_row(row_view, row);
-        if (!decoded) {
-            return decoded;
+        if (kind == packet_kind::local_infile) {
+            // LOAD DATA LOCAL INFILE asks the *client* for a file. A database client
+            // that serves arbitrary local files to a server is a security hole, so it
+            // is refused before any file is opened.
+            return status{rpc_code::no_such_method,
+                          "mysql LOAD DATA LOCAL INFILE is not supported"};
         }
-        if (row.values.size() != static_cast<std::size_t>(column_count)) {
+        if (kind == packet_kind::ok) {
+            ok_packet ok;
+            const status decoded = decode_ok(payload, capabilities_, ok);
+            if (!decoded) {
+                return decoded;
+            }
+            status_flags_ = ok.status_flags;
+            list->add(std::unique_ptr<result_set>(new memory_result_set(
+                {}, static_cast<std::int64_t>(ok.affected_rows))));
+            if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) == 0) {
+                break;
+            }
+            continue;
+        }
+        if (kind == packet_kind::eof) {
             return status{rpc_code::protocol_error,
-                          "mysql row does not match the column count"};
+                          "mysql sent an end-of-stream packet before any result set"};
         }
-        ++rows;
-        if (rows > options_.max_result_rows) {
-            return status{rpc_code::resource_exhausted,
-                          "mysql result set exceeds max_result_rows"};
-        }
-        std::vector<std::string> values;
-        values.reserve(row.values.size());
-        for (const std::string_view value : row.values) {
-            bytes += value.size();
-            values.emplace_back(value.data(), value.size());
-        }
-        if (bytes > options_.max_result_bytes) {
-            return status{rpc_code::resource_exhausted,
-                          "mysql result set exceeds max_result_bytes"};
-        }
-        set->add_row(std::move(values), std::move(row.nulls));
-    }
 
-    if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) != 0) {
-        // A multi-statement command produced another result set. The second set is
-        // not read here, so the connection would be left mid-stream; closing it is
-        // the only safe outcome.
-        fail(status{rpc_code::no_such_method, "mysql multiple result sets are not supported"});
-        return status{rpc_code::no_such_method, "mysql multiple result sets are not supported"};
+        // A result set: column count, then the definitions, then rows.
+        std::size_t offset = 0;
+        std::uint64_t column_count = 0;
+        bool is_null = false;
+        const status count_read = read_lenenc_int(payload, offset, false, column_count, is_null);
+        if (!count_read) {
+            return count_read;
+        }
+        if (column_count == 0 || column_count > 4096) {
+            return status{rpc_code::protocol_error,
+                          "mysql result set column count is implausible"};
+        }
+
+        std::vector<column_info> columns;
+        columns.reserve(static_cast<std::size_t>(column_count));
+        for (std::uint64_t index = 0; index < column_count; ++index) {
+            std::vector<std::byte> definition_payload;
+            const status defined = read_message(definition_payload);
+            if (!defined) {
+                fail(defined);
+                return defined;
+            }
+            column_definition definition;
+            const status decoded = decode_column(
+                span<const std::byte>(definition_payload.data(), definition_payload.size()),
+                definition);
+            if (!decoded) {
+                return decoded;
+            }
+            columns.push_back(mysql::to_column_info(definition));
+        }
+        const std::int64_t affected = -1;
+        std::unique_ptr<memory_result_set> set(
+            new memory_result_set(std::move(columns), affected));
+
+        // Without CLIENT_DEPRECATE_EOF an EOF packet closes the column definitions;
+        // with it the server omits that terminator.
+        if ((capabilities_ & mask(capability::deprecate_eof)) == 0) {
+            std::vector<std::byte> eof_payload;
+            const status eof_read = read_message(eof_payload);
+            if (!eof_read) {
+                fail(eof_read);
+                return eof_read;
+            }
+        }
+
+        std::size_t rows = 0;
+        std::size_t bytes = 0;
+        for (;;) {
+            std::vector<std::byte> row_payload;
+            const status row_read = read_message(row_payload);
+            if (!row_read) {
+                fail(row_read);
+                return row_read;
+            }
+            const span<const std::byte> row_view(row_payload.data(), row_payload.size());
+            if (row_view.empty()) {
+                return status{rpc_code::protocol_error, "empty mysql row packet"};
+            }
+            const std::uint8_t first = byte_at(row_view, 0);
+            // A short 0xfe packet ends the row stream (EOF); with DEPRECATE_EOF the
+            // terminator is an OK packet whose header is 0xfe and carries a status.
+            if (first == 0xfe && row_view.size() < 9) {
+                eof_packet eof;
+                (void)decode_eof(row_view, eof);
+                status_flags_ = eof.status_flags;
+                break;
+            }
+            // With CLIENT_DEPRECATE_EOF the row stream ends with an OK packet whose
+            // header byte is 0xfe. Its layout is the OK layout, so the status word sits
+            // after two length-encoded integers rather than at a fixed offset.
+            if ((capabilities_ & mask(capability::deprecate_eof)) != 0 && first == 0xfe) {
+                std::size_t ok_offset = 1;
+                std::uint64_t ignored = 0;
+                bool ignored_null = false;
+                (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+                (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+                if (ok_offset + 4 <= row_view.size()) {
+                    status_flags_ = read_u16(row_view, ok_offset);
+                }
+                break;
+            }
+            if (first == 0xff) {
+                err_packet err;
+                const status decoded = decode_err(row_view, err);
+                if (!decoded) {
+                    return decoded;
+                }
+                // A mid-result-set error is the server's answer; the partial rows are
+                // discarded rather than returned as if complete.
+                return status{map_error_code(err.code), err.message};
+            }
+
+            text_row row;
+            const status decoded = decode_text_row(row_view, row);
+            if (!decoded) {
+                return decoded;
+            }
+            if (row.values.size() != static_cast<std::size_t>(column_count)) {
+                return status{rpc_code::protocol_error,
+                              "mysql row does not match the column count"};
+            }
+            ++rows;
+            if (rows > options_.max_result_rows) {
+                return status{rpc_code::resource_exhausted,
+                              "mysql result set exceeds max_result_rows"};
+            }
+            std::vector<std::string> values;
+            values.reserve(row.values.size());
+            for (const std::string_view value : row.values) {
+                bytes += value.size();
+                values.emplace_back(value.data(), value.size());
+            }
+            if (bytes > options_.max_result_bytes) {
+                return status{rpc_code::resource_exhausted,
+                              "mysql result set exceeds max_result_bytes"};
+            }
+            set->add_row(std::move(values), std::move(row.nulls));
+        }
+
+        list->add(std::move(set));
+        if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) == 0) {
+            break;
+        }
     }
 
     if (out != nullptr) {
-        *out = set.release();
+        *out = list.release();
     }
     return status{};
 }

@@ -58,6 +58,10 @@ public:
 
     void close() noexcept override;
 
+    // A materialised cursor holds what it decoded (the contrast to streaming).
+    [[nodiscard]] std::size_t rows_decoded() const noexcept override { return values_.size(); }
+    [[nodiscard]] std::size_t rows_buffered() const noexcept override { return values_.size(); }
+
     // Diagnostics for adapters that enforce row/byte ceilings while decoding.
     [[nodiscard]] std::size_t row_count() const noexcept { return values_.size(); }
 

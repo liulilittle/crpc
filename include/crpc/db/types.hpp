@@ -39,6 +39,37 @@
 namespace crpc {
 namespace db {
 
+// Transaction isolation levels, the four ANSI/ADO.NET levels plus SNAPSHOT,
+// which SQL Server supports natively. `unspecified` is the default: the backend's
+// own default applies, which is what plain `begin()` already does.
+enum class isolation_level : std::uint8_t {
+    unspecified,
+    read_uncommitted,
+    read_committed,
+    repeatable_read,
+    serializable,
+    snapshot
+};
+
+// The ANSI name of an isolation level, for the SQL a backend emits. Never returns
+// nullptr. `unspecified` is "UNSPECIFIED" so that no nullptr can ever escape.
+[[nodiscard]] constexpr const char* to_string(isolation_level level) noexcept {
+    switch (level) {
+    case isolation_level::read_uncommitted:
+        return "READ UNCOMMITTED";
+    case isolation_level::read_committed:
+        return "READ COMMITTED";
+    case isolation_level::repeatable_read:
+        return "REPEATABLE READ";
+    case isolation_level::serializable:
+        return "SERIALIZABLE";
+    case isolation_level::snapshot:
+        return "SNAPSHOT";
+    default:
+        return "UNSPECIFIED";
+    }
+}
+
 // The value kind a column reports. `unknown` means the backend did not say, which
 // is common for an expression column; the caller must then decide from the data.
 enum class db_type : std::uint8_t {

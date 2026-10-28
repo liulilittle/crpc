@@ -753,4 +753,282 @@ CRPC_TEST(tds_it_bulk_insert_refuses_a_shape_mismatch) {
     CRPC_CHECK_EQ(std::uint64_t{0}, affected);
 }
 
+CRPC_TEST(tds_it_multiple_result_sets_in_one_batch) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // One batch, two result sets. Both must come back, in order, through
+    // `next_result()` -- the second set was previously drained and discarded.
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query("SELECT 1 AS a; SELECT 2 AS b", {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("multi-result batch", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(raw != nullptr);
+    if (raw == nullptr) {
+        return;
+    }
+    CRPC_CHECK_EQ(std::string("a"), raw->column(0).name);
+    CRPC_CHECK(raw->next());
+    CRPC_CHECK_EQ(std::int64_t{1}, raw->get_int64(0).value());
+    CRPC_CHECK_FALSE(raw->next());
+
+    CRPC_CHECK(raw->next_result());
+    CRPC_CHECK_EQ(std::string("b"), raw->column(0).name);
+    CRPC_CHECK(raw->next());
+    CRPC_CHECK_EQ(std::int64_t{2}, raw->get_int64(0).value());
+    CRPC_CHECK_FALSE(raw->next());
+    CRPC_CHECK_FALSE(raw->next_result());
+
+    // The session must still answer: the whole reply, not just the first set, was
+    // consumed.
+    crpc::db::result_set* again = nullptr;
+    const crpc::status second = it.session->query("SELECT 7 AS n", {}, &again);
+    crpc::db::statement_guard again_guard(again);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (again != nullptr) {
+        CRPC_CHECK(again->next());
+        CRPC_CHECK_EQ(std::int64_t{7}, again->get_int64(0).value());
+    }
+}
+
+CRPC_TEST(tds_it_named_parameters) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // A caller-written @lo/@hi pair bound by name, with a non-ASCII value to prove
+    // the encoding. The list order need not match the text order.
+    crpc::db::parameter hi = crpc::db::parameter::from_text("héllo");
+    hi.name = "hi";
+    crpc::db::parameter lo = crpc::db::parameter::from_int64(40);
+    lo.name = "lo";
+    crpc::db::parameter params[2] = {lo, hi};
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query(
+        "SELECT @lo + 2 AS n, @hi AS s",
+        crpc::span<const crpc::db::parameter>(params, 2), &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("named parameters", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(raw != nullptr);
+    if (raw != nullptr) {
+        CRPC_CHECK(raw->next());
+        CRPC_CHECK_EQ(std::int64_t{42}, raw->get_int64(0).value());
+        CRPC_CHECK_EQ(std::string("héllo"), raw->get_text(1).value());
+    }
+}
+
+CRPC_TEST(tds_it_streaming_reads_one_hundred_thousand_rows) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+
+    crpc::db::result_set* raw = nullptr;
+    const crpc::status ran = it.session->query_streaming(
+        "SELECT TOP (100000) a.object_id + b.column_id AS n "
+        "FROM sys.all_columns a CROSS JOIN sys.all_columns b",
+        {}, &raw);
+    crpc::db::statement_guard guard(raw);
+    if (!ran) {
+        report("streaming query", ran.error());
+        CRPC_CHECK(static_cast<bool>(ran));
+        return;
+    }
+    CRPC_CHECK(raw != nullptr);
+    if (raw == nullptr) {
+        return;
+    }
+    CRPC_CHECK(raw->is_streaming());
+
+    std::int64_t read = 0;
+    while (raw->next()) {
+        CRPC_CHECK(read < static_cast<std::int64_t>(raw->rows_decoded()));
+        // At rest the cursor holds at most the row it is handing out; it must not
+        // be materialising the 100k-row result.
+        CRPC_CHECK(raw->rows_buffered() <= 1);
+        ++read;
+    }
+    CRPC_CHECK_EQ(std::int64_t{100000}, read);
+    CRPC_CHECK_EQ(std::size_t{100000}, raw->rows_decoded());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::ok),
+                  static_cast<int>(raw->last_error().code));
+
+    // The reply was fully drained; the connection serves the next request.
+    crpc::db::result_set* after = nullptr;
+    const crpc::status second = it.session->query("SELECT 3 AS n", {}, &after);
+    crpc::db::statement_guard after_guard(after);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (after != nullptr) {
+        CRPC_CHECK(after->next());
+        CRPC_CHECK_EQ(std::int64_t{3}, after->get_int64(0).value());
+    }
+}
+
+CRPC_TEST(tds_it_isolation_level_is_accepted_by_the_server) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    // SERIALIZABLE maps to transaction_isolation_level 4 in sys.dm_exec_sessions.
+    // Asking the server what it is running, from the same session, is the proof
+    // that the SET was accepted and in force.
+    crpc::status began = it.session->begin(crpc::db::isolation_level::serializable);
+    if (!began) {
+        report("begin(serializable)", began.error());
+    }
+    CRPC_CHECK(static_cast<bool>(began));
+    CRPC_CHECK(it.session->in_transaction());
+    if (began) {
+        crpc::db::result_set* state = nullptr;
+        const crpc::status inspected = it.session->query(
+            "SELECT transaction_isolation_level FROM sys.dm_exec_sessions "
+            "WHERE session_id = @@SPID",
+            {}, &state);
+        crpc::db::statement_guard guard(state);
+        CRPC_CHECK(static_cast<bool>(inspected));
+        if (state != nullptr && state->next()) {
+            CRPC_CHECK_EQ(std::int64_t{4}, state->get_int64(0).value());
+        }
+    }
+    crpc::status ended = it.session->rollback();
+    if (!ended) {
+        report("rollback", ended.error());
+    }
+    CRPC_CHECK(static_cast<bool>(ended));
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+}
+
+CRPC_TEST(tds_it_command_timeout_interrupts_waitfor_on_the_server) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    CRPC_CHECK(static_cast<bool>(it.session->query("USE crpc_tds_it", {}, nullptr)));
+    crpc::db::result_set* made = nullptr;
+    const crpc::status created = it.session->query(
+        "IF OBJECT_ID('crpc_timeout_marks') IS NOT NULL DROP TABLE crpc_timeout_marks; "
+        "CREATE TABLE crpc_timeout_marks (mark int)",
+        {}, &made);
+    crpc::db::statement_guard made_guard(made);
+    CRPC_CHECK(static_cast<bool>(created));
+
+    // The SPID of the session under test, read from a second session so the first
+    // can stay in the query.
+    it_session observer;
+    if (!observer.ok()) {
+        report("observer login", observer.session->connect_error());
+        CRPC_CHECK(observer.ok());
+        return;
+    }
+    crpc::db::result_set* spid_set = nullptr;
+    const crpc::status spid_ran = observer.session->query("SELECT @@SPID", {}, &spid_set);
+    crpc::db::statement_guard spid_guard(spid_set);
+    CRPC_CHECK(static_cast<bool>(spid_ran));
+    std::int64_t spid = -1;
+    if (spid_set != nullptr && spid_set->next()) {
+        spid = spid_set->get_int64(0).value();
+    }
+    CRPC_CHECK(spid > 0);
+
+    const auto running_on_server = [&observer, spid]() {
+        crpc::db::result_set* count = nullptr;
+        const crpc::status ran = observer.session->query(
+            "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE session_id = " +
+                std::to_string(spid),
+            {}, &count);
+        crpc::db::statement_guard guard(count);
+        if (!ran || count == nullptr) {
+            return -1LL;
+        }
+        return count->next() ? count->get_int64(0).value() : -1LL;
+    };
+
+    // A 5-second WAITFOR followed by an INSERT, with a 1-second command timeout.
+    // If the timeout merely returned an error while the batch kept running, the
+    // INSERT behind the WAITFOR would still land -- which is exactly the thing the
+    // test exists to forbid.
+    const crpc::status set = it.session->set_command_timeout(std::chrono::seconds(1));
+    CRPC_CHECK(static_cast<bool>(set));
+
+    crpc::status outcome;
+    std::thread runner([&] {
+        crpc::db::result_set* rows = nullptr;
+        outcome = it.session->query(
+            "WAITFOR DELAY '00:00:05'; INSERT INTO crpc_timeout_marks VALUES (1)", {},
+            &rows);
+        crpc::db::statement_guard guard(rows);
+    });
+
+    // The server must be executing the WAITFOR while the client waits.
+    bool saw_running = false;
+    for (int i = 0; i < 40; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (running_on_server() == 1) {
+            saw_running = true;
+            break;
+        }
+    }
+
+    const auto began = std::chrono::steady_clock::now();
+    runner.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - began)
+                             .count();
+
+    CRPC_CHECK(saw_running);
+    // The cancel landed inside the 5-second delay.
+    CRPC_CHECK(elapsed < 4000);
+    CRPC_CHECK_FALSE(static_cast<bool>(outcome));
+    if (!outcome) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled),
+                      static_cast<int>(outcome.error().code));
+    }
+    CRPC_CHECK(it.session->is_open());
+
+    // The server really stopped: the statement after the WAITFOR never ran.
+    crpc::db::result_set* count_set = nullptr;
+    const crpc::status counted = observer.session->query(
+        "SELECT COUNT(*) FROM crpc_timeout_marks", {}, &count_set);
+    crpc::db::statement_guard count_guard(count_set);
+    CRPC_CHECK(static_cast<bool>(counted));
+    if (count_set != nullptr) {
+        CRPC_CHECK(count_set->next());
+        CRPC_CHECK_EQ(std::int64_t{0}, count_set->get_int64(0).value());
+    }
+
+    // And the interrupted session still answers.
+    crpc::db::result_set* after = nullptr;
+    const crpc::status second = it.session->query("SELECT 11 AS n", {}, &after);
+    crpc::db::statement_guard after_guard(after);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (after != nullptr) {
+        CRPC_CHECK(after->next());
+        CRPC_CHECK_EQ(std::int64_t{11}, after->get_int64(0).value());
+    }
+}
+
 CRPC_TEST_MAIN()

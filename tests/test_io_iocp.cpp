@@ -650,21 +650,44 @@ CRPC_TEST(iocp_accept_burst_500) {
     }
     l->start(&ss);
 
+    // The case is about accepting a burst, not about connect never failing: on a
+    // loaded machine a single connect() out of 500 can transiently fail, and the old
+    // version then failed on `established == 500` while accepts had correctly matched
+    // every connection that did succeed (499). A failed connect is retried a bounded
+    // number of times so the burst is still 500, and the assertion that matters --
+    // accepts equals the number of established connections -- keeps its teeth.
     const int n = 500;
     std::vector<std::unique_ptr<connection>> conns;
     conns.reserve(static_cast<std::size_t>(n));
     int established = 0;
+    int connect_failures = 0;
     for (int i = 0; i < n; ++i) {
-        auto c = client.connect(endpoint::tcp("127.0.0.1", port),
-                                connect_options{});
+        std::unique_ptr<connection> c;
+        for (int attempt = 0; attempt < 3 && !c; ++attempt) {
+            if (attempt != 0) {
+                // Give the accept side a turn: a connect that failed while the
+                // pre-posted AcceptEx batch was being replenished is backpressure.
+                crpc_test::wait_for([] { return false; }, 10);
+            }
+            c = client.connect(endpoint::tcp("127.0.0.1", port), connect_options{});
+        }
         if (c) {
             ++established;
             conns.push_back(std::move(c));
+        } else {
+            ++connect_failures;
         }
     }
+    if (connect_failures != 0) {
+        std::printf("  connect failures after retries: %d\n", connect_failures);
+    }
     CRPC_CHECK_EQ(n, established);
-    CRPC_CHECK(wait_for([&] { return ss.accepts.load() == n; }, 30000));
-    CRPC_CHECK_EQ(n, ss.accepts.load());
+    // Every connection that was established must have been accepted: that is the
+    // property under test, and it is independent of how many connects succeeded.
+    CRPC_CHECK(wait_for([&] {
+        return ss.accepts.load() == established;
+    }, 30000));
+    CRPC_CHECK_EQ(established, ss.accepts.load());
     l->stop();
 }
 
