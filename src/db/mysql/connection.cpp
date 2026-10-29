@@ -1,4 +1,4 @@
-﻿// CRPC -- MySQL connection implementation.
+// CRPC -- MySQL connection implementation.
 #include <crpc/db/mysql/connection.hpp>
 
 #include <algorithm>
@@ -14,6 +14,8 @@
 #include <crpc/db/mysql/auth.hpp>
 #include <crpc/crypto/rsa.hpp>
 #include <crpc/io.hpp>
+
+#include "tls_channel.hpp"
 
 namespace crpc {
 namespace db {
@@ -306,6 +308,16 @@ status connection::perform_handshake() {
     server_version_ = greeting.server_version;
     server_capabilities_ = greeting.capabilities;
 
+    // Only capabilities both sides understand are negotiated. Asking for one
+    // the server did not offer makes it reject the handshake.
+    capabilities_ = options_.capabilities & greeting.capabilities;
+    capabilities_ |= mask(capability::protocol_41);
+
+    const status upgraded = negotiate_tls(greeting);
+    if (!upgraded) {
+        return upgraded;
+    }
+
     const status authenticated = authenticate(greeting);
     if (!authenticated) {
         return authenticated;
@@ -337,12 +349,75 @@ status connection::perform_handshake() {
     return status{};
 }
 
-status connection::authenticate(const handshake& greeting) {
-    // Only capabilities both sides understand are negotiated. Asking for one the
-    // server did not offer makes it reject the handshake.
-    capabilities_ = options_.capabilities & greeting.capabilities;
-    capabilities_ |= mask(capability::protocol_41);
+status connection::negotiate_tls(const handshake& greeting) {
+    if (!options_.tls_options.enabled) {
+        return status{};
+    }
+    // Fail closed: a caller that required TLS must never get a silent
+    // cleartext session because the server could not provide it.
+    if ((greeting.capabilities & mask(capability::ssl)) == 0) {
+        if (options_.tls_options.require) {
+            return status{rpc_code::failed_precondition,
+                          "the mysql server does not support TLS (no CLIENT_SSL capability) "
+                          "and the connection options require it"};
+        }
+        // "prefer": the session continues in cleartext, visibly.
+        tls_downgraded_ = true;
+        return status{};
+    }
+    // A build without a TLS backend is refused even for "prefer": the
+    // downgrade rule covers what the server can do, never what this binary
+    // was built with. Nothing has been written yet.
+    if (!tls_backend_available()) {
+        return status{rpc_code::failed_precondition,
+                      "mysql TLS is enabled but this build has no TLS backend; rebuild "
+                      "with CRPC_WITH_OPENSSL=ON (no cleartext fallback)"};
+    }
 
+    // SSLRequest: the response header fields -- capability flags, max packet
+    // size, charset, and 23 reserved zero bytes -- with CLIENT_SSL set, sent
+    // instead of the full handshake response. The sequence continues at 1;
+    // the HandshakeResponse41 follows the upgrade at 2.
+    capabilities_ |= mask(capability::ssl);
+    std::vector<std::byte> ssl_request(32, std::byte{0});
+    for (int i = 0; i < 4; ++i) {
+        ssl_request[static_cast<std::size_t>(i)] =
+            static_cast<std::byte>((capabilities_ >> (8 * i)) & 0xffu);
+    }
+    const std::uint32_t max_packet = handshake_response_options{}.max_packet_size;
+    for (int i = 0; i < 4; ++i) {
+        ssl_request[static_cast<std::size_t>(4 + i)] =
+            static_cast<std::byte>((max_packet >> (8 * i)) & 0xffu);
+    }
+    ssl_request[8] = static_cast<std::byte>(options_.charset);
+
+    const status sent = send_message(span<const std::byte>(ssl_request.data(), ssl_request.size()),
+                                     sequence_);
+    if (!sent) {
+        return sent;
+    }
+
+    // The upgrade replaces the channel: the greeting and the SSLRequest used
+    // the cleartext transport, everything after this point -- TLS records
+    // during the handshake, then the encrypted MySQL framing -- rides on the
+    // wrapper. The wrapper reports is_secure() only after a completed
+    // handshake, which is what steers caching_sha2 full authentication to the
+    // cleartext-password path. On failure the transport comes back and `fail`
+    // closes it through the ordinary path.
+    tls_client_options tls;
+    tls.server_name = options_.tls_options.server_name;
+    tls.verify_server = options_.tls_options.verify_certificate;
+    tls.ca_bundle = options_.tls_options.ca_bundle;
+    result<std::unique_ptr<channel>> secured = open_tls_channel(link_, tls);
+    if (!secured) {
+        return secured.error();
+    }
+    link_ = std::move(secured.value());
+    tls_active_ = true;
+    return status{};
+}
+
+status connection::authenticate(const handshake& greeting) {
     auth_plugin_ = greeting.auth_plugin_name;
     if (auth_plugin_.empty()) {
         // A server that offers no plugin name predates the plugin mechanism.
@@ -380,8 +455,11 @@ status connection::authenticate(const handshake& greeting) {
     }
     payload.resize(written);
 
-    // The response continues the greeting's sequence.
-    const status sent = send_message(span<const std::byte>(payload.data(), payload.size()), 1);
+    // The response continues the current sequence: 1 on the cleartext path
+    // (which is exactly what the greeting read left), 2 when the SSLRequest
+    // already consumed the first client sequence. Hard-coding the 1 that used
+    // to be right would break the TLS path.
+    const status sent = send_message(span<const std::byte>(payload.data(), payload.size()), sequence_);
     if (!sent) {
         return sent;
     }
@@ -1872,6 +1950,19 @@ result<db::connection*> connection_factory::open() {
     // bounds it on a plain thread, while a coroutine parks until the server
     // answers or the link dies.
     config.operation_timeout = std::chrono::seconds(15);
+
+    // The endpoint host is the SNI / verification name when the caller left it
+    // unset. An IP literal carries no SNI (and no name to verify against),
+    // matching what a TLS client may send for a bare address.
+    if (options_.tls_options.enabled && options_.tls_options.server_name.empty()) {
+        const std::string& host = endpoint_.host();
+        const bool ipv6 = host.find(':') != std::string::npos;
+        const bool ipv4 =
+            !host.empty() && host.find_first_not_of("0123456789.") == std::string::npos;
+        if (!ipv4 && !ipv6) {
+            options_.tls_options.server_name = host;
+        }
+    }
 
     auto session = std::unique_ptr<connection>(new connection(
         options_, std::unique_ptr<channel>(

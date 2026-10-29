@@ -248,7 +248,10 @@ headers and the library reads it from its own: `http_server_options` and
 `io::tls_config` (by value into `http_server::http_server` / `listen_tls`, and
 `tls_config` returned by value from `tls_context::config`), `rpc::method_options`
 (by value into `method_slot` / `service_registry::register_method`),
-`push::subscribe_options` (by value into `hub::subscribe`), and
+`push::subscribe_options` (by value into `hub::subscribe`),
+`db::mysql::connection_options` (by value into the exported `mysql::connection`
+constructor; its nested `tls` struct carries the TLS transport policy the
+handshake reads), and
 `resilience::rate_limit_config` / `breaker_config` / `bulkhead_config` /
 `retry_policy` (by reference into the corresponding constructors). The structs
 that are genuinely outside this scope are the ones with **no** out-of-line entry
@@ -287,6 +290,7 @@ is guarded.
 - `::crpc::db::mysql::err_packet`
 - `::crpc::db::mysql::handshake`
 - `::crpc::db::mysql::handshake_response_options`
+- `::crpc::db::mysql::connection_options`
 - `::crpc::db::mysql::ok_packet`
 - `::crpc::db::mysql::binary_row`
 - `::crpc::db::mysql::prepare_ok`
