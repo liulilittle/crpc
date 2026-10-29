@@ -724,6 +724,15 @@ CRPC_TEST(server_dedup_abandons_suspended_duplicate_on_disconnect) {
     CRPC_CHECK_EQ(1, state.calls.load());
     // Both requests were handled (one executed, one abandoned) and the server
     // is still healthy afterwards.
+    //
+    // `requests_handled` is incremented at the *end* of `handle_request`, and
+    // for the follower that end comes after its connection was closed and the
+    // duplicate was abandoned -- so it can still read 1 when both client-side
+    // calls have already returned. Asserting the snapshot right after `join()`
+    // therefore failed intermittently (2 in 6 runs under load). Wait for the
+    // server to finish the second request, then assert the exact count.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&srv] { return srv->stats().requests_handled >= 2; }, 5000));
     CRPC_CHECK_EQ(2u, srv->stats().requests_handled);
 
     leader_client->close();
