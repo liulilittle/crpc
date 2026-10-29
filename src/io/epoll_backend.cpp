@@ -303,11 +303,14 @@ public:
             // short consumption it has already made, and a snapshot taken
             // before that point would skip the wake entirely -- the
             // connection would stay paused with retained bytes and nothing
-            // would ever schedule it again. With a pause to clear or retained
-            // bytes present the loop consumes the request under `mtx_` in the
-            // same critical section that records the pause, so the wake
-            // cannot be swallowed either way.
-            if (read_paused_ || rx_tail_ != 0) {
+            // would ever schedule it again. With a pause to clear, retained
+            // bytes present, or a delivery attempt in flight the loop
+            // consumes the request under `mtx_` in the same critical section
+            // that records the pause, so the wake cannot be swallowed either
+            // way. The in-flight case is the one `read_paused_` and
+            // `rx_tail_` cannot see: on_data is running, the remainder has
+            // not been stashed and no pause has been recorded yet.
+            if (read_paused_ || rx_tail_ != 0 || delivering_) {
                 ++pending_wakes_;
             }
         }
@@ -471,7 +474,9 @@ private:
             return nullptr;
         }
         const std::size_t n = std::min(space, pending_remaining_);
-        std::memcpy(tx_.get() + tx_tail_, pending_data_, n);
+        if (n != 0) {
+            std::memcpy(tx_.get() + tx_tail_, pending_data_, n);
+        }
         tx_tail_ += n;
         pending_data_ += n;
         pending_remaining_ -= n;
@@ -506,16 +511,19 @@ private:
                     std::make_error_code(std::errc::operation_not_supported), 0};
             } else {
                 const std::size_t copied = ring_append_locked(data);
-                if (copied == data.size()) {
-                    immediate = c;
-                    immediate_result = io::io_result{std::error_code{}, data.size()};
-                } else {
-                    pending_data_ = data.data() + copied;
-                    pending_remaining_ = data.size() - copied;
-                    pending_accepted_ = data.size();
-                    pending_c_ = c;
-                }
-                need_service = (tx_tail_ != tx_head_) || (pending_c_ != nullptr);
+                // Every accepted push completes from `write_loop`, after the
+                // bytes have been handed to the kernel -- never from here.
+                // At this point the bytes only sit in the user-space ring,
+                // and `close()` is abortive (it discards queued bytes), so
+                // completing now would let a caller that pushes and closes
+                // lose the data. "Complete = kernel accepted" matches IOCP,
+                // where a chunk completes only in `handle_send_complete`
+                // after `WSASend` finished.
+                pending_data_ = data.data() + copied;
+                pending_remaining_ = data.size() - copied;
+                pending_accepted_ = data.size();
+                pending_c_ = c;
+                need_service = true;
             }
         }
         if (immediate != nullptr) {
@@ -532,6 +540,9 @@ private:
         for (;;) {
             {
                 std::lock_guard<std::mutex> lk(mtx_);
+                // The previous attempt finished; a demand queued from here on
+                // can only be fulfilled by a future attempt.
+                delivering_ = false;
                 if (closed_ || error_delivered_) {
                     return;
                 }
@@ -547,11 +558,21 @@ private:
                     --pending_wakes_;
                     read_paused_ = false;
                 }
+                // This iteration will call on_data and may end by recording a
+                // pause from a short consumption. Mark the attempt in flight:
+                // a resume_read() arriving inside this window must queue a
+                // demand, because the pause decision that follows the
+                // consumption reads pending_wakes_ under this same mutex --
+                // without the flag both the demand and the bytes would be
+                // lost (neither read_paused_ nor rx_tail_ is visible yet).
+                delivering_ = true;
             }
             // Announce one call for this iteration. The source is borrowed, so
             // it must not be held across iterations.
             io::source* src = bound_.enter();
             if (src == nullptr) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                delivering_ = false;
                 return;
             }
             if (rx_tail_ != 0) {
@@ -580,6 +601,13 @@ private:
                             } else {
                                 read_paused_ = true;
                             }
+                        }
+                        // Leaving the attempt (the return below) ends the
+                        // in-flight window; the again path keeps it and the
+                        // next iteration's critical section re-arms it under
+                        // the same lock.
+                        if (!again) {
+                            delivering_ = false;
                         }
                     }
                     if (again) {
@@ -614,6 +642,9 @@ private:
                                 read_paused_ = true;
                             }
                         }
+                        if (!again) {
+                            delivering_ = false;
+                        }
                     }
                     if (again) {
                         continue;
@@ -627,6 +658,7 @@ private:
             if (k == 0) {
                 {
                     std::lock_guard<std::mutex> lk(mtx_);
+                    delivering_ = false;
                     if (!closed_) {
                         peer_eof_ = true;
                     }
@@ -638,7 +670,13 @@ private:
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                delivering_ = false;
                 return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                delivering_ = false;
             }
             fail(errno_ec(errno));
             return;
@@ -829,6 +867,13 @@ private:
     // receive side
     std::size_t rx_tail_ = 0;
     bool read_paused_ = false;
+    // True while the loop thread is inside a delivery attempt whose outcome
+    // may be a pause (set in the loop's critical section before on_data, cleared
+    // at the pause decision or on every exit). A resume_read() observed during
+    // this window queues a demand: read_paused_ and rx_tail_ are both still
+    // false at that instant, yet the imminent short consumption would record a
+    // pause and swallow the wake. Loop-thread write, consumed under mtx_.
+    bool delivering_ = false;
     // Number of queued delivery requests the read loop has not fulfilled yet.
     // `resume_read()` and `bind_source()` queue one and schedule; the read
     // loop fulfils a request with a delivery attempt and may not stop while
