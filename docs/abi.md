@@ -396,6 +396,10 @@ is guarded.
 - `::crpc::mvc::route_params`
 - `::crpc::net::backoff_config`
 - `::crpc::net::connect_options`
+- `::crpc::net::icmp_echo_reply`
+- `::crpc::net::icmp_options`
+- `::crpc::net::icmp_ping_result`
+- `::crpc::net::icmp_ping_statistics`
 - `::crpc::net::resolve_options`
 - `::crpc::net::retry_report`
 - `::crpc::obs::log_record`

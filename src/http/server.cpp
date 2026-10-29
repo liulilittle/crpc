@@ -684,7 +684,6 @@ private:
 
     server_state& state_;
     runtime* shard_ = nullptr;
-    std::size_t shard_index_ = 0;
     bool tls_mode_ = false;
     // The socket peer captured at accept time (never header-derived).
     net::ip_address peer_address_;
@@ -1287,7 +1286,6 @@ session::session(server_state& state, std::size_t shard_index,
     : state_(state),
       shard_(shard_index < state.shards.size() ? state.shards[shard_index].get()
                                                : nullptr),
-      shard_index_(shard_index),
       tls_mode_(tls_mode),
       peer_address_(peer_ip(peer)),
       peer_port_(peer.type() == endpoint::kind::tcp ? peer.port() : 0),
