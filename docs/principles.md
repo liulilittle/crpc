@@ -53,7 +53,7 @@ rule is a review obligation.
 | 10 | Events precede data | Applying a delta before the snapshot or without a gap check | watch state index `S`: `E <= S` dropped, `E == S+1` applied, `E > S+1` resync | `watch_gap_triggers_resync`, `watch_drops_duplicate_and_old_index` |
 | 11 | NULL must not pass through | Deleting by absence; a stale registration reviving a tombstone | tombstones; a tombstone rejects every incarnation that is not strictly greater | `registry_tombstone_blocks_old_incarnation`, `watch` tombstone tests |
 | 12 | Causality | Ordering cross-node events by wall clock | monotonic clocks for all control decisions; trace parent from the send/receive pair; registry index | `tracer_parent_child_relation`; flow clock tests; see §5 for the deadline defect |
-| 13 | End-to-end argument | Treating a middle-layer ACK as correctness | idempotency key travels to the endpoint; TCP framing is transport, not a business guarantee | key carried in the envelope; server dedup is **specified, not implemented** |
+| 13 | End-to-end argument | Treating a middle-layer ACK as correctness | idempotency key travels to the endpoint; TCP framing is transport, not a business guarantee | key carried in the envelope; server dedup implemented in `rpc/dedup.hpp` (per-process; see §6) |
 | 14 | Observation interferes | Blocking the forwarding path on logging or metrics | log records go to a per-thread ring; tracer uses a bounded queue; hooks are frozen and empty-chain is cheap | log/tracer allocation and overflow tests; AOP is not yet on the call path |
 
 ## 3. AP before C <a id="s3"></a>
@@ -139,15 +139,25 @@ The dispatcher decodes the key into the context. A written non-idempotent call
 that times out is marked `unknown_side_effect`. `retry` refuses
 `unknown_side_effect` unless the call is idempotent.
 
-**Gap:** the server-side dedup table (fresh/in-progress/done, per-client ring,
-FIFO eviction) is **specified, not implemented**. Exactly-once is therefore not
-yet a property of a CRPC deployment; only the key transport and the timeout
-semantics exist.
+**Server side:** the bounded dedup table (`rpc/dedup.hpp`) closes the gap.
+A fresh key executes; an in-flight key suspends the duplicate until the leader
+publishes and then resends its exact response (concurrent duplicates execute the
+handler exactly once); a completed key replays the cached response without
+running the handler. Only successes are cached — a failed completion is an
+uncached tombstone whose later replay re-executes, which is what keeps the
+client retry policy meaningful. The table is bounded (LRU capacity 4096, a
+monotonic-clock TTL of 5 minutes as the dedup window, a 16 KiB per-entry
+response cache bound, a bounded suspension wait that the connection teardown can
+interrupt through `abandon`); a table saturated with in-flight entries degrades
+to at-least-once instead of growing memory. Exactly-once is therefore a
+property of one process (every shard shares the dispatcher's table); independent
+nodes dedup on their own, and a replay after eviction or expiry re-executes —
+the window must be sized against the client retry budget.
 
 **Verification:** `client_idempotent_timeout_has_no_unknown_side_effect`,
-`retry_unknown_side_effect_requires_idempotency`, and the `call_id`
-encode/decode tests. A replay test that executes a handler once is **specified,
-not implemented** because there is no dedup table to test.
+`retry_unknown_side_effect_requires_idempotency`, the `call_id`
+encode/decode tests, and `tests/test_rpc_dedup.cpp` (exactly-once replay,
+concurrent duplicates, window expiry, abandon on disconnect, capacity bound).
 
 ## 7. Control theory <a id="s7"></a>
 

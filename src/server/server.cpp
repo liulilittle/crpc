@@ -96,6 +96,11 @@ void wake_push_pump(server_connection* sc) noexcept;
 // `server::impl` (it needs the full type).
 void schedule_detach_connection(server_connection* sc) noexcept;
 
+// Ends every dedup duplicate suspended on behalf of `wait_key` with an explicit
+// error. Defined after `server::impl` (it needs the full type); safe to call
+// from the early teardown paths that run before the impl is complete.
+void abandon_dedup_waiters(server::impl* owner, const void* wait_key) noexcept;
+
 class send_op_pool;
 
 // Owns the bytes of one outgoing frame until the backend completes the write.
@@ -343,6 +348,10 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
     if (!sc->closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
     }
+    // The connection is gone: a duplicate suspended in dispatch against an
+    // original call on this connection must end with an explicit error instead
+    // of waiting (R18: the drop is visible, not silent).
+    abandon_dedup_waiters(sc->owner, sc);
     // A lost response would otherwise strand the peer until its deadline. Close
     // explicitly so every in-flight call observes EOF/failure; the drop is then
     // visible to the client instead of disappearing silently (R18).
@@ -1332,8 +1341,12 @@ struct server::impl {
         buffer response;
         bool has_response = false;
         bool handler_ran = false;
+        // The connection pointer is the dedup wait key: when this connection
+        // closes, `abandon` wakes a duplicate suspended on this call with an
+        // explicit error instead of letting it wait for the original.
         const status dispatched = dispatch->dispatch(request, response, has_response,
-                                                     steady_now(), handler_ran);
+                                                     steady_now(), handler_ran,
+                                                     job.conn.get());
 
         rpc_code outcome_code = rpc_code::ok;
         if (!dispatched.ok()) {
@@ -1540,6 +1553,12 @@ server_connection::~server_connection() {
     // Records still waiting for their turn are owned by the pool; give them
     // back before the connection goes away.
     release_send_queue();
+    // Last-resort abandon: the reader path (`on_terminal`) and the send-failure
+    // path normally end suspended duplicates already, but a connection object
+    // can also be torn down without either having run. Idempotent; the dedup
+    // table outlives every connection (declared before `connections` in the
+    // impl, so reverse destruction tears the connections down first).
+    abandon_dedup_waiters(owner, this);
     // Connection teardown order is part of the contract: detach from the hub
     // before the connection and its push token can disappear. The detach is
     // synchronous under push_mutex; a no-op when the terminal path already ran.
@@ -1555,6 +1574,12 @@ void server_connection::on_terminal() noexcept {
     if (closed.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    // The reader observed EOF or a transport error: this connection will not
+    // deliver anything again. End every dedup duplicate that is suspended in
+    // dispatch on this connection's behalf with an explicit `canceled` error
+    // instead of letting it block the shard thread until the original
+    // completes (or until its own wait bound).
+    abandon_dedup_waiters(owner, this);
     // The detach is queued on the shard. It holds this connection alive until
     // it runs, so the hub detach still precedes destruction; the closed flag
     // already stops the pump from targeting this connection in the meantime.
@@ -1572,6 +1597,12 @@ void wake_push_pump(server_connection* sc) noexcept {
 void schedule_detach_connection(server_connection* sc) noexcept {
     if (sc != nullptr && sc->owner != nullptr) {
         sc->owner->schedule_detach(sc);
+    }
+}
+
+void abandon_dedup_waiters(server::impl* owner, const void* wait_key) noexcept {
+    if (owner != nullptr && owner->dispatch != nullptr) {
+        (void)owner->dispatch->dedup().abandon(wait_key);
     }
 }
 

@@ -4,6 +4,48 @@
 
 ## 未发布
 
+### 服务端幂等去重表
+
+- RPC 服务端现在会对重放调用去重。信封携带非空 `call_id`（R6 三元组
+  `(client_id, client_epoch, seq)`，客户端每次重试原样复用）的请求在 handler
+  执行前先进入一张有界表：新键执行；仍在处理中的键把副本**挂起**（绝不丢弃），
+  等 leader 发布后原样重发其编码响应，因此并发副本恰好执行一次 handler；
+  已完成的键逐字节重放缓存响应，不执行 handler。这补上了需求 12 的
+  「响应丢失 + 重试 = handler 执行两次」正确性事故，也让需求 16 的重试预算
+  站在真实的服务端保证之上。证据：`tests/test_rpc_dedup.cpp`（13 用例 / 97 断言）。
+- 新增 `rpc::dedup_table`（`include/crpc/rpc/dedup.hpp`、`src/rpc/dedup.cpp`），
+  由 `rpc::dispatcher` 持有、同一 server 进程的全部分片共享。配置经
+  `rpc::dedup_options`（由**头内联**的 `dispatcher(registry, dedup_options)`
+  构造函数消费，记录因此不跨共享库边界——[abi.zh-CN.md](abi.zh-CN.md) §4）：
+  容量 4096 条、LRU 淘汰（处理中条目被钉住；被处理中条目占满的表退化为至少一次
+  bypass，绝不挂死、绝不无界增长——原稿的每客户端 FIFO 环在客户端数量上无界，
+  这正是改用 LRU 的原因）；以单调时钟 5 分钟 TTL 定义去重窗口（绝不用墙钟）；
+  单条缓存响应上限 16 KiB（超限响应只递交给完成时挂起的副本，不为重放保留）；
+  挂起副本上限 30 秒——且永远与请求自带 wire deadline 取交集——`max_wait <= 0`
+  完全禁用挂起（处理中副本立即收到可重试的显式错误）；容量 0 关闭该表。
+  计数器（`claims_leader`、`claims_replay`、`claims_waiter`、`claims_bypass`、
+  `waiters_woken`、`waiters_abandoned`、`waiters_expired`、`evictions`、
+  `entries`）经 `dedup_table::stats()` 读取。
+- 只有成功的响应会被缓存与重放。失败的完成是一枚未缓存墓碑：与其并发的副本
+  收到 leader 的错误，但其后的重放会再执行——客户端重试策略因此保持有意义
+  （`test_server_client.cpp` 的 `retry_idempotent_only` 依赖这一点）。
+  重放的 `ONE_WAY` 副本被静默丢弃。
+- 挂起的副本可被打断：服务端把连接指针作为等待键传给 `dispatch`，连接拆除
+  （`on_terminal`、发送失败、连接析构）时调用 `dedup_table::abandon`，以显式
+  `canceled` 错误结束该副本，而不是让分片线程滞留。
+- 表的键是 `(call_id, service_id, method_id)`：设计按
+  `(client_id, target_service)` 分配 `seq`，以信封 id 限定作用域可以排除跨方法的误重放。
+- 已文档化的限制（[architecture.zh-CN.md](architecture.zh-CN.md) §14）：保证只覆盖
+  `min(TTL, LRU 生命周期)` 窗口——淘汰或过期后的重放会再执行，因此客户端重试预算
+  与服务端窗口必须配套取值；`client_epoch` 变化（客户端重启）产生新键，旧条目经
+  同样的边界老化淘汰（epoch 是键的一部分，旧 epoch 条目永远无法遮蔽新 epoch 调用）；
+  表是每进程的——多分片 server 经同一 dispatcher 共享，但独立进程/节点各自去重，
+  把 `call_id` 路由到同一节点是负载均衡的事，本层不解决。
+- **ABI：** 纯增量。新增导出类 `rpc::dedup_table`（含内嵌 `lease`）、`dispatcher`
+  构造函数重载与新的六参数 `dispatch` 重载；`dispatcher` 增加了一个
+  `dedup_table` 数据成员，消费方与库必须用同一套头文件重建（本 MAJOR 周期
+  本来就有此要求）。无既有记录改变布局；无既有导出符号改签名。
+
 ### HTTP/2 客户端：ALPN 协商、h2c 先验知识与多路复用
 
 - `http::client` 现在会在连接协商出 HTTP/2 时说 HTTP/2。TLS 下由 ALPN 结果决定：默认提供
