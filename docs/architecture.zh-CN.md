@@ -294,7 +294,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1160-1164`，`on_response` 在 `:1196-1200` 与 `:1424-1428`），它不是可观测性链。
+`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1277-1283`，`on_response` 在 `:1429-1437` 与 `:1657-1665`），它不是可观测性链。
 
 **异常契约。** HTTP 与 RPC 路径跨越两种不同的边界，它们的行为并不相同。头内联边界编译进消费方，跟随**消费方**的异常选项；库翻译单元是预编译的，保留**库**的选项。
 
@@ -339,7 +339,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 调用与类型化桩 | `rpc/call.hpp`、`rpc/client.hpp`、`rpc/dispatcher.hpp` | 部分：无协程或桩宏 |
 | 截止时间与取消 | `rpc/client.cpp`、`rpc/call.cpp` | 已实现，有测试 |
 | 幂等键 | `rpc/call.hpp`（`call_id`）、`rpc/dedup.hpp`（`dedup_table`）、调用信封 | 已实现：有界服务端去重表（LRU + 单调 TTL 窗口、处理中挂起可 abandon、响应重放）；仅进程级 |
-| 有序 lane | `rpc/call.hpp` 中的 `lane_token` | 已设计，未实现 |
+| 有序 lane | `rpc/call.hpp` 中的 `lane_token`、`rpc/lane_queue.hpp`、`src/server/server.cpp`、`client_facade.hpp` | 已实现：每个 (connection, lane_id) 一条串行队列；客户端经 `client::lane(lane_id)` 显式 opt-in，按 lane 单调分配 seq；乱序缓冲 + 有界缺号等待（`CRPC_LANE_GAP_TIMEOUT_MS`，默认 5 秒）后跳号；重复 seq 拒绝（含已消费水位）；关闭/停机时排队调用以明确错误完成；lane 排空即释放队列条目 |
 | HTTP/1.1 | `http/message.hpp`、`http/server.hpp` | 已实现：消息层 + 服务端门面 |
 | HTTP/2 与 HPACK | `http2/*`、`http/server.hpp` | 已实现：协议层 + h2c/h2 服务端 |
 | HTTPS/TLS | `http/server.hpp`、`io/tls.hpp` | `CRPC_WITH_OPENSSL` 下已实现；未启用时返回明确错误 |

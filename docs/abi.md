@@ -148,6 +148,13 @@ whatever `call_state` contains. That stability covers the handle, not the heap
 object it points at: the object's size still follows the headers it was
 allocated with, which is the case measured above.
 
+`rpc::lane_queue` (`rpc/lane_queue.hpp`) is the same kind of citizen: a
+header-only class with no `CRPC_API`, wired into the server request path
+and directly includable by tests. It carries no `CRPC_API` signature, so
+its nested records never enter the cross-boundary list above; its layout
+is fixed by the headers a consumer compiles against, like every other
+header-only component.
+
 ## 3. Symbol visibility
 
 - Every exported symbol is declared `CRPC_API` (see `include/crpc/config.hpp`).

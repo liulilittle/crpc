@@ -78,6 +78,7 @@ void drop_payload(void* raw) noexcept {
     delete payload;
 }
 
+
 lane_queue::item item_for(std::uint64_t seq, std::vector<std::uint64_t>* dropped) {
     lane_queue::item work;
     work.seq = seq;
@@ -85,6 +86,23 @@ lane_queue::item item_for(std::uint64_t seq, std::vector<std::uint64_t>* dropped
     work.drop = &drop_payload;
     return work;
 }
+
+// Admits one work item and releases the payload the scheduler declined:
+// `run_now` hands the item straight back to the caller and `duplicate`
+// never transfers ownership, so the test deletes the payload in both
+// cases; only a `buffered` verdict leaves the scheduler owning it (the
+// item is then released by a pop or by `fail_all`).
+lane_queue::admission admit_one(lane_queue& queue, std::uint64_t lane_id,
+                                std::uint64_t seq,
+                                std::vector<std::uint64_t>* dropped) {
+    lane_queue::item work = item_for(seq, dropped);
+    const lane_queue::admission verdict = queue.admit(lane_id, work);
+    if (verdict != lane_queue::admission::buffered) {
+        delete static_cast<recorded_payload*>(work.payload);
+    }
+    return verdict;
+}
+
 
 // Fires the newest armed timer for `lane_id` through the scheduler's own
 // validation path and reports whether a gap was skipped.
@@ -108,12 +126,12 @@ CRPC_TEST(lane_queue_in_order_runs_and_releases) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(7, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 7, 0, &dropped)));
     // The lane is running: the next two park behind their predecessor.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(7, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 7, 1, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(7, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 7, 2, &dropped)));
     CRPC_CHECK_EQ(1u, queue->active_lanes());
     CRPC_CHECK_EQ(2u, queue->buffered_calls());
     CRPC_CHECK(timers.armed.empty()); // in-order arrivals never arm a gap timer
@@ -144,11 +162,11 @@ CRPC_TEST(lane_queue_out_of_order_buffers_until_filled) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(3, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 3, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(3, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 3, 2, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(3, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 3, 1, &dropped)));
     CRPC_CHECK_EQ(1u, queue->active_lanes());
     CRPC_CHECK_EQ(2u, queue->buffered_calls());
     CRPC_CHECK(timers.armed.empty()); // the gap never blocked: seq 1 arrived
@@ -185,9 +203,9 @@ CRPC_TEST(lane_queue_gap_timeout_skips_missing) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(4, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 4, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(4, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 4, 2, &dropped)));
     // seq 1 never arrives. The drain observes the gap and arms the timer.
     CRPC_CHECK_FALSE(queue->pop_runnable(4).has_value());
     CRPC_CHECK_EQ(1u, timers.armed.size());
@@ -217,14 +235,14 @@ CRPC_TEST(lane_queue_late_seq_after_skip_is_duplicate) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(5, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 5, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(5, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 5, 2, &dropped)));
     CRPC_CHECK_FALSE(queue->pop_runnable(5).has_value());
     CRPC_CHECK(fire_timer(*queue, timers, 5));
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(5, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 5, 1, &dropped)));
     // The duplicate did not move the expected value and nothing was dropped.
     CRPC_CHECK(dropped.empty());
     std::optional<lane_queue::item> next = queue->pop_runnable(5);
@@ -245,16 +263,16 @@ CRPC_TEST(lane_queue_duplicate_rejected) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(6, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 6, 0, &dropped)));
     // Consumed position: refused.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(6, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 6, 0, &dropped)));
     // Next position arrives while the lane is busy: parked (claimed).
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(6, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 6, 1, &dropped)));
     // A re-send of the parked position: refused, scheduler keeps one copy.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(6, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 6, 1, &dropped)));
     CRPC_CHECK_EQ(1u, queue->active_lanes());
     CRPC_CHECK_EQ(1u, queue->buffered_calls());
     CRPC_CHECK(queue->is_parked(6, 1));
@@ -264,6 +282,15 @@ CRPC_TEST(lane_queue_duplicate_rejected) {
         CRPC_CHECK_EQ(1u, next->seq);
         delete static_cast<recorded_payload*>(next->payload);
     }
+    CRPC_CHECK_FALSE(queue->pop_runnable(6).has_value());
+    // The queue entry is released, but the consumed positions are remembered:
+    // a replay of a run position after the quiet moment is still a duplicate,
+    // and the next fresh call continues above the watermark.
+    CRPC_CHECK_EQ(0u, queue->active_lanes());
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
+                  static_cast<int>(admit_one(*queue, 6, 0, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_one(*queue, 6, 2, &dropped)));
     CRPC_CHECK_FALSE(queue->pop_runnable(6).has_value());
     CRPC_CHECK_EQ(0u, queue->active_lanes());
     CRPC_CHECK(dropped.empty());
@@ -277,11 +304,11 @@ CRPC_TEST(lane_queue_fail_all_drops_buffered) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(1, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(1, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 1, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(1, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 2, &dropped)));
     CRPC_CHECK_EQ(1u, queue->active_lanes());
     CRPC_CHECK_EQ(2u, queue->buffered_calls());
 
@@ -295,7 +322,7 @@ CRPC_TEST(lane_queue_fail_all_drops_buffered) {
     }
     // A drained scheduler accepts new lanes again.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(1, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 0, &dropped)));
 }
 
 // Different lanes never wait on each other: a blocked lane A does not stop
@@ -309,15 +336,15 @@ CRPC_TEST(lane_queue_lanes_are_independent) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(10, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 10, 0, &dropped)));
     // Lane 11 is a different serial domain: it runs even though lane 10 has a
     // call in flight.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(11, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 11, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(10, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 10, 1, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(11, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 11, 1, &dropped)));
     CRPC_CHECK_EQ(2u, queue->active_lanes());
     CRPC_CHECK_EQ(2u, queue->buffered_calls());
 
@@ -353,16 +380,16 @@ CRPC_TEST(lane_queue_gap_timer_cancelled_when_gap_fills) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(8, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 8, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(8, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 8, 2, &dropped)));
     CRPC_CHECK_FALSE(queue->pop_runnable(8).has_value());
     CRPC_CHECK_EQ(1u, timers.armed.size());
 
     // The missing seq arrives while the lane is idle: it is next, everything
     // buffered sits above it, so it runs now.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(8, item_for(1, &dropped))));
+                  static_cast<int>(admit_one(*queue, 8, 1, &dropped)));
     // A timer fired here would re-validate and do nothing (the expected value
     // moved when the arrival claimed its position).
     CRPC_CHECK_FALSE(fire_timer(*queue, timers, 8));
@@ -392,14 +419,14 @@ CRPC_TEST(lane_queue_first_seq_above_zero_is_a_gap) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(9, item_for(41, &dropped))));
+                  static_cast<int>(admit_one(*queue, 9, 41, &dropped)));
     // The scheduler arms the gap timer for expected seq 0.
     CRPC_CHECK_EQ(1u, timers.armed.size());
     CRPC_CHECK_EQ(0u, timers.armed.front().expected_seq);
     // A re-send of the same still-gapped position is refused, and the
     // scheduler keeps only the first payload.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(9, item_for(41, &dropped))));
+                  static_cast<int>(admit_one(*queue, 9, 41, &dropped)));
     CRPC_CHECK_EQ(1u, queue->buffered_calls());
     // The skip fires on the gap: the buffered call runs, the missing prefix
     // (0..40) is never executed.
@@ -425,9 +452,9 @@ CRPC_TEST(lane_queue_gap_without_timer_hooks_blocks) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(1, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(1, item_for(2, &dropped))));
+                  static_cast<int>(admit_one(*queue, 1, 2, &dropped)));
     CRPC_CHECK_FALSE(queue->pop_runnable(1).has_value());
     CRPC_CHECK_EQ(1u, queue->active_lanes());
     CRPC_CHECK_EQ(1u, queue->buffered_calls());
@@ -447,9 +474,9 @@ CRPC_TEST(lane_queue_rearm_after_partial_progress) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(2, item_for(0, &dropped))));
+                  static_cast<int>(admit_one(*queue, 2, 0, &dropped)));
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(2, item_for(3, &dropped))));
+                  static_cast<int>(admit_one(*queue, 2, 3, &dropped)));
     CRPC_CHECK_FALSE(queue->pop_runnable(2).has_value());
     CRPC_CHECK_EQ(1u, timers.armed.size());
     CRPC_CHECK_EQ(1u, timers.armed.front().expected_seq);

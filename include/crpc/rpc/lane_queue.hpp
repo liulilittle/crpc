@@ -45,7 +45,16 @@
 //     side effect inside a lane that promises exactly-once ordering. The
 //     scheduler answers `duplicate`; the server rejects the call with
 //     `failed_precondition` without running its handler. A duplicate never
-//     moves the expected value.
+//     moves the expected value. The consumed positions outlive the queue: when
+//     an idle lane releases its entry, the scheduler keeps a one-word
+//     watermark per lane id, and a call that arrives later below that
+//     watermark is still a duplicate. Without the watermark, a replayed
+//     sequence after a quiet moment would be mistaken for the first frame of
+//     a fresh lane and executed twice. The watermark is the ordering memory of
+//     the connection and lives until the scheduler is failed or destroyed, so
+//     a client must not reset its per-lane counter on a live connection; the
+//     watermark itself is eight bytes per distinct lane, while the queued
+//     work -- the part that scales with load -- is fully released.
 //   * Gaps. A call whose `seq` is above the expected value is buffered and the
 //     missing positions below it are waited on for a bounded time
 //     (`options::gap_timeout`, measured from the first observation of the
@@ -166,8 +175,7 @@ public:
         lane_state& ls = lane_for(lane_id);
         if (work.seq < ls.next_run) {
             return admission::duplicate;
-        }
-        const bool claimed = work.seq == ls.next_run;
+        }        const bool claimed = work.seq == ls.next_run;
         if (claimed) {
             ls.next_run = work.seq + 1;
         }
@@ -288,6 +296,7 @@ public:
             ls.waiting.clear();
         }
         lanes_.clear();
+        consumed_.clear();
         return dropped;
     }
 
@@ -340,6 +349,13 @@ private:
         }
         std::unique_ptr<lane_state> fresh(new lane_state());
         fresh->lane_id = lane_id;
+        // A released lane left a watermark of the positions it consumed: the
+        // fresh state resumes above it, so a replay below the watermark is
+        // still a duplicate instead of a fresh first frame.
+        const auto consumed = consumed_.find(lane_id);
+        if (consumed != consumed_.end()) {
+            fresh->next_run = consumed->second;
+        }
         lane_state& ref = *fresh;
         lanes_.emplace(lane_id, std::move(fresh));
         return ref;
@@ -392,6 +408,11 @@ private:
         lane_state& ls = *it->second;
         ls.detached = true;
         cancel_gap_locked(ls);
+        // Keep the ordering memory: everything up to `next_run` was claimed
+        // (executed, buffered-then-run, or skipped). A later replay below the
+        // watermark must stay a duplicate even though the queue entry -- the
+        // part that scales with load -- is released here.
+        consumed_[ls.lane_id] = ls.next_run;
         lanes_.erase(it);
     }
 
@@ -403,6 +424,10 @@ private:
     options opt_{};
     mutable std::mutex mutex_;
     lane_table lanes_;
+    // Per-lane consumed watermark, kept after the queue entry is released.
+    // One word per distinct lane id; cleared by `fail_all` (teardown has no
+    // ordering left to protect).
+    std::unordered_map<std::uint64_t, std::uint64_t> consumed_;
 };
 
 } // namespace crpc::rpc
