@@ -273,11 +273,28 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 客户端路径按端点经过同样的阶段：负载均衡 + breaker 感知的重新选择、每端点 rate/bulkhead（探针跳过）、带共享预算且遵守 `retry_after` 的重试、每端点 breaker（`src/client/client_facade.cpp`）。服务端流水线证据：`src/server/server.cpp:317-403,905-1168,1362-1408`；`include/crpc/server.hpp:78-217`。
 
+### 服务端幂等去重
+
+上述重试预算成立的前提，是服务端绝不把同一重放调用执行两次。这就是服务端去重表（`include/crpc/rpc/dedup.hpp`、`src/rpc/dedup.cpp`），由 dispatcher 持有、同一 server 进程的全部分片共享。信封携带非空 `call_id`（R6 三元组）的请求在 handler 执行前先向表申请：
+
+- **新键** → 调用方执行（`claims_leader`），并在 dispatch 退出时发布编码后的响应；
+- **键仍在处理中** → 该副本被**挂起**（绝不丢弃）在 `claim` 内等待 leader 发布，然后原样重发 leader 的响应（`claims_waiter`/`waiters_woken`）；并发副本因此恰好执行一次 handler；
+- **键已完成且已缓存** → 逐字节重放缓存响应，不执行 handler（`claims_replay`）；
+- **键已完成但未缓存** → 重新申请该键，handler 再次执行。
+
+只有成功的响应才会被缓存。失败的完成是一枚未缓存墓碑：与它并发的副本仍会收到 leader 的错误，但之后的重放会重新执行——这正是客户端重试策略保持有意义的原因。重放的 `ONE_WAY` 副本被静默丢弃（没有可等待的响应）。
+
+边界与淘汰（全部可经 `dedup_options` 配置）：容量 4096 条、LRU 淘汰（最久未使用的*已完成*条目让位；处理中条目被钉住；被处理中条目占满的表退化为至少一次 bypass，绝不挂死、绝不无界增长——原稿的每客户端 FIFO 环在客户端数量上无界，这是改用 LRU 的原因）；以单调时钟（steady_clock）从 dispatch 时刻起算的 5 分钟 TTL 定义去重窗口，绝不用墙钟；单条缓存响应上限 16 KiB（超限响应只递交给完成时挂起的副本，不为之后的重放保留）；挂起副本上限 30 秒（且永远受请求自带 wire deadline 约束），分片线程绝不会被无限期占用；`max_wait <= 0` 完全禁用挂起（处理中副本立即收到可重试的显式错误）。重启客户端（`client_epoch` 变化）的旧条目永远无法遮蔽新 epoch 的调用——epoch 是键的一部分——并经同样的 TTL/LRU 边界老化淘汰。
+
+等待可被打断：服务端把连接指针作为等待键传给 `dispatch`，连接拆除（`on_terminal`、发送失败、连接析构）时调用 `dedup_table::abandon`，以显式 `canceled` 错误结束挂起的副本，而不是让它们滞留。
+
+已文档化的限制：保证只覆盖 `min(TTL, LRU 生命周期)` 窗口——淘汰/过期后的重放会再执行，因此客户端重试预算与服务端窗口必须配套取值；表是每进程的（多分片 server 经同一 dispatcher 共享，保证是进程级），各自独立的多进程/多节点分别去重——把 `call_id` 路由到同一节点是负载均衡的事，本层不解决。证据：`tests/test_rpc_dedup.cpp`（13 用例：恰好一次重放、并发副本、键独立、无键回归、过期再执行、超限不缓存、断连 abandon、容量有界、失败墓碑、one-way 丢弃、bypass、两个端到端服务端用例）。
+
 ## 15. 可观测性 <a id="s15"></a>
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1140-1144`，`on_response` 在 `:1176-1180` 与 `:1400-1404`），它不是可观测性链。
+`obs::interceptor_chain` 是每个 hook 点的固定钩子表。空链只花一次可预测分支；钩子在启动时注册并冻结。该链尚未被 `rpc::client`/`rpc::dispatcher` 调用；这部分接线属于**已设计，未实现**。服务端门面另有一个 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1151-1155`，`on_response` 在 `:1187-1191` 与 `:1415-1419`），它不是可观测性链。
 
 **异常契约。** HTTP 与 RPC 路径跨越两种不同的边界，它们的行为并不相同。头内联边界编译进消费方，跟随**消费方**的异常选项；库翻译单元是预编译的，保留**库**的选项。
 
@@ -321,7 +338,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | RTTI 文本/模式编解码 | `codec.hpp` 适配器 | 已实现，条件编译 |
 | 调用与类型化桩 | `rpc/call.hpp`、`rpc/client.hpp`、`rpc/dispatcher.hpp` | 部分：无协程或桩宏 |
 | 截止时间与取消 | `rpc/client.cpp`、`rpc/call.cpp` | 已实现，有测试 |
-| 幂等键 | `rpc/call.hpp`（`call_id`）、调用信封 | 部分：键已携带，无去重表 |
+| 幂等键 | `rpc/call.hpp`（`call_id`）、`rpc/dedup.hpp`（`dedup_table`）、调用信封 | 已实现：有界服务端去重表（LRU + 单调 TTL 窗口、处理中挂起可 abandon、响应重放）；仅进程级 |
 | 有序 lane | `rpc/call.hpp` 中的 `lane_token` | 已设计，未实现 |
 | HTTP/1.1 | `http/message.hpp`、`http/server.hpp` | 已实现：消息层 + 服务端门面 |
 | HTTP/2 与 HPACK | `http2/*`、`http/server.hpp` | 已实现：协议层 + h2c/h2 服务端 |

@@ -4,6 +4,67 @@
 
 ## Unreleased
 
+### Server-side idempotency dedup table
+
+- The RPC server now deduplicates replayed calls. A request whose envelope
+  carries a non-empty `call_id` (the R6 triple `(client_id, client_epoch,
+  seq)`, reused unchanged by every client retry) is claimed in a bounded table
+  before the handler runs: a fresh key executes; a key that is still in flight
+  *suspends* the duplicate (never drops it) until the leader publishes and then
+  resends its exact encoded response, so concurrent duplicates execute the
+  handler exactly once; a completed key replays the cached response byte for
+  byte without running the handler. This closes requirement 12's "response lost
+  + retry = handler executed twice" correctness incident for non-idempotent
+  operations, and requirement 16's retry budget now stands on a real server
+  guarantee. Evidence: `tests/test_rpc_dedup.cpp` (13 cases / 97 checks).
+- New `rpc::dedup_table` (`include/crpc/rpc/dedup.hpp`,
+  `src/rpc/dedup.cpp`), owned by `rpc::dispatcher` and shared by every shard of
+  one server process. Configuration through `rpc::dedup_options` (consumed by
+  the inline `dispatcher(registry, dedup_options)` constructor, so the record
+  never crosses the shared-library boundary — [abi.md](abi.md) §4): capacity
+  4096 entries with LRU eviction (in-flight entries pinned; a table saturated
+  with in-flight entries degrades to at-least-once bypass, never a hang and
+  never unbounded memory — the design sketch's per-client FIFO ring is
+  unbounded in the number of clients, which is why LRU was chosen); a
+  monotonic-clock TTL of 5 minutes defines the dedup window (never a wall
+  clock); a 16 KiB per-entry cap on cached responses (larger responses are
+  handed to the duplicates suspended at completion but not retained for
+  replays); a 30 s cap — always intersected with the request's own wire
+  deadline — on suspending a duplicate, with `max_wait <= 0` disabling
+  suspension entirely (in-flight duplicates are refused immediately with a
+  retryable error); capacity 0 disables the table. Counters (`claims_leader`,
+  `claims_replay`, `claims_waiter`, `claims_bypass`, `waiters_woken`,
+  `waiters_abandoned`, `waiters_expired`, `evictions`, `entries`) are readable
+  through `dedup_table::stats()`.
+- Only successful responses are cached and replayed. A failed completion is an
+  uncached tombstone: its concurrent duplicates receive the leader's error, but
+  a later replay re-executes, which keeps the client retry policy meaningful
+  (`retry_idempotent_only` in `test_server_client.cpp` depends on it). A
+  replayed `ONE_WAY` duplicate is dropped silently.
+- A suspended duplicate is interruptible: the server passes the connection
+  pointer to `dispatch` as the wait key, and connection teardown
+  (`on_terminal`, send failure, connection destruction) calls
+  `dedup_table::abandon`, ending the duplicate with an explicit `canceled`
+  error instead of stranding a shard thread.
+- The table's key is `(call_id, service_id, method_id)`: the design allocates
+  `seq` per `(client_id, target_service)`, so scoping by the envelope ids rules
+  out cross-method false replays.
+- Documented limits ([architecture.md](architecture.md) §14): the guarantee
+  holds inside `min(TTL, LRU lifetime)` — a replay after eviction or expiry
+  re-executes, so the client retry budget and the server window must be sized
+  together; `client_epoch` changes (client restart) create fresh keys and old
+  entries age out through the same bounds (the epoch is part of the key, so a
+  stale entry can never shadow a new-epoch call); the table is per process —
+  multi-shard servers share it through the one dispatcher, but independent
+  processes/nodes each dedup on their own, and routing a `call_id` to one node
+  is a load-balancer concern not solved here.
+- **ABI:** additive. New exported classes `rpc::dedup_table` (with nested
+  `lease`) and a `dispatcher` constructor overload plus a new six-argument
+  `dispatch` overload; `dispatcher` gained a `dedup_table` data member, so a
+  consumer and the library must be rebuilt from the same headers (already
+  required by this MAJOR cycle). No existing record changes layout; no existing
+  exported symbol changes signature.
+
 ### HTTP/2 client: ALPN negotiation, h2c prior knowledge, multiplexing
 
 - `http::client` now speaks HTTP/2 when the connection negotiates it. Over TLS

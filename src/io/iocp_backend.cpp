@@ -27,8 +27,12 @@
 // framework source.  A short or zero return pauses delivery and retains the
 // tail; only `resume_read()` restarts it.  Delivery runs under a single-writer
 // `delivering` flag, exactly like the in-process backend's drain loop, so a
-// re-entrant `resume_read` from inside `on_data` cannot recurse.  A paused
-// reader keeps no completion outstanding, so the pump blocks instead of
+// re-entrant `resume_read` from inside `on_data` cannot recurse.  Demands for
+// delivery (a resume, a first `bind_source`, a completed receive) are counted
+// in `pending_wakes`; a delivery pass consumes them under the connection mutex
+// in the same critical section that releases `delivering`, so a wake can never
+// fall into an ownerless gap between "decided to stop" and "flag released".  A
+// paused reader keeps no completion outstanding, so the pump blocks instead of
 // spinning; a zero-byte completion is EOF and never re-posts a read.
 //
 // Write path
@@ -79,7 +83,6 @@
 namespace crpc {
 namespace {
 
-// --- Error mapping (specification section 6.6) -------------------------------
 
 std::error_code map_wsa_error(unsigned long code) noexcept {
     switch (code) {
@@ -224,12 +227,21 @@ struct conn_state {
 
     std::atomic<bool> delivering{false};
 
-    // Bumped by `resume_read()` under `m`. A delivery pass that is already
-    // running when a resume arrives would otherwise finish against a stale view
-    // of `paused` and re-pause the connection, swallowing the resume: the caller
-    // un-paused, saw no data, and nothing would ever wake delivery again.
-    // The pass compares this value before it stops and loops again if it moved.
-    std::uint64_t resume_epoch = 0;
+    // Number of queued delivery requests that no delivery attempt has
+    // fulfilled yet. `resume_read()` and `bind_source()` queue one when (and
+    // only when) retained bytes are waiting, and a completed receive queues one
+    // for its fresh bytes; all under `m`. The delivery loop fulfils a request
+    // with an actual delivery attempt and may not stop while one is visible:
+    // its single exit decision runs under `m` in the same critical section
+    // that releases `delivering`, consuming a visible request and continuing
+    // instead. A wake arriving after that critical section finds
+    // `delivering == false` and runs its own pass, so no wake can be swallowed
+    // by a pass that already decided to stop, and none is left lingering after
+    // the flag is released. This replaces an earlier "generation" counter: a
+    // generation captured after the wake made the wake invisible to the pass,
+    // and a pass that observed only the stale `paused` flag stopped with data
+    // retained forever.
+    std::uint64_t pending_wakes = 0;
 
     // Set while a send completion is still owned by the backend (posted but its
     // user callback has not run yet). `close()` waits for it so a caller that
@@ -706,40 +718,60 @@ void handle_read_error(conn_state* st, unsigned long wsa_error) noexcept {
 }
 
 void deliver_read(conn_state* st) noexcept {
+    if (st->delivering.exchange(true, std::memory_order_acq_rel)) {
+        // Another pass owns delivery. Its single exit decision below runs under
+        // `m` and consumes a visible pending wake before it releases the flag,
+        // so a wake issued now is either consumed by that pass or, arriving
+        // after the release, re-enters here and owns a pass itself.
+        return;
+    }
     for (;;) {
-        if (st->delivering.exchange(true, std::memory_order_acq_rel)) {
-            // Another pass owns delivery. It will re-check `resume_epoch` before
-            // it stops, so a resume issued now is not lost.
-            return;
-        }
-        std::uint64_t pass_epoch = 0;
-        {
-            std::lock_guard<std::mutex> lk(st->m);
-            pass_epoch = st->resume_epoch;
-        }
+        // Deliver bytes, pause, or re-arm the receive until this round cannot
+        // make progress on its own.
         for (;;) {
             std::byte* ptr = nullptr;
             std::size_t avail = 0;
             bool post = false;
             bool stop = false;
+            const char* why = "";
             {
                 std::lock_guard<std::mutex> lk(st->m);
                 if (st->phase != conn_phase::open) {
                     st->rx_off = 0;
                     st->rx_got = 0;
                     stop = true;
-                } else if (st->paused) {
-                    stop = true;
-                } else if (st->rx_off < st->rx_got) {
-                    if (!st->bound.active()) {
-                        st->paused = true;
-                        stop = true;
-                    } else {
-                        ptr = st->rx.get() + st->rx_off;
-                        avail = st->rx_got - st->rx_off;
-                    }
+                    why = "phase";
                 } else {
-                    post = true;
+                    // A queued wake outranks the paused decision an earlier
+                    // iteration made from a consumer that had no credit: the
+                    // caller demanded delivery, so deliver.
+                    if (st->paused && st->pending_wakes != 0) {
+                        --st->pending_wakes;
+                        st->paused = false;
+                    }
+                    if (st->rx_off < st->rx_got) {
+                        if (st->paused) {
+                            stop = true;
+                            why = "paused";
+                        } else if (!st->bound.active()) {
+                            st->paused = true;
+                            stop = true;
+                            why = "unbound";
+                        } else {
+                            // This attempt fulfils one queued wake, if any: a
+                            // request means "try to deliver", and a try the
+                            // consumer rejects is still fulfilled.
+                            if (st->pending_wakes != 0) {
+                                --st->pending_wakes;
+                            }
+                            ptr = st->rx.get() + st->rx_off;
+                            avail = st->rx_got - st->rx_off;
+                            why = "deliver";
+                        }
+                    } else {
+                        post = true;
+                        why = "post";
+                    }
                 }
             }
 
@@ -774,20 +806,25 @@ void deliver_read(conn_state* st) noexcept {
             }
         }
 
-        st->delivering.store(false, std::memory_order_release);
-
-        bool more = false;
-        bool resumed = false;
+        // The single exit decision. Deciding to stop and releasing the
+        // single-writer flag are one critical section: an unfulfilled wake is
+        // either consumed here (and this pass keeps ownership, looping back
+        // above without re-claiming the flag) or it lands after the release and
+        // finds `delivering == false`, running its own pass. There is no
+        // ownerless gap in between, and no wake is ever left queued behind a
+        // released flag.
+        bool again = false;
         {
             std::lock_guard<std::mutex> lk(st->m);
-            // A resume that arrived during this pass outranks the `paused` flag
-            // this pass may have just set from a stale `consumed`: the caller
-            // asked for delivery to continue, so continue.
-            resumed = st->resume_epoch != pass_epoch;
-            more = st->phase == conn_phase::open &&
-                   (resumed || !st->paused) && st->rx_off < st->rx_got;
+            if (st->phase == conn_phase::open && st->pending_wakes != 0) {
+                --st->pending_wakes;
+                st->paused = false;
+                again = true;
+            } else {
+                st->delivering.store(false, std::memory_order_release);
+            }
         }
-        if (!more) {
+        if (!again) {
             return;
         }
     }
@@ -814,7 +851,9 @@ void handle_recv_complete(overlapped_op* op, std::size_t bytes,
         } else {
             st->rx_off = 0;
             st->rx_got = bytes;
-            st->paused = false;
+            // New bytes demand delivery exactly like a resume does; the pass
+            // consumes this request under `m` before it may stop.
+            ++st->pending_wakes;
             deliver = true;
         }
     }
@@ -1110,10 +1149,14 @@ public:
                 if (st_->phase != conn_phase::open) {
                     return;
                 }
-                // Delivery paused because no source was bound. Clear it like
-                // resume_read() does; otherwise deliver_read() stops on the
-                // first check and never resumes on this connection.
-                st_->paused = false;
+                // Delivery may have paused while no source was bound; that can
+                // only happen with retained bytes, so queue the demand only
+                // then. With an empty buffer there is nothing to deliver and a
+                // queued wake would never be fulfilled -- it would linger and
+                // later override an unrelated pause.
+                if (st_->rx_off < st_->rx_got) {
+                    ++st_->pending_wakes;
+                }
             }
             deliver_read(st_.get());
         }
@@ -1128,10 +1171,18 @@ public:
             if (st_->phase != conn_phase::open) {
                 return;
             }
-            st_->paused = false;
-            // Tell any in-flight delivery pass that this resume must not be
-            // undone by a decision it already made about `paused`.
-            ++st_->resume_epoch;
+            // Queue the demand instead of clearing `paused` here: a running
+            // pass that is about to write back its own short-consumption pause
+            // would otherwise overwrite this clear, and a pass that captured a
+            // generation counter before this point could never see the wake.
+            // The delivery loop fulfils the request with a delivery attempt in
+            // the same critical section that releases `delivering`, so the wake
+            // either restarts that pass or runs its own. An empty buffer needs
+            // no wake: `paused` implies retained bytes, and incoming bytes
+            // queue their own wake on completion.
+            if (st_->rx_off < st_->rx_got) {
+                ++st_->pending_wakes;
+            }
         }
         deliver_read(st_.get());
     }

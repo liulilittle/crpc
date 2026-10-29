@@ -47,6 +47,7 @@
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/rpc/call.hpp>
+#include <crpc/rpc/dedup.hpp>
 #include <crpc/span.hpp>
 
 namespace crpc::rpc {
@@ -230,6 +231,14 @@ class CRPC_API dispatcher {
 public:
     explicit dispatcher(service_registry& registry) noexcept : registry_(&registry) {}
 
+    // A dispatcher with a configured idempotency dedup table. The options are
+    // consumed by this INLINE constructor, so their layout never crosses the
+    // shared-library boundary (docs/abi.md section 4). Note that adding a data
+    // member to `dispatcher` grows the type: a consumer and the library must be
+    // rebuilt from the same headers, which this cycle already requires.
+    dispatcher(service_registry& registry, const dedup_options& dedup) noexcept
+        : registry_(&registry), dedup_(dedup) {}
+
     // Dispatches one REQUEST (or ONE_WAY) frame.
     //
     // `response_out` receives the RESPONSE payload when `has_response` is true.
@@ -252,10 +261,31 @@ public:
                                   std::chrono::steady_clock::time_point now,
                                   bool& handler_ran) noexcept;
 
+    // Same as above with idempotency dedup enabled for this call.
+    //
+    // When the request carries a non-empty `call_id`, the dispatcher consults
+    // the table before running the handler: a fresh key executes, a key that is
+    // still in flight suspends the caller until the leader publishes and then
+    // resends its exact response, and a completed key resends the cached
+    // response without running the handler. `dedup_wait_key` is the opaque
+    // connection identity handed to `dedup_table::abandon` when that connection
+    // closes; null means the wait is only bounded by time, never abandoned.
+    // See `rpc/dedup.hpp` for the full semantics.
+    [[nodiscard]] status dispatch(const frame& request, buffer& response_out, bool& has_response,
+                                  std::chrono::steady_clock::time_point now, bool& handler_ran,
+                                  const void* dedup_wait_key) noexcept;
+
     [[nodiscard]] const service_registry& registry() const noexcept { return *registry_; }
+
+    // The server-side idempotency dedup table. The server calls `abandon` on
+    // connection teardown; tests read `stats()`.
+    [[nodiscard]] dedup_table& dedup() noexcept { return dedup_; }
 
 private:
     service_registry* registry_;
+    // Declared after `registry_` and constructed by the inline constructors, so
+    // a consumer and the library always agree on its size (same headers).
+    dedup_table dedup_;
 };
 
 // --- Typed method trampoline -------------------------------------------------
