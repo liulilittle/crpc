@@ -196,8 +196,6 @@ std::vector<std::byte> raw_frame(u32 payload_len, u8 type, u8 flags, u32 stream_
 
 u8 lz4_flags() { return static_cast<u8>(frame_flag_compressed | 0x20u); }
 u8 zstd_flags() { return static_cast<u8>(frame_flag_compressed | 0x40u); }
-u8 gzip_flags() { return static_cast<u8>(frame_flag_compressed | 0x60u); }
-
 // Compressed payload bytes: u32 LE logical length followed by the codec stream.
 std::vector<std::byte> make_compressed_payload(const std::vector<std::byte>& plain,
                                                const compression_limits& limits = {}) {

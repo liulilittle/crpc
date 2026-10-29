@@ -141,11 +141,11 @@ status counting_handler(void* self, const call_envelope&, crpc::span<const std::
 
 struct fixture {
     service_registry registry;
-    dispatcher dispatch{registry, options};
-    handler_state state;
     dedup_options options;
+    handler_state state;
+    dispatcher dispatch{registry, options};
 
-    explicit fixture(dedup_options opts) : options(opts), dispatch{registry, opts} {
+    explicit fixture(dedup_options opts) : options(std::move(opts)) {
         (void)registry.register_service(1, "svc");
         (void)registry.register_method(1, 1, "op", &counting_handler, &state,
                                        method_options{});

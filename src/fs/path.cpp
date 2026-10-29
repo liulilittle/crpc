@@ -13,11 +13,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include "os.hpp"
 #else
 #include <unistd.h>
 #include <limits.h>
 #endif
+#include "os.hpp"
 
 namespace crpc {
 namespace fs {
@@ -220,6 +220,9 @@ bool folded_equal(std::string_view a, std::string_view b) noexcept {
     return true;
 }
 
+#if defined(CRPC_OS_WINDOWS)
+// Only the Windows drive/share comparison folds case; POSIX paths are
+// case-sensitive by definition.
 std::string folded(std::string_view s) {
     std::string out(s);
     for (char& c : out) {
@@ -227,6 +230,7 @@ std::string folded(std::string_view s) {
     }
     return out;
 }
+#endif
 
 bool insensitive_less(std::string_view a, std::string_view b) noexcept {
     const std::size_t n = a.size() < b.size() ? a.size() : b.size();

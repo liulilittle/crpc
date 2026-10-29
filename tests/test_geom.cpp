@@ -77,13 +77,6 @@ real uniform_real(real lo, real hi, std::uint64_t& state) {
                                  unit_random(state));
 }
 
-// A guaranteed-unit direction avoids the degenerate near-zero vector that a
-// uniform [-1,1]x[-1,1] pair could produce (which the ray API rejects).
-vec2 random_unit_direction(std::uint64_t& state) {
-    const real a = uniform_real(0.0f, geom::k_two_pi, state);
-    return vec2(std::cos(a), std::sin(a));
-}
-
 geom::polygon poly_of(std::initializer_list<vec2> points) {
     geom::polygon p;
     p.vertices.assign(points.begin(), points.end());
@@ -1151,7 +1144,6 @@ CRPC_TEST(geom_performance_point_in_polygon_and_circle_polygon) {
                                 100.0f * std::sin(a) - 2.0f));
     }
     const geom::polygon poly{vertices};
-    const geom::circle probe_circle{vec2(3.0f, -2.0f), 20.0f};
     std::uint64_t state = 0x123456789ULL;
 
     volatile int sink = 0;

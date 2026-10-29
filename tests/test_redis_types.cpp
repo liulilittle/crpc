@@ -34,7 +34,12 @@ value vint(i64 v) { return value{v}; }
 value vreal(double v) { return value{v}; }
 value vstr(std::string s) { return value{std::move(s)}; }
 value varray(std::vector<value> items) {
-    return value{array_value{std::move(items)}};
+    // Parentheses, not braces: array_value aliases std::vector<value>, so
+    // `array_value{std::move(items)}` is list-initialisation and prefers the
+    // initializer_list<value> constructor -- the whole vector converts to a
+    // single value (value is constructible from array_value) and ends up
+    // wrapped as the vector's only element.
+    return value{array_value(std::move(items))};
 }
 value vmap(std::vector<std::pair<value, value>> entries) {
     return value{map_value{std::move(entries)}};

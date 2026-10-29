@@ -31,7 +31,7 @@
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
 #include <crpc/io.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -95,7 +95,7 @@ public:
     }
 
 private:
-    crpc::iocp_backend backend_;
+    tcp_backend backend_;
     std::unique_ptr<crpc::db::mysql::connection> conn_;
 };
 
@@ -107,7 +107,7 @@ void drop(crpc::result<crpc::db::result_set*> rows) {
 
 // A cluster built against the real primary plus the given replica ports.
 struct it_cluster {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::cluster> db;
 
     // `tune` runs last so a case can override any option the defaults set below.

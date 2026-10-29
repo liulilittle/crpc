@@ -17,7 +17,7 @@
 
 #include <crpc/error.hpp>
 #include <crpc/http/client.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -38,7 +38,7 @@ namespace {
 
 CRPC_TEST(http_put_with_a_body_completes) {
     (void)require_gateway();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::http::client_options options;
     options.host = env_or("CRPC_HBASE_HOST", "127.0.0.1");
     options.port = static_cast<std::uint16_t>(std::stoi(env_or("CRPC_HBASE_PORT", "18080")));
@@ -64,7 +64,7 @@ CRPC_TEST(http_put_with_a_body_completes) {
 
 CRPC_TEST(http_get_completes) {
     (void)require_gateway();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::http::client_options options;
     options.host = env_or("CRPC_HBASE_HOST", "127.0.0.1");
     options.port = static_cast<std::uint16_t>(std::stoi(env_or("CRPC_HBASE_PORT", "18080")));

@@ -54,15 +54,52 @@
 
 // --- Tuple helpers ----------------------------------------------------------
 
-#define CRPC_ORM_FIELD_NAME_IMPL(name, ...) name
+// Taking the first element of a tuple with a plain variadic macro leaves the
+// degenerate one-element tuple `(name)` passing zero variadic arguments, which
+// GCC rejects under -Wpedantic -Werror ("ISO C++11 requires at least one
+// argument for the ..."). Appending one trailing empty argument at the inner
+// level keeps every expansion well-formed; the empty argument is consumed here
+// and never reaches the output.
+#define CRPC_ORM_FIELD_NAME_IMPL(...) \
+    RTTI_EXPAND(CRPC_ORM_FIELD_NAME_IMPL_I(__VA_ARGS__, ))
+#define CRPC_ORM_FIELD_NAME_IMPL_I(name, ...) name
 #define CRPC_ORM_FIELD_NAME(tuple) CRPC_ORM_FIELD_NAME_IMPL tuple
 
 // One field-attribute entry, WITHOUT a trailing comma: the entry list is
 // comma-joined by per-count macros below, so RTTI_NARG (which counts macro
 // arguments) sees exactly one entry per field. RTTI_APPLY_OPT cannot be used
 // for the entry list — it mistakes a parenthesised-tuple list for an empty one.
-#define CRPC_ORM_ENTRY_IMPL(name, ...) RTTI_FIELD_ATTR_ENTRY(name, __VA_ARGS__)
-#define CRPC_ORM_ENTRY(T, tuple) CRPC_ORM_ENTRY_IMPL tuple
+//
+// The unpacker is selected by the tuple's element count (same per-arity table
+// style as CRPC_ORM_FN_n / CRPC_ORM_ENTRIES_n, bounded at 20 like those). A
+// plain variadic unpacker would pass zero variadic arguments for the
+// one-element tuple `(name)` and trip -Wpedantic -Werror, and a trailing empty
+// argument cannot be consumed here because it would flow into the attribute
+// list and be emitted as a stray attribute. The expansion is byte-identical to
+// the previous single variadic unpacker for every arity.
+#define CRPC_ORM_ENTRY_UNPACK_1(name) RTTI_FIELD_ATTR_ENTRY(name, )
+#define CRPC_ORM_ENTRY_UNPACK_N(name, ...) RTTI_FIELD_ATTR_ENTRY(name, __VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_2(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_3(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_4(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_5(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_6(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_7(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_8(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_9(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_10(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_11(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_12(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_13(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_14(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_15(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_16(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_17(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_18(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_19(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY_UNPACK_20(...) CRPC_ORM_ENTRY_UNPACK_N(__VA_ARGS__)
+#define CRPC_ORM_ENTRY(T, tuple) \
+    RTTI_EXPAND(RTTI_CAT(CRPC_ORM_ENTRY_UNPACK_, RTTI_NARG tuple) tuple)
 
 // --- Field-name joining (comma separated, no trailing comma) ----------------
 

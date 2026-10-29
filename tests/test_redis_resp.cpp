@@ -54,16 +54,6 @@ resp_value parse_one(const std::string& text) {
     return value;
 }
 
-resp_value parse_one(const std::vector<std::byte>& bytes) {
-    resp_parser parser;
-    parser.feed(as_span(bytes));
-    resp_value value;
-    CRPC_CHECK_EQ(static_cast<int>(parser.next(value)),
-                  static_cast<int>(resp_parser::result::value_ready));
-    CRPC_CHECK(parser.finish().ok());
-    return value;
-}
-
 std::string encode_value_text(const resp_value& value, resp_protocol protocol) {
     // The buffer is exactly the declared size: a size computation that
     // disagrees with the encoder now fails the encode instead of being masked
@@ -566,7 +556,7 @@ CRPC_TEST(resp_parser_rejects_malformed_lengths) {
 }
 
 CRPC_TEST(resp_parser_rejects_bad_boolean) {
-    for (const std::string& text : {"#x\r\n", "#true\r\n", "#\r\n"}) {
+    for (const std::string text : {"#x\r\n", "#true\r\n", "#\r\n"}) {
         resp_parser parser;
         parser.feed(as_span(bytes_of(text)));
         resp_value value;
@@ -578,7 +568,7 @@ CRPC_TEST(resp_parser_rejects_bad_boolean) {
 }
 
 CRPC_TEST(resp_parser_rejects_bad_double) {
-    for (const std::string& text : {",\r\n", ",abc\r\n", ",1.2.3\r\n", ",1 2\r\n"}) {
+    for (const std::string text : {",\r\n", ",abc\r\n", ",1.2.3\r\n", ",1 2\r\n"}) {
         resp_parser parser;
         parser.feed(as_span(bytes_of(text)));
         resp_value value;
@@ -838,7 +828,7 @@ CRPC_TEST(resp_parser_large_pipeline_consumes_all) {
 }
 
 CRPC_TEST(resp_parser_rejects_bare_cr_in_simple_string) {
-    for (const std::string& text : {"+ab\rcd\r\n", "-ab\rcd\r\n", "+ab\ncd\r\n"}) {
+    for (const std::string text : {"+ab\rcd\r\n", "-ab\rcd\r\n", "+ab\ncd\r\n"}) {
         resp_parser parser;
         parser.feed(as_span(bytes_of(text)));
         resp_value value;
@@ -920,7 +910,7 @@ CRPC_TEST(resp_encode_to_string_rejects_crlf_in_simple_string) {
 }
 
 CRPC_TEST(resp_parser_rejects_double_overflow) {
-    for (const std::string& text : {",1e999\r\n", ",-1e999\r\n"}) {
+    for (const std::string text : {",1e999\r\n", ",-1e999\r\n"}) {
         resp_parser parser;
         parser.feed(as_span(bytes_of(text)));
         resp_value value;

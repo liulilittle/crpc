@@ -77,17 +77,32 @@ CRPC_TEST(msmq_priority_and_label_limits) {
 }
 
 CRPC_TEST(msmq_error_mapping_ok) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     CRPC_CHECK_EQ(crpc::rpc_code::ok,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0)));
 }
 
 CRPC_TEST(msmq_error_mapping_queue_not_found) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_QUEUE_NOT_FOUND = 0xC00E0003.
     CRPC_CHECK_EQ(crpc::rpc_code::not_found,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xC00E0003)));
 }
 
 CRPC_TEST(msmq_error_mapping_timeout_is_deadline) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_IO_TIMEOUT = 0xC00E001B. A timed-out receive must not surface as
     // a fatal error; it is the dedicated timeout code.
     const auto code = crpc::mq::msmq::map_mq_error(
@@ -98,18 +113,33 @@ CRPC_TEST(msmq_error_mapping_timeout_is_deadline) {
 }
 
 CRPC_TEST(msmq_error_mapping_access_denied) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_ACCESS_DENIED = 0xC00E0025.
     CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xC00E0025)));
 }
 
 CRPC_TEST(msmq_error_mapping_queue_exists) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_QUEUE_EXISTS = 0xC00E0005.
     CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xC00E0005)));
 }
 
 CRPC_TEST(msmq_error_mapping_sender_cert_buffer) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_SENDER_CERT_BUFFER_TOO_SMALL = 0xC00E002B. This is a caller-side
     // buffer problem, so it maps to invalid_argument, not to a retryable code.
     CRPC_CHECK_EQ(crpc::rpc_code::invalid_argument,
@@ -117,6 +147,11 @@ CRPC_TEST(msmq_error_mapping_sender_cert_buffer) {
 }
 
 CRPC_TEST(msmq_error_mapping_misc) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // invalid parameter, illegal property value, label too long, buffer overflow.
     CRPC_CHECK_EQ(crpc::rpc_code::invalid_argument,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xC00E0006)));
@@ -135,12 +170,22 @@ CRPC_TEST(msmq_error_mapping_misc) {
 }
 
 CRPC_TEST(msmq_error_mapping_service_unavailable) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_SERVICE_NOT_AVAILABLE = 0xC00E000B.
     CRPC_CHECK_EQ(crpc::rpc_code::unavailable,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xC00E000B)));
 }
 
 CRPC_TEST(msmq_error_mapping_transaction_usage) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     // MQ_ERROR_TRANSACTION_USAGE = 0xC00E0050: the caller mixed transactional
     // and non-transactional operations on one queue.
     CRPC_CHECK_EQ(crpc::rpc_code::failed_precondition,
@@ -148,6 +193,11 @@ CRPC_TEST(msmq_error_mapping_transaction_usage) {
 }
 
 CRPC_TEST(msmq_error_mapping_unknown_falls_back_application) {
+#if !defined(CRPC_OS_WINDOWS)
+    // map_mq_error maps MQ_ERROR_* HRESULTs; on non-Windows the MSMQ
+    // layer is a stub that answers unavailable for every code.
+    crpc_test::skip("MSMQ is Windows only");
+#endif
     CRPC_CHECK_EQ(crpc::rpc_code::application,
                   crpc::mq::msmq::map_mq_error(static_cast<std::uint32_t>(0xEEEEEEEE)));
 }

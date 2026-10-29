@@ -17,10 +17,6 @@ namespace db {
 namespace mongo {
 namespace {
 
-[[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
-    return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
-}
-
 // The commands this client can write. Only those may carry `txnNumber`; adding one to
 // a read or to `hello` would make the server refuse the command.
 [[nodiscard]] bool is_write_command(std::string_view name) noexcept {

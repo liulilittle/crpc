@@ -47,12 +47,17 @@ namespace {
     return config;
 }
 
+// Only the TLS branch below uses this, and that branch exists only with an
+// OpenSSL backend. Defining it unconditionally makes a non-OpenSSL build warn
+// that it is unused (GCC -Wunused-function under -Werror).
+#if defined(CRPC_HAVE_OPENSSL)
 [[nodiscard]] std::chrono::milliseconds timeout_budget(const h2_client_options& options) {
     return options.timeout_seconds == 0
                ? std::chrono::milliseconds(0)
                : std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::seconds(options.timeout_seconds));
 }
+#endif
 
 } // namespace
 

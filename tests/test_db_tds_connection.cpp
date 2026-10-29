@@ -43,11 +43,6 @@ using bytes = std::vector<std::byte>;
 
 void put_u8(bytes& out, std::uint8_t value) { out.push_back(static_cast<std::byte>(value)); }
 
-void put_u16_be(bytes& out, std::uint16_t value) {
-    put_u8(out, static_cast<std::uint8_t>((value >> 8) & 0xffu));
-    put_u8(out, static_cast<std::uint8_t>(value & 0xffu));
-}
-
 void put_u16_le(bytes& out, std::uint16_t value) {
     put_u8(out, static_cast<std::uint8_t>(value & 0xffu));
     put_u8(out, static_cast<std::uint8_t>((value >> 8) & 0xffu));

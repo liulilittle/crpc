@@ -87,8 +87,9 @@ public:
 private:
     enum class stage : u8 { headers, body, failed };
     struct assembly {
-        response response;
-        stage stage = stage::headers;
+        crpc::http::response response;
+        crpc::http::detail::h2_session::stage stage =
+            crpc::http::detail::h2_session::stage::headers;
         bool have_length = false;
         std::size_t declared = 0;
         std::size_t received = 0;

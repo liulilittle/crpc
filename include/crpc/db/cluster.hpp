@@ -313,7 +313,7 @@ public:
 
     // --- Replica health ------------------------------------------------------
     // A snapshot in replica order; cheap and local, never contacts a server.
-    [[nodiscard]] std::vector<replica_health> replica_health() const;
+    [[nodiscard]] std::vector<::crpc::db::replica_health> replica_health() const;
 
     // Probes one replica immediately, regardless of the cooldown. Returns true
     // when the replica answered a ping. An out-of-range index is

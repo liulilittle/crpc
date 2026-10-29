@@ -16,10 +16,6 @@ struct scratch {
     path file(std::string_view name) const { return dir() / path(std::string(name)); }
 };
 
-span<const std::byte> bytes_of(const std::string& s) {
-    return span<const std::byte>(reinterpret_cast<const std::byte*>(s.data()), s.size());
-}
-
 std::string view_text(span<const std::byte> view) {
     return std::string(reinterpret_cast<const char*>(view.data()), view.size());
 }

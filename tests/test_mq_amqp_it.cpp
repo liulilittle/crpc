@@ -39,7 +39,7 @@
 
 #include <crpc/db/channel.hpp>
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/mq/amqp/connection.hpp>
 #include <crpc/mq/amqp/types.hpp>
 #include <crpc/net/connection.hpp>
@@ -88,7 +88,7 @@ void report(const char* what, const crpc::rpc_error& error) {
 }
 
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::mq::amqp::connection> session;
     std::unique_ptr<crpc::mq::amqp::channel> channel;
 
@@ -190,7 +190,11 @@ struct it_session {
     std::string command = "wsl -e bash -lc \"";
     command += arguments;
     command += "\"";
+#if defined(_WIN32)
     FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
     if (pipe == nullptr) {
         return false;
     }
@@ -198,7 +202,11 @@ struct it_session {
     while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         output += buffer;
     }
+#if defined(_WIN32)
     const int rc = _pclose(pipe);
+#else
+    const int rc = pclose(pipe);
+#endif
     return rc == 0;
 }
 
@@ -958,7 +966,7 @@ CRPC_TEST(amqp_it_quorum_queue_declares_and_routes) {
 
 CRPC_TEST(amqp_it_multi_node_connect_skips_a_dead_node) {
     (void)require_server();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     connection_options options = options_from_env();
     const std::uint16_t dead =
         find_closed_port(backend, options.host);
@@ -1001,7 +1009,7 @@ CRPC_TEST(amqp_it_multi_node_connect_skips_a_dead_node) {
 
 CRPC_TEST(amqp_it_failover_reconnect_redeclares_and_consumes) {
     (void)require_failover_control();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     connection_options options = options_from_env();
     const std::uint16_t second = second_port();
     options.nodes = {{options.host, options.port}, {options.host, second}};

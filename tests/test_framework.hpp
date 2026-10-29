@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -294,13 +295,58 @@ inline void report_failure(const char* file, int line, const char* expression,
     std::fflush(stderr);
 }
 
+// Does `os << value` compile for T? Several test files provide stream
+// operators for their enum classes (to_string-based) in the enums' own
+// namespaces so argument-dependent lookup finds them here; the detection
+// prefers those whenever they exist and never competes with them.
+template <typename T, typename = void>
+struct stream_insertable : std::false_type {};
+
+template <typename T>
+struct stream_insertable<T, std::void_t<decltype(std::declval<std::ostream&>()
+                                                 << std::declval<const T&>())>>
+    : std::true_type {};
+
+// Renders one side of a failed comparison. GCC resolves unqualified names in
+// templates strictly at the definition point plus ADL, so an enum with no ADL
+// stream operator (the ws/* enums live in a nested namespace their printers do
+// not match) must fall back to the underlying integer instead of failing to
+// compile the whole test.
+template <typename A>
+void render_check_value(std::ostream& out, const A& value) {
+    if constexpr (stream_insertable<A>::value) {
+        out << value;
+    } else if constexpr (std::is_enum<A>::value) {
+        out << static_cast<std::underlying_type_t<A>>(value);
+    } else {
+        out << "<unprintable value>";
+    }
+}
+
+// Heterogeneous integral comparisons (a size_t against a literal int, say) are
+// exactly the comparison `a == b` would perform -- usual arithmetic conversions
+// match std::common_type -- but spelled out with explicit casts so GCC's
+// -Wsign-compare does not fire on legitimate test expressions.
+template <typename A, typename B>
+bool equal_renderable(const A& a, const B& b) {
+    if constexpr (std::is_integral<A>::value && std::is_integral<B>::value) {
+        using common = std::common_type_t<A, B>;
+        return static_cast<common>(a) == static_cast<common>(b);
+    } else {
+        return a == b;
+    }
+}
+
 template <typename A, typename B>
 void check_equal(const char* file, int line, const char* expression, const A& expected,
                  const B& actual) {
     ++check_count();
-    if (!(expected == actual)) {
+    if (!equal_renderable(expected, actual)) {
         std::ostringstream out;
-        out << "expected: " << expected << "\n  actual:   " << actual;
+        out << "expected: ";
+        render_check_value(out, expected);
+        out << "\n  actual:   ";
+        render_check_value(out, actual);
         report_failure(file, line, expression, out.str());
     }
 }

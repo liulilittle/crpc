@@ -31,7 +31,7 @@
 #include <crpc/db/mongo/connection.hpp>
 #include <crpc/db/mongo/protocol.hpp>
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -58,7 +58,7 @@ void report(const char* what, const crpc::rpc_error& error) {
 }
 
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mongo::connection> session;
 
     explicit it_session(std::string_view user = {}, std::string_view password = {}) {
@@ -304,7 +304,7 @@ void print_sent_field(const std::vector<std::byte>& message, const char* name) {
 // The session of an explicit connection with a recording channel, for the distributed
 // cases that assert on what went out.
 struct instrumented_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mongo::connection> session;
     recording_channel* recorder = nullptr;
 
@@ -878,7 +878,7 @@ CRPC_TEST(mongo_it_topology_discovery_sees_the_replica_set) {
 
 CRPC_TEST(mongo_it_read_preference_and_concern_are_the_sent_bytes) {
     (void)require_server();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::db::mongo::connection_options options = it_options();
     options.read_preference = crpc::db::mongo::read_preference_mode::secondary;
     options.read_concern = crpc::db::mongo::read_concern_level::majority;
@@ -941,7 +941,7 @@ CRPC_TEST(mongo_it_read_preference_and_concern_are_the_sent_bytes) {
 
 CRPC_TEST(mongo_it_write_concern_majority_acknowledges) {
     (void)require_server();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::db::mongo::connection_options options = it_options();
     options.write_concern = crpc::db::mongo::write_concern_options::majority();
     auto inner = std::make_unique<crpc::db::socket_channel>(it_transport_config(), backend);
@@ -975,7 +975,7 @@ CRPC_TEST(mongo_it_write_concern_majority_acknowledges) {
 
 CRPC_TEST(mongo_it_write_concern_errors_are_reported) {
     (void)require_server();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
 
     // 1) An unsatisfiable w on a one-node set is a writeConcernError, not a command
     //    failure: ok stays 1 and the reply carries the writeConcernError document.
@@ -1043,7 +1043,7 @@ CRPC_TEST(mongo_it_write_concern_errors_are_reported) {
 
 CRPC_TEST(mongo_it_retryable_write_is_not_duplicated_after_a_lost_reply) {
     (void)require_server();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::db::mongo::connection_options options = it_options();
     options.reconnect = [&backend]() -> crpc::result<std::unique_ptr<crpc::db::channel>> {
         std::unique_ptr<crpc::db::channel> fresh(

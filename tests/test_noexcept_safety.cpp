@@ -152,17 +152,6 @@ crpc::status noop_handler(void*, const crpc::call_envelope&, crpc::span<const st
     return crpc::status{};
 }
 
-std::size_t encode_minimal_envelope(std::byte* out, std::size_t capacity) {
-    crpc::call_envelope env;
-    env.service_id = kService;
-    env.method_id = kMethod;
-    env.codec = crpc::codec_id::crpc_binary;
-    std::size_t written = 0;
-    const crpc::status st =
-        crpc::encode_call_envelope(crpc::span<std::byte>(out, capacity), env, written);
-    return st.ok() ? written : 0;
-}
-
 // A server with one in-flight call per pooled connection, used by the GOAWAY and
 // dispatch cases.
 struct server_under_test {

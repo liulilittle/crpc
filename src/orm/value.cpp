@@ -80,7 +80,9 @@ std::string format_system_time(std::chrono::system_clock::time_point value) {
     const std::int64_t minute = (rem % 3600) / 60;
     const std::int64_t second = rem % 60;
 
-    char buffer[24] = {0};
+    // Wide enough for the worst-case rendering of every directive (a full-width
+    // year plus three long long fields), so -Wformat-truncation is satisfied.
+    char buffer[128] = {0};
     (void)std::snprintf(buffer, sizeof(buffer), "%04d-%02u-%02u %02lld:%02lld:%02lld",
                         year, month, day, static_cast<long long>(hour),
                         static_cast<long long>(minute), static_cast<long long>(second));

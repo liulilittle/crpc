@@ -27,7 +27,7 @@
 #include <crpc/db/client.hpp>
 #include <crpc/db/mysql/connection.hpp>
 #include <crpc/orm/orm.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 // Entities are registered at global scope: RTTI_DEFINE_TYPE opens `namespace
 // rtti` for the specialization, which must resolve to ::rtti.
@@ -81,7 +81,7 @@ const char* const k_create =
     ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
 struct it_fixture {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mysql::connection_factory> factory;
     std::unique_ptr<crpc::db::pool> session_pool;
     std::unique_ptr<crpc::db::client> raw;

@@ -18,7 +18,7 @@ result<session> session::open(db::pool& pool, dialect d) {
     owned.pool_ = &pool;
     owned.lease_ = std::move(lease.value());
     owned.dialect_ = d;
-    return std::move(owned);
+    return owned;
 }
 
 status session::execute(const std::string& sql, span<const parameter> params) {
