@@ -273,21 +273,6 @@ namespace {
 // small fixed buffer rather than a vector: every call would otherwise allocate twice.
 using sha256_pad = std::array<std::uint8_t, 64>;
 
-[[nodiscard]] sha256_digest sha256_of(const std::uint8_t* data, std::size_t size) noexcept {
-    sha_state state;
-    sha256_init(state);
-    absorb(state, sha256_block_fn, data, size);
-    finish(state, sha256_block_fn);
-    sha256_digest digest{};
-    for (std::size_t i = 0; i < 8; ++i) {
-        digest[i * 4] = static_cast<std::uint8_t>((state.h[i] >> 24) & 0xffu);
-        digest[i * 4 + 1] = static_cast<std::uint8_t>((state.h[i] >> 16) & 0xffu);
-        digest[i * 4 + 2] = static_cast<std::uint8_t>((state.h[i] >> 8) & 0xffu);
-        digest[i * 4 + 3] = static_cast<std::uint8_t>(state.h[i] & 0xffu);
-    }
-    return digest;
-}
-
 // Hashes two pieces without concatenating them into a buffer. HMAC always needs
 // ipad||message and opad||inner, and copying the message for the sake of a single call is
 // what makes an HMAC in a hot path slow.
