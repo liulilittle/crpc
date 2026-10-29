@@ -277,11 +277,28 @@ Both per-service stages are `nullopt` by default (one predictable branch; no obj
 
 The client path passes through the same stages per endpoint: load balancing with breaker-aware re-selection, per-endpoint rate/bulkhead gates (probes skip them), retry with a shared budget and an honoured `retry_after`, and a per-endpoint breaker (`src/client/client_facade.cpp`). Evidence for the server pipeline: `src/server/server.cpp:295-380,882-1145,1339-1385`; `include/crpc/server.hpp:78-180`.
 
+### Server-side idempotency dedup
+
+The retry budget above assumes the server never executes a replayed call twice. That is the server-side dedup table (`include/crpc/rpc/dedup.hpp`, `src/rpc/dedup.cpp`), owned by the dispatcher and shared by every shard of one server process. A request whose envelope carries a non-empty `call_id` (the R6 triple) claims the table before the handler runs:
+
+- **fresh key** -> the caller executes (`claims_leader`) and publishes the encoded response at dispatch exit;
+- **key still in flight** -> the duplicate is *suspended* (never dropped) inside `claim` until the leader publishes, then resends the leader's exact response (`claims_waiter`/`waiters_woken`); concurrent duplicates therefore execute the handler exactly once;
+- **key completed and cached** -> the cached response is replayed byte-for-byte without running the handler (`claims_replay`);
+- **key completed but uncached** -> the entry is re-claimed and the handler runs again.
+
+Only successful responses are cached. A failed completion is an uncached tombstone: its concurrent duplicates still receive the leader's error, but a later replay re-executes, which is what keeps the client retry policy meaningful. A replayed `ONE_WAY` duplicate is dropped silently (no response exists to wait for).
+
+Bounds and eviction (all configurable through `dedup_options`): capacity 4096 entries with LRU eviction (the least recently used *completed* entry yields; in-flight entries are pinned; a table saturated with in-flight entries degrades to at-least-once bypass, never a hang and never unbounded memory — the per-client FIFO ring of the original sketch is unbounded in the number of clients, which is why LRU was chosen); a monotonic (steady-clock) TTL of 5 minutes from the dispatch instant defines the dedup window, never a wall clock; a 16 KiB per-entry cap on cached responses (larger responses are handed to the duplicates suspended at completion but not retained for replays); a 30 s cap (and always the request's own wire deadline) on suspending a duplicate, so a shard thread is never held indefinitely; `max_wait <= 0` disables suspension entirely (in-flight duplicates are refused immediately with a retryable error). An entry whose `client_epoch` belongs to a restarted client can never shadow a new-epoch call — the epoch is part of the key — and ages out through the same TTL/LRU bounds.
+
+Waiters are interruptible: the server hands the connection pointer to `dispatch` as the wait key, and connection teardown (`on_terminal`, send failure, connection destruction) calls `dedup_table::abandon`, ending suspended duplicates with an explicit `canceled` error instead of stranding them.
+
+Documented limits: the guarantee holds inside the window `min(TTL, LRU lifetime)` — a replay after eviction/expiry re-executes, so the client retry budget and the server window must be sized together; the table is per process (multi-shard servers share it through the one dispatcher, so the guarantee is process-wide), and independent server processes/nodes each dedup on their own — routing a `call_id` to one node is a load-balancer concern, not solved here. Evidence: `tests/test_rpc_dedup.cpp` (13 cases: exactly-once replay, concurrent duplicates, independence, no-key regression, expiry re-execution, oversized non-cached, abandon on disconnect, capacity bound, failure tombstone, one-way duplicate, bypass, two end-to-end server cases).
+
 ## 15. Observability <a id="s15"></a>
 
 `obs::trace_context` carries a 16-byte trace id, an 8-byte span id, an 8-byte parent and W3C flags; `parse_traceparent`/`format_traceparent` implement the W3C header, and `baggage` is ordered and bounded. `obs::deadline` is relative (`after(duration)`), as required for cross-machine propagation.
 
-`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:1140-1144` for `on_request`, `:1176-1180` and `:1400-1404` for `on_response`), but it is not the observability chain.
+`obs::interceptor_chain` is a fixed table of hooks per hook point. An empty chain costs one predictable branch; hooks are registered at startup and frozen. The chain is not yet called by `rpc::client`/`rpc::dispatcher`; that wiring is **specified, not implemented**. The server facade has a separate `server_interceptor` hook that is called around `dispatch` (`src/server/server.cpp:1151-1155` for `on_request`, `:1187-1191` and `:1415-1419` for `on_response`), but it is not the observability chain.
 
 **Exception contract.** The HTTP and RPC paths cross two different boundaries, and they do not behave alike. A header-inline boundary is compiled into the consumer and follows the consumer's exception flags; a library translation unit is prebuilt and keeps the library's flags.
 
@@ -325,7 +342,7 @@ The estimator, pacer and window are not yet wired into `io` or `rpc`. The integr
 | RTTI text/schema codecs | `codec.hpp` adapters | implemented, conditionally compiled |
 | Calls and typed stubs | `rpc/call.hpp`, `rpc/client.hpp`, `rpc/dispatcher.hpp`, `client_facade.hpp` | implemented: callback/poll core plus coroutine `client_facade`; no generated stub macros |
 | Deadline and cancel | `rpc/client.cpp`, `rpc/call.cpp` | implemented, tested |
-| Idempotency key | `rpc/call.hpp` (`call_id`), call envelope | partial: key carried, no dedup table |
+| Idempotency key | `rpc/call.hpp` (`call_id`), `rpc/dedup.hpp` (`dedup_table`), call envelope | implemented: bounded server-side dedup table (LRU + monotonic TTL window, in-flight suspension with abandon, response replay); per-process only |
 | Ordered lanes | `lane_token` in `rpc/call.hpp` | specified, not implemented |
 | HTTP/1.1 | `http/message.hpp`, `http/server.hpp` | implemented: message layer + server facade |
 | HTTP/2 and HPACK | `http2/*`, `http/server.hpp` | implemented: protocol layer + h2c/h2 server |
