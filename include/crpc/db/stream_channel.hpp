@@ -69,7 +69,7 @@ public:
     // plaintext password.
     [[nodiscard]] bool is_secure() const noexcept override;
 
-    [[nodiscard]] bool is_open() const noexcept;
+    [[nodiscard]] bool is_open() const noexcept override;
 
     // Waits until the TLS handshake settles (completed or failed), bounded by
     // `budget` (a zero or negative budget waits indefinitely, like a zero

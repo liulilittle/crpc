@@ -246,11 +246,24 @@ struct client_options {
     // milliseconds. Zero disables the wait, which is what a caller that manages the state
     // itself wants.
     std::uint32_t transition_timeout_ms = 30000;
+
+    // Keep one HTTP/1.1 keep-alive connection per gateway parked between
+    // calls, instead of dialing a fresh exchange every time. Off by default:
+    // the failover design dials per attempt on purpose, so a transport
+    // failure and a scripted transport both see one exchange per connection;
+    // a caller that routes sustained traffic through one gateway opts in
+    // here. With it on, a parked connection is health-checked before reuse
+    // (`client::is_open`, which the transport marks closed on a peer FIN or
+    // TLS close_notify), a connection retired by the server is dropped, and a
+    // concurrent call finding the slot occupied simply dials its own -- so
+    // reuse never serializes callers.
+    bool reuse_connection = false;
 };
 
-// One gateway session. It owns no socket: each call opens a fresh HTTP exchange, because the
-// gateway's HTTP/1.1 keep-alive is not worth a state machine here and a REST call is not a
-// hot path.
+// One gateway session. By default it owns no socket: each call opens a fresh
+// HTTP exchange, because the gateway's HTTP/1.1 keep-alive is not worth a state
+// machine here and a REST call is not a hot path. `client_options::reuse_connection`
+// opts into one parked keep-alive connection per gateway instead.
 class CRPC_API client final {
 public:
     // Opens the gateway connection lazily, through `opener`, so a caller can supply a
