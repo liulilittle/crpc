@@ -28,12 +28,14 @@
 //   * Scope. State is per scheduler instance. The server creates one scheduler
 //     per connection and keys it by the client-assigned `lane_id`, so the
 //     serial domain is one `(connection, lane_id)` pair. A fresh connection
-//     starts with no lane state; the first ordered call on a lane *baselines*
-//     it: `next_run` becomes `seq + 1` and the call runs immediately. The
-//     client facade allocates `seq` from 0 per lane, so a well-behaved client
-//     baselines at 0; a client that resumes a lane with a higher counter after
-//     a reconnect still works, because the baseline is the first observed
-//     frame, not a fixed constant.
+//     starts with no lane state, and every fresh lane expects `seq == 0`
+//     (the client facade allocates per-lane sequences from 0). A first frame
+//     above 0 is a gap: it is buffered and the bounded wait below applies,
+//     which is also what keeps a multiplexing client safe when its very first
+//     two frames race -- the lower sequence is buffered, never mistaken for a
+//     baseline or refused as a duplicate. A client that resumes a lane with a
+//     higher counter on a new connection therefore pays one gap wait before
+//     the lane proceeds.
 //   * Order. Within a lane, execution is strictly ascending by `seq` and at
 //     most one call runs at a time. Positions are claimed on arrival: a call
 //     whose `seq` equals the expected value consumes that position immediately,
@@ -162,14 +164,6 @@ public:
     admission admit(std::uint64_t lane_id, const item& work) {
         std::lock_guard<std::mutex> lk(mutex_);
         lane_state& ls = lane_for(lane_id);
-        if (!ls.baselined) {
-            // First ordered call on this lane: baseline at the observed
-            // sequence and run immediately.
-            ls.baselined = true;
-            ls.next_run = work.seq + 1;
-            ls.running = true;
-            return admission::run_now;
-        }
         if (work.seq < ls.next_run) {
             return admission::duplicate;
         }
@@ -184,19 +178,25 @@ public:
             ls.running = true;
             return admission::run_now;
         }
-        ls.waiting.emplace(work.seq, work);
-        const std::uint64_t head = ls.waiting.begin()->first;
-        if (head <= ls.next_run) {
-            // No blocking gap in front of the queue. An armed gap timer whose
-            // gap just filled is stale: cancel it now rather than letting it
-            // fire into a re-validated no-op later.
-            if (ls.gap_armed) {
-                cancel_gap_locked(ls);
+        if (ls.waiting.emplace(work.seq, work).second) {
+            const std::uint64_t head = ls.waiting.begin()->first;
+            if (head <= ls.next_run) {
+                // No blocking gap in front of the queue. An armed gap timer
+                // whose gap just filled is stale: cancel it now rather than
+                // letting it fire into a re-validated no-op later.
+                if (ls.gap_armed) {
+                    cancel_gap_locked(ls);
+                }
+            } else if (idle) {
+                maybe_arm_gap(ls);
             }
-        } else if (idle) {
-            maybe_arm_gap(ls);
+            return admission::buffered;
         }
-        return admission::buffered;
+        // The position is already parked (a re-send of a still-gapped
+        // sequence, for example). The scheduler keeps the first copy and took
+        // no ownership of this one; the caller refuses it exactly like a
+        // consumed position.
+        return admission::duplicate;
     }
 
     // Marks the lane's running call finished and returns the next runnable
@@ -257,6 +257,17 @@ public:
         return true;
     }
 
+    // True when `seq` of `lane_id` is still parked (admitted, not yet run).
+    // The server routes a keyed replay with it: a replay of a call that has
+    // already finished can ride the dispatcher's dedup table to its recorded
+    // outcome, but a replay of a call that is still queued must not execute
+    // ahead of it, so it is refused like an unkeyed duplicate.
+    [[nodiscard]] bool is_parked(std::uint64_t lane_id, std::uint64_t seq) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const auto it = lanes_.find(lane_id);
+        return it != lanes_.end() && it->second->waiting.count(seq) != 0;
+    }
+
     // Releases every buffered call of every lane through its `drop` callback
     // and clears all state. Running calls are not touched: their ownership
     // never entered the scheduler. Returns the number of dropped calls.
@@ -301,11 +312,14 @@ public:
 private:
     struct lane_state {
         std::uint64_t lane_id = 0;
-        // One past the last claimed position. Claimed positions have arrived;
-        // a buffered `seq < next_run` was claimed on arrival, a buffered
-        // `seq > next_run` sits behind a gap.
+        // One past the last claimed position. Every fresh lane expects seq 0:
+        // the client facade allocates per-lane sequences from 0, so a first
+        // frame above 0 is a gap the bounded wait resolves (a reconnecting
+        // client that resumes mid-lane pays one gap wait; a client that
+        // really lost its first frames gets them skipped, never wedged).
+        // Claimed positions have arrived; a buffered `seq < next_run` was
+        // claimed on arrival, a buffered `seq > next_run` sits behind a gap.
         std::uint64_t next_run = 0;
-        bool baselined = false;
         bool running = false;
         // The outstanding gap timer targets `gap_armed_for`; false when none.
         bool gap_armed = false;

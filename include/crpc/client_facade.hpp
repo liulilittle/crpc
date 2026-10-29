@@ -1666,7 +1666,7 @@ public:
     // counter (0, 1, 2, ...), so a well-behaved client never skips a number.
     // The server executes the calls of one `(connection, lane_id)` pair
     // strictly in `seq` order and at most one at a time, while different
-    // lanes proceed independently. Semantics -- baseline, gaps, duplicates,
+    // lanes proceed independently. Semantics -- gap waits, duplicates,
     // failures, teardown -- are normative in `rpc/lane_queue.hpp` and restated
     // in docs/architecture.md.
     //
@@ -1674,8 +1674,8 @@ public:
     //   * The guarantee is per connection. A pool of one connection (the
     //     default) gives end-to-end ordering; a larger pool must not mix one
     //     lane across connections, because each connection orders its own
-    //     queue and reconnects re-baseline the lane at the first observed
-    //     frame.
+    //     queue, and a reconnecting client that resumes a lane mid-counter
+    //     pays one gap wait on the new connection before it proceeds.
     //   * Ordering covers execution (the side effects handlers observe), not
     //     response arrival: a queued call can be answered after a later
     //     position that ran on another lane, and a locally refused call

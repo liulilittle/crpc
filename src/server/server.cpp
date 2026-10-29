@@ -262,6 +262,10 @@ struct request_job {
     bool lane_ordered = false;
     u64 lane_id = 0;
     u64 lane_seq = 0;
+    // Set when the lane scheduler took ownership of a parked call: the job
+    // is then released by the drain (after it finally runs), by the gap-timer
+    // drain, or by the teardown drop path -- never here.
+    bool lane_parked = false;
     // Set when the lane drain hands a parked call back to `handle_request`:
     // the call has already consumed its position, so it skips admission and
     // skips the end-of-call drain (the outer drain loop owns the lane).
@@ -1258,6 +1262,15 @@ struct server::impl {
         frame request;
         request.header = job.header;
         request.payload = job.payload.readable();
+        // The dispatcher rebuilds the handler's context from this frame, and
+        // the lane token travels in the ordered extension: submit() copied it
+        // into the job beside the payload, and it must reach the frame here,
+        // or a handler would observe lane 0/seq 0 while the scheduler still
+        // ordered the call correctly.
+        if (job.lane_ordered) {
+            request.ordered.lane_id = job.lane_id;
+            request.ordered.lane_seq = job.lane_seq;
+        }
 
         // One `on_request` per frame: a call the lane scheduler parked and
         // later drained re-enters here, and the interceptor has already seen
@@ -1310,12 +1323,25 @@ struct server::impl {
             if (verdict == rpc::lane_queue::admission::duplicate) {
                 const bool keyed = decoded && envelope.extensions.has(
                                                      trace_extension::has_idempotency_key);
-                if (!keyed) {
+                bool parked = false;
+                if (keyed) {
+                    std::lock_guard<std::mutex> lk(sc->lane_mutex);
+                    parked = sc->lanes.is_parked(job.lane_id, job.lane_seq);
+                }
+                // A replay without a key would double-apply side effects the
+                // lane promises to order exactly once, and a replay of a call
+                // that is still parked would execute ahead of it (the dedup
+                // table has no entry for an undispatched call). Both are
+                // refused without running the handler. Only a keyed replay of
+                // an already-finished position reaches the dispatcher, where
+                // the dedup table replays or waits for the recorded outcome.
+                if (!keyed || parked) {
                     if (wants_response) {
                         send_error(sc, job.header.stream_id,
                                    rpc_code::failed_precondition,
                                    std::chrono::milliseconds(0),
-                                   "lane seq already consumed");
+                                   parked ? "lane seq is still queued"
+                                          : "lane seq already consumed");
                     }
                     complete_call(sc, job.counted);
                     return;
@@ -1323,6 +1349,9 @@ struct server::impl {
                 // A keyed replay keeps the consumed position untouched and
                 // never drains: it is not a lane participant this time.
             } else if (verdict == rpc::lane_queue::admission::buffered) {
+                // Ownership transferred to the scheduler: run_job must not
+                // delete this job (see the flag's contract on request_job).
+                job.lane_parked = true;
                 return;
             } else {
                 lane_run_now = true;
@@ -1642,9 +1671,16 @@ struct server::impl {
     }
 
     static void run_job(void* ctx) noexcept {
+        // A parked ordered-lane call transfers ownership to the lane
+        // scheduler: the drain deletes it after it finally runs, the teardown
+        // drop path deletes it if it never will. Releasing it here would hand
+        // the scheduler a dangling pointer.
         std::unique_ptr<request_job> job(static_cast<request_job*>(ctx));
         if (job->conn && job->conn->owner != nullptr) {
             job->conn->owner->handle_request(*job);
+        }
+        if (job->lane_parked) {
+            (void)job.release();
         }
     }
 

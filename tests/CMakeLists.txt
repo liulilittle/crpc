@@ -83,6 +83,10 @@ foreach(source ${CRPC_TEST_SOURCES})
 endforeach()
 
 set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 120)
+# The lane E2E suite drives real shard runtimes and one bounded gap wait of
+# 3 s; on a saturated box every runtime-driven wait slows down together, so
+# the suite gets the same headroom as the server/client suite.
+set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 120)
 
 # --- C ABI smoke test --------------------------------------------------------
 # Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is

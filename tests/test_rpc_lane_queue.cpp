@@ -235,7 +235,9 @@ CRPC_TEST(lane_queue_late_seq_after_skip_is_duplicate) {
     }
 }
 
-// A replay of a still-live position is rejected without disturbing the queue.
+// A replay of a consumed position -- and of a still-parked one -- is rejected
+// without disturbing the queue. The first frame runs only when it carries the
+// expected seq 0.
 CRPC_TEST(lane_queue_duplicate_rejected) {
     timer_bridge timers;
     auto queue = std::make_shared<lane_queue>();
@@ -243,13 +245,25 @@ CRPC_TEST(lane_queue_duplicate_rejected) {
     std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
-                  static_cast<int>(queue->admit(6, item_for(3, &dropped))));
+                  static_cast<int>(queue->admit(6, item_for(0, &dropped))));
+    // Consumed position: refused.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(6, item_for(3, &dropped))));
+                  static_cast<int>(queue->admit(6, item_for(0, &dropped))));
+    // Next position arrives while the lane is busy: parked (claimed).
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(queue->admit(6, item_for(1, &dropped))));
+    // A re-send of the parked position: refused, scheduler keeps one copy.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
-                  static_cast<int>(queue->admit(6, item_for(2, &dropped))));
+                  static_cast<int>(queue->admit(6, item_for(1, &dropped))));
     CRPC_CHECK_EQ(1u, queue->active_lanes());
-    CRPC_CHECK_EQ(0u, queue->buffered_calls());
+    CRPC_CHECK_EQ(1u, queue->buffered_calls());
+    CRPC_CHECK(queue->is_parked(6, 1));
+    std::optional<lane_queue::item> next = queue->pop_runnable(6);
+    CRPC_CHECK(next.has_value());
+    if (next.has_value()) {
+        CRPC_CHECK_EQ(1u, next->seq);
+        delete static_cast<recorded_payload*>(next->payload);
+    }
     CRPC_CHECK_FALSE(queue->pop_runnable(6).has_value());
     CRPC_CHECK_EQ(0u, queue->active_lanes());
     CRPC_CHECK(dropped.empty());
@@ -367,27 +381,38 @@ CRPC_TEST(lane_queue_gap_timer_cancelled_when_gap_fills) {
     CRPC_CHECK(dropped.empty());
 }
 
-// The baseline is the first observed frame, so a lane resumed after a
-// reconnect with a higher counter keeps working; a replay of the baseline is
-// a duplicate.
-CRPC_TEST(lane_queue_baseline_follows_first_seq) {
+// Every fresh lane expects seq 0. A first frame above 0 is a gap (buffered
+// behind the bounded wait, never mistaken for a baseline and never refused),
+// and a re-send of a still-gapped position is a duplicate: the scheduler keeps
+// the first copy and takes no ownership of the second.
+CRPC_TEST(lane_queue_first_seq_above_zero_is_a_gap) {
     timer_bridge timers;
     auto queue = std::make_shared<lane_queue>();
     queue->set_options(timers.options(50ms));
     std::vector<std::uint64_t> dropped;
 
-    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
                   static_cast<int>(queue->admit(9, item_for(41, &dropped))));
+    // The scheduler arms the gap timer for expected seq 0.
+    CRPC_CHECK_EQ(1u, timers.armed.size());
+    CRPC_CHECK_EQ(0u, timers.armed.front().expected_seq);
+    // A re-send of the same still-gapped position is refused, and the
+    // scheduler keeps only the first payload.
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::duplicate),
                   static_cast<int>(queue->admit(9, item_for(41, &dropped))));
-    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
-                  static_cast<int>(queue->admit(9, item_for(42, &dropped))));
+    CRPC_CHECK_EQ(1u, queue->buffered_calls());
+    // The skip fires on the gap: the buffered call runs, the missing prefix
+    // (0..40) is never executed.
+    CRPC_CHECK(fire_timer(*queue, timers, 9));
     std::optional<lane_queue::item> next = queue->pop_runnable(9);
     CRPC_CHECK(next.has_value());
     if (next.has_value()) {
-        CRPC_CHECK_EQ(42u, next->seq);
+        CRPC_CHECK_EQ(41u, next->seq);
         delete static_cast<recorded_payload*>(next->payload);
     }
+    CRPC_CHECK_FALSE(queue->pop_runnable(9).has_value());
+    CRPC_CHECK_EQ(0u, queue->active_lanes());
+    CRPC_CHECK(dropped.empty());
 }
 
 // Without timer hooks a gap blocks the lane until the missing call arrives or
