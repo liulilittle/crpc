@@ -1287,16 +1287,19 @@ CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
         std::atomic<int> calls{0};
         const std::thread::id caller = std::this_thread::get_id();
         std::thread::id callback_thread;
-        bool ok_in_callback = false;
-        int value_in_callback = -1;
+        // Written by the completion thread and read here after wait_for();
+        // plain locals raced under ThreadSanitizer even though the wait_for
+        // happens first, because the wait does not publish the writes.
+        std::atomic<bool> ok_in_callback{false};
+        std::atomic<int> value_in_callback{-1};
         crpc::response<int>& chained = r.then(
             [&calls, &ok_in_callback, &value_in_callback, &callback_thread](
                 crpc::rpc::rpc_result<int> result) {
                 ++calls;
                 callback_thread = std::this_thread::get_id();
-                ok_in_callback = result.ok();
+                ok_in_callback.store(result.ok(), std::memory_order_release);
                 if (result.ok()) {
-                    value_in_callback = result.value();
+                    value_in_callback.store(result.value(), std::memory_order_release);
                 }
             });
         CRPC_CHECK(&chained == &r);
@@ -1319,8 +1322,8 @@ CRPC_TEST(response_wrapper_then_runs_on_completion_thread_once) {
         std::this_thread::sleep_for(50ms);
         CRPC_CHECK_EQ(1, calls.load());
         CRPC_CHECK(callback_thread != caller);
-        CRPC_CHECK(ok_in_callback);
-        CRPC_CHECK_EQ(7, value_in_callback);
+        CRPC_CHECK(ok_in_callback.load(std::memory_order_acquire));
+        CRPC_CHECK_EQ(7, value_in_callback.load(std::memory_order_acquire));
     }
 
     cli->close();

@@ -71,11 +71,11 @@
 // 6. Four admission refusals DO write the reserved `crpc-degradable: true`
 //    response meta entry, and only when the request still has at least
 //    min_remaining_ns of wire deadline left:
-//      - the per-service breaker (`!permit.allowed()`, send_error at 1217);
-//      - the per-service rate bucket, success exit (send_error at 1277);
-//      - the per-service bulkhead (send_error at 1302);
-//      - the per-service in-flight cap (send_error at 1321).
-//    The rate bucket's OTHER exit -- deadline not met (send_error at 1266) --
+//      - the per-service breaker (`!permit.allowed()`, send_error at 1226);
+//      - the per-service rate bucket, success exit (send_error at 1286);
+//      - the per-service bulkhead (send_error at 1311);
+//      - the per-service in-flight cap (send_error at 1330).
+//    The rate bucket's OTHER exit -- deadline not met (send_error at 1275) --
 //    never sets it: a deadline miss is not degradable (fallback_eligible()
 //    rejects deadline_exceeded first). The connection-level flood bucket and
 //    the per-connection cap (both reach send_error() through the forced-error

@@ -105,6 +105,12 @@ for san in "${SAN_LIST[@]}"; do
       case "$san" in
         asan|all) export ASAN_OPTIONS="${ASAN_OPTIONS:-}:allocator_may_return_null=1" ;;
       esac
+      # The same impossible-allocation test runs under TSan, where the
+      # option that turns the abort into a null return lives on
+      # TSAN_OPTIONS.
+      case "$san" in
+        tsan|all) export TSAN_OPTIONS="${TSAN_OPTIONS:-}:allocator_may_return_null=1" ;;
+      esac
       if ! "$CTEST" "${CTEST_ARGS[@]}" 2>&1 | tee -a "$LOG"; then
         log ERROR "ctest failed $ARCH/$cfg/$san run $r"
         FAILURES=$((FAILURES + 1))

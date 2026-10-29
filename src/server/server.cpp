@@ -452,12 +452,21 @@ void finish_send(server_connection* sc, io::io_result result) noexcept {
 
 struct server::impl {
     options opt;
+    rpc::service_registry registry;
+    // Declared before `send_pool` so it is destroyed *after* it. `send_op`
+    // owns a `shared_ptr<server_connection>`, and `~server_connection`
+    // calls `abandon_dedup_waiters()`, which reaches the dedup table
+    // through `dispatch`. With the old order `dispatch` died first, so
+    // draining the send pool at shutdown ran that call on freed memory
+    // (Release-only access violation in `dedup_table::abandon_impl`, from
+    // `tcp_idempotent_replay_converges` teardown). Members are destroyed
+    // in reverse declaration order, so everything that can still reach
+    // the dispatcher must be declared below this line.
+    std::unique_ptr<rpc::dispatcher> dispatch;
     // Send-path record pool. Declared after `opt` so the constructor can size
     // it from the options; owned by the impl, so it outlives every completion
     // (`send_op::complete` returns records here).
     send_op_pool send_pool;
-    rpc::service_registry registry;
-    std::unique_ptr<rpc::dispatcher> dispatch;
     std::vector<std::unique_ptr<runtime>> shards;
     std::vector<std::unique_ptr<listener>> listeners;
     std::vector<listener_config> pending_listeners;

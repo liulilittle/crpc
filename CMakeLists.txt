@@ -113,12 +113,21 @@ else()
     endif()
 endif()
 
+# Kept in a variable and applied to the crpc target below, for the same
+# reason as the warning policy: add_compile_options() is directory-scoped
+# and would instrument the vendored rtti and corocc checkouts too. corocc
+# uses atomic_thread_fence, which -fsanitize=thread rejects outright
+# ("atomic_thread_fence is not supported with -fsanitize=thread"), so a
+# directory-scoped flag makes the TSan configuration impossible to build.
+# Instrumenting the code this project owns is what the gate is for;
+# third-party code is not analysed, which can hide a race inside it but
+# never invents one here.
+set(CRPC_SANITIZER_OPTIONS "")
 if(CRPC_SANITIZER)
     if(MSVC)
-        add_compile_options(/fsanitize=${CRPC_SANITIZER})
+        set(CRPC_SANITIZER_OPTIONS /fsanitize=${CRPC_SANITIZER})
     else()
-        add_compile_options(-fsanitize=${CRPC_SANITIZER} -fno-omit-frame-pointer)
-        add_link_options(-fsanitize=${CRPC_SANITIZER})
+        set(CRPC_SANITIZER_OPTIONS -fsanitize=${CRPC_SANITIZER} -fno-omit-frame-pointer)
     endif()
 endif()
 
@@ -223,6 +232,13 @@ add_library(crpc ${CRPC_LIBRARY_TYPE})
 # already exclude the MASM backend.
 if(NOT MSVC)
     target_compile_options(crpc PUBLIC ${CRPC_WARNING_OPTIONS})
+endif()
+
+if(CRPC_SANITIZER_OPTIONS)
+    # PUBLIC so tests, bench and examples are instrumented too: an
+    # uninstrumented test cannot observe the library's races.
+    target_compile_options(crpc PUBLIC ${CRPC_SANITIZER_OPTIONS})
+    target_link_options(crpc PUBLIC ${CRPC_SANITIZER_OPTIONS})
 endif()
 
 # Sources are discovered by pattern so that independent subsystems can be added

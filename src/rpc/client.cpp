@@ -32,9 +32,14 @@ struct client::write_lock {
         ++owner_.write_depth_;
     }
     ~write_lock() {
-        --owner_.write_depth_;
+        // The depth is read while the lock is still held. Reading it after
+        // unlock() raced with another thread incrementing it in the
+        // constructor (ThreadSanitizer reports exactly that pair), and the
+        // report itself must run with the mutex released so it can take
+        // completion_mutex_ without inverting lock order.
+        const bool outermost = (--owner_.write_depth_ == 0);
         owner_.write_mutex_.unlock();
-        if (owner_.write_depth_ == 0) {
+        if (outermost) {
             owner_.report_write_failure();
         }
     }
