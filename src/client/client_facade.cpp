@@ -426,16 +426,19 @@ struct client::timer_gate {
 namespace client_detail {
 
 void call_core::signal() noexcept {
+    signal_thread.store(std::this_thread::get_id(),
+                        std::memory_order_release);
     done.store(true, std::memory_order_release);
     // The completion callback runs before the waiters are released, so a
     // `get()` that returns after the callback has observed it. A `then` body
     // may call get() on the same handle; it sees the terminal state at once.
     invoke_callback();
-    {
-        std::lock_guard<std::mutex> lk(mutex);
-    }
-    cv.notify_all();
     client* const who = owner.load(std::memory_order_acquire);
+    // Last touch of this object: `publish_signaled()` sets `signaled` and
+    // notifies under `mutex`, so a waiter that returns from here has a
+    // happens-before edge with everything above. Nothing below this call
+    // may dereference `this`.
+    publish_signaled();
     if (who != nullptr) {
         who->notify_waiter();
     }
@@ -658,6 +661,8 @@ void client::finalize_one(const std::shared_ptr<client_detail::call_state_base>&
         }
         // R2: wake a blocked get() promptly with `shutting_down` instead of
         // letting it sit until the plain-thread timeout or a cancelled timer.
+        core->signal_thread.store(std::this_thread::get_id(),
+                                  std::memory_order_release);
         core->done.store(true, std::memory_order_release);
         // Publish the shutdown under the lock the non-blocking accessors take,
         // so `error()`/`origin()` do not race this write.
@@ -670,13 +675,20 @@ void client::finalize_one(const std::shared_ptr<client_detail::call_state_base>&
         // the shutdown through the handle the callback received.
         core->invoke_callback();
         client* const who = core->owner.load(std::memory_order_acquire);
+        core->owner.store(nullptr, std::memory_order_release);
+        // Last touch of the core (see call_core::signaled).
+        core->publish_signaled();
         if (who != nullptr) {
             who->notify_waiter();
         }
-        core->owner.store(nullptr, std::memory_order_release);
     } catch (...) {
         // Allocation failure while building the shutdown error. The core is
         // already marked `finalized`; the client is closing.
+        //
+        // `done` was published before the throwing statement, so a handle
+        // destructor may already be waiting for `signaled`; publish it here
+        // or that wait never ends.
+        core->publish_signaled();
     }
 }
 
@@ -1254,7 +1266,11 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     connection* raw_ptr = raw.get();
     auto slot = std::make_shared<client_detail::connection_slot>();
     slot->pool = pool;
-    slot->idle_since = steady_now();
+    slot->idle_since_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            steady_now().time_since_epoch())
+            .count(),
+        std::memory_order_relaxed);
 
     rpc::client_options co;
     co.slot_capacity = static_cast<u32>(options_.slot_capacity);
@@ -1279,7 +1295,11 @@ void client::release_slot(
         return;
     }
     slot->in_flight.fetch_sub(1, std::memory_order_acq_rel);
-    slot->idle_since = steady_now();
+    slot->idle_since_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            steady_now().time_since_epoch())
+            .count(),
+        std::memory_order_relaxed);
     auto* pool = static_cast<impl::endpoint_pool*>(slot->pool);
     if (pool != nullptr) {
         pool->in_flight.fetch_sub(1, std::memory_order_acq_rel);
@@ -1689,7 +1709,10 @@ void client::evict_idle(const std::shared_ptr<impl>& impl,
                 if (slot->in_flight.load(std::memory_order_acquire) != 0) {
                     continue;
                 }
-                if (now - slot->idle_since < idle_eviction) {
+                const std::chrono::steady_clock::time_point idle_since{
+                    std::chrono::nanoseconds(slot->idle_since_ns.load(
+                        std::memory_order_relaxed))};
+                if (now - idle_since < idle_eviction) {
                     continue;
                 }
                 bool closed_now = false;

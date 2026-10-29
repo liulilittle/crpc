@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -247,13 +248,16 @@ inline std::vector<case_entry>& registry() {
     return entries;
 }
 
-inline int& failure_count() {
-    static int count = 0;
+// Atomic: a case may assert from a worker thread it started, so these
+// counters are incremented concurrently. ThreadSanitizer reports the plain
+// `int` version as a data race on every multithreaded case.
+inline std::atomic<int>& failure_count() {
+    static std::atomic<int> count{0};
     return count;
 }
 
-inline int& check_count() {
-    static int count = 0;
+inline std::atomic<int>& check_count() {
+    static std::atomic<int> count{0};
     return count;
 }
 
@@ -440,12 +444,14 @@ inline int run_all(int argc, char** argv) {
         ++ran;
         // A skipped case counts as passed; skip() already printed the visible
         // "SKIP <case>: <reason>" line, so the per-case stream stays uniform.
-        std::printf("%s %s\n", failure_count() == before ? "PASS" : "FAIL",
+        std::printf("%s %s\n", failure_count().load() == before ? "PASS" : "FAIL",
                     entry.name);
     }
+    // std::atomic<int> is not copyable, so it cannot be passed through a
+    // variadic printf; load each counter once.
     std::printf("\n%d case(s), %d check(s), %d failure(s), %d skipped\n", ran,
-                check_count(), failure_count(), skip_count());
-    return failure_count() == 0 ? 0 : 1;
+                check_count().load(), failure_count().load(), skip_count());
+    return failure_count().load() == 0 ? 0 : 1;
 }
 
 } // namespace crpc_test

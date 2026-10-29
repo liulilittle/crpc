@@ -50,6 +50,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -401,7 +402,12 @@ struct connection_slot {
     std::recursive_mutex mutex;
     std::atomic<std::uint32_t> in_flight{0};
     std::atomic<bool> healthy{true};
-    std::chrono::steady_clock::time_point idle_since{};
+    // Nanoseconds since the steady-clock epoch, atomic because `release_slot`
+    // writes it from whichever thread finished a call while the idle reaper
+    // reads it on the shard thread with no lock held. It stays eight bytes,
+    // so the offsets of the members below are unchanged for code that was
+    // compiled against the previous header.
+    std::atomic<std::int64_t> idle_since_ns{0};
     void* pool = nullptr;
 };
 
@@ -538,6 +544,21 @@ struct CRPC_API call_core {
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<bool> done{false};
+    // Set by the notifier as its *last* touch of this object, under
+    // `mutex` and together with `cv.notify_all()`. `done` is published
+    // before the completion callback runs (a `then` body may call
+    // get() reentrantly), so a waiter that observes `done` can return
+    // -- and drop the last handle -- while the notifier is still using
+    // `mutex`/`cv`. `~call_core` would then race the notifier
+    // (ThreadSanitizer: pthread_cond_destroy vs pthread_cond_broadcast
+    // in call_core::signal). `release()` waits for this flag before it
+    // drops the state, which puts the destroy strictly after the
+    // notifier's last touch.
+    std::atomic<bool> signaled{false};
+    // The thread currently inside `signal()`. A callback that destroys
+    // the handle it was given would otherwise wait for a flag only it
+    // can set; the API forbids that, but it must not deadlock.
+    std::atomic<std::thread::id> signal_thread{};
     // Set by whichever of finish_attempt/abandon_attempt wins the attempt's
     // terminal transition. Guards exactly-once release of the deadline timer,
     // the connection slot and the breaker permit.
@@ -586,15 +607,42 @@ struct CRPC_API call_core {
     resilience::retry_sequence* retry = nullptr;
 
     void signal() noexcept;
+    // Publishes `signaled` and wakes the waiters. Must be the last
+    // thing a completion path does to this object.
+    void publish_signaled() noexcept {
+        std::lock_guard<std::mutex> lk(mutex);
+        signaled.store(true, std::memory_order_release);
+        cv.notify_all();
+    }
+    // Blocks until the notifier that published `done` has finished with
+    // this object. No-op when nothing is completing, when the notifier
+    // is already done, or when this *is* the notifier.
+    void wait_for_signal_tail() noexcept {
+        if (!done.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (signal_thread.load(std::memory_order_acquire) ==
+            std::this_thread::get_id()) {
+            return;
+        }
+        // The mutex acquisition is what orders this against the
+        // notifier: it stores `signaled` and notifies while holding
+        // `mutex`, and only releases it afterwards. Testing the flag
+        // without the lock would let this return while the notifier is
+        // still inside `cv.notify_all()`.
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this] { return signaled.load(std::memory_order_acquire); });
+    }
     // Invokes the armed `then` callback exactly once, on the thread that
     // terminates the call. Safe to call more than once; the callback runs at
     // most once. Public so the terminal paths (close/cancel) can reach it.
     void invoke_callback() noexcept {
         if (callback_armed.exchange(false, std::memory_order_acq_rel)) {
-            call_core_callback_invoker invoke = callback_invoke;
-            void* owner_ptr = callback_owner;
-            callback_invoke = nullptr;
-            callback_owner = nullptr;
+            call_core_callback_invoker invoke =
+                callback_invoke.load(std::memory_order_acquire);
+            void* owner_ptr = callback_owner.load(std::memory_order_acquire);
+            callback_invoke.store(nullptr, std::memory_order_release);
+            callback_owner.store(nullptr, std::memory_order_release);
             if (invoke != nullptr) {
                 invoke(callback_storage.bytes, owner_ptr, *this);
             }
@@ -607,6 +655,7 @@ struct CRPC_API call_core {
     }
     void reset_for_attempt() noexcept {
         done.store(false, std::memory_order_release);
+        signaled.store(false, std::memory_order_release);
         finalized.store(false, std::memory_order_release);
         terminal.store(rpc_code::ok, std::memory_order_release);
         degraded_.store(false, std::memory_order_release);
@@ -629,8 +678,14 @@ struct CRPC_API call_core {
 
     // --- `then` callback (inline, heap-free) ---
     rpc::call_callback_storage callback_storage{};
-    call_core_callback_invoker callback_invoke = nullptr;
-    void* callback_owner = nullptr;
+    // Atomic: `invoke_callback` runs on whichever thread terminates the call
+    // while `rebind_owner` runs on the thread that moved the handle, and the
+    // two touch these pointers concurrently. `callback_armed` decides who runs
+    // the callback, but it does not order these pointer accesses against each
+    // other. An atomic pointer has the same size and alignment as a plain one,
+    // so `call_core` keeps its layout.
+    std::atomic<call_core_callback_invoker> callback_invoke{nullptr};
+    std::atomic<void*> callback_owner{nullptr};
     // Claimed exactly once by the completion path or by `then()` when the call
     // already terminated. Atomic so a handle destructor can disarm it without a
     // race against a backend-thread invocation.
@@ -1164,9 +1219,13 @@ public:
                         // run the `then` callback exactly once. `completed`
                         // distinguishes this terminal hand-off from the
                         // per-attempt `done` so a later cancel() is a no-op.
+                        st->core.signal_thread.store(
+                            std::this_thread::get_id(),
+                            std::memory_order_release);
                         st->core.done.store(true, std::memory_order_release);
                         st->core.completed.store(true, std::memory_order_release);
                         st->core.invoke_callback();
+                        st->core.publish_signaled();
                     }
                 }
             } guard{st, std::nullopt};
@@ -1495,16 +1554,17 @@ public:
             client_detail::call_core& core = state_->core;
             std::memcpy(core.callback_storage.bytes,
                         static_cast<const void*>(std::addressof(fn)), sizeof(fn_type));
-            core.callback_invoke = &then_thunk<fn_type>;
-            core.callback_owner = this;
+            core.callback_invoke.store(&then_thunk<fn_type>,
+                                       std::memory_order_release);
+            core.callback_owner.store(this, std::memory_order_release);
             // Publish the callback before arming it; the completion path claims
             // it with an acquire exchange. If completion already happened, claim
             // it here instead so the callback runs exactly once.
             core.callback_armed.store(true, std::memory_order_release);
             if (core.done.load(std::memory_order_acquire) &&
                 core.callback_armed.exchange(false, std::memory_order_acq_rel)) {
-                core.callback_invoke = nullptr;
-                core.callback_owner = nullptr;
+                core.callback_invoke.store(nullptr, std::memory_order_release);
+                core.callback_owner.store(nullptr, std::memory_order_release);
                 fn(*this);
             }
         }
@@ -1528,8 +1588,8 @@ public:
         void rebind_owner(call* old) noexcept {
             if (state_ != nullptr &&
                 state_->core.callback_armed.load(std::memory_order_acquire) &&
-                state_->core.callback_owner == old) {
-                state_->core.callback_owner = this;
+                state_->core.callback_owner.load(std::memory_order_acquire) == old) {
+                state_->core.callback_owner.store(this, std::memory_order_release);
             }
         }
 
@@ -1551,6 +1611,11 @@ public:
                     st->inner.reset();
                 }
             }
+            // A completion may still be inside `signal()` on a reader
+            // thread: it publishes `done` before it runs the callback and
+            // only then touches `mutex`/`cv`. Dropping the last handle
+            // here would free those members under it.
+            st->core.wait_for_signal_tail();
             client* const owner = client_detail::live_owner(st->core);
             if (owner != nullptr) {
                 owner->abandon_attempt(st->core);

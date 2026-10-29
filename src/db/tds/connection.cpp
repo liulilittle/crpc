@@ -697,6 +697,10 @@ status connection::cancel() {
     // ATTENTION is the one message that carries no AllHeaders block: it is a bare
     // header with no body, and the server answers with a DONE that has the attention
     // bit set. The acknowledgement is consumed by whoever is reading the reply.
+    // The packet id is read under `write_mutex_`: `send_message` advances it
+    // while holding that mutex, so reading it before the lock raced with a
+    // concurrent request (ThreadSanitizer reports exactly that pair).
+    const std::lock_guard<std::mutex> guard(write_mutex_);
     packet_header header;
     header.type = packet_type::attention;
     header.length = static_cast<std::uint16_t>(header_size);
@@ -706,7 +710,6 @@ status connection::cancel() {
     if (prefix.size() != header_size) {
         return status{rpc_code::protocol_error, "the TDS header did not encode"};
     }
-    const std::lock_guard<std::mutex> guard(write_mutex_);
     // Only an in-flight request can be cancelled; an idle session has nothing to
     // acknowledge, and waiting for that acknowledgement would stall the next reply.
     attention_pending_ = in_request_.load();

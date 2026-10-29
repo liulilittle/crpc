@@ -903,6 +903,18 @@ struct epoll_backend::impl::listener_impl final : listener {
     listener_impl(impl& owner, int fd, listen_options o) noexcept
         : owner_(owner), fd_(fd), opt_(o) {}
     ~listener_impl() override {
+        // The loop thread may be inside on_acceptable() right now. The
+        // connection path already guards this with cb_inflight_; the listener
+        // had no equivalent, so closing the socket here raced with accept4()
+        // and with the sink call it makes (ThreadSanitizer reports the pair).
+        // Waiting is skipped on the loop thread itself, which cannot be inside
+        // a callback and destroy the listener at the same time.
+        if (std::this_thread::get_id() !=
+            owner_.loop_tid_.load(std::memory_order_acquire)) {
+            while (cb_inflight_.load(std::memory_order_acquire) != 0) {
+                std::this_thread::yield();
+            }
+        }
         if (fd_ >= 0) {
             if (owner_.epfd_ >= 0) {
                 (void)::epoll_ctl(owner_.epfd_, EPOLL_CTL_DEL, fd_, nullptr);
@@ -925,7 +937,9 @@ struct epoll_backend::impl::listener_impl final : listener {
     }
 
     void stop() noexcept override {
-        stopped_ = true;
+        // Atomic: stop() may run on any thread while the loop thread is inside
+        // on_acceptable(); a plain bool raced there (ThreadSanitizer reports it).
+        stopped_.store(true, std::memory_order_release);
         if (fd_ >= 0 && owner_.epfd_ >= 0) {
             (void)::epoll_ctl(owner_.epfd_, EPOLL_CTL_DEL, fd_, nullptr);
         }
@@ -936,7 +950,7 @@ struct epoll_backend::impl::listener_impl final : listener {
             const int cfd =
                 ::accept4(fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (cfd >= 0) {
-                if (stopped_ || sink_ == nullptr) {
+                if (stopped_.load(std::memory_order_acquire) || sink_ == nullptr) {
                     (void)::close(cfd);
                     continue;
                 }
@@ -975,7 +989,10 @@ struct epoll_backend::impl::listener_impl final : listener {
     int fd_ = -1;
     listen_options opt_;
     accept_sink* sink_ = nullptr;
-    bool stopped_ = false;
+    std::atomic<bool> stopped_{false};
+    // Mirrors epoll_connection::cb_inflight_: one per on_acceptable() call
+    // in progress, so the destructor can wait for it to finish.
+    std::atomic<int> cb_inflight_{0};
     std::uint64_t token_ = 0;
     std::atomic<bool> queued_{false};
 };
@@ -1275,6 +1292,7 @@ void epoll_backend::impl::dispatch(const epoll_event& ev) noexcept {
     std::uint32_t kind = kind_free;
     void* ptr = nullptr;
     epoll_connection* conn = nullptr;
+    listener_impl* lst = nullptr;
     {
         std::lock_guard<std::mutex> lk(reg_mutex_);
         if (index >= slots_.size()) {
@@ -1289,6 +1307,14 @@ void epoll_backend::impl::dispatch(const epoll_event& ev) noexcept {
         if (kind == kind_conn && ptr != nullptr) {
             conn = static_cast<epoll_connection*>(ptr);
             conn->cb_inflight_.fetch_add(1, std::memory_order_acquire);
+        } else if (kind == kind_listener && ptr != nullptr) {
+            // Same guard as the connection branch above: the increment
+            // happens under `reg_mutex_`, so the destructor -- which
+            // frees the slot under that mutex and then waits for the
+            // count to reach zero -- cannot free this object while
+            // on_acceptable() is running.
+            lst = static_cast<listener_impl*>(ptr);
+            lst->cb_inflight_.fetch_add(1, std::memory_order_acquire);
         }
     }
 
@@ -1300,8 +1326,9 @@ void epoll_backend::impl::dispatch(const epoll_event& ev) noexcept {
         }
         break;
     case kind_listener:
-        if (ptr != nullptr) {
-            static_cast<listener_impl*>(ptr)->on_acceptable();
+        if (lst != nullptr) {
+            lst->on_acceptable();
+            lst->cb_inflight_.fetch_sub(1, std::memory_order_release);
         }
         break;
     case kind_eventfd: {
@@ -1335,6 +1362,7 @@ void epoll_backend::impl::drain_work() noexcept {
         std::uint32_t kind = kind_free;
         void* ptr = nullptr;
         epoll_connection* conn = nullptr;
+        listener_impl* lst = nullptr;
         {
             std::lock_guard<std::mutex> lk(reg_mutex_);
             if (index >= slots_.size()) {
@@ -1350,15 +1378,22 @@ void epoll_backend::impl::drain_work() noexcept {
                 conn = static_cast<epoll_connection*>(ptr);
                 conn->queued_.store(false, std::memory_order_release);
                 conn->cb_inflight_.fetch_add(1, std::memory_order_acquire);
+            } else if (kind == kind_listener && ptr != nullptr) {
+                // Guarded under `reg_mutex_` for the same reason as
+                // dispatch(): free_slot() takes this mutex before it
+                // clears the slot, so the count is already non-zero
+                // when the destructor starts waiting.
+                lst = static_cast<listener_impl*>(ptr);
+                lst->queued_.store(false, std::memory_order_release);
+                lst->cb_inflight_.fetch_add(1, std::memory_order_acquire);
             }
         }
         if (kind == kind_conn && conn != nullptr) {
             conn->service();
             conn->cb_inflight_.fetch_sub(1, std::memory_order_release);
-        } else if (kind == kind_listener && ptr != nullptr) {
-            auto* l = static_cast<listener_impl*>(ptr);
-            l->queued_.store(false, std::memory_order_release);
-            l->on_acceptable();
+        } else if (kind == kind_listener && lst != nullptr) {
+            lst->on_acceptable();
+            lst->cb_inflight_.fetch_sub(1, std::memory_order_release);
         }
     }
 }
