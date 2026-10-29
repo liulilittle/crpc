@@ -303,12 +303,32 @@ still expected to fail the process; it simply may not leave a minidump.
 
 ## 9. CI reuse <a id="s9"></a>
 
-The design's CI matrix is MSVC x64 Debug/Release, MSVC x86 Debug/Release, GCC x64, Clang x64, ASan, UBSan, TSan, fuzz smoke, golden bytes and a benchmark report. CI is intended to invoke `scripts/build.*` and `scripts/test.*` exactly as a developer does; no CI YAML is checked in yet, and no build logic is duplicated outside the scripts. The local equivalents are `.\scripts\test.ps1 -Config Both -Arch x64 -Sanitizer none` and `./scripts/test.sh --config Debug --arch x64 --sanitizer all --compiler clang`.
+`.github/workflows/ci.yml` is checked in, and every job is a checkout plus a call to
+`scripts/build.*` / `scripts/test.*` with documented flags only -- no build logic is
+duplicated outside the scripts, which is what makes the scripts the single source of
+truth (requirement 25).
+
+| Job | Matrix |
+| --- | --- |
+| `linux` | gcc x64 and clang x64, each Debug and Release |
+| `linux-sanitizers` | `test.sh --sanitizer all` (asan + ubsan + tsan) |
+| `windows` | MSVC x64, Debug and Release |
+
+Both optimiser settings appear on both platforms because a Release-only defect has
+shipped twice, and both Linux compilers appear because clang's `-Werror` diagnostics
+are not a superset of MSVC's `/W4`: five clang-only warnings (unused constants, unused
+internal declarations) were hiding in code that built clean on Windows.
+
+Not yet in the workflow, and therefore still a local step: MSVC x86, fuzz smoke,
+golden bytes and the benchmark report. The local equivalents are
+`.\scripts\test.ps1 -Config Both -Arch x64 -Sanitizer none`,
+`.\scripts\build.ps1 -Config Debug -Arch x86` and
+`./scripts/test.sh --config Debug --arch x64 --sanitizer all --compiler clang`.
 
 A "zero warnings" claim requires the build log to contain no `warning:` line;
 the scripts treat a warning as a failure even when the compiler emitted no
-error. The 2026-10-19 status recorded in `.opencode/process.md` is 16 suites
-green on x64 Debug and x86 Debug; rerun the scripts to confirm the current tree.
+error. Rerun the scripts to confirm the current tree; the suite count changes as
+subsystems are added, so no fixed number is stated here.
 
 ## 10. Troubleshooting <a id="s10"></a>
 

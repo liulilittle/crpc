@@ -90,7 +90,11 @@ value vmap(std::vector<std::pair<value, value>> entries) {
 value vset(std::vector<value> items) {
     return value{set_value{std::move(items)}};
 }
-bool values_equal(const value& a, const value& b) {
+// Retained as the structural comparator for RESP value trees. Nothing calls it
+// today (the tests that did were replaced by direct field assertions), so clang
+// reports it as unneeded in a -Werror build; keep it available instead of
+// deleting a helper the next test will want back.
+[[maybe_unused]] bool values_equal(const value& a, const value& b) {
     if (a.kind() != b.kind()) {
         return false;
     }

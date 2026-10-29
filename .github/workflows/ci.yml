@@ -1,0 +1,148 @@
+# CI uses the repository's own one-click scripts unchanged (requirement 25).
+# Nothing here re-implements a build step: every job is a checkout plus a call
+# to scripts/build.* and scripts/test.* with documented flags only. If a job
+# needs a new flag, the script gains it first.
+#
+# Coverage rationale
+#   * Both optimiser settings on both platforms. A Release-only defect has
+#     shipped twice (an arena overflow that only `-Walloc-size-larger-than=`
+#     saw, and a use-after-free in `server::impl`'s member destruction order),
+#     so Debug alone is not a gate.
+#   * Both compilers on Linux. MSVC accepts things gcc rejects (a multi-char
+#     constant made a tab comparison permanently false) and clang rejects
+#     things gcc accepts.
+#   * Every sanitizer, because requirement 26 makes them merge gates. They run
+#     as one job with `--sanitizer all` so the build tree is shared per
+#     sanitizer and the report parsing lives in one place (test.sh).
+#
+# The scripts default their build root to <repo>/.opencode/tmp/out, so the
+# build and test steps of a job agree without passing a path.
+
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux/${{ matrix.compiler }}/${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc, config: Debug }
+          - { compiler: gcc, config: Release }
+          - { compiler: clang, config: Debug }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build libssl-dev
+          gcc --version | head -1
+          clang --version | head -1
+          cmake --version | head -1
+
+      - name: Build
+        run: >-
+          bash scripts/build.sh
+          --config ${{ matrix.config }}
+          --compiler ${{ matrix.compiler }}
+          --jobs "$(nproc)"
+
+      - name: Test
+        run: >-
+          bash scripts/test.sh
+          --config ${{ matrix.config }}
+          --compiler ${{ matrix.compiler }}
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-${{ matrix.compiler }}-${{ matrix.config }}
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
+  linux-sanitizers:
+    name: linux/sanitizers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build libssl-dev
+          gcc --version | head -1
+
+      # --sanitizer all makes test.sh build and run asan, ubsan and tsan in
+      # separate build directories (they cannot share one binary). build.sh
+      # itself takes a single sanitizer, so this one call does both halves.
+      - name: Build and test (asan + ubsan + tsan)
+        run: bash scripts/test.sh --config Debug --sanitizer all
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-sanitizers
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
+  windows:
+    name: windows/${{ matrix.config }}
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { config: Debug }
+          - { config: Release }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+          (Get-Command cl -ErrorAction SilentlyContinue) | Out-Null
+
+      # The script locates vcvars through vswhere, so it does not need a
+      # developer prompt.
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build.ps1 -Config ${{ matrix.config }} -Arch x64 -Jobs $env:NUMBER_OF_PROCESSORS
+
+      - name: Test
+        shell: pwsh
+        run: ./scripts/test.ps1 -Config ${{ matrix.config }} -Arch x64
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-${{ matrix.config }}
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore

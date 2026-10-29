@@ -34,6 +34,16 @@ namespace fs {
 class CRPC_API byte_buffer {
 public:
     static constexpr std::size_t npos = static_cast<std::size_t>(-1);
+    // The largest size this container will grow to. A length read from a
+    // file header or a frame is untrusted, so the rejection of an absurd
+    // request must be a policy, not a consequence of the allocator happening
+    // to fail: on a 32-bit build `SIZE_MAX / 4` is 1 GiB, which a 32-bit
+    // process can actually allocate, and the copy that follows then runs off
+    // the caller's bad pointer. 512 MiB is far above any whole-file use this
+    // container documents and well below what a 32-bit process can satisfy.
+    // A caller that needs more must stream rather than load.
+    static constexpr std::size_t default_max_capacity =
+        static_cast<std::size_t>(512) * 1024 * 1024;
 
     byte_buffer() = default;
 
@@ -71,11 +81,14 @@ public:
                                 std::size_t count = npos) const noexcept;
 
     // Ensure capacity for at least `new_capacity` bytes. `resource_exhausted`
-    // when the allocation fails (the buffer is then left unchanged).
+    // when the allocation fails or `new_capacity` exceeds
+    // `default_max_capacity` (the buffer is then left unchanged).
     status reserve(std::size_t new_capacity);
 
-    // Appends bytes. `resource_exhausted` on allocation failure (the buffer is
-    // left unchanged). `ok` means everything was appended.
+    // Appends bytes. `resource_exhausted` on allocation failure or when the
+    // result would exceed `default_max_capacity` (the buffer is left
+    // unchanged, and `data` is never read). `ok` means everything was
+    // appended.
     status append(span<const std::byte> data);
     status append(const char* text);
     status append(std::string_view text);

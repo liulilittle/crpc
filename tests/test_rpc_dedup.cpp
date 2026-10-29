@@ -310,7 +310,12 @@ CRPC_TEST(dedup_oversized_response_not_cached_but_still_deduped) {
     options.max_cached_bytes = 8;
     fixture fx{options};
     fx.state.response_bytes = 64;
-    fx.state.sleep_ms = 100;
+    // Long enough that a thread created after the leader claimed still
+    // reaches dispatch inside the window. 100 ms was a bet on thread
+    // start-up latency, and on a loaded x86 Debug machine it lost: the
+    // leader finished first, the follower re-executed, and `calls` became
+    // 2 instead of 1.
+    fx.state.sleep_ms = 500;
     const built_request request = make_call(1, 1, make_key(4), true);
 
     std::atomic<bool> first_ok{false};
@@ -333,8 +338,15 @@ CRPC_TEST(dedup_oversized_response_not_cached_but_still_deduped) {
                        std::memory_order_release);
         first_response = std::move(result.response);
     });
+    // The follower must arrive while the leader is still in flight. Poll the
+    // table's own record of the claim instead of sleeping a fixed 20 ms.
+    const auto claim_deadline = std::chrono::steady_clock::now() + 5s;
+    while (fx.dispatch.dedup().stats().claims_leader == 0 &&
+           std::chrono::steady_clock::now() < claim_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    CRPC_CHECK_EQ(1u, fx.dispatch.dedup().stats().claims_leader);
     auto follower = std::thread([&] {
-        std::this_thread::sleep_for(20ms);
         dispatch_result result = run(fx.dispatch, request);
         second_ok.store(result.dispatched.ok() && body_of(result).size() == 64,
                         std::memory_order_release);
@@ -342,6 +354,10 @@ CRPC_TEST(dedup_oversized_response_not_cached_but_still_deduped) {
     });
     leader.join();
     follower.join();
+    // The dedup path, not the re-execute path, must have served the second
+    // call: that is what `calls == 1` below means, and pinning it directly
+    // makes a failure say which of the two went wrong.
+    CRPC_CHECK_EQ(1u, fx.dispatch.dedup().stats().claims_waiter);
 
     // The in-flight window deduplicated: one execution, both served.
     CRPC_CHECK(first_ok.load());
@@ -373,8 +389,18 @@ CRPC_TEST(dedup_abandoned_waiter_gets_explicit_error) {
         dispatch_result result = run(fx.dispatch, request);
         leader_ok.store(result.dispatched.ok() && result.has_response, std::memory_order_release);
     });
+    // Wait for the leader to own the key instead of sleeping: a fixed delay is
+    // a bet on thread start-up latency, and on a loaded x86 Debug machine the
+    // follower could claim first (then it would be the leader, and the abandon
+    // below would find no waiter).
+    const auto claim_deadline = std::chrono::steady_clock::now() + 5s;
+    while (fx.dispatch.dedup().stats().claims_leader == 0 &&
+           std::chrono::steady_clock::now() < claim_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    CRPC_CHECK_EQ(1u, fx.dispatch.dedup().stats().claims_leader);
+
     auto follower = std::thread([&] {
-        std::this_thread::sleep_for(30ms);
         dispatch_result result = run(fx.dispatch, request, &connection);
         follower_calls.store(fx.state.calls.load(), std::memory_order_release);
         follower_abandoned.store(result.dispatched.ok() &&
@@ -382,8 +408,16 @@ CRPC_TEST(dedup_abandoned_waiter_gets_explicit_error) {
                                  std::memory_order_release);
     });
 
-    // Let the follower suspend, then close its connection.
-    std::this_thread::sleep_for(120ms);
+    // The follower must actually be suspended before its connection is closed;
+    // `claims_waiter` is the table's own record of that transition, so poll it
+    // rather than guessing how long a thread needs to get there.
+    const auto suspend_deadline = std::chrono::steady_clock::now() + 5s;
+    while (fx.dispatch.dedup().stats().claims_waiter == 0 &&
+           std::chrono::steady_clock::now() < suspend_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    CRPC_CHECK_EQ(1u, fx.dispatch.dedup().stats().claims_waiter);
+
     const std::size_t ended = fx.dispatch.dedup().abandon(&connection);
     CRPC_CHECK_EQ(1u, ended);
 
@@ -670,10 +704,14 @@ CRPC_TEST(server_dedup_abandons_suspended_duplicate_on_disconnect) {
         (void)call_once(*follower_client);
         follower_done.store(true, std::memory_order_release);
     });
-    // Give the follower time to suspend inside dispatch, then close its
-    // connection. The server must end the suspended duplicate instead of
-    // waiting for the gated handler.
-    std::this_thread::sleep_for(200ms);
+    // Wait until the server holds both calls, then close the follower's
+    // connection. A flat 200 ms sleep was a bet on how long the follower
+    // takes to reach dispatch, and on a loaded machine it lost: the close
+    // arrived before the request was even handled, so `requests_handled`
+    // was 1 instead of 2. `in_flight_calls` is the server's own record that
+    // both jobs were admitted.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&srv] { return srv->stats().in_flight_calls >= 2; }, 5000));
     follower_client->close();
 
     state.release.store(true, std::memory_order_release);

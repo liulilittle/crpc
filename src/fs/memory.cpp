@@ -56,6 +56,9 @@ status byte_buffer::reserve(std::size_t new_capacity) {
     if (new_capacity <= capacity_) {
         return status();
     }
+    if (new_capacity > default_max_capacity) {
+        return alloc_failed(new_capacity);
+    }
     std::unique_ptr<std::byte[]> next(new (std::nothrow) std::byte[new_capacity]);
     if (next == nullptr) {
         return alloc_failed(new_capacity);
@@ -75,6 +78,13 @@ status byte_buffer::append(span<const std::byte> data) {
     const std::size_t needed = size_ + data.size();
     if (needed < size_) {
         return alloc_failed(data.size()); // size_t overflow guard
+    }
+    // Checked before any allocation and before `data` is touched: on a
+    // 32-bit build `SIZE_MAX / 4` is small enough that the allocation could
+    // succeed, and the memcpy below would then read through a bad source
+    // pointer instead of the request being refused.
+    if (needed > default_max_capacity) {
+        return alloc_failed(data.size());
     }
     if (needed > capacity_) {
         // Geometric growth is the buffer's job; never below what is needed.

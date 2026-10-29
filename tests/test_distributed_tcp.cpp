@@ -134,8 +134,6 @@ constexpr crpc::u64 k_apply = 2;
 constexpr crpc::u64 k_dump = 3;
 constexpr const char* k_service_name = "distributed.tcp-echo";
 
-std::atomic<unsigned> fixture_counter{0};
-
 // Per-process candidate ports. The listener bind is retried by the fixtures,
 // so a collision with another process or another test binary only costs an
 // attempt instead of a failure.

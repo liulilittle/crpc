@@ -134,9 +134,16 @@ template <typename Ctl>
 // `name_literal`. `Ctl` is the complete controller type; `Method` is the method
 // name used to form the metadata member (`crpc_rpc_meta_##Method`) and must be
 // declared before the macro.
+//
+// `crpc_rpc_meta_##Method` is exposed for introspection, but the registrar below
+// does not need it (it recomputes the id and the name), so a controller that
+// never reads it would otherwise trip clang's -Wunused-const-variable in a
+// -Werror build. `[[maybe_unused]]` states that the member is deliberately
+// optional rather than forgotten.
 #define CRPC_RPC_METHOD(Ctl, Method, name_literal)                              \
-    inline static constexpr ::crpc::rpc::method_meta crpc_rpc_meta_##Method{     \
-        ::crpc::rpc::method_id_from<Ctl>(), name_literal};                       \
+    [[maybe_unused]] inline static constexpr ::crpc::rpc::method_meta            \
+        crpc_rpc_meta_##Method{                                                  \
+            ::crpc::rpc::method_id_from<Ctl>(), name_literal};                   \
     friend class ::crpc::rpc::service_registrar<Ctl>;                            \
     inline static const bool crpc_rpc_reg_##Method = [] {                        \
         ::crpc::rpc::service_registrar<Ctl>::methods().push_back(                \

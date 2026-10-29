@@ -79,14 +79,24 @@ foreach(source ${CRPC_TEST_SOURCES})
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
     add_test(NAME ${target} COMMAND ${target})
-    set_tests_properties(${target} PROPERTIES TIMEOUT 30)
+    # The timeout is a hang detector, not a performance gate. A deadlock never
+    # finishes, so any finite limit catches it; a limit tight enough to also
+    # bound runtime turns "this machine is slow or busy" into a gate failure.
+    # It did: a flat 30 s timed out `crpc_test_rpc_core` (44 s of 21992 checks
+    # in a Debug x86 build) and `crpc_test_abi_docs` (41 s, since fixed to 2.8 s
+    # by indexing its scan). 120 s keeps ~2.7x headroom over the slowest
+    # legitimate case while still failing a hang inside a run.
+    set_tests_properties(${target} PROPERTIES TIMEOUT 120)
 endforeach()
 
-set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 120)
-# The lane E2E suite drives real shard runtimes and one bounded gap wait of
+# server_client is the slowest suite (55 s in Debug x86: it starts real
+# runtimes and waits for deadlines to expire). It needs more than the default
+# hang window, and it is a wall-clock-bound test rather than a compute one.
+set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 300)
+# The lane E2E suite drives real shard runtimes plus one bounded gap wait of
 # 3 s; on a saturated box every runtime-driven wait slows down together, so
 # the suite gets the same headroom as the server/client suite.
-set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 120)
+set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 300)
 
 # --- C ABI smoke test --------------------------------------------------------
 # Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is

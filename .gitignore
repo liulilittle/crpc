@@ -65,6 +65,11 @@ third_party/_fetched/
 tmp/
 scratch/
 
+# Redis Sentinel/Replica configs written while exercising the client against
+# a local 6380/6381/26380 setup; they are machine-local, not part of the build.
+replica.conf
+sentinel.conf
+
 # Test-run artifacts that must never be committed
 obs_rotation.log*
 *.dmp
