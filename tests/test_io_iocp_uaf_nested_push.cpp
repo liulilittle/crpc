@@ -43,14 +43,45 @@ namespace {
 using namespace crpc;
 using namespace std::chrono;
 
+// Candidate ports must stay clear of the Windows dynamic/ephemeral range
+// (49152..65535): this process's own client connections and every other
+// parallel ctest process allocate ephemeral ports there, so a bind inside
+// that range collides under `ctest -j8` (observed: listen() returned null and
+// the test failed without touching anything it was written to test). The
+// 20000..29999 band is below the ephemeral floor; the PID keeps parallel
+// processes apart and the counter separates repeated calls in one process.
 std::uint16_t nested_next_port() {
     static std::mutex m;
     static unsigned counter = 0;
     std::lock_guard<std::mutex> lk(m);
-    const unsigned base = 41000u + (::GetCurrentProcessId() % 12000u);
+    const unsigned base = 20000u + (::GetCurrentProcessId() % 5000u);
     const unsigned value = base + counter;
     ++counter;
-    return static_cast<std::uint16_t>(value % 50000u + 1024u);
+    return static_cast<std::uint16_t>(20000u + value % 10000u);
+}
+
+// Binds the first free candidate port, retrying up to 16 times. A computed
+// port is never guaranteed to be free: another process -- including a
+// parallel ctest test -- can take it between our pick and our bind. The
+// `listener` interface exposes no local address (io.hpp), so the test cannot
+// bind port 0 and read the assignment back; walking a candidate list is the
+// deterministic alternative. `bound_port` receives the port that actually
+// bound; callers must connect to it, not to the first pick.
+std::unique_ptr<listener> listen_with_retry(iocp_backend& server,
+                                            std::uint16_t& bound_port) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::uint16_t port = nested_next_port();
+        auto l = server.listen(endpoint::tcp("127.0.0.1", port),
+                               listen_options{});
+        if (l != nullptr) {
+            bound_port = port;
+            return l;
+        }
+    }
+    std::fprintf(stderr,
+                 "nested_push: all 16 candidate ports failed to bind\n");
+    std::fflush(stderr);
+    return nullptr;
 }
 
 span<const std::byte> nested_bytes(const std::vector<std::byte>& v) {
@@ -156,8 +187,8 @@ CRPC_TEST(iocp_close_waits_for_nested_push_delivery) {
     CRPC_CHECK(client.running());
 
     nested_server us;
-    const std::uint16_t port = nested_next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_with_retry(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -222,8 +253,8 @@ CRPC_TEST(iocp_close_waits_for_reused_completion_repush) {
     CRPC_CHECK(client.running());
 
     nested_server us;
-    const std::uint16_t port = nested_next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_with_retry(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
