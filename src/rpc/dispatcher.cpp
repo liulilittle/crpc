@@ -43,8 +43,13 @@ status respond_error(buffer& out, bool& has_response, bool wants_response,
 
 // Rebuilds the per-call context a handler sees from the decoded envelope.
 // `now` is the dispatcher's reference instant; the wire carries the time left,
-// so the local deadline is `now` plus that duration.
-call_context build_context(const call_envelope& envelope,
+// so the local deadline is `now` plus that duration. `request` contributes the
+// ordered-lane token: a handler observes which `(lane_id, seq)` position its
+// caller assigned, which is what an ordered consumer needs to reason about
+// its own side effects. The token is informational here -- the server's lane
+// scheduler reads it from the frame before dispatch and is the component that
+// enforces the ordering.
+call_context build_context(const call_envelope& envelope, const frame& request,
                            std::chrono::steady_clock::time_point now) {
     call_context ctx;
     const trace_extension& ext = envelope.extensions;
@@ -65,6 +70,9 @@ call_context build_context(const call_envelope& envelope,
     if (ext.has(trace_extension::has_idempotency_key)) {
         ctx.has_idempotency_key = true;
         ctx.idempotency = call_id::decode(ext.idempotency_key);
+    }
+    if ((request.header.flags & frame_flag_ordered) != 0) {
+        ctx.lane = lane_token{request.ordered.lane_id, request.ordered.lane_seq};
     }
     return ctx;
 }
@@ -388,7 +396,7 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
         service->enter();
         entered = true;
 
-        call_context ctx = build_context(envelope, now);
+        call_context ctx = build_context(envelope, request, now);
         buffer body_out;
         status handler_status;
         handler_ran = true;

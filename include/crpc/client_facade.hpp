@@ -50,6 +50,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1594,6 +1595,89 @@ public:
         return stub<Resp, Req>(*this, service_id, method_id);
     }
 
+    // Ordered-lane caller (requirement 11). `lane(lane_id)` returns a caller
+    // bound to one client-assigned lane; every call issued through it carries
+    // a `lane_token` whose `seq` is allocated from a per-lane monotonic
+    // counter (0, 1, 2, ...), so a well-behaved client never skips a number.
+    // The server executes the calls of one `(connection, lane_id)` pair
+    // strictly in `seq` order and at most one at a time, while different
+    // lanes proceed independently. Semantics -- baseline, gaps, duplicates,
+    // failures, teardown -- are normative in `rpc/lane_queue.hpp` and restated
+    // in docs/architecture.md.
+    //
+    // Scope and limits, stated plainly:
+    //   * The guarantee is per connection. A pool of one connection (the
+    //     default) gives end-to-end ordering; a larger pool must not mix one
+    //     lane across connections, because each connection orders its own
+    //     queue and reconnects re-baseline the lane at the first observed
+    //     frame.
+    //   * Ordering covers execution (the side effects handlers observe), not
+    //     response arrival: a queued call can be answered after a later
+    //     position that ran on another lane, and a locally refused call
+    //     consumes its position without producing a response frame.
+    //   * A call issued through a lane is retried with the same `seq` on every
+    //     attempt: a retry is the same logical position, not a new one.
+    //   * `lane(0)` is the no-lane spelling: its calls behave exactly like
+    //     plain calls (no token, no queueing), which keeps "0 means no lane"
+    //     true on both sides of the wire.
+    class lane_caller {
+    public:
+        // The stub of a lane-bound caller. `call` stamps the context with the
+        // lane token before handing the request to `start_encoded`.
+        template <typename Resp, typename Req>
+        class [[nodiscard]] stub {
+        public:
+            stub(client& owner, u64 lane_id, u64 service_id, u64 method_id) noexcept
+                : owner_(&owner), lane_id_(lane_id), service_id_(service_id),
+                  method_id_(method_id) {}
+
+            [[nodiscard]] rpc::rpc_result<client::call<Resp>> call(
+                const Req& request, rpc::call_context ctx = {}) {
+                if (lane_id_ != 0) {
+                    ctx.lane = rpc::lane_token{lane_id_, owner_->next_lane_seq(lane_id_)};
+                }
+                buffer encoded;
+                const status encoded_status = rpc::call_codec<Req>::encode(request, encoded);
+                if (!encoded_status.ok()) {
+                    return rpc::rpc_result<client::call<Resp>>(encoded_status.error());
+                }
+                return owner_->template start_encoded<Resp>(service_id_, method_id_,
+                                                            encoded.readable(), std::move(ctx));
+            }
+
+        private:
+            client* owner_;
+            u64 lane_id_;
+            u64 service_id_;
+            u64 method_id_;
+        };
+
+        template <typename Resp, typename Req>
+        [[nodiscard]] stub<Resp, Req> service(u64 service_id, u64 method_id) noexcept {
+            return stub<Resp, Req>(*owner_, lane_id_, service_id, method_id);
+        }
+
+        // Strongly typed overload: the ids cannot be swapped.
+        template <typename Resp, typename Req>
+        [[nodiscard]] stub<Resp, Req> service(service_id service, method_id method) noexcept {
+            return stub<Resp, Req>(*owner_, lane_id_, service.value, method.value);
+        }
+
+    private:
+        friend class client;
+        lane_caller(client& owner, u64 lane_id) noexcept
+            : owner_(&owner), lane_id_(lane_id) {}
+
+        client* owner_;
+        u64 lane_id_;
+    };
+
+    // Returns a caller bound to `lane_id`. See `lane_caller` for the
+    // guarantee and its limits.
+    [[nodiscard]] lane_caller lane(u64 lane_id) noexcept {
+        return lane_caller(*this, lane_id);
+    }
+
     // Strongly typed overload: the ids cannot be swapped.
     template <typename Resp, typename Req>
     [[nodiscard]] stub<Resp, Req> service(service_id service, method_id method) {
@@ -1818,6 +1902,15 @@ private:
     void sleep_for(client_detail::call_core& core, std::chrono::nanoseconds delay) noexcept;
     void notify_waiter() noexcept;
     rpc::call_id make_call_id() noexcept;
+
+    // Allocates the next `seq` for one ordered lane (0, 1, 2, ...). The
+    // counter is shared by every `lane(lane_id)` caller of this client and
+    // grows monotonically; the server consumes it in order and rejects a
+    // number it has already seen as a duplicate.
+    [[nodiscard]] u64 next_lane_seq(u64 lane_id) {
+        std::lock_guard<std::mutex> lk(lane_mutex_);
+        return lane_next_seq_[lane_id]++;
+    }
     static void deadline_tick(const std::shared_ptr<impl>& impl,
                               std::chrono::nanoseconds idle_eviction) noexcept;
     static void evict_idle(const std::shared_ptr<impl>& impl,
@@ -1839,6 +1932,14 @@ private:
     std::atomic<bool> closed_{false};
     std::atomic<std::uint64_t> seq_{0};
     std::array<std::byte, 16> client_id_{};
+    // Per-lane sequence counters for `lane(lane_id)` callers (requirement 11).
+    // Monotonic per lane, contiguous from 0: the counter lives in the client,
+    // so every lane stub shares one stream of sequence numbers regardless of
+    // which thread issues the calls. A lane that is only ever used through
+    // one caller could keep the counter inline, but a shared map costs one
+    // mutex acquisition per lane call and keeps the API shape uniform.
+    std::mutex lane_mutex_;
+    std::unordered_map<u64, u64> lane_next_seq_;
     resilience::retry_budget budget_;
     std::atomic<std::size_t> calls_started_{0};
     std::atomic<std::size_t> retries_{0};

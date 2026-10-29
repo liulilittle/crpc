@@ -169,8 +169,11 @@ struct lane_token {
 };
 
 // Delivery guarantee. The v1 core implements `reliable` (request/response) and
-// `unreliable` (fire-and-forget ONE_WAY). Ordered reliable lanes are carried by
-// the lane token but serial execution is a server concern. The enum lives in
+// `unreliable` (fire-and-forget ONE_WAY). A call that carries a lane token
+// opts into ordered delivery: the server executes the calls of one
+// `(connection, lane_id)` pair strictly in `seq` order, at most one at a time
+// (`rpc::lane_queue`, wired in `src/server/server.cpp`). `lane_id == 0` and a
+// missing token both mean "no ordering". The enum lives in
 // `crpc/delivery_mode.hpp` and is shared with the push hub, so a mode can be
 // forwarded between the RPC and push APIs without a conversion.
 
