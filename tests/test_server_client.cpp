@@ -4910,18 +4910,6 @@ struct remote_breaker_fixture {
     }
 };
 
-// Runs one call to completion and returns its code. Opening a breaker needs the
-// terminal result to be recorded, so the handle must be consumed, not dropped.
-int run_one(crpc::client::stub<int, int>& stub, int argument) {
-    auto started = stub.call(argument);
-    if (!started.ok()) {
-        return static_cast<int>(started.code());
-    }
-    auto handle = std::move(started).value();
-    const auto result = handle.get();
-    return result.ok() ? 0 : static_cast<int>(result.code());
-}
-
 CRPC_TEST(fallback_rejects_a_remote_refusal_for_a_non_idempotent_call) {
     // Given: an open server breaker and a non-idempotent client call.
     remote_breaker_fixture f("crpc-fallback-remote-nonidem", false);
@@ -4933,6 +4921,13 @@ CRPC_TEST(fallback_rejects_a_remote_refusal_for_a_non_idempotent_call) {
     cache->value = 41;
     CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
                                    &retain_cache, &release_cache));
+    // This case owns the initial reference; the installed policy retains its
+    // own. Hand ours back at scope exit, after every use, so the object is
+    // actually freed -- LeakSanitizer reports it otherwise.
+    struct cache_release {
+        cache_state* state;
+        ~cache_release() { release_cache(state); }
+    } cache_guard{cache};
     f.open_breaker();
 
     // When: the call meets the open breaker (sent == true).
@@ -4971,6 +4966,13 @@ CRPC_TEST(fallback_applies_a_cached_value_on_a_remote_breaker_refusal) {
     cache->value = 41;
     CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
                                    &retain_cache, &release_cache));
+    // This case owns the initial reference; the installed policy retains its
+    // own. Hand ours back at scope exit, after every use, so the object is
+    // actually freed -- LeakSanitizer reports it otherwise.
+    struct cache_release {
+        cache_state* state;
+        ~cache_release() { release_cache(state); }
+    } cache_guard{cache};
     f.open_breaker();
 
     // When: the idempotent call meets the open breaker.
@@ -5024,6 +5026,13 @@ CRPC_TEST(fallback_does_not_run_when_the_call_never_starts) {
     cache->value = 41;
     CRPC_CHECK(cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
                                  &retain_cache, &release_cache));
+    // This case owns the initial reference; the installed policy retains its
+    // own. Hand ours back at scope exit, after every use, so the object is
+    // actually freed -- LeakSanitizer reports it otherwise.
+    struct cache_release {
+        cache_state* state;
+        ~cache_release() { release_cache(state); }
+    } cache_guard{cache};
 
     // When: the call is refused before a handle exists.
     auto stub = cli->service<int, int>(kService, kEcho);
@@ -5146,6 +5155,13 @@ CRPC_TEST(retain_and_release_run_exactly_once_regardless_of_call_count) {
     cache->value = 41;
     CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
                                    &retain_cache, &release_cache));
+    // This case owns the initial reference; the installed policy retains its
+    // own. Hand ours back at scope exit, after every use, so the object is
+    // actually freed -- LeakSanitizer reports it otherwise.
+    struct cache_release {
+        cache_state* state;
+        ~cache_release() { release_cache(state); }
+    } cache_guard{cache};
     CRPC_CHECK_EQ(1, g_cache_counters.retains.load());
     CRPC_CHECK_EQ(0, g_cache_counters.releases.load());
     f.open_breaker();
@@ -5217,6 +5233,13 @@ CRPC_TEST(fallback_overrun_reports_deadline_exceeded) {
     cache->delay = 120ms;
     CRPC_CHECK(f.cli->set_fallback(&cached_fallback, cache, kFallbackFloor,
                                    &retain_cache, &release_cache));
+    // This case owns the initial reference; the installed policy retains its
+    // own. Hand ours back at scope exit, after every use, so the object is
+    // actually freed -- LeakSanitizer reports it otherwise.
+    struct cache_release {
+        cache_state* state;
+        ~cache_release() { release_cache(state); }
+    } cache_guard{cache};
     f.open_breaker();
 
     // When: the degraded attempt runs past the deadline.

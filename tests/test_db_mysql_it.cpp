@@ -36,7 +36,7 @@
 #include <crpc/db/mysql/connection.hpp>
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -51,7 +51,7 @@ namespace {
 }
 
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mysql::connection_factory> factory;
     std::unique_ptr<crpc::db::client> db;
 
@@ -308,7 +308,7 @@ CRPC_TEST(mysql_it_isolation_level_and_command_timeout_surface) {
     options.database = env_or("CRPC_MYSQL_DB", "crpc_it");
     const std::string host = env_or("CRPC_MYSQL_HOST", "127.0.0.1");
     const std::string port = env_or("CRPC_MYSQL_PORT", "3306");
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::net::connection_config config;
     config.ep = crpc::endpoint::tcp(host, static_cast<std::uint16_t>(std::stoi(port)));
     config.operation_timeout = std::chrono::seconds(15);
@@ -394,7 +394,7 @@ CRPC_TEST(mysql_it_caching_sha2_full_auth) {
     const std::string host = env_or("CRPC_MYSQL_HOST", "127.0.0.1");
     const std::string port = env_or("CRPC_MYSQL_PORT", "3306");
 
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::db::mysql::connection_options options;
     options.user = user;
     options.password = password;
@@ -474,7 +474,7 @@ struct it_tls_options {
 // Opens one direct session (no pool) with the requested TLS policy. `session`
 // is null when the handshake failed; factory_open_error() then says why.
 struct tls_it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mysql::connection_factory> factory;
     std::unique_ptr<crpc::db::mysql::connection> session;
     std::string open_error;
@@ -504,29 +504,6 @@ struct tls_it_session {
         return open_error;
     }
 };
-
-// Reads a single-string status value (SHOW STATUS / SELECT @@...), empty on
-// any failure.
-std::string it_scalar(crpc::db::mysql::connection& session, const char* sql) {
-    crpc::db::result_set* rows = nullptr;
-    const crpc::status ran = session.query(sql, {}, &rows);
-    crpc::db::statement_guard guard(rows);
-    if (!ran.ok()) {
-        std::printf("  scalar query '%s' failed: %s\n", sql, ran.error().message.c_str());
-        return std::string();
-    }
-    if (rows == nullptr || !rows->next()) {
-        std::printf("  scalar query '%s': no row\n", sql);
-        return std::string();
-    }
-    // SHOW STATUS has two columns (name, value); SELECT @@... has one.
-    const std::size_t value_column = rows->column_count() > 1 ? 1 : 0;
-    if (rows->is_null(value_column)) {
-        std::printf("  scalar query '%s': null value\n", sql);
-        return std::string();
-    }
-    return std::string(rows->get_text(value_column).value());
-}
 
 // Restores require_secure_transport=OFF no matter how the case ends: the
 // variable is global, and leaving it ON would poison every later MySQL

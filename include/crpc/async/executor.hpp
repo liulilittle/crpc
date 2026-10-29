@@ -44,6 +44,13 @@ class executor;
 
 namespace detail {
 
+// future is defined before executor, so it cannot name a member of
+// executor directly: a nested-name-specifier requires a complete type, and
+// executor is only forward-declared at that point (GCC rejects it; MSVC is
+// lenient). This free function is declared here and defined once executor is
+// complete, which keeps the self-deadlock check inside future::get.
+[[nodiscard]] executor* current_executor() noexcept;
+
 template <typename T>
 struct is_result : std::false_type {};
 
@@ -51,7 +58,7 @@ template <typename T>
 struct is_result<crpc::result<T>> : std::true_type {};
 
 // Maps a callable's return type to the future's value type, flattening
-// esult<T> to T. Declared here rather than inside executor because a
+// crpc::result<T> to T. Declared here rather than inside executor because a
 // member's trailing return type cannot see a nested type declared later.
 template <typename Produced>
 struct produced_value {
@@ -90,7 +97,7 @@ public:
         if (!state_) {
             return rpc_error{rpc_code::failed_precondition, "future is not valid"};
         }
-        if (owner_ != nullptr && executor::current() == owner_) {
+        if (owner_ != nullptr && detail::current_executor() == owner_) {
             return rpc_error{rpc_code::failed_precondition,
                              "a worker must not block on its own executor"};
         }
@@ -104,7 +111,7 @@ public:
         if (!state_) {
             return rpc_error{rpc_code::failed_precondition, "future is not valid"};
         }
-        if (owner_ != nullptr && executor::current() == owner_) {
+        if (owner_ != nullptr && detail::current_executor() == owner_) {
             return rpc_error{rpc_code::failed_precondition,
                              "a worker must not block on its own executor"};
         }
@@ -251,6 +258,15 @@ private:
     std::vector<std::thread> workers_;
     bool closed_ = false;
 };
+
+namespace detail {
+
+// Defined here, after `executor` is complete: this indirection lets
+// `future::get` ask whether a worker of its own executor is running it, without
+// naming a type that is still incomplete where `future` is declared.
+inline executor* current_executor() noexcept { return executor::current(); }
+
+} // namespace detail
 
 } // namespace async
 } // namespace crpc

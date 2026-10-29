@@ -33,10 +33,6 @@ using crpc::db::tds::token_type;
     return crpc::span<const std::byte>(data.data(), data.size());
 }
 
-[[nodiscard]] const std::byte* bytes(const std::vector<std::byte>& data) noexcept {
-    return data.data();
-}
-
 [[nodiscard]] std::string hex(const std::vector<std::byte>& data, std::size_t from = 0,
                               std::size_t count = static_cast<std::size_t>(-1)) {
     static const char* digits = "0123456789abcdef";

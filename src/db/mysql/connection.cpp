@@ -26,10 +26,6 @@ namespace {
     return static_cast<std::uint8_t>(data[index]);
 }
 
-[[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
-    return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
-}
-
 // Trailing NULs are never part of a challenge: the handshake announces one byte
 // more than it means, and an auth-switch request pads the same way.
 [[nodiscard]] std::vector<std::byte> trim_trailing_nuls(span<const std::byte> data) {
@@ -1518,8 +1514,8 @@ namespace {
 // caller's.
 [[nodiscard]] bool is_load_data_local(std::string_view sql) noexcept {
     std::size_t index = 0;
-    while (index < sql.size() && (sql[index] == ' ' || sql[index] == '\\t' ||
-                                  sql[index] == '\\r' || sql[index] == '\\n')) {
+    while (index < sql.size() && (sql[index] == ' ' || sql[index] == '\t' ||
+                                  sql[index] == '\r' || sql[index] == '\n')) {
         ++index;
     }
     constexpr std::string_view prefix = "LOAD DATA LOCAL INFILE";

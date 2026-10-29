@@ -231,6 +231,11 @@ struct bignum {
                           static_cast<ULONG>(out.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     return status >= 0;
 #else
+    // Android: bionic declares getrandom(2) only from API 28; this build
+    // targets older APIs, so the /dev/urandom read below -- the same OS
+    // cryptographic source the getrandom path falls back to -- is the
+    // generator. There is still no predictable fallback.
+#if !defined(__ANDROID__)
     // getrandom(2) may return short reads on very large requests and is
     // interrupted by signals; loop until the buffer is full.
     std::size_t done = 0;
@@ -243,25 +248,29 @@ struct bignum {
         if (got < 0 && errno == EINTR) {
             continue;
         }
-        // getrandom(2) unavailable (old kernel): read /dev/urandom once.
-        const int fd = ::open("/dev/urandom", O_RDONLY);
-        if (fd < 0) {
-            return false;
-        }
-        bool ok = true;
-        std::size_t filled = 0;
-        while (filled < out.size()) {
-            const ssize_t read_bytes = ::read(fd, out.data() + filled, out.size() - filled);
-            if (read_bytes <= 0) {
-                ok = false;
-                break;
-            }
-            filled += static_cast<std::size_t>(read_bytes);
-        }
-        ::close(fd);
-        return ok;
+        break;  // getrandom(2) unavailable (old kernel): use /dev/urandom
     }
-    return true;
+    if (done == out.size()) {
+        return true;
+    }
+#endif
+    // Read /dev/urandom once (getrandom(2) unavailable, or Android pre-28).
+    const int fd = ::open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = true;
+    std::size_t filled = 0;
+    while (filled < out.size()) {
+        const ssize_t read_bytes = ::read(fd, out.data() + filled, out.size() - filled);
+        if (read_bytes <= 0) {
+            ok = false;
+            break;
+        }
+        filled += static_cast<std::size_t>(read_bytes);
+    }
+    ::close(fd);
+    return ok;
 #endif
 }
 

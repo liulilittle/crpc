@@ -76,3 +76,6 @@ __pycache__/
 
 .worktrees/
 
+
+# Local source-tree snapshots produced while investigating a branch
+.snaps/

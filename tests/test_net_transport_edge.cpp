@@ -32,14 +32,6 @@ using crpc::net::address;
 using crpc::net::listener;
 using crpc::net::tcp_stream;
 
-[[nodiscard]] crpc::u16 free_loopback_port() {
-    auto bound = listener::bind(address::tcp("127.0.0.1", 0));
-    if (!bound) {
-        return 0;
-    }
-    return bound.value()->local().port();
-}
-
 [[nodiscard]] std::string temp_unix_path(const char* tag) {
     static unsigned long sequence = 0;
     ++sequence;

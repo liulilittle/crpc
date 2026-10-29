@@ -252,21 +252,6 @@ sha1_digest sha1(span<const std::byte> first, span<const std::byte> second) noex
     return digest;
 }
 
-sha256_digest sha256(span<const std::byte> data) noexcept {
-    sha_state state;
-    sha256_init(state);
-    absorb(state, sha256_block_fn, reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
-    finish(state, sha256_block_fn);
-    sha256_digest digest{};
-    for (std::size_t i = 0; i < 8; ++i) {
-        digest[i * 4] = static_cast<std::uint8_t>((state.h[i] >> 24) & 0xffu);
-        digest[i * 4 + 1] = static_cast<std::uint8_t>((state.h[i] >> 16) & 0xffu);
-        digest[i * 4 + 2] = static_cast<std::uint8_t>((state.h[i] >> 8) & 0xffu);
-        digest[i * 4 + 3] = static_cast<std::uint8_t>(state.h[i] & 0xffu);
-    }
-    return digest;
-}
-
 namespace {
 
 // HMAC needs the key XORed with a repeated byte, padded to the 64-byte block. Built as a
@@ -310,6 +295,10 @@ using sha256_pad = std::array<std::uint8_t, 64>;
 }
 
 } // namespace
+
+sha256_digest sha256(span<const std::byte> data) noexcept {
+    return sha256_of(reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
+}
 
 sha256_digest hmac_sha256(span<const std::byte> key, span<const std::byte> message) {
     sha256_pad ipad{};

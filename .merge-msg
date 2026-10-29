@@ -1,0 +1,9 @@
+﻿Merge master 9170b9f into wt/ordered-lanes
+
+Resolves the dedup-vs-lane overlap:
+- dispatcher.cpp: build_context keeps the lane-aware signature and is called
+  at master's earlier position (before the dedup table claims its lease).
+- server.cpp: teardown and forward declarations combine both sides; the
+  envelope decode moves into handle_request ahead of the lane gate so a
+  duplicate lane seq carrying an idempotency key can fall through to dedup
+  (retry of a known call) while an unkeyed replay stays rejected.

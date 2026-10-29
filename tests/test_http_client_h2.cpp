@@ -43,11 +43,10 @@
 #include <crpc/io.hpp>
 #include <crpc/mvc/router.hpp>
 
+#include "test_tcp_backend.hpp"
 #if defined(_WIN32)
-#include <crpc/io/iocp_backend.hpp>
 #include <windows.h>
 #else
-#include <crpc/io/epoll_backend.hpp>
 #include <unistd.h>
 #endif
 
@@ -1548,12 +1547,8 @@ CRPC_TEST(h2_client_send_and_send_text_round_trip) {
 
 // --- TLS + ALPN ---------------------------------------------------------------
 
-#if defined(_WIN32)
-using tcp_backend = crpc::iocp_backend;
-#else
-using tcp_backend = crpc::io::epoll_backend;
-#endif
-
+// Only the OpenSSL-gated fixtures below call this.
+#if defined(CRPC_HAVE_OPENSSL)
 [[nodiscard]] crpc::u16 next_port() {
 #if defined(_WIN32)
     static const unsigned base = 26200u + (::GetCurrentProcessId() % 20000u);
@@ -1564,6 +1559,7 @@ using tcp_backend = crpc::io::epoll_backend;
     const unsigned value = base + counter.fetch_add(7, std::memory_order_relaxed);
     return static_cast<crpc::u16>(1024u + value % (65536u - 1024u));
 }
+#endif
 
 #if defined(CRPC_HAVE_OPENSSL)
 

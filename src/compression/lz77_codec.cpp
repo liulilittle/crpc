@@ -127,7 +127,11 @@ status lz77_compress(span<const std::byte> in, span<std::byte> out,
     while (index < size) {
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
-        if (index + lz77_min_match <= size) {
+        // hash4 reads four bytes, so the guard must reserve four. It used to
+        // reserve lz77_min_match (3), which let the last position with exactly
+        // three bytes left read one byte past the input -- a heap-buffer-overflow
+        // ASan reports at hash4.
+        if (index + 4 <= size) {
             const u32 hash = hash4(in, index);
             int candidate = head[hash];
             previous[index & (lz77_window - 1)] = candidate;
@@ -172,7 +176,7 @@ status lz77_compress(span<const std::byte> in, span<std::byte> out,
             const std::size_t end = index + best_length;
             ++index;
             while (index < end) {
-                if (index + lz77_min_match <= size) {
+                if (index + 4 <= size) {
                     const u32 hash = hash4(in, index);
                     previous[index & (lz77_window - 1)] = head[hash];
                     head[hash] = static_cast<int>(index);

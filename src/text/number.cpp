@@ -7,6 +7,10 @@
 // explicitly. Formatting uses std::to_chars into a fixed work buffer, which
 // cannot overrun by construction.
 #include <charconv>
+#include <cerrno>
+#if defined(__ANDROID__)
+#include <locale.h>
+#endif
 #include <cstddef>
 #include <system_error>
 
@@ -108,6 +112,28 @@ result<double> parse_double(std::string_view text) {
         return invalid("not a complete decimal literal");
     }
     double value = 0.0;
+#if defined(__ANDROID__)
+    // libc++ in the Android NDK deletes the floating-point `from_chars`
+    // overload, so the portable path below cannot be used. `strtod_l` with an
+    // explicit "C" locale is the replacement: it is locale-independent (the
+    // process locale may use ',' as the decimal point, which would make a
+    // plain `strtod` stop early) and correctly rounded, like `from_chars`.
+    static const locale_t c_locale = ::newlocale(LC_ALL_MASK, "C", nullptr);
+    if (c_locale == nullptr) {
+        return invalid("no C locale available to parse a number");
+    }
+    std::string terminated(text);
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = ::strtod_l(terminated.c_str(), &end, c_locale);
+    if (end != terminated.c_str() + terminated.size()) {
+        return invalid("not a complete decimal literal");
+    }
+    if (errno == ERANGE) {
+        return invalid("floating-point literal is out of range");
+    }
+    value = parsed;
+#else
     const auto outcome = std::from_chars(text.data(), text.data() + text.size(),
                                          value);
     if (outcome.ec == std::errc::result_out_of_range) {
@@ -117,6 +143,7 @@ result<double> parse_double(std::string_view text) {
         outcome.ptr != text.data() + text.size()) {
         return invalid("not a complete decimal literal");
     }
+#endif
     return value;
 }
 

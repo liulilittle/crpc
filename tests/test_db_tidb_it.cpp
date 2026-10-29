@@ -45,7 +45,7 @@
 #include <crpc/db/tidb/retry.hpp>
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/span.hpp>
 
 namespace {
@@ -75,7 +75,7 @@ namespace {
 
 // One TiDB backend: an IO backend, a factory over it and a pool.
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::tidb::connection_factory> factory;
     std::unique_ptr<crpc::db::pool> pool;
     std::string database;
@@ -105,7 +105,7 @@ struct it_session {
 
 // One MySQL 8 pool for the comparison half.
 struct mysql_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::mysql::connection_factory> factory;
     std::unique_ptr<crpc::db::pool> pool;
     std::string database;

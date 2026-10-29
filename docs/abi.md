@@ -256,6 +256,13 @@ handshake reads), and
 `retry_policy` (by reference into the corresponding constructors). The structs
 that are genuinely outside this scope are the ones with **no** out-of-line entry
 point at all; the list below is maintained by `crpc_test_abi_docs`, not by hand.
+`rpc::dedup_options` and `rpc::dedup_statistics` are the current examples of
+that exclusion: the dedup table is configured only through the INLINE
+`dispatcher(registry, dedup_options)` constructor and read only by the inline
+`dedup_table::stats()`, so both records are consumed in the caller's own
+translation unit and never cross the shared-library boundary. If those
+constructors ever move out of line, `crpc_test_abi_docs` fails until the
+records are guarded or listed.
 
 `resilience::fallback_context` is in scope for the same reason even though no
 signature spells its name: the library builds it and calls the consumer's
@@ -389,6 +396,10 @@ is guarded.
 - `::crpc::mvc::route_params`
 - `::crpc::net::backoff_config`
 - `::crpc::net::connect_options`
+- `::crpc::net::icmp_echo_reply`
+- `::crpc::net::icmp_options`
+- `::crpc::net::icmp_ping_result`
+- `::crpc::net::icmp_ping_statistics`
 - `::crpc::net::resolve_options`
 - `::crpc::net::retry_report`
 - `::crpc::obs::log_record`

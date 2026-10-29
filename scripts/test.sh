@@ -97,6 +97,14 @@ for san in "${SAN_LIST[@]}"; do
       log INFO "--- ctest $ARCH/$cfg/$san run $r/$REPEAT ---"
       CTEST_ARGS=(--test-dir "$BUILD_DIR" --output-on-failure)
       [[ -n "$FILTER" ]] && CTEST_ARGS+=(-R "$FILTER")
+      # A test may deliberately request an impossible allocation to prove the
+      # failure is reported as an error instead of crashing
+      # (fs_buffer_reserve_failure_is_an_error asks for SIZE_MAX/2). ASan
+      # aborts such a request by default, before the code under test can
+      # observe a null return, so allow the allocator to return null.
+      case "$san" in
+        asan|all) export ASAN_OPTIONS="${ASAN_OPTIONS:-}:allocator_may_return_null=1" ;;
+      esac
       if ! "$CTEST" "${CTEST_ARGS[@]}" 2>&1 | tee -a "$LOG"; then
         log ERROR "ctest failed $ARCH/$cfg/$san run $r"
         FAILURES=$((FAILURES + 1))

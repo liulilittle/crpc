@@ -36,7 +36,7 @@
 #include <vector>
 
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/memcached/client.hpp>
 #include <crpc/memcached/protocol.hpp>
 #include <crpc/memcached/router.hpp>
@@ -64,7 +64,7 @@ using namespace std::chrono_literals;
 }
 
 struct memcached_rig {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::memcached::router> instance;
 
     memcached_rig(const std::string& host, std::uint16_t first, std::uint16_t second,
@@ -104,7 +104,11 @@ struct node_guard {
 
     ~node_guard() {
         if (stopped && !start_command.empty()) {
-            (void)std::system(start_command.c_str());
+            // Best-effort restore; the exit status cannot be acted on in a
+            // destructor, but it must be consumed for glibc's
+            // warn_unused_result.
+            const int rc = std::system(start_command.c_str());
+            (void)rc;
         }
     }
 };
@@ -112,7 +116,8 @@ struct node_guard {
 // Runs `command` and sleeps briefly so a daemonised process can bind its port.
 void run_command(const std::string& command) {
     if (!command.empty()) {
-        (void)std::system(command.c_str());
+        const int rc = std::system(command.c_str());
+        (void)rc;
     }
     std::this_thread::sleep_for(400ms);
 }

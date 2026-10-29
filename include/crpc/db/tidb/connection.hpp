@@ -79,7 +79,7 @@ public:
 
     // The session transaction mode at connect time. Only meaningful when
     // `is_tidb()` is true; otherwise `unknown`.
-    [[nodiscard]] txn_mode txn_mode() const noexcept { return txn_mode_; }
+    [[nodiscard]] crpc::db::tidb::txn_mode txn_mode() const noexcept { return txn_mode_; }
 
 private:
     // Runs the capability queries after the handshake. Failures are swallowed:

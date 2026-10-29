@@ -41,7 +41,7 @@
 #include <vector>
 
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/redis/client.hpp>
 #include <crpc/redis/connection.hpp>
 #include <crpc/redis/pipeline.hpp>
@@ -89,7 +89,7 @@ crpc::result<crpc::redis::resp_value> call(crpc::redis::client& c,
 // is heap-owned because `command_channel` neither default-constructs nor
 // reassigns; it is created right after the connection is acquired.
 struct raw_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::connection_pool pool;
     std::shared_ptr<crpc::redis::connection> conn;
     std::unique_ptr<crpc::redis::command_channel> channel;
@@ -204,7 +204,7 @@ std::int64_t client_info_resp(const crpc::redis::resp_value& reply) {
 
 CRPC_TEST(it_reads_redis_version) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client c(client_options(), backend);
     crpc::result<crpc::redis::resp_value> info = call(c, {"INFO", "server"});
     CRPC_CHECK(info.ok());
@@ -229,7 +229,7 @@ CRPC_TEST(it_reads_redis_version) {
 
 CRPC_TEST(it_command_runs_arbitrary_commands) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client c(client_options(), backend);
     CRPC_CHECK(c.connect().ok());
 
@@ -263,7 +263,7 @@ CRPC_TEST(it_command_runs_arbitrary_commands) {
 
 CRPC_TEST(it_command_encoding_is_injection_safe) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client c(client_options(), backend);
     CRPC_CHECK(c.connect().ok());
 
@@ -288,7 +288,7 @@ CRPC_TEST(it_command_encoding_is_injection_safe) {
 
 CRPC_TEST(it_resp3_client_negotiates_and_serves_resp3_shapes) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client::options opts = client_options();
     opts.protocol = crpc::redis::resp_protocol::resp3;
     crpc::redis::client c(opts, backend);
@@ -351,7 +351,7 @@ CRPC_TEST(it_resp3_client_negotiates_and_serves_resp3_shapes) {
 
 CRPC_TEST(it_resp2_client_keeps_resp2_shapes) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client c(client_options(), backend);
     CRPC_CHECK(c.connect().ok());
 
@@ -388,7 +388,7 @@ CRPC_TEST(it_resp2_client_keeps_resp2_shapes) {
 
 CRPC_TEST(it_resp3_pool_negotiates_every_connection) {
     (void)require_redis();
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client::options opts = client_options();
     opts.protocol = crpc::redis::resp_protocol::resp3;
     opts.pool.max_size = 8;
@@ -428,7 +428,7 @@ CRPC_TEST(it_client_tracking_sends_push_invalidations) {
 
     // A second, independent connection mutates the key. On either protocol the
     // mutation reply shares no ordering with the invalidation push.
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     crpc::redis::client writer(client_options(), backend);
     CRPC_CHECK(writer.connect().ok());
 
@@ -537,7 +537,7 @@ bool read_text(const crpc::result<crpc::redis::resp_value>& reply,
 // A direct, unpooled command against one port, for putting the topology back
 // into a known shape before the failover case runs.
 crpc::result<crpc::redis::resp_value> admin_command(
-    crpc::iocp_backend& backend, const std::string& host, std::uint16_t port,
+    tcp_backend& backend, const std::string& host, std::uint16_t port,
     crpc::redis::command args) {
     crpc::net::pool_config options;
     options.connection.ep = crpc::endpoint::tcp(host, port);
@@ -561,7 +561,7 @@ crpc::result<crpc::redis::resp_value> admin_command(
 // Used to wait for a promotion to actually finish: Sentinel can publish the new
 // address before the promoted node has dropped its replica state, and a write
 // in that window is rejected with READONLY.
-bool node_is_master(crpc::iocp_backend& backend, const std::string& host,
+bool node_is_master(tcp_backend& backend, const std::string& host,
                     std::uint16_t port) {
     crpc::result<crpc::redis::resp_value> info = admin_command(
         backend, host, port, crpc::redis::command{"INFO", "replication"});
@@ -603,7 +603,7 @@ void flatten_text(const crpc::redis::resp_value& value, std::string& out) {
 // Waits until Sentinel reports `replica_port` as a healthy replica of the
 // current master. After SENTINEL RESET the daemon starts from nothing, so
 // FAILOVER is answered with NOGOODSLAVE until discovery has run.
-bool wait_until_replica_known(crpc::iocp_backend& backend, const std::string& host,
+bool wait_until_replica_known(tcp_backend& backend, const std::string& host,
                               std::uint16_t sentinel_port, std::uint16_t replica_port,
                               std::chrono::seconds budget) {
     const std::string wanted = host + ":" + std::to_string(replica_port);
@@ -626,7 +626,7 @@ bool wait_until_replica_known(crpc::iocp_backend& backend, const std::string& ho
     return false;
 }
 
-bool wait_until_master(crpc::iocp_backend& backend, const std::string& host,
+bool wait_until_master(tcp_backend& backend, const std::string& host,
                        std::uint16_t port, std::chrono::seconds budget) {
     const auto deadline = std::chrono::steady_clock::now() + budget;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -668,7 +668,7 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
         std::stoi(env_or("CRPC_REDIS_SENTINEL_PORT", "26380")));
     const std::string trigger = env_or("CRPC_REDIS_SENTINEL_TRIGGER", "failover");
 
-    crpc::iocp_backend backend;
+    tcp_backend backend;
 
     // The case ends by failing the master over, so it cannot assume which node
     // is the master when it starts: a second run begins with the roles swapped,

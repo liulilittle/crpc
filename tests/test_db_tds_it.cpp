@@ -34,7 +34,7 @@
 #include <crpc/db/tds/connection.hpp>
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -56,7 +56,7 @@ namespace {
 }
 
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::tds::connection_factory> factory;
     std::unique_ptr<crpc::db::tds::connection> session;
 

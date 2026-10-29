@@ -50,7 +50,7 @@
 | 10 | 事件先于权威数据 | 在快照之前或缺少缺口检查时应用增量 | watch 状态 index `S`：`E <= S` 丢弃，`E == S+1` 应用，`E > S+1` 重新同步 | `watch_gap_triggers_resync`、`watch_drops_duplicate_and_old_index` |
 | 11 | NULL 不能穿透 | 用“不存在”表达删除；过期注册复活墓碑 | 墓碑；墓碑拒绝所有不是严格更大的 incarnation | `registry_tombstone_blocks_old_incarnation`、watch 墓碑测试 |
 | 12 | 因果性 | 用墙钟排序跨节点事件 | 所有控制决策使用单调时钟；trace 父子来自发送/接收对；registry index | `tracer_parent_child_relation`；流控时钟测试；截止时间缺陷见 §5 |
-| 13 | 端到端论证 | 把中间层 ACK 当作正确性 | 幂等键到达端点；TCP 帧只是传输，不是业务保证 | 信封携带键；服务端去重属于**已设计，未实现** |
+| 13 | 端到端论证 | 把中间层 ACK 当作正确性 | 幂等键到达端点；TCP 帧只是传输，不是业务保证 | 信封携带键；服务端去重已在 `rpc/dedup.hpp` 实现（进程级；见 §6） |
 | 14 | 观测会干扰 | 在转发路径上因日志或指标阻塞 | 日志进入每线程环；追踪使用有界队列；钩子冻结，空链开销低 | 日志/追踪分配与溢出测试；AOP 尚未接到调用路径 |
 
 ## 3. AP 优先于 C <a id="s3"></a>
@@ -123,13 +123,18 @@ index/fence 测试。整条调用路径的时钟回拨测试属于**已设计，
 已写出且非幂等的调用超时后标记 `unknown_side_effect`。`retry`
 在调用非幂等时拒绝 `unknown_side_effect`。
 
-**缺口：** 服务端去重表（fresh/in-progress/done、每客户端环、FIFO
-驱逐）属于**已设计，未实现**。因此恰好一次尚不是 CRPC 部署的性质；目前只有键传输与超时语义。
+**服务端：** 有界去重表（`rpc/dedup.hpp`）补上了这一缺口。
+新键执行；处理中的键把副本挂起到 leader 发布并原样重发其响应（并发副本恰好执行一次
+handler）；已完成的键直接重放缓存响应，不执行 handler。只有成功响应会被缓存——失败完成是一枚未缓存墓碑，
+其后的重放会再执行，这正是客户端重试策略保持有意义的原因。表有界（LRU 容量 4096、
+以单调时钟 5 分钟 TTL 作为去重窗口、单条响应缓存上限 16 KiB、
+挂起等待有界且可经 `abandon` 被连接拆除打断）；被处理中条目占满的表退化为至少一次而不是增长内存。
+因此恰好一次是单进程的性质（全部分片共享 dispatcher 的表）；独立节点各自去重，
+且淘汰/过期后的重放会再执行——窗口必须与客户端重试预算配套取值。
 
 **验证：**
-`client_idempotent_timeout_has_no_unknown_side_effect`、`retry_unknown_side_effect_requires_idempotency`，
-以及 `call_id` 编解码测试。执行一次 handler 的重放测试属于**已设计，未实现**，
-因为没有去重表可测。
+`client_idempotent_timeout_has_no_unknown_side_effect`、`retry_unknown_side_effect_requires_idempotency`、
+`call_id` 编解码测试，以及 `tests/test_rpc_dedup.cpp`（恰好一次重放、并发副本、窗口过期、断连 abandon、容量有界）。
 
 ## 7. 控制论 <a id="s7"></a>
 

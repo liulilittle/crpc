@@ -434,6 +434,14 @@ struct queue::impl {
 
 #endif // CRPC_OS_WINDOWS
 
+#if !defined(CRPC_OS_WINDOWS)
+// MSMQ only exists on Windows: nothing on this platform ever creates an impl.
+// The out-of-line constructor and destructor below still need the type to be
+// complete so the member unique_ptr can be destroyed, hence this empty
+// definition.
+struct queue::impl {};
+#endif // !CRPC_OS_WINDOWS
+
 queue::queue(std::unique_ptr<impl> pimpl) noexcept : impl_(std::move(pimpl)) {}
 
 queue::~queue() = default;

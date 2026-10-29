@@ -105,6 +105,11 @@ void wake_push_pump(server_connection* sc) noexcept;
 // `server::impl` (it needs the full type).
 void schedule_detach_connection(server_connection* sc) noexcept;
 
+// Ends every dedup duplicate suspended on behalf of `wait_key` with an explicit
+// error. Defined after `server::impl` (it needs the full type); safe to call
+// from the early teardown paths that run before the impl is complete.
+void abandon_dedup_waiters(server::impl* owner, const void* wait_key) noexcept;
+
 // --- ordered-lane bridge (defined after `server_connection`) -----------------
 //
 // The scheduler owns the ordering state; the server owns the timer wheel and
@@ -403,6 +408,10 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
     if (!sc->closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
     }
+    // The connection is gone: a duplicate suspended in dispatch against an
+    // original call on this connection must end with an explicit error instead
+    // of waiting (R18: the drop is visible, not silent).
+    abandon_dedup_waiters(sc->owner, sc);
     // A lost response would otherwise strand the peer until its deadline. Close
     // explicitly so every in-flight call observes EOF/failure; the drop is then
     // visible to the client instead of disappearing silently (R18).
@@ -1252,13 +1261,27 @@ struct server::impl {
             }
         }
 
+        // The envelope is decoded once here, before the lane gate: the
+        // duplicate rule below needs the idempotency key, and the admitted
+        // pipeline reuses the result. A drained call re-decodes its own
+        // payload, which is a small bounded copy.
+        call_envelope envelope;
+        const bool decoded = decode_call_envelope(request.payload, envelope).ok();
+
         // Ordered-lane admission (requirement 11; semantics in
         // rpc/lane_queue.hpp). A frame with the ORDERED extension and a
         // non-zero lane id consumes its `(lane_id, seq)` position before any
         // admission stage runs, so a locally refused call still keeps the
         // lane's sequence contiguous. The three outcomes:
-        //   duplicate -> the position was already consumed; reject without
-        //                running the handler;
+        //   duplicate -> the position was already consumed. A replay that
+        //                carries an idempotency key is a retry of a known
+        //                logical call: it bypasses the gate and lets the
+        //                dispatcher's dedup table wait for / replay the
+        //                leader, so a client retrying a slow lane call gets
+        //                the original outcome instead of a refusal. Without
+        //                a key a replay would double-apply side effects the
+        //                lane promises to order exactly once, so it is
+        //                rejected without running the handler;
         //   buffered  -> parked behind its predecessor or a gap; the lane
         //                drain or the gap timer owns the call from here and
         //                the in-flight accounting stays held;
@@ -1276,22 +1299,28 @@ struct server::impl {
                 verdict = sc->lanes.admit(job.lane_id, work);
             }
             if (verdict == rpc::lane_queue::admission::duplicate) {
-                if (wants_response) {
-                    send_error(sc, job.header.stream_id,
-                               rpc_code::failed_precondition,
-                               std::chrono::milliseconds(0),
-                               "lane seq already consumed");
+                const bool keyed = decoded && envelope.extensions.has(
+                                                     trace_extension::has_idempotency_key);
+                if (!keyed) {
+                    if (wants_response) {
+                        send_error(sc, job.header.stream_id,
+                                   rpc_code::failed_precondition,
+                                   std::chrono::milliseconds(0),
+                                   "lane seq already consumed");
+                    }
+                    complete_call(sc, job.counted);
+                    return;
                 }
-                complete_call(sc, job.counted);
+                // A keyed replay keeps the consumed position untouched and
+                // never drains: it is not a lane participant this time.
+            } else if (verdict == rpc::lane_queue::admission::buffered) {
                 return;
+            } else {
+                lane_run_now = true;
             }
-            if (verdict == rpc::lane_queue::admission::buffered) {
-                return;
-            }
-            lane_run_now = true;
         }
 
-        handle_admitted_request(job, request);
+        handle_admitted_request(job, request, envelope, decoded);
 
         if (lane_run_now) {
             // The call finished (any outcome -- even a local admission
@@ -1329,13 +1358,14 @@ struct server::impl {
     // exit path releases the accounting exactly once; a lane call that exits
     // early (breaker open, bulkhead full, deadline refused) has still
     // consumed its lane position, and the caller drains the lane afterwards.
-    void handle_admitted_request(request_job& job, const frame& request) noexcept {
+    // The envelope arrives pre-decoded from `handle_request` (the lane gate
+    // needs it first); `decoded` is false for a malformed envelope, which the
+    // dispatcher answers with the canonical decode_error.
+    void handle_admitted_request(request_job& job, const frame& request,
+                                 const call_envelope& envelope,
+                                 bool decoded) noexcept {
         const std::shared_ptr<server_connection>& sc = job.conn;
         const bool wants_response = job.header.type != frame_type::one_way;
-        // Per-service cap and breaker. A malformed envelope is left to the
-        // dispatcher, which produces the decode_error response.
-        call_envelope envelope;
-        const bool decoded = decode_call_envelope(request.payload, envelope).ok();
         const u64 service_id = decoded ? envelope.service_id : 0;
 
         if (decoded && service_id == push::push_control_service_id) {
@@ -1521,8 +1551,12 @@ struct server::impl {
         buffer response;
         bool has_response = false;
         bool handler_ran = false;
+        // The connection pointer is the dedup wait key: when this connection
+        // closes, `abandon` wakes a duplicate suspended on this call with an
+        // explicit error instead of letting it wait for the original.
         const status dispatched = dispatch->dispatch(request, response, has_response,
-                                                     steady_now(), handler_ran);
+                                                     steady_now(), handler_ran,
+                                                     job.conn.get());
 
         rpc_code outcome_code = rpc_code::ok;
         if (!dispatched.ok()) {
@@ -1833,6 +1867,12 @@ server_connection::~server_connection() {
         std::lock_guard<std::mutex> lk(lane_mutex);
         (void)lanes.fail_all();
     }
+    // Last-resort abandon: the reader path (`on_terminal`) and the send-failure
+    // path normally end suspended duplicates already, but a connection object
+    // can also be torn down without either having run. Idempotent; the dedup
+    // table outlives every connection (declared before `connections` in the
+    // impl, so reverse destruction tears the connections down first).
+    abandon_dedup_waiters(owner, this);
     // Connection teardown order is part of the contract: detach from the hub
     // before the connection and its push token can disappear. The detach is
     // synchronous under push_mutex; a no-op when the terminal path already ran.
@@ -1856,6 +1896,12 @@ void server_connection::on_terminal() noexcept {
         std::lock_guard<std::mutex> lk(lane_mutex);
         (void)lanes.fail_all();
     }
+    // The reader observed EOF or a transport error: this connection will not
+    // deliver anything again. End every dedup duplicate that is suspended in
+    // dispatch on this connection's behalf with an explicit `canceled` error
+    // instead of letting it block the shard thread until the original
+    // completes (or until its own wait bound).
+    abandon_dedup_waiters(owner, this);
     // The detach is queued on the shard. It holds this connection alive until
     // it runs, so the hub detach still precedes destruction; the closed flag
     // already stops the pump from targeting this connection in the meantime.
@@ -1873,6 +1919,12 @@ void wake_push_pump(server_connection* sc) noexcept {
 void schedule_detach_connection(server_connection* sc) noexcept {
     if (sc != nullptr && sc->owner != nullptr) {
         sc->owner->schedule_detach(sc);
+    }
+}
+
+void abandon_dedup_waiters(server::impl* owner, const void* wait_key) noexcept {
+    if (owner != nullptr && owner->dispatch != nullptr) {
+        (void)owner->dispatch->dedup().abandon(wait_key);
     }
 }
 

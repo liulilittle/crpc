@@ -27,11 +27,6 @@ using crpc::db::tds::token_type;
     return crpc::span<const std::byte>(data.data(), data.size());
 }
 
-void put_be16(std::vector<std::byte>& out, std::uint16_t value) {
-    out.push_back(static_cast<std::byte>((value >> 8) & 0xffu));
-    out.push_back(static_cast<std::byte>(value & 0xffu));
-}
-
 void put_le16(std::vector<std::byte>& out, std::uint16_t value) {
     out.push_back(static_cast<std::byte>(value & 0xffu));
     out.push_back(static_cast<std::byte>((value >> 8) & 0xffu));

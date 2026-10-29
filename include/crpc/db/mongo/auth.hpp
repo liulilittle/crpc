@@ -61,6 +61,12 @@ public:
     // The salt and iteration count the server chose, for diagnostics.
     [[nodiscard]] std::uint32_t iterations() const noexcept { return iterations_; }
 
+    // The mechanism this exchange was constructed for, for diagnostics. It was
+    // stored but unreadable, so clang reported the field as unused; surfacing it
+    // is more useful than deleting it, since a failed handshake is exactly when
+    // the caller wants to know which mechanism was attempted.
+    [[nodiscard]] auth_mechanism mechanism() const noexcept { return mechanism_; }
+
 private:
     std::string user_;
     std::string password_;

@@ -12,14 +12,6 @@ namespace {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
 }
 
-[[nodiscard]] std::vector<std::byte> to_bytes(const std::uint8_t* data, std::size_t size) {
-    std::vector<std::byte> out(size);
-    for (std::size_t i = 0; i < size; ++i) {
-        out[i] = static_cast<std::byte>(data[i]);
-    }
-    return out;
-}
-
 // Both scrambles are "hash(pw) XOR hash( ...  || nonce)" with a different hash and
 // a different inner construction, so the nonce is validated once here.
 [[nodiscard]] status check_nonce(span<const std::byte> nonce) {

@@ -154,7 +154,12 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 以及 `resilience::rate_limit_config` /
 `breaker_config` / `bulkhead_config` / `retry_policy`（按引用传入各自构造函数）。
 真正在本范围之外的，是**完全没有** out-of-line 入口的结构体；下列清单由
-`crpc_test_abi_docs` 维护，不靠手写。
+`crpc_test_abi_docs` 维护，不靠手写。`rpc::dedup_options` 与
+`rpc::dedup_statistics` 是这一排除的现行示例：去重表只经**头内联**的
+`dispatcher(registry, dedup_options)` 构造函数配置、只经头内联的
+`dedup_table::stats()` 读取，两个记录都在调用方自己的翻译单元内被消费，
+从不跨共享库边界。若这些构造函数将来改为 out-of-line，`crpc_test_abi_docs`
+会失败，直到记录被护栏守护或列入清单。
 
 `resilience::fallback_context` 出于同样的理由属于本范围，尽管没有任何签名写出它的
 名字：库构造它并用它调用消费者的 `fallback_fn`，因此两侧必须对字段偏移达成一致。
@@ -285,6 +290,10 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::mvc::route_params`
 - `::crpc::net::backoff_config`
 - `::crpc::net::connect_options`
+- `::crpc::net::icmp_echo_reply`
+- `::crpc::net::icmp_options`
+- `::crpc::net::icmp_ping_result`
+- `::crpc::net::icmp_ping_statistics`
 - `::crpc::net::resolve_options`
 - `::crpc::net::retry_report`
 - `::crpc::obs::log_record`

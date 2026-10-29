@@ -250,6 +250,37 @@ CRPC_TEST(load_data_streams_caller_bytes_then_terminates) {
     CRPC_CHECK_EQ(static_cast<int>(4), static_cast<int>(h.raw->sequence_of(4)));
 }
 
+CRPC_TEST(load_data_recognizes_statements_with_leading_whitespace) {
+    // Regression: the leading-whitespace skip in is_load_data_local used to
+    // compare against multi-character constants ('\\t' instead of '\t'), so a
+    // statement beginning with a tab, CR or LF was silently not recognized as
+    // LOAD DATA LOCAL INFILE and load_data refused it outright.
+    harness h;
+    // The server asks for the file (0xfb) at sequence 1; one 1-byte data
+    // packet (sequence 2) and the empty terminator (sequence 3) follow, so the
+    // OK is sequence 4.
+    h.raw->push(packet({std::byte{0xfb}}, 1));
+    h.raw->push(packet(ok_payload(1), 4));
+
+    const std::vector<std::byte> data = bytes_of("x");
+    slice_data_source source(crpc::span<const std::byte>(data.data(), data.size()));
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status loaded = h.session->load_data(
+        "\t\r\n LOAD DATA LOCAL INFILE 'x' INTO TABLE t", source, &rows, 16);
+    CRPC_CHECK(loaded.ok());
+    if (!loaded.ok()) {
+        std::printf("  error: %s\n", loaded.message().c_str());
+        return;
+    }
+    // The wire keeps the caller's statement verbatim: only the recognition
+    // step skips the leading whitespace, the SQL text is sent as-is.
+    CRPC_CHECK_EQ(std::string("\t\r\n LOAD DATA LOCAL INFILE 'x' INTO TABLE t"),
+                  h.raw->payload_of(1).substr(1));
+    // load_data allocates the result set into `out` on success; the caller
+    // owns it. Without this LeakSanitizer reports the case.
+    delete rows;
+}
+
 CRPC_TEST(load_data_sends_no_bytes_when_the_server_refuses) {
     harness h;
     h.raw->push(packet(err_payload(1148, "The used command is not allowed"), 1));
