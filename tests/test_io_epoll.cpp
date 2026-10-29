@@ -400,19 +400,15 @@ struct resume_mid_callback_source final : io::source {
 };
 
 CRPC_TEST(epoll_resume_during_on_data_is_not_lost) {
-// Red-line evidence for a residual lost-wake window: a resume_read() that
-// lands *inside* on_data -- before the loop stashes the unconsumed remainder
-// into rx_ and records the pause -- queues no delivery demand, because
-// resume_read() queues only when `read_paused_ || rx_tail_ != 0`
-// (src/io/epoll_backend.cpp, resume_read); at that instant neither holds. The
-// short-consumption tail then takes the pause with pending_wakes_ == 0 and
-// the retained bytes are never delivered. The test fails red on the
-// pre-81a4131 code AND on the merged pending_wakes port; it stays skipped
-// until the window is closed so the suite stays green.
-#if !defined(CRPC_EPOLL_WINDOW_FIXED)
-    crpc_test::skip("epoll lost-wake window (resume during on_data) still "
-                    "open after the 81a4131 pending_wakes port; fix pending");
-#endif
+// Red-line evidence for the lost-wake window: a resume_read() that lands
+// *inside* on_data -- before the loop stashes the unconsumed remainder into
+// rx_ and records the pause -- must queue a delivery demand. While a delivery
+// attempt is in flight neither `read_paused_` nor `rx_tail_` holds yet, so
+// the backend tracks the attempt with `delivering_` and resume_read() queues
+// on it (src/io/epoll_backend.cpp, resume_read). Without that, the short
+// consumption below takes the pause with pending_wakes_ == 0 and the retained
+// bytes are never delivered: this test failed red until the window was
+// closed, and now runs unconditionally.
     auto be = io::epoll_backend::create();
     CRPC_CHECK(be.ok());
     fixture f(*be.value());
@@ -728,6 +724,53 @@ CRPC_TEST(epoll_bind_source_null_waits_for_in_flight_delivery) {
     CRPC_CHECK(unbind_returned.load(std::memory_order_acquire));
     CRPC_CHECK(exited_at_return.load(std::memory_order_acquire));
 
+    f.shutdown();
+}
+
+CRPC_TEST(epoll_push_completes_only_after_kernel_accepted) {
+// Red-line evidence for the push-completion contract: when the bytes fit the
+// send ring, push used to complete immediately -- while the bytes were still
+// only in the user-space ring. A caller that closes right after the
+// completion (the `Connection: close` pattern) then hits the abortive close,
+// which discards undelivered queued bytes, and the peer loses the response.
+// The loop thread is parked inside another connection's on_data, so no write
+// pass can run while the test pushes: pre-fix the completion had already
+// fired at that point (red), post-fix it stays pending until the bytes have
+// been handed to the kernel (green). The second half proves the completed
+// push survives an immediate close: the peer must observe every byte.
+    auto be = io::epoll_backend::create();
+    CRPC_CHECK(be.ok());
+    fixture f(*be.value());
+    CRPC_CHECK(f.ok);
+
+    recording_source server_rx;
+    f.server->bind_source(&server_rx);
+
+    // Park the loop thread inside the client connection's on_data.
+    blocking_source park;
+    f.client->bind_source(&park);
+    const std::string probe = "park";
+    recording_completion parked;
+    f.server->sink().push(bytes_of(probe), &parked);
+    CRPC_CHECK(park.wait_entered());
+
+    // Exactly ring capacity: the push takes the "fully fits the ring" path.
+    const std::string payload(64 * 1024, 'x');
+    recording_completion done;
+    f.client->sink().push(bytes_of(payload), &done);
+    // The loop is parked inside on_data, so nothing can have reached the
+    // kernel yet: the completion must still be pending.
+    CRPC_CHECK_EQ(0, done.calls.load());
+
+    park.unblock();
+    CRPC_CHECK(wait_until([&] { return done.calls.load() == 1; }, 5000));
+
+    // The completion now means kernel-accepted, so the abortive close that
+    // follows must not discard the payload.
+    f.client->close();
+    CRPC_CHECK(wait_until([&] { return server_rx.size() == payload.size(); },
+                          5000));
+    CRPC_CHECK_EQ(payload.size(), server_rx.size());
     f.shutdown();
 }
 
