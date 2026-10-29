@@ -54,6 +54,38 @@ struct connection_options {
         mask(capability::plugin_auth_lenenc_data) | mask(capability::transactions) |
         mask(capability::multi_results) | mask(capability::multi_statements) |
         mask(capability::deprecate_eof);
+
+    // TLS transport policy for the connection phase. When `enabled`, the client
+    // sends the 32-byte SSLRequest packet (the response header with CLIENT_SSL)
+    // after the greeting, replaces the wire with a TLS handshake, and then sends
+    // the authentication response inside the encrypted session.
+    struct tls {
+        // Request the TLS upgrade. Default off: the connection stays cleartext,
+        // exactly as before this option existed.
+        bool enabled = false;
+
+        // Fail closed. When the server does not offer CLIENT_SSL, a required
+        // TLS session is refused before any byte is written; with `require ==
+        // false` ("prefer") the session continues in cleartext and
+        // `connection::tls_downgraded()` reports it. A build without the TLS
+        // backend is refused either way: the downgrade rule covers what the
+        // server can do, never what this binary was built with.
+        bool require = true;
+
+        // Verify the server certificate (chain and host name) during the
+        // handshake. On by default; a test against a self-signed server may
+        // turn it off, a production deployment must not.
+        bool verify_certificate = true;
+
+        // Sent as SNI and checked against the certificate's host names. Empty
+        // omits SNI and the host-name check (the endpoint factory fills this
+        // from the endpoint host unless that host is an IP literal).
+        std::string server_name;
+
+        // PEM trust anchors. Empty uses the system default store.
+        std::string ca_bundle;
+    };
+    tls tls_options;
 };
 
 // Client-supplied bytes for `LOAD DATA LOCAL INFILE`.
@@ -170,6 +202,16 @@ public:
     // Why the handshake failed, when it did. A factory that only reports "handshake
     // failed" hides the server's own message, which is the one thing that helps.
     [[nodiscard]] const rpc_error& connect_error() const noexcept { return connect_error_; }
+    // True when the session runs inside an established TLS session: the
+    // SSLRequest went out, the handshake completed, and every later byte --
+    // including the authentication response -- is encrypted. This is the same
+    // fact `link_->is_secure()` reports to the auth layer.
+    [[nodiscard]] bool tls_active() const noexcept { return tls_active_; }
+    // True when the caller asked for TLS ("prefer", `tls.require == false`)
+    // but the server did not offer CLIENT_SSL and the session continued in
+    // cleartext. Diagnostics only: a downgrade is never silent, but it is also
+    // not an error the caller asked for.
+    [[nodiscard]] bool tls_downgraded() const noexcept { return tls_downgraded_; }
 
 private:
     friend class prepared_statement;
@@ -178,6 +220,11 @@ private:
     // `handshake` shadows the `handshake` type for the rest of the class, which
     // silently breaks the two declarations below it.
     [[nodiscard]] status perform_handshake();
+    // Runs the TLS half of the connection phase for an enabled `tls_options`:
+    // capability check, the SSLRequest packet, and the channel upgrade. Must
+    // run after the greeting was decoded and before the authentication
+    // response is sent.
+    [[nodiscard]] status negotiate_tls(const handshake& greeting);
     [[nodiscard]] status authenticate(const handshake& greeting);
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
     [[nodiscard]] status send_message(span<const std::byte> payload, std::uint8_t sequence);
@@ -214,6 +261,10 @@ private:
     rpc_error connect_error_;
     // Set when the session needed caching_sha2_password full authentication.
     bool full_auth_ = false;
+    // Set once the channel has been upgraded to TLS (see `tls_active()`), and
+    // when a "prefer" caller had to continue in cleartext (`tls_downgraded()`).
+    bool tls_active_ = false;
+    bool tls_downgraded_ = false;
 };
 
 // A server-side prepared statement, owned by the session that prepared it.
