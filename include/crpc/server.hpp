@@ -50,6 +50,7 @@
 #include <crpc/error.hpp>
 #include <crpc/frame.hpp>
 #include <crpc/io.hpp>
+#include <crpc/observability/interceptor.hpp>
 #include <crpc/push/hub.hpp>
 #include <crpc/push/wire.hpp>
 #include <crpc/resilience/bulkhead.hpp>
@@ -123,6 +124,29 @@ private:
 // Optional request/response observer. `on_request` runs on the shard thread
 // before dispatch; `on_response` runs after the response frame is built.
 // Implementations must be noexcept and must not block.
+//
+// Relationship to the observability interceptor chain: the two mechanisms are
+// independent and coexist; this class is not replaced. `server_interceptor` is
+// an unconditional, exception-free observer pair that cannot alter a call. The
+// observability chain (`obs::interceptor_chain`, installed with
+// `server::builder::interceptor_chain`) is a per-hook-point table with a
+// mutable `obs::call_context`, a short-circuit verdict and an exception
+// boundary. Per request the order is pinned:
+//
+//   1. every `server_interceptor::on_request` (registration order),
+//   2. the chain's `before_call` hooks (registration order; a hook returning
+//      false, or throwing, ends the request with the chain verdict -- the
+//      handler, the admission stages and `after_call` never run),
+//   3. the admission stages (breaker, rate, bulkhead, caps),
+//   4. the handler (dispatch),
+//   5. the chain's `after_call` hooks (registration order; a hook returning
+//      false, or throwing, replaces the response with the chain verdict),
+//   6. every `server_interceptor::on_response` (registration order) with the
+//      final outcome code.
+//
+// Use `server_interceptor` for infallible metrics/trace side observations;
+// use the observability chain when a hook needs per-call context, must be
+// able to refuse a call, or must be isolated from its own exceptions.
 class CRPC_API server_interceptor {
 public:
     virtual ~server_interceptor() = default;
@@ -263,6 +287,21 @@ public:
         }
 
         builder& add_interceptor(server_interceptor& interceptor);
+        // Installs the observability interceptor chain used around the call
+        // path (hook points `before_call` and `after_call`; see
+        // `include/crpc/observability/interceptor.hpp`). The chain is
+        // borrowed and must outlive the server, including every stop() ->
+        // start() cycle; `start()` freezes it before any listener accepts,
+        // so `add()` afterwards returns false. Push-control frames (the
+        // `push::push_control_service_id` service) bypass the chain: it is
+        // reserved for dispatched application calls.
+        //
+        // Not installing a chain (the default) leaves the call path
+        // unchanged. The only cost is one predictable branch per hook point
+        // (`count(point) == 0`): no lock, no allocation, no virtual call and
+        // no per-call `obs::call_context` construction. See
+        // `handle_request` in src/server/server.cpp for the guarded sites.
+        builder& interceptor_chain(obs::interceptor_chain& chain);
         builder& shards(std::size_t count);
         builder& handler_workers(std::size_t count);
         builder& handler_stack_bytes(std::size_t bytes);
@@ -335,6 +374,9 @@ public:
         std::vector<listener_config> listeners_;
         std::vector<std::function<status(rpc::service_registry&)>> registrations_;
         std::vector<server_interceptor*> interceptors_;
+        // Borrowed, like the legacy `interceptors_` list: builder-side state,
+        // copied into `impl` by build() and never part of `options`.
+        obs::interceptor_chain* aop_chain_ = nullptr;
     };
 
     ~server();

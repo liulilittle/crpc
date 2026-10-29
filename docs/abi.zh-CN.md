@@ -350,7 +350,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 装饰，其 out-of-line 成员函数会读取消费方分配对象中的私有 `options_` 成员，因此其布局
 与 ABI 相关；它不在上面的清单中，因为它不是普通聚合记录。成员数量与 `offsetof`
 护栏无法作用于其私有数据成员，其宽度也不是固定数字：它等于 `sizeof(server::options)`
-加上三个 `std::vector` 成员并按 builder 的对齐向上取整，而 `std::vector` 的宽度会随
+加上三个 `std::vector` 成员与借用的 `obs::interceptor_chain*` 可观测性链指针，
+并按 builder 的对齐向上取整，而 `std::vector` 的宽度会随
 标准库调试配置变化（MSVC x64：Release 392 字节，Debug 416 字节；x86：304 / 312）。
 因此 `src/abi_check.cpp` 锁定的是这一结构关系而非绝对尺寸，并要求 builder 保持
 options 的对齐；它能在所有目标与配置上捕获 builder 成员的增删或类型变更。三个等宽
@@ -458,6 +459,18 @@ MAJOR 处理（见第 8 节）。
 符号，因此属于 MINOR 增补，不改变任何布局。`set_fallback` 接收 `void*` 加一对
 `noexcept` 的 `retain`/`release`，而不是标准库拥有型类型，因此它保活的引用由调用方
 自己的代码创建与销毁，没有消费方的 control block 跨越边界。
+
+AOP 调用路径接线（需求 17）改变两个导出面。其一，`server::builder` 末尾新增私有
+数据成员 `obs::interceptor_chain* aop_chain_`（由新的
+`builder::interceptor_chain(obs::interceptor_chain&)` 方法安装）；该已导出封装类的
+布局发生变化，因此按第 1 节属 **MAJOR**：`sizeof(server::builder)` 增加一个指针的
+宽度，`src/abi_check.cpp` 的结构关系断言已扩展为「options + 三个 vector + 指针」
+形式。其二，`rpc::dispatcher` 新增一个 `dispatch` 重载，末尾多收一个
+`const metadata_list* context_metadata` 注入指针；新重载即新导出符号（属 **MINOR**
+增补），既有重载保持修饰名与行为不变，`nullptr` 表示「不注入」——未安装拦截器链的
+每个调用点都传 `nullptr`。两处变更都不触及 `server::options`、任何线上格式或任何
+跨边界记录：`obs::interceptor_chain` 与 `obs::call_context` 仍是仅头文件的类型、
+没有导出的数据布局，response/error 编码保持不变。
 
 `resilience::min_remaining_ns`（1'000'000 ns）是服务端准入地板的**单一权威**：
 dispatcher 的执行前 deadline 拒绝与服务端四处 `crpc-degradable` 判定都读它。客户端

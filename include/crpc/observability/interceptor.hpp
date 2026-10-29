@@ -41,6 +41,19 @@ namespace obs {
 
 // Hook points cover the client/server call, serialisation, retry, breaker and
 // connection lifecycle. `count` is a sentinel, never registered.
+//
+// Wiring status: the server call path runs `before_call` and `after_call`
+// around admission and dispatch (see `server::builder::interceptor_chain` and
+// `handle_request` in src/server/server.cpp). On the client, `after_call` runs
+// through the process-wide default chain (see
+// `set_default_interceptor_chain` below) from `diagnostics::on_completion`,
+// once per terminal `response<>::get()` outcome. A per-client or per-attempt
+// client chain is deliberately not installed: the facade's attempt loop is
+// per-attempt (retries re-enter `issue`), so an `after_call` there would fire
+// once per attempt and double-fire for `response<>::get()` users next to the
+// diagnostics outlet, and `client::options` is an ABI-documented struct. The
+// remaining hook points (`before_serialize`, `after_deserialize`, `on_retry`,
+// `on_breaker_event`, `on_connect`, `on_close`) have no call-path outlet yet.
 enum class hook_point : u8 {
     before_call = 0,
     after_call,

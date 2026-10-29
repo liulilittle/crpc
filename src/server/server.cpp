@@ -75,6 +75,15 @@ inline constexpr std::size_t send_buffer_retain_bytes_default = 1u << 20; // 1 M
 #endif
 }
 
+// The empty chain handed to every server that did not install one. It is
+// constant-initialized (a defaulted constructor over zero-initialised
+// members: no dynamic initialisation, no guard variable), so the call path
+// reads `aop_chain` unconditionally and pays exactly one predictable branch
+// per hook point -- the `count(point) == 0` check -- whether or not a chain
+// was configured. `handle_request` never dereferences a null pointer and
+// never constructs an `obs::call_context` on this path.
+obs::interceptor_chain g_empty_aop_chain{};
+
 } // namespace
 
 struct server_connection;
@@ -390,6 +399,43 @@ void finish_send(server_connection* sc, io::io_result result) noexcept {
     }
 }
 
+// Fills the per-call AOP context from the decoded envelope. Only called when
+// the chain has at least one interceptor at the relevant hook point, so the
+// lookups (two hash lookups into the frozen registry) and the stack writes
+// never happen on the empty path. The service/method views borrow the frozen
+// registry's strings, which outlive every request; the deadline is the wire's
+// remaining time. An undecoded envelope leaves the identifiers empty: the
+// chain still observes the request and may refuse it.
+void fill_aop_context(obs::call_context& context, const call_envelope& envelope,
+                      bool decoded,
+                      const rpc::service_registry& registry) noexcept {
+    if (!decoded) {
+        return;
+    }
+    const trace_extension& ext = envelope.extensions;
+    if (ext.has(trace_extension::has_trace_id)) {
+        context.trace.trace.bytes = ext.trace_id;
+    }
+    if (ext.has(trace_extension::has_span_id)) {
+        context.trace.span.bytes = ext.span_id;
+    }
+    if (ext.has(trace_extension::has_parent_span_id)) {
+        context.trace.parent.bytes = ext.parent_span_id;
+    }
+    if (ext.has(trace_extension::has_deadline)) {
+        context.deadline = obs::deadline::after(
+            std::chrono::nanoseconds(ext.deadline_ns));
+    }
+    const rpc::service_slot* service = registry.find_service(envelope.service_id);
+    if (service != nullptr) {
+        context.service = service->name();
+        const rpc::method_slot* method = service->find_method(envelope.method_id);
+        if (method != nullptr) {
+            context.method = method->name();
+        }
+    }
+}
+
 struct server::impl {
     options opt;
     rpc::service_registry registry;
@@ -411,6 +457,11 @@ struct server::impl {
     std::vector<std::unique_ptr<listener>> listeners;
     std::vector<listener_config> pending_listeners;
     std::vector<server_interceptor*> interceptors;
+    // Borrowed observability chain (never null: `build()` substitutes the
+    // static empty chain above when the builder did not install one). Frozen
+    // by `start()` before any listener accepts; `run()`/`count()` are then
+    // lock-free from any handler thread.
+    obs::interceptor_chain* aop_chain = nullptr;
 
     std::atomic<bool> running{false};
     std::atomic<bool> accepting{false};
@@ -1166,8 +1217,39 @@ struct server::impl {
         call_envelope envelope;
         const bool decoded = decode_call_envelope(request.payload, envelope).ok();
         const u64 service_id = decoded ? envelope.service_id : 0;
+        const bool push_control =
+            decoded && service_id == push::push_control_service_id;
 
-        if (decoded && service_id == push::push_control_service_id) {
+        // --- AOP request hook --------------------------------------------------
+        //
+        // Zero cost when unused: `aop_chain` is never null (the static empty
+        // chain is substituted in build()), and `count()` on a constant hook
+        // point compiles to one byte load, so the empty path is exactly one
+        // predictable branch -- no lock, no allocation, no virtual call and
+        // no `obs::call_context` construction (the optional stays empty).
+        obs::interceptor_chain& aop = *aop_chain;
+        std::optional<obs::call_context> aop_context;
+        if (!push_control && aop.count(obs::hook_point::before_call) != 0) {
+            obs::call_context& context = aop_context.emplace();
+            fill_aop_context(context, envelope, decoded, registry);
+            if (!aop.run(obs::hook_point::before_call, context)) {
+                // Short-circuit (a hook returned false, or threw and the chain
+                // converted it): the handler, the admission stages and
+                // `after_call` never run. The chain forces a non-ok verdict --
+                // `canceled` when a hook set none, `internal` when a hook
+                // threw -- so this is always the interceptor's answer.
+                if (wants_response) {
+                    send_error(sc, job.header.stream_id, context.result,
+                               std::chrono::milliseconds(0),
+                               context.error_message);
+                }
+                handled.fetch_add(1, std::memory_order_relaxed);
+                complete_call(sc, job.counted);
+                return;
+            }
+        }
+
+        if (push_control) {
             buffer response;
             rpc_code outcome = rpc_code::ok;
             {
@@ -1353,9 +1435,17 @@ struct server::impl {
         // The connection pointer is the dedup wait key: when this connection
         // closes, `abandon` wakes a duplicate suspended on this call with an
         // explicit error instead of letting it wait for the original.
+        // Interceptor-written metadata reaches the handler's `call_context`
+        // through the context-injection overload; without an AOP context the
+        // pointer is null and the dispatcher behaves exactly as before.
+        const metadata_list* injected_metadata = nullptr;
+        if (aop_context.has_value() && !aop_context->metadata.empty()) {
+            injected_metadata = &aop_context->metadata;
+        }
         const status dispatched = dispatch->dispatch(request, response, has_response,
                                                      steady_now(), handler_ran,
-                                                     job.conn.get());
+                                                     job.conn.get(),
+                                                     injected_metadata);
 
         rpc_code outcome_code = rpc_code::ok;
         if (!dispatched.ok()) {
@@ -1368,50 +1458,87 @@ struct server::impl {
                 outcome_code = coded;
             }
         }
-        if (outcome_code == rpc_code::deadline_exceeded) {
-            deadline_rejected.fetch_add(1, std::memory_order_relaxed);
-        } else if (outcome_code == rpc_code::overload && !handler_ran) {
-            // The dispatcher's per-method concurrency limit. Application
-            // handlers that return `overload` are not local admissions.
-            rejected.fetch_add(1, std::memory_order_relaxed);
+
+        // --- AOP response hook -------------------------------------------------
+        //
+        // Runs exactly when the request entered dispatch (the request-side
+        // chain completed, or the chain had no `before_call` hooks at all).
+        // The dispatched outcome is pre-filled into `context.result`; if the
+        // chain stops early here -- a hook returned false, or threw and the
+        // chain converted it -- the verdict replaces the response: the client
+        // receives `context.result` with `context.error_message` and an empty
+        // body. A completed chain leaves the dispatched response untouched.
+        bool aop_vetoed = false;
+        if (!push_control && aop.count(obs::hook_point::after_call) != 0) {
+            if (!aop_context.has_value()) {
+                obs::call_context& context = aop_context.emplace();
+                fill_aop_context(context, envelope, decoded, registry);
+            }
+            aop_context->result = outcome_code;
+            if (!aop.run(obs::hook_point::after_call, *aop_context)) {
+                aop_vetoed = true;
+                outcome_code = aop_context->result;
+            }
+        }
+
+        if (!aop_vetoed) {
+            if (outcome_code == rpc_code::deadline_exceeded) {
+                deadline_rejected.fetch_add(1, std::memory_order_relaxed);
+            } else if (outcome_code == rpc_code::overload && !handler_ran) {
+                // The dispatcher's per-method concurrency limit. Application
+                // handlers that return `overload` are not local admissions.
+                rejected.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (permit.allowed()) {
-            switch (outcome_code) {
-            case rpc_code::ok:
-                permit.success();
-                break;
-            case rpc_code::deadline_exceeded:
-                // The dispatcher refuses an expired wire deadline before the
-                // handler starts; a handler can also report one while running.
-                // `handler_ran` is the explicit signal for that difference:
-                // a pre-execution refusal says nothing about the service, while
-                // one produced by a running handler is a slow call.
-                if (handler_ran) {
-                    permit.slow();
-                } else {
-                    permit.ignore();
-                }
-                break;
-            case rpc_code::internal:
-            case rpc_code::unavailable:
-            case rpc_code::not_acknowledged:
-                permit.failure();
-                break;
-            default:
-                // Local admission and application outcomes (not_found,
-                // no_such_method, invalid_argument, failed_precondition,
-                // decode_error, protocol_error, canceled, shutting_down,
-                // overload, resource_exhausted, application, ...) are not
-                // dependency failures and must not open the service breaker.
+            if (aop_vetoed) {
+                // An interceptor's policy refusal is not evidence about the
+                // service: it must not open the breaker or count a failure.
                 permit.ignore();
-                break;
+            } else {
+                switch (outcome_code) {
+                case rpc_code::ok:
+                    permit.success();
+                    break;
+                case rpc_code::deadline_exceeded:
+                    // The dispatcher refuses an expired wire deadline before the
+                    // handler starts; a handler can also report one while running.
+                    // `handler_ran` is the explicit signal for that difference:
+                    // a pre-execution refusal says nothing about the service, while
+                    // one produced by a running handler is a slow call.
+                    if (handler_ran) {
+                        permit.slow();
+                    } else {
+                        permit.ignore();
+                    }
+                    break;
+                case rpc_code::internal:
+                case rpc_code::unavailable:
+                case rpc_code::not_acknowledged:
+                    permit.failure();
+                    break;
+                default:
+                    // Local admission and application outcomes (not_found,
+                    // no_such_method, invalid_argument, failed_precondition,
+                    // decode_error, protocol_error, canceled, shutting_down,
+                    // overload, resource_exhausted, application, ...) are not
+                    // dependency failures and must not open the service breaker.
+                    permit.ignore();
+                    break;
+                }
             }
         }
         if (!dispatched.ok()) {
             failures.fetch_add(1, std::memory_order_relaxed);
         }
 
-        if (has_response && wants_response) {
+        if (aop_vetoed) {
+            if (wants_response) {
+                send_error(sc, job.header.stream_id, outcome_code,
+                           std::chrono::milliseconds(0),
+                           aop_context->error_message);
+            }
+        } else if (has_response && wants_response) {
             (void)send_payload(sc, job.header.stream_id, frame_type::response,
                                response.readable());
         } else if (!dispatched.ok() && wants_response) {
@@ -1787,6 +1914,11 @@ server::builder& server::builder::add_interceptor(server_interceptor& intercepto
     return *this;
 }
 
+server::builder& server::builder::interceptor_chain(obs::interceptor_chain& chain) {
+    aop_chain_ = &chain;
+    return *this;
+}
+
 server::builder& server::builder::shards(std::size_t count) {
     options_.shards = count == 0 ? 1 : count;
     return *this;
@@ -1874,6 +2006,10 @@ std::unique_ptr<server> server::builder::build() {
     auto result = std::unique_ptr<server>(new server(options_));
     impl& state = *result->impl_;
     state.interceptors = interceptors_;
+    // Never null afterwards: the static empty chain (constant-initialised,
+    // no guard variable) keeps the call path a single predictable branch per
+    // hook point even when the builder installed nothing.
+    state.aop_chain = aop_chain_ != nullptr ? aop_chain_ : &g_empty_aop_chain;
     for (auto& registration : registrations_) {
         const status registered = registration(state.registry);
         if (!registered.ok()) {
@@ -1910,6 +2046,14 @@ status server::start() {
     if (!frozen.ok()) {
         impl_->running.store(false, std::memory_order_release);
         return frozen;
+    }
+    // Freeze the observability chain before any listener can accept, per the
+    // chain's freeze-once contract: `add()`/`freeze()` are startup-only and
+    // `run()`/`count()` are lock-free afterwards from any handler thread. The
+    // static empty chain is shared and already immutable, so it is skipped to
+    // keep even the shared flag untouched.
+    if (impl_->aop_chain != &g_empty_aop_chain) {
+        impl_->aop_chain->freeze();
     }
     try {
         impl_->build_guards();

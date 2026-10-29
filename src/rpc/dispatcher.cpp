@@ -386,6 +386,14 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
 status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
                             std::chrono::steady_clock::time_point now, bool& handler_ran,
                             const void* dedup_wait_key) noexcept {
+    return dispatch(request, response_out, has_response, now, handler_ran,
+                    dedup_wait_key, nullptr);
+}
+
+status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
+                            std::chrono::steady_clock::time_point now, bool& handler_ran,
+                            const void* dedup_wait_key,
+                            const metadata_list* context_metadata) noexcept {
     // Building the decode-failure message, the refusal errors and the success
     // response all allocate, and this function is `noexcept` (the server's
     // shard calls it). An allocation failure would reach `std::terminate`.
@@ -437,6 +445,14 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
         }
 
         call_context ctx = build_context(envelope, now);
+        // Context injection from the observability interceptor chain: a
+        // `before_call` hook's metadata entries become visible to the
+        // application handler. Null (the empty-chain case) costs nothing.
+        if (context_metadata != nullptr) {
+            for (const auto& entry : *context_metadata) {
+                ctx.metadata.set(entry.first, entry.second);
+            }
+        }
 
         // --- Idempotency dedup ------------------------------------------------
         //
