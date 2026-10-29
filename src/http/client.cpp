@@ -122,6 +122,14 @@ public:
         }
     }
 
+    // Bytes read from the channel but not consumed by a message. On a
+    // keep-alive connection this must be zero once a response is complete:
+    // anything left belongs to no framed message and would pollute the next
+    // response, which is exactly the classic keep-alive bug.
+    [[nodiscard]] std::size_t buffered() const noexcept {
+        return buffer_.size() - position_;
+    }
+
 private:
     // Moves more bytes into the buffer and returns how many arrived.
     [[nodiscard]] result<std::size_t> fill() {
@@ -154,6 +162,53 @@ private:
         return false;
     }
     return lower(*value).find("chunked") != std::string::npos;
+}
+
+// True when a comma-separated Connection value carries the token. HTTP
+// regulates persistence through this one field: `close` retires the
+// connection, `keep-alive` requests (or confirms) its reuse.
+[[nodiscard]] bool connection_has_token(const header_list& headers,
+                                        std::string_view token) {
+    const std::string* value = headers.find("connection");
+    if (value == nullptr) {
+        return false;
+    }
+    std::size_t start = 0;
+    const std::string text = lower(*value);
+    while (start <= text.size()) {
+        const std::size_t comma = text.find(',', start);
+        std::string item = text.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) {
+            item.erase(item.begin());
+        }
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) {
+            item.pop_back();
+        }
+        if (item == token) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            return false;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
+// Whether the response retires the connection. `Connection: close` always
+// does. An HTTP/1.0 reply is a one-shot protocol: it keeps the connection
+// alive only when it says `keep-alive` explicitly, which is exactly the
+// reverse of HTTP/1.1, where persistence is the default and `close` is the
+// opt-out.
+[[nodiscard]] bool response_retires_connection(const response& out) {
+    if (connection_has_token(out.headers, "close")) {
+        return true;
+    }
+    if (out.version == http_version::http_1_0) {
+        return !connection_has_token(out.headers, "keep-alive");
+    }
+    return false;
 }
 
 // Reports whether the header was present, separately from its value: `Content-Length: 0` means
@@ -193,7 +248,15 @@ struct client::impl {
     client_options options;
     std::unique_ptr<db::channel> link;
     rpc_error setup_error;
+    // One-shot bookkeeping for `keep_alive == false`: a client built that way
+    // sends `Connection: close`, so a second `send` would write into a socket
+    // the server has retired. With keep-alive on, the flag never gates.
     bool used = false;
+    // Set when a response left bytes on the connection beyond its framing:
+    // the response was well-formed and is delivered, but the connection can
+    // never be trusted for another response, so every later `send` fails with
+    // this stored reason instead of parsing the leftover bytes.
+    rpc_error poisoned;
     // Set by make_client when the link is the TLS stream channel: the
     // negotiated ALPN decides the protocol, and the result is only known
     // after the handshake, so the decision is taken at the first send().
@@ -203,6 +266,16 @@ struct client::impl {
     // Created on demand for an h2 connection (negotiated or h2c prior
     // knowledge).
     std::unique_ptr<detail::h2_session> h2;
+
+    // A connection that failed mid-exchange is never handed out again: some
+    // of the request or response may be on the wire, and the framing position
+    // is unknowable. Closing here is what keeps the pool from ever returning
+    // such a connection to its idle set.
+    void retire_link() noexcept {
+        if (link) {
+            link->close();
+        }
+    }
 };
 
 client::client(client_options options, std::unique_ptr<db::channel> link)
@@ -228,12 +301,21 @@ void client::close() noexcept {
 }
 
 bool client::is_open() const noexcept {
-    // A channel has no generic liveness query: each framing layer knows its own state, and
-    // a TCP link can be half-closed without telling anyone. "Has a usable link and has not
-    // been used yet" is what this client can answer honestly. A client that failed TLS
-    // setup has no link and is never open.
-    return impl_ != nullptr && impl_->link != nullptr && impl_->setup_error.ok() &&
-           !impl_->used;
+    // A failed TLS setup has no link and is never open. A poisoned connection
+    // carries bytes beyond its framing and is never open. With keep-alive on,
+    // "open" means the channel still reports a usable link -- which is what a
+    // pool consults before a borrow; with keep-alive off the client is
+    // one-shot, so it stops being open once its request has been sent.
+    if (impl_ == nullptr || impl_->link == nullptr || !impl_->setup_error.ok()) {
+        return false;
+    }
+    if (!impl_->poisoned.ok()) {
+        return false;
+    }
+    if (!impl_->options.keep_alive && impl_->used) {
+        return false;
+    }
+    return impl_->link->is_open();
 }
 
 result<response> client::send(method verb, std::string_view target, span<const std::byte> body,
@@ -247,13 +329,22 @@ result<response> client::send(method verb, std::string_view target, span<const s
     if (!impl_ || !impl_->link) {
         return rpc_error{rpc_code::shutting_down, "the HTTP client has no link"};
     }
-    if (impl_->used) {
+    if (!impl_->options.keep_alive && impl_->used) {
         // One request per connection: the request asked for `Connection: close`, so a
         // second request would be written into a socket the server has already closed.
         return rpc_error{rpc_code::failed_precondition,
                          "this HTTP client has already sent its request"};
     }
-    impl_->used = true;
+    if (!impl_->poisoned.ok()) {
+        // A previous response left bytes on the wire beyond its framing. The
+        // leftover bytes are not part of any message this client sent, so
+        // they must never be parsed as one: refusing here is the guarantee
+        // that a broken server cannot make the next response out of garbage.
+        return impl_->poisoned;
+    }
+    if (!impl_->options.keep_alive) {
+        impl_->used = true;
+    }
 
     // TLS negotiation: the handshake settles on backend callbacks, so wait for
     // it here (bounded by the request budget) and read the ALPN result. An
@@ -275,6 +366,17 @@ result<response> client::send(method verb, std::string_view target, span<const s
     }
     const bool use_h2 =
         impl_->tls_link != nullptr ? impl_->negotiated_h2 : impl_->options.h2c;
+    if (!impl_->link->is_open()) {
+        // The connection was retired (by a `Connection: close` response, a
+        // close-delimited body, the peer, a failed handshake, or
+        // `client::close()`), and this client has no way to dial a
+        // replacement -- that is what `client_pool` is for. The check sits
+        // after the handshake on purpose: a handshake failure must surface as
+        // its TLS error, not as a generic precondition.
+        return rpc_error{rpc_code::failed_precondition,
+                         "the HTTP connection is closed; open a new client or "
+                         "borrow one from a client_pool"};
+    }
 
     if (use_h2) {
         if (!impl_->h2) {
@@ -313,7 +415,23 @@ result<response> client::send(method verb, std::string_view target, span<const s
         request += ':';
         request += std::to_string(impl_->options.port);
     }
-    request += "\r\nConnection: close\r\n";
+    // Persistence is regulated through this one field. The caller may spell it
+    // (a caller that sends `Connection: close` gets the one-shot exchange it
+    // asked for); otherwise the option decides: keep-alive announces that this
+    // connection may carry the next request, close retires it after this one.
+    bool caller_sent_connection = impl_->options.default_headers.contains("connection");
+    for (const header& item : extra_headers) {
+        if (lower(item.name) == "connection") {
+            caller_sent_connection = true;
+        }
+    }
+    if (!caller_sent_connection) {
+        request += "\r\nConnection: ";
+        request += impl_->options.keep_alive ? "keep-alive" : "close";
+        request += "\r\n";
+    } else {
+        request += "\r\n";
+    }
     for (const header& item : impl_->options.default_headers) {
         request += item.name;
         request += ": ";
@@ -333,88 +451,138 @@ result<response> client::send(method verb, std::string_view target, span<const s
     }
     request += "\r\n";
 
+    // From here on the request is on its way to the kernel. Every failure
+    // after this point leaves the framing position unknowable: the connection
+    // is retired (never reused), and a transport-shaped failure is reported
+    // as `unknown_side_effect` -- the request may have been executed, so a
+    // non-idempotent caller must not blind-retry.
+    const auto fail_after_request = [this](const rpc_error& original) {
+        impl_->retire_link();
+        switch (original.code) {
+        case rpc_code::eof:
+        case rpc_code::connection_reset:
+        case rpc_code::broken_pipe:
+        case rpc_code::unavailable:
+        case rpc_code::deadline_exceeded:
+            return rpc_error{rpc_code::unknown_side_effect,
+                             "the request was written but no complete response "
+                             "arrived: " +
+                                 original.message};
+        default:
+            return original;
+        }
+    };
+
     status written = impl_->link->write(as_bytes(request));
     if (!written) {
+        // Nothing of this request was accepted by the kernel, so the raw
+        // failure stands (a refused connect stays `connection_refused`).
+        impl_->retire_link();
         return written.error();
     }
     if (!body.empty()) {
         written = impl_->link->write(body);
         if (!written) {
-            return written.error();
+            return fail_after_request(written.error());
         }
     }
 
     line_reader reader(*impl_->link);
-    result<std::string> status_line = reader.line(8u * 1024u);
-    if (!status_line) {
-        return status_line.error();
-    }
-    // "HTTP/1.1 200 OK": the version, a space, three digits, then an optional reason.
-    const std::string& line = status_line.value();
-    const std::size_t first_space = line.find(' ');
-    if (first_space == std::string::npos || line.size() < first_space + 4) {
-        return rpc_error{rpc_code::protocol_error, "a malformed HTTP status line"};
-    }
     response out;
-    const std::string_view version = std::string_view(line).substr(0, first_space);
-    out.version = version == "HTTP/1.0" ? http_version::http_1_0 : http_version::http_1_1;
-    const std::string_view code_text = std::string_view(line).substr(first_space + 1, 3);
-    int code = 0;
-    for (const char c : code_text) {
-        if (c < '0' || c > '9') {
-            return rpc_error{rpc_code::protocol_error, "a non-numeric HTTP status code"};
-        }
-        code = code * 10 + (c - '0');
-    }
-    out.status_code = code;
-    if (line.size() > first_space + 4) {
-        out.reason = line.substr(first_space + 4);
-    }
-
-    std::size_t header_bytes = 0;
     for (;;) {
-        result<std::string> field = reader.line(8u * 1024u);
-        if (!field) {
-            return field.error();
+        // The status line, then the header block. An interim 1xx response is
+        // skipped: the real response follows on the same connection, and
+        // stopping at the interim would leave its successors unparsed. 101 is
+        // terminal: the protocol switches and this client speaks none of the
+        // upgraded ones.
+        result<std::string> status_line = reader.line(8u * 1024u);
+        if (!status_line) {
+            return fail_after_request(status_line.error());
         }
-        if (field.value().empty()) {
-            break;
+        // "HTTP/1.1 200 OK": the version, a space, three digits, then an optional reason.
+        const std::string& line = status_line.value();
+        const std::size_t first_space = line.find(' ');
+        if (first_space == std::string::npos || line.size() < first_space + 4) {
+            return fail_after_request(
+                rpc_error{rpc_code::protocol_error, "a malformed HTTP status line"});
         }
-        header_bytes += field.value().size() + 2;
-        if (header_bytes > impl_->options.max_header_bytes) {
-            return rpc_error{rpc_code::resource_exhausted, "the response headers exceed their limit"};
+        out = response{};
+        const std::string_view version = std::string_view(line).substr(0, first_space);
+        out.version =
+            version == "HTTP/1.0" ? http_version::http_1_0 : http_version::http_1_1;
+        const std::string_view code_text = std::string_view(line).substr(first_space + 1, 3);
+        int code = 0;
+        for (const char c : code_text) {
+            if (c < '0' || c > '9') {
+                return fail_after_request(
+                    rpc_error{rpc_code::protocol_error, "a non-numeric HTTP status code"});
+            }
+            code = code * 10 + (c - '0');
         }
-        const std::size_t colon = field.value().find(':');
-        if (colon == std::string::npos) {
-            return rpc_error{rpc_code::protocol_error, "a malformed HTTP header field"};
+        out.status_code = code;
+        if (line.size() > first_space + 4) {
+            out.reason = line.substr(first_space + 4);
         }
-        const std::string name = field.value().substr(0, colon);
-        std::string_view value = std::string_view(field.value()).substr(colon + 1);
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-            value.remove_prefix(1);
+
+        std::size_t header_bytes = 0;
+        for (;;) {
+            result<std::string> field = reader.line(8u * 1024u);
+            if (!field) {
+                return fail_after_request(field.error());
+            }
+            if (field.value().empty()) {
+                break;
+            }
+            header_bytes += field.value().size() + 2;
+            if (header_bytes > impl_->options.max_header_bytes) {
+                return fail_after_request(rpc_error{rpc_code::resource_exhausted,
+                                                    "the response headers exceed their limit"});
+            }
+            const std::size_t colon = field.value().find(':');
+            if (colon == std::string::npos) {
+                return fail_after_request(
+                    rpc_error{rpc_code::protocol_error, "a malformed HTTP header field"});
+            }
+            const std::string name = field.value().substr(0, colon);
+            std::string_view value = std::string_view(field.value()).substr(colon + 1);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+                value.remove_prefix(1);
+            }
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+                value.remove_suffix(1);
+            }
+            // header_list has `add`, not `append`; it copies the strings.
+            out.headers.add(name, value);
         }
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-            value.remove_suffix(1);
+
+        if (out.status_code == 101) {
+            impl_->retire_link();
+            return out;
         }
-        // header_list has `add`, not `append`; it copies the strings.
-        out.headers.add(name, value);
+        // 1xx interim responses carry no body and no framing of their own.
+        if (out.status_code >= 100 && out.status_code < 200) {
+            continue;
+        }
+        break;
     }
 
-    // 204 and 304 carry no body, and neither does a 1xx; reading one would consume the next
-    // response's bytes.
-    if (out.status_code == 204 || out.status_code == 304 ||
-        (out.status_code >= 100 && out.status_code < 200)) {
-        return out;
-    }
-
-    if (is_chunked(out.headers)) {
+    // What follows is body framing, and it decides how the connection may be
+    // reused: the response must be read to its very last framed byte before
+    // another request goes out, or the leftover bytes become the next
+    // response -- the classic keep-alive corruption.
+    bool close_delimited = false;
+    // A HEAD response's framing headers describe the body a GET would have
+    // carried; the body itself never follows. 204 and 304 carry no body.
+    const bool bodyless = verb == method::head || out.status_code == 204 ||
+                          out.status_code == 304;
+    if (!bodyless && is_chunked(out.headers)) {
         // The chunk grammar is read here rather than through `chunked_decoder` because the
         // decoder expects bytes and this reader owns the buffered remainder; feeding it
         // would mean re-implementing the same buffer hand-off twice.
         for (;;) {
             result<std::string> size_line = reader.line(8u * 1024u);
             if (!size_line) {
-                return size_line.error();
+                return fail_after_request(size_line.error());
             }
             std::string_view text = size_line.value();
             const std::size_t semicolon = text.find(';');
@@ -434,75 +602,102 @@ result<response> client::send(method verb, std::string_view target, span<const s
                 } else if (c == ' ' || c == '\t') {
                     continue;
                 } else {
-                    return rpc_error{rpc_code::protocol_error, "a malformed chunk size"};
+                    return fail_after_request(
+                        rpc_error{rpc_code::protocol_error, "a malformed chunk size"});
                 }
                 if (digit < 0) {
-                    return rpc_error{rpc_code::protocol_error, "a malformed chunk size"};
+                    return fail_after_request(
+                        rpc_error{rpc_code::protocol_error, "a malformed chunk size"});
                 }
                 saw_digit = true;
                 size = size * 16 + static_cast<std::size_t>(digit);
             }
             if (!saw_digit) {
-                return rpc_error{rpc_code::protocol_error, "an empty chunk size"};
+                return fail_after_request(
+                    rpc_error{rpc_code::protocol_error, "an empty chunk size"});
             }
             if (size == 0) {
                 // Trailers, terminated by an empty line.
                 for (;;) {
                     result<std::string> trailer = reader.line(8u * 1024u);
                     if (!trailer) {
-                        return trailer.error();
+                        return fail_after_request(trailer.error());
                     }
                     if (trailer.value().empty()) {
                         break;
                     }
                 }
-                return out;
+                break;
             }
             if (out.body.size() + size > impl_->options.max_body_bytes) {
-                return rpc_error{rpc_code::resource_exhausted,
-                                 "the response body exceeds its limit"};
+                return fail_after_request(rpc_error{rpc_code::resource_exhausted,
+                                                    "the response body exceeds its limit"});
             }
             result<std::string> chunk = reader.exact(size);
             if (!chunk) {
-                return chunk.error();
+                return fail_after_request(chunk.error());
             }
             out.body += chunk.value();
             // The chunk is followed by its own CRLF.
             result<std::string> terminator = reader.line(2u * 1024u);
             if (!terminator) {
-                return terminator.error();
+                return fail_after_request(terminator.error());
             }
             if (!terminator.value().empty()) {
-                return rpc_error{rpc_code::protocol_error, "a chunk is not followed by CRLF"};
+                return fail_after_request(
+                    rpc_error{rpc_code::protocol_error, "a chunk is not followed by CRLF"});
             }
+        }
+    } else if (!bodyless) {
+        result<length_field> length = content_length(out.headers);
+        if (!length) {
+            return fail_after_request(length.error());
+        }
+        if (length.value().value > impl_->options.max_body_bytes) {
+            return fail_after_request(rpc_error{rpc_code::resource_exhausted,
+                                                "the response body exceeds its limit"});
+        }
+        if (length.value().present) {
+            // A declared length, including zero, is authoritative: an empty body is a body of no
+            // bytes, not "read until the peer closes".
+            if (length.value().value != 0) {
+                result<std::string> body_text = reader.exact(length.value().value);
+                if (!body_text) {
+                    return fail_after_request(body_text.error());
+                }
+                out.body = std::move(body_text.value());
+            }
+        } else {
+            // No Content-Length and no chunking: the body runs to the end of
+            // the connection. The close *is* the delimiter, so this response
+            // consumes the connection with it.
+            result<std::string> rest = reader.rest(impl_->options.max_body_bytes);
+            if (!rest) {
+                return fail_after_request(rest.error());
+            }
+            out.body = std::move(rest.value());
+            close_delimited = true;
         }
     }
 
-    result<length_field> length = content_length(out.headers);
-    if (!length) {
-        return length.error();
+    // The exchange is complete; decide what the connection is worth now.
+    if (close_delimited || response_retires_connection(out)) {
+        impl_->retire_link();
+    } else if (reader.buffered() != 0) {
+        // The server wrote bytes beyond the response's framing. This response
+        // is well-formed and is delivered below; the connection is not: the
+        // extra bytes belong to no message this client sent, so parsing them
+        // as the next response could only fabricate one. Poison, and refuse
+        // every later exchange on this client with the stored reason.
+        impl_->poisoned = rpc_error{
+            rpc_code::protocol_error,
+            "the server sent " + std::to_string(reader.buffered()) +
+                " byte(s) beyond the response framing"};
+        impl_->retire_link();
+    } else if (!impl_->options.keep_alive) {
+        // The historical one-shot behaviour: one exchange per connection.
+        impl_->retire_link();
     }
-    if (length.value().value > impl_->options.max_body_bytes) {
-        return rpc_error{rpc_code::resource_exhausted, "the response body exceeds its limit"};
-    }
-    if (length.value().present) {
-        // A declared length, including zero, is authoritative: an empty body is a body of no
-        // bytes, not "read until the peer closes".
-        if (length.value().value != 0) {
-            result<std::string> body_text = reader.exact(length.value().value);
-            if (!body_text) {
-                return body_text.error();
-            }
-            out.body = std::move(body_text.value());
-        }
-        return out;
-    }
-    // No Content-Length and no chunking: the body runs to the end of the connection.
-    result<std::string> rest = reader.rest(impl_->options.max_body_bytes);
-    if (!rest) {
-        return rest.error();
-    }
-    out.body = std::move(rest.value());
     return out;
 }
 

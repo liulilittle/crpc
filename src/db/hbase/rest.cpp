@@ -752,6 +752,11 @@ struct client::endpoint_state {
     std::string last_error_message;
     std::chrono::system_clock::time_point last_success_at{};
     std::chrono::steady_clock::time_point dead_since{};
+    // The parked keep-alive connection of `reuse_connection`. Taken out for
+    // the duration of one exchange and returned when healthy, so a concurrent
+    // call finding the slot empty dials its own instead of waiting.
+    std::unique_ptr<http::client> link;
+    std::mutex link_mutex;
 };
 
 void client::resolve_endpoints() {
@@ -760,7 +765,12 @@ void client::resolve_endpoints() {
     } else if (!options_.host.empty()) {
         endpoints_.push_back(endpoint{options_.host, options_.port});
     }
-    states_.assign(endpoints_.size(), endpoint_state{});
+    // `endpoint_state` carries a mutex and a parked connection, so it can
+    // only be constructed in place, never copied or moved. The fill
+    // constructor value-initializes every slot in place; the vector itself
+    // is what moves.
+    std::vector<endpoint_state> fresh(endpoints_.size());
+    states_ = std::move(fresh);
 }
 
 client::client(client_options options, opener open)
@@ -800,9 +810,21 @@ result<std::unique_ptr<http::client>> client::make_link(const endpoint& ep) {
 result<http::response> client::send_on(std::size_t index, http::method verb,
                                        std::string_view target, std::string_view body,
                                        std::string_view content_type) {
-    result<std::unique_ptr<http::client>> link = make_link(endpoints_[index]);
+    endpoint_state& state = states_[index];
+    // Take the parked connection out for the duration of the exchange, so a
+    // concurrent call either finds it here (and reuses it) or finds the slot
+    // empty and dials its own -- reuse never serializes callers.
+    std::unique_ptr<http::client> link;
+    if (options_.reuse_connection) {
+        std::lock_guard<std::mutex> lock(state.link_mutex);
+        link = std::move(state.link);
+    }
     if (!link) {
-        return link.error();
+        result<std::unique_ptr<http::client>> opened = make_link(endpoints_[index]);
+        if (!opened) {
+            return opened.error();
+        }
+        link = std::move(opened.value());
     }
     http::header fields[2];
     std::size_t count = 0;
@@ -814,10 +836,20 @@ result<http::response> client::send_on(std::size_t index, http::method verb,
         fields[count].value = std::string(content_type);
         ++count;
     }
-    result<http::response> reply = link.value()->send(
+    result<http::response> reply = link->send(
         verb, target, span<const std::byte>(reinterpret_cast<const std::byte*>(body.data()),
                                             body.size()),
         span<const http::header>(fields, count));
+    // A healthy connection is parked for the next call; a retired or broken
+    // one (the server said close, the exchange failed, the peer died) closes
+    // here with the client, and the next call dials fresh.
+    const bool healthy = link->is_open();
+    if (options_.reuse_connection && healthy) {
+        std::lock_guard<std::mutex> lock(state.link_mutex);
+        if (!state.link) {
+            state.link = std::move(link);
+        }
+    }
     if (!reply) {
         mark_failure(index, reply.error());
         return reply.error();

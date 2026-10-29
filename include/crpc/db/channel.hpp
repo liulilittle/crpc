@@ -76,6 +76,16 @@ public:
     // stays honest, and existing implementations need no change.
     [[nodiscard]] virtual bool is_secure() const noexcept { return false; }
 
+    // True while the link can still carry bytes. A channel that observes its
+    // transport (peer FIN, an abortive reset, a failed write, TLS close_notify)
+    // reports those closures here, which is what makes a borrow-time health
+    // check possible: the socket and TLS stream channels do exactly that, so a
+    // connection the peer closed while idle reads as closed before the next
+    // send. The default is `true` -- the honest answer for a channel that
+    // cannot observe its peer at all -- and a consumer that needs the
+    // observation must use a channel that implements this.
+    [[nodiscard]] virtual bool is_open() const noexcept { return true; }
+
 protected:
     channel() = default;
 };
@@ -101,7 +111,7 @@ public:
     [[nodiscard]] status write(span<const std::byte> data) override;
     void close() noexcept override;
 
-    [[nodiscard]] bool is_open() const noexcept;
+    [[nodiscard]] bool is_open() const noexcept override;
 
 private:
     std::unique_ptr<crpc::net::connection> link_;
