@@ -386,6 +386,8 @@ result<matched_reply> icmp_socket::impl::wait_reply(
         msghdr message{};
         message.msg_name = &source;
         message.msg_namelen = sizeof(source);
+        message.msg_iov = &iov;
+        message.msg_iovlen = 1;
         unsigned char control[64];
         message.msg_control = control;
         message.msg_controllen = sizeof(control);

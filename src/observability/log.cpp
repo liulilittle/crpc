@@ -5,6 +5,7 @@
 #include <limits>
 #include <new>
 #include <system_error>
+#include <type_traits>
 
 #if defined(CRPC_OS_WINDOWS)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -48,11 +49,29 @@ std::uint64_t wall_clock_ns() noexcept {
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
+namespace {
+
+// pthread_t is a pointer on glibc and macOS but an integer (`long`) on
+// bionic, so a blanket reinterpret_cast is ill-formed on Android. A template
+// is required, not a plain `if constexpr`: in a non-template context both
+// branches are still type-checked, and the pointer cast on an integer type is
+// a hard error. Inside a template the discarded branch is never instantiated.
+template <typename ThreadId>
+[[nodiscard]] std::uint64_t pthread_id_as_u64(ThreadId self) noexcept {
+    if constexpr (std::is_pointer<ThreadId>::value) {
+        return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(self));
+    } else {
+        return static_cast<std::uint64_t>(self);
+    }
+}
+
+} // namespace
+
 std::uint64_t current_thread_id() noexcept {
 #if defined(CRPC_OS_WINDOWS)
     return static_cast<std::uint64_t>(GetCurrentThreadId());
 #else
-    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pthread_self()));
+    return pthread_id_as_u64(pthread_self());
 #endif
 }
 

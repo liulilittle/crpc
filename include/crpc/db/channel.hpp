@@ -37,16 +37,20 @@ public:
     channel(const channel&) = delete;
     channel& operator=(const channel&) = delete;
 
+    // These four re-declare `net::channel`'s pure virtuals and say so with
+    // `override`: the class already marks its destructor `override`, so clang
+    // reports -Winconsistent-missing-override without it, and the keyword also
+    // makes the compiler check that the signatures still match the base.
     // Reads exactly `count` bytes. A peer that closes first is `eof`, a reset is
     // `connection_reset`; both are terminal for this channel.
-    [[nodiscard]] virtual result<std::vector<std::byte>> read_exact(std::size_t count) = 0;
+    [[nodiscard]] result<std::vector<std::byte>> read_exact(std::size_t count) override = 0;
 
     // Reads at least one byte and at most `buffer.size()`, blocking until some arrive.
     //
     // A TLS record layer needs this: it cannot know in advance how many bytes the peer
     // will send, so it must be able to consume whatever is there. Protocol layers that
     // always know their next length (MySQL, TDS framing) keep using `read_exact`.
-    [[nodiscard]] virtual result<std::size_t> read_some(span<std::byte> buffer) {
+    [[nodiscard]] result<std::size_t> read_some(span<std::byte> buffer) override {
         // A default in terms of read_exact keeps every existing channel usable; a
         // channel that can do better overrides it.
         if (buffer.empty()) {
@@ -62,10 +66,10 @@ public:
 
     // Writes every byte. `ok` means the kernel accepted them, not that the server
     // processed them.
-    [[nodiscard]] virtual status write(span<const std::byte> data) = 0;
+    [[nodiscard]] status write(span<const std::byte> data) override = 0;
 
     // Terminal and idempotent.
-    virtual void close() noexcept = 0;
+    void close() noexcept override = 0;
 
     // True when the link protects bytes end to end from the wire: an
     // established TLS session qualifies; a plain TCP socket (loopback included)
