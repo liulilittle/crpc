@@ -23,6 +23,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "test_framework.hpp"
@@ -895,9 +897,47 @@ std::vector<std::string> unguarded_crossing_records(const fs::path& root,
     }
 
     std::set<std::string> crossing;
-    for (const auto& sig : signatures) {
-        for (const auto& record : records) {
-            const std::vector<std::string> path = split_ns(record.qual);
+    // `has_spelling` accepts a spelling only when the characters on both sides
+    // of the match are neither identifier characters nor ':', so a spelling that
+    // matches is exactly one maximal run of [ident_char | ':'] in the signature
+    // text. Indexing those runs turns the scan below from
+    // O(signatures x records) string searches into a handful of hash lookups per
+    // record. The cross product was 24 s in a Debug x86 build, which is close
+    // enough to the 30 s CTest timeout that a loaded machine failed the gate.
+    std::unordered_map<std::string, std::vector<std::size_t>> by_token;
+    for (std::size_t i = 0; i < signatures.size(); ++i) {
+        const std::string& text = signatures[i].text;
+        for (std::size_t p = 0; p < text.size();) {
+            if (!ident_char(text[p]) && text[p] != ':') {
+                ++p;
+                continue;
+            }
+            std::size_t q = p;
+            while (q < text.size() && (ident_char(text[q]) || text[q] == ':')) {
+                ++q;
+            }
+            by_token[text.substr(p, q - p)].push_back(i);
+            p = q;
+        }
+    }
+
+    for (std::size_t ri = 0; ri < records.size(); ++ri) {
+        const ScannedRecord& record = records[ri];
+        const std::vector<std::string> path = split_ns(record.qual);
+        // Every spelling the per-scope walk below can test is the qualified name
+        // with some namespace prefix removed, so collect the signatures that
+        // could possibly match before doing any exact check.
+        std::unordered_set<std::size_t> candidates;
+        for (std::size_t k = 0; k < path.size(); ++k) {
+            const std::string spelling =
+                join_ns(std::vector<std::string>(path.begin() + k, path.end()));
+            const auto found = by_token.find(spelling);
+            if (found != by_token.end()) {
+                candidates.insert(found->second.begin(), found->second.end());
+            }
+        }
+        for (const std::size_t si : candidates) {
+            const ScannedSig& sig = signatures[si];
             const std::vector<std::string> record_ns(path.begin(), path.end() - 1);
             bool hit = false;
             bool hit_by_value = false;
