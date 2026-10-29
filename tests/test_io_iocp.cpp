@@ -1,4 +1,4 @@
-﻿// CRPC -- IOCP transport backend tests.
+// CRPC -- IOCP transport backend tests.
 //
 // On a non-Windows target the whole file collapses to an empty main that exits
 // zero, so the suite can include it unconditionally.  On Windows the tests
@@ -37,14 +37,42 @@ namespace {
 using namespace crpc;
 using namespace std::chrono;
 
+// Candidate ports must stay clear of the Windows dynamic/ephemeral range
+// (49152..65535): this process's own client connections and every other
+// parallel ctest process allocate ephemeral ports there, so a bind inside
+// that range collides under `ctest -j8`. The 20000..29999 band is below the
+// ephemeral floor; the PID keeps parallel processes apart and the counter
+// separates repeated calls in one process.
 std::uint16_t next_port() {
     static std::mutex m;
     static unsigned counter = 0;
     std::lock_guard<std::mutex> lk(m);
-    const unsigned base = 20000u + (::GetCurrentProcessId() % 20000u);
+    const unsigned base = 20000u + (::GetCurrentProcessId() % 5000u);
     const unsigned value = base + counter;
     ++counter;
-    return static_cast<std::uint16_t>(value % 60000u + 1024u);
+    return static_cast<std::uint16_t>(20000u + value % 10000u);
+}
+
+// Binds the first free candidate port, retrying up to 16 times. Short-lived
+// test processes recycle pids, and a previous incarnation's TIME_WAIT
+// connections block the exclusive (SO_EXCLUSIVEADDRUSE) rebind of the same
+// port, so a single pick fails roughly once per several thousand runs and
+// turned long test loops flaky for reasons unrelated to what they exercise.
+// `bound_port` receives the port that actually bound; callers must connect to
+// it, not to the first pick.
+std::unique_ptr<listener> listen_free(iocp_backend& be,
+                                      std::uint16_t& bound_port) noexcept {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::uint16_t port = next_port();
+        auto l = be.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+        if (l != nullptr) {
+            bound_port = port;
+            return l;
+        }
+    }
+    std::fprintf(stderr, "test_io_iocp: all 16 candidate ports failed to bind\n");
+    std::fflush(stderr);
+    return nullptr;
 }
 
 // Delegates to the harness helper, which spins before sleeping. A local
@@ -258,8 +286,8 @@ CRPC_TEST(iocp_listen_connect_echo) {
     CRPC_CHECK(client.running());
 
     echo_server ss;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -294,8 +322,8 @@ CRPC_TEST(iocp_large_transfer_small_queue) {
     iocp_backend client(opt);
 
     echo_server ss;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -340,8 +368,8 @@ CRPC_TEST(iocp_reader_pause_resume) {
     iocp_backend client;
 
     plain_server ps;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -387,13 +415,71 @@ CRPC_TEST(iocp_reader_pause_resume) {
     l->stop();
 }
 
+CRPC_TEST(iocp_reader_bind_queues_no_lingering_wake) {
+    // A bind over an empty receive buffer must not queue a delivery wake:
+    // nothing can fulfil it, it would linger forever and later override an
+    // unrelated pause, forcing delivery attempts the consumer never asked for.
+    // Observable contract: the first rejected delivery attempt must be the
+    // only one -- a lingering wake would surface as a second `on_data` call.
+    iocp_backend server;
+    iocp_backend client;
+
+    plain_server ps;
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
+    CRPC_CHECK(l != nullptr);
+    if (!l) {
+        return;
+    }
+    l->start(&ps);
+
+    auto conn = client.connect(endpoint::tcp("127.0.0.1", port), connect_options{});
+    CRPC_CHECK(conn != nullptr);
+    if (!conn) {
+        return;
+    }
+    CRPC_CHECK(wait_for([&] { return ps.accepts.load() == 1; }, 5000));
+
+    recording_source cs;
+    cs.credit = 0;
+    conn->bind_source(&cs); // empty rx: must queue nothing
+
+    connection* server_conn = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ps.m);
+        if (!ps.bundles.empty()) {
+            server_conn = ps.bundles.front()->conn.get();
+        }
+    }
+    CRPC_CHECK(server_conn != nullptr);
+    if (!server_conn) {
+        return;
+    }
+
+    const std::string payload(200, 'x');
+    counting_completion done;
+    server_conn->sink().push(bytes_of(payload), &done);
+    CRPC_CHECK(wait_for([&] { return done.calls.load() == 1; }, 5000));
+    CRPC_CHECK(wait_for([&] { return cs.data_calls.load() >= 1; }, 5000));
+    CRPC_CHECK_EQ(0u, cs.size());
+    // Give any lingering-wake-driven extra attempt ample time to show up.
+    std::this_thread::sleep_for(150ms);
+    CRPC_CHECK_EQ(1, cs.data_calls.load());
+
+    cs.credit = static_cast<std::size_t>(-1);
+    conn->resume_read();
+    CRPC_CHECK(wait_for([&] { return cs.size() == payload.size(); }, 5000));
+    CRPC_CHECK_EQ(payload.size(), cs.size());
+    l->stop();
+}
+
 CRPC_TEST(iocp_peer_close_eof_once) {
     iocp_backend server;
     iocp_backend client;
 
     plain_server ps;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -425,8 +511,8 @@ CRPC_TEST(iocp_reset_delivers_error_once) {
     iocp_backend server;
 
     plain_server ps;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -479,8 +565,8 @@ CRPC_TEST(iocp_100_concurrent_connections) {
     iocp_backend client(opt);
 
     echo_server ss;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -532,8 +618,8 @@ CRPC_TEST(iocp_close_during_inflight_write) {
 
     echo_server ss;
     ss.bind_source = false; // never reads: the client write must stay pending
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -587,8 +673,8 @@ CRPC_TEST(iocp_10k_messages) {
     iocp_backend client(opt);
 
     echo_server ss;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -642,8 +728,8 @@ CRPC_TEST(iocp_accept_burst_500) {
 
     echo_server ss;
     ss.bind_source = false;
-    const std::uint16_t port = next_port();
-    auto l = server.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
+    std::uint16_t port = 0;
+    auto l = listen_free(server, port);
     CRPC_CHECK(l != nullptr);
     if (!l) {
         return;
@@ -706,9 +792,8 @@ CRPC_TEST(iocp_destruction_bounded_live_connection) {
             return;
         }
         echo_server ss;
-        const std::uint16_t port = next_port();
-        listener = backend->listen(endpoint::tcp("127.0.0.1", port),
-                                   listen_options{});
+        std::uint16_t port = 0;
+        listener = listen_free(*backend, port);
         CRPC_CHECK(listener != nullptr);
         if (listener) {
             listener->start(&ss);

@@ -278,7 +278,15 @@ public:
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            read_paused_ = false;
+            // Queue a delivery attempt for the newly bound source only when
+            // it can be fulfilled: a pause to clear or retained bytes to hand
+            // over. Incrementing with neither would leave a count that never
+            // gets consumed and would later cancel an unrelated, legitimate
+            // pause -- forcing a delivery attempt the consumer never asked
+            // for.
+            if (read_paused_ || rx_tail_ != 0) {
+                ++pending_wakes_;
+            }
         }
         // Schedule unconditionally. A level-triggered edge may already have
         // been consumed by read_loop() while no source was bound; in
@@ -288,17 +296,22 @@ public:
     }
 
     void resume_read() noexcept override {
-        bool was_paused = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            was_paused = read_paused_;
-            if (was_paused) {
-                read_paused_ = false;
+            // Queue the demand only when it can be fulfilled, instead of
+            // snapping `read_paused_`: the loop may be about to set it from a
+            // short consumption it has already made, and a snapshot taken
+            // before that point would skip the wake entirely -- the
+            // connection would stay paused with retained bytes and nothing
+            // would ever schedule it again. With a pause to clear or retained
+            // bytes present the loop consumes the request under `mtx_` in the
+            // same critical section that records the pause, so the wake
+            // cannot be swallowed either way.
+            if (read_paused_ || rx_tail_ != 0) {
+                ++pending_wakes_;
             }
         }
-        if (was_paused) {
-            schedule();
-        }
+        schedule();
     }
 
     void close() noexcept override {
@@ -519,8 +532,20 @@ private:
         for (;;) {
             {
                 std::lock_guard<std::mutex> lk(mtx_);
-                if (closed_ || error_delivered_ || read_paused_) {
+                if (closed_ || error_delivered_) {
                     return;
+                }
+                if (read_paused_) {
+                    // A queued demand outranks the pause an earlier iteration
+                    // recorded from a short consumption: consume it and keep
+                    // delivering. Without this, a demand queued between the
+                    // consumption and the pause would be swallowed by the
+                    // pause and the retained bytes would never be delivered.
+                    if (pending_wakes_ == 0) {
+                        return;
+                    }
+                    --pending_wakes_;
+                    read_paused_ = false;
                 }
             }
             // Announce one call for this iteration. The source is borrowed, so
@@ -539,9 +564,26 @@ private:
                     std::memmove(rx_.get(), rx_.get() + used, rx_tail_ - used);
                     rx_tail_ -= used;
                     bound_.leave();
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    if (!closed_ && !error_delivered_) {
-                        read_paused_ = true;
+                    bool again = false;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        if (!closed_ && !error_delivered_) {
+                            if (pending_wakes_ != 0) {
+                                // A demand arrived while this consumption was
+                                // in flight: keep going instead of pausing.
+                                // The decision and the consumption share one
+                                // critical section, so the demand cannot be
+                                // swallowed by a pause recorded right after
+                                // it was queued.
+                                --pending_wakes_;
+                                again = true;
+                            } else {
+                                read_paused_ = true;
+                            }
+                        }
+                    }
+                    if (again) {
+                        continue;
                     }
                     return;
                 }
@@ -559,9 +601,22 @@ private:
                     std::memmove(rx_.get(), rx_.get() + used, got - used);
                     rx_tail_ = got - used;
                     bound_.leave();
-                    std::lock_guard<std::mutex> lk(mtx_);
-                    if (!closed_ && !error_delivered_) {
-                        read_paused_ = true;
+                    bool again = false;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        if (!closed_ && !error_delivered_) {
+                            if (pending_wakes_ != 0) {
+                                // Same demand-vs-pause arbitration as the
+                                // retained-bytes branch above.
+                                --pending_wakes_;
+                                again = true;
+                            } else {
+                                read_paused_ = true;
+                            }
+                        }
+                    }
+                    if (again) {
+                        continue;
                     }
                     return;
                 }
@@ -774,6 +829,16 @@ private:
     // receive side
     std::size_t rx_tail_ = 0;
     bool read_paused_ = false;
+    // Number of queued delivery requests the read loop has not fulfilled yet.
+    // `resume_read()` and `bind_source()` queue one and schedule; the read
+    // loop fulfils a request with a delivery attempt and may not stop while
+    // one is visible: its pause decision and the consumption of a visible
+    // request happen under `mtx_` in the same critical section, so a wake can
+    // never be swallowed by a loop pass that already decided to pause. This
+    // mirrors `pending_wakes` in the IOCP backend; both replace a scheme
+    // where the waker snapped a flag that a running pass was about to set,
+    // losing the wake and retaining bytes forever.
+    std::uint64_t pending_wakes_ = 0;
     bool peer_eof_ = false;
     bool eof_delivered_ = false;
     bool error_delivered_ = false;
