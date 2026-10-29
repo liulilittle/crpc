@@ -388,7 +388,11 @@ void lz77_tokenize(span<const std::byte> in, std::vector<lz77_token>& tokens) {
     while (position < size) {
         int best_length = 0;
         int best_distance = 0;
-        if (position + static_cast<std::size_t>(deflate_min_match) <= size) {
+        // hash4 reads four bytes, so the guard must reserve four. It used to
+        // reserve deflate_min_match (3), which let the final position with
+        // exactly three bytes left read one byte past the end of the input --
+        // a heap-buffer-overflow that ASan reports at hash4.
+        if (position + 4 <= size) {
             const u32 hash = hash4(in, position);
             int candidate = head[hash];
             previous[position & (static_cast<std::size_t>(deflate_window) - 1)] = candidate;
@@ -426,7 +430,7 @@ void lz77_tokenize(span<const std::byte> in, std::vector<lz77_token>& tokens) {
             const std::size_t end = position + static_cast<std::size_t>(best_length);
             ++position;
             while (position < end) {
-                if (position + static_cast<std::size_t>(deflate_min_match) <= size) {
+                if (position + 4 <= size) {
                     const u32 hash = hash4(in, position);
                     previous[position & (static_cast<std::size_t>(deflate_window) - 1)] = head[hash];
                     head[hash] = static_cast<int>(position);

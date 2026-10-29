@@ -276,6 +276,9 @@ CRPC_TEST(load_data_recognizes_statements_with_leading_whitespace) {
     // step skips the leading whitespace, the SQL text is sent as-is.
     CRPC_CHECK_EQ(std::string("\t\r\n LOAD DATA LOCAL INFILE 'x' INTO TABLE t"),
                   h.raw->payload_of(1).substr(1));
+    // load_data allocates the result set into `out` on success; the caller
+    // owns it. Without this LeakSanitizer reports the case.
+    delete rows;
 }
 
 CRPC_TEST(load_data_sends_no_bytes_when_the_server_refuses) {

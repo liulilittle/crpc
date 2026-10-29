@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings: a CR before every newline makes bash fail
+# at the first line with "$'\r': command not found". scripts/test.sh had been
+# converted to CRLF on a Windows checkout and could not run on Linux at all.
+*.sh text eol=lf
+
+# PowerShell is fine with either, but CRLF is what the Windows tooling expects.
+*.ps1 text eol=crlf
