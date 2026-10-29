@@ -147,8 +147,9 @@ CRPC_TEST(fs_path_join) {
 }
 
 CRPC_TEST(fs_path_case_sensitivity) {
-    CRPC_CHECK(path("C:/Foo/Bar.txt") == path("c:\\foo\\bar.TXT"));
 #if defined(CRPC_OS_WINDOWS)
+    // Windows paths compare case-insensitively; drive-relative spellings fold.
+    CRPC_CHECK(path("C:/Foo/Bar.txt") == path("c:\\foo\\bar.TXT"));
     CRPC_CHECK_EQ(true, path("C:/a") == path("c:\\A"));
     CRPC_CHECK_EQ(false, path_sensitive_equal(path("C:/a"), path("c:/A")));
 #else

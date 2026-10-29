@@ -35,11 +35,10 @@
 #include <crpc/io.hpp>
 #include <crpc/mvc/router.hpp>
 
+#include "test_tcp_backend.hpp"
 #if defined(_WIN32)
-#include <crpc/io/iocp_backend.hpp>
 #include <windows.h>
 #else
-#include <crpc/io/epoll_backend.hpp>
 #include <unistd.h>
 #endif
 
@@ -50,17 +49,14 @@ using namespace crpc;
 
 namespace {
 
-#if defined(_WIN32)
-using tcp_backend = crpc::iocp_backend;
-#else
-using tcp_backend = crpc::io::epoll_backend;
-#endif
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
                                  text.size());
 }
 
+// Only the OpenSSL-gated fixtures below call these.
+#if defined(CRPC_HAVE_OPENSSL)
 crpc::u16 next_port() {
 #if defined(_WIN32)
     static const unsigned base = 26000u + (::GetCurrentProcessId() % 20000u);
@@ -72,6 +68,7 @@ crpc::u16 next_port() {
     const unsigned value = base + counter.fetch_add(7, std::memory_order_relaxed);
     return static_cast<crpc::u16>(value % 60000u + 1024u);
 }
+#endif
 
 // --- Certificate fixture -----------------------------------------------------
 
@@ -364,6 +361,7 @@ private:
 
 // --- Library HTTP server route ----------------------------------------------
 
+#if defined(CRPC_HAVE_OPENSSL)
 status handle_secure(void*, const http::request&, const mvc::route_params&,
                      const codec&, const codec_registry&, http::response& out) {
     out.status_code = 200;
@@ -382,6 +380,7 @@ void add_secure_route(mvc::router& router) {
     CRPC_CHECK(router.add(std::move(entry)).ok());
     CRPC_CHECK(router.freeze().ok());
 }
+#endif
 
 // --- Tests -------------------------------------------------------------------
 

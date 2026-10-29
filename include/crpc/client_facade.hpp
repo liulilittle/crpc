@@ -1169,7 +1169,7 @@ public:
                         st->core.invoke_callback();
                     }
                 }
-            } guard{st};
+            } guard{st, std::nullopt};
             // Publishes a terminal outcome into the guard (and, through it, the
             // call state) and returns it. `Resp` is copied into the cache only
             // when it is copyable; a move-only `Resp` still returns by value.

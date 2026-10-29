@@ -31,7 +31,7 @@
 #include <crpc/db/types.hpp>
 #include <crpc/error.hpp>
 #include <crpc/io.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -53,7 +53,7 @@ namespace {
 }
 
 struct it_cluster {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::cluster> db;
 
     it_cluster(crpc::db::read_route reads = crpc::db::read_route::primary,

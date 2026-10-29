@@ -188,7 +188,9 @@ public:
 struct rig {
     int opened = 0;
     std::unique_ptr<channel_factory> factory;
-    pool_options pool_options;
+    // Fully qualified: the member `pool_options` hides the type name in this
+    // scope, and GCC -Wchanges-meaning rejects the unqualified spelling.
+    crpc::db::pool_options pool_options;
 
     rig() {
         connection_options options;

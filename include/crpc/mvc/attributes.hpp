@@ -92,9 +92,13 @@
 // `(controller_t, member, path_literal)` or the two-argument lambda form
 // `(path_literal, callable)`; the argument count selects the expansion.
 #define CRPC_HTTP_GET_SELECT(_1, _2, _3, NAME, ...) NAME
+// The trailing empty argument keeps CRPC_HTTP_GET_SELECT's own variadic tail
+// non-empty for the two-argument lambda form: with only four arguments the
+// `...` would receive nothing and GCC rejects that under -Wpedantic -Werror.
+// The selected NAME is unchanged for both forms.
 #define CRPC_HTTP_GET(...)                                                    \
     CRPC_HTTP_GET_SELECT(__VA_ARGS__, CRPC_HTTP_GET_CTL,                      \
-                         CRPC_HTTP_GET_LAMBDA)(__VA_ARGS__)
+                         CRPC_HTTP_GET_LAMBDA, )(__VA_ARGS__)
 #define CRPC_HTTP_GET_CTL(controller_t, member, path_literal)                  \
     CRPC_MVC_ACTION(get, controller_t, member, ::crpc::http::method::get,      \
                     path_literal)

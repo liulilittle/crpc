@@ -684,12 +684,11 @@ CRPC_TEST(aoi_tick_collapses_repeated_moves) {
 
     // A watcher that moves several times in one tick is reconciled once, at
     // its final position.
-    CRPC_CHECK(status_ok(world.add_watcher(2, watcher_options{
-                                                vec2{50.0, 50.0},
-                                                aoi_shape::circle,
-                                                10.0,
-                                                0.0,
-                                                0.0})));
+    watcher_options watcher_2;
+    watcher_2.position = vec2{50.0, 50.0};
+    watcher_2.shape = aoi_shape::circle;
+    watcher_2.radius = 10.0;
+    CRPC_CHECK(status_ok(world.add_watcher(2, watcher_2)));
     CRPC_CHECK(status_ok(world.add_entity(2, make_state(vec2{75.0, 50.0}))));
     world.tick();
     CRPC_CHECK(world.drain_events().empty()); // entity 2 is outside watcher 2

@@ -53,11 +53,10 @@
 #include <crpc/io.hpp>
 #include <crpc/mvc/router.hpp>
 
+#include "test_tcp_backend.hpp"
 #if defined(_WIN32)
-#include <crpc/io/iocp_backend.hpp>
 #include <windows.h>
 #else
-#include <crpc/io/epoll_backend.hpp>
 #include <unistd.h>
 #endif
 
@@ -68,11 +67,6 @@ using namespace crpc;
 
 namespace {
 
-#if defined(_WIN32)
-using tcp_backend = crpc::iocp_backend;
-#else
-using tcp_backend = crpc::io::epoll_backend;
-#endif
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
@@ -297,6 +291,13 @@ private:
                 return;
             }
             if (step.close_after) {
+                // connection::close is abortive (io.hpp): it discards bytes
+                // still queued in the backend's send ring. The response is
+                // flushed to the kernel asynchronously by the loop thread, so
+                // hold the connection briefly before closing -- what a real
+                // server's graceful teardown does -- or the peer may observe
+                // nothing but the EOF.
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 return;
             }
         }
@@ -578,14 +579,6 @@ private:
     std::mutex log_mu_;
     std::vector<int> opened_;
 };
-
-[[nodiscard]] std::unique_ptr<http::client> client_over(std::unique_ptr<db::channel> link) {
-    http::client_options options;
-    options.host = "fake";
-    options.keep_alive = true;
-    return std::unique_ptr<http::client>(
-        new http::client(std::move(options), std::move(link)));
-}
 
 } // namespace
 

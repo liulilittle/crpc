@@ -19,11 +19,6 @@ namespace {
     return span<const std::byte>(data.data(), data.size());
 }
 
-[[nodiscard]] span<const std::byte> span_of(std::string_view text) noexcept {
-    return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
-                                 text.size());
-}
-
 [[nodiscard]] std::vector<std::byte> copy_bytes(span<const std::byte> data) {
     if (data.empty()) {
         return {};
@@ -213,7 +208,7 @@ result<std::unique_ptr<connection>> connection::open(connection_options options,
             conn->shard_ = shard;
             conn->nodes_ = std::move(candidates);
             conn->set_node(index);
-            return std::move(conn);
+            return conn;
         }
         last_error = conn->connect_error();
     }

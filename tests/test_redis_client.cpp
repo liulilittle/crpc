@@ -37,18 +37,6 @@ using namespace std::chrono_literals;
 
 namespace {
 
-crpc::redis::resp_value text(std::string value) {
-    return crpc::redis::resp_value(crpc::redis::resp_bulk_string{std::move(value)});
-}
-
-crpc::redis::resp_value simple(std::string value) {
-    return crpc::redis::resp_value(crpc::redis::resp_simple_string{std::move(value)});
-}
-
-crpc::redis::resp_value integer(std::int64_t value) {
-    return crpc::redis::resp_value(crpc::redis::resp_integer{value});
-}
-
 // --- In-process fake Redis server -------------------------------------------
 
 struct scripted_reply {

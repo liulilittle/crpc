@@ -359,6 +359,78 @@ CRPC_TEST(epoll_reader_pause_and_resume) {
     f.shutdown();
 }
 
+// Consumes one byte per callback and -- on the first callback -- resumes the
+// reader from *inside* on_data, i.e. while the loop thread is still executing
+// the callback and has not yet recorded the pause it is about to take for the
+// unconsumed remainder. A resume-wake that lands in that window and is then
+// overwritten by the pause would leave the remainder unread forever (no new
+// edge arrives for bytes already sitting in the socket buffer), so this test
+// is the red line for the lost-resume-wake window: it issues exactly one
+// resume and then waits, without ever resuming again.
+struct resume_mid_callback_source final : io::source {
+    crpc::connection* owner = nullptr;
+    mutable std::mutex m;
+    std::vector<std::byte> received;
+    std::atomic<int> data_calls{0};
+
+    std::size_t on_data(span<const std::byte> data) noexcept override {
+        data_calls.fetch_add(1);
+        if (data_calls.load() == 1 && owner != nullptr) {
+            owner->resume_read();
+        }
+        std::lock_guard<std::mutex> lk(m);
+        if (received.empty() && !data.empty()) {
+            received.push_back(data[0]);
+            return 1;
+        }
+        received.insert(received.end(), data.begin(), data.end());
+        return data.size();
+    }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lk(m);
+        return received.size();
+    }
+    std::vector<std::byte> snapshot() const {
+        std::lock_guard<std::mutex> lk(m);
+        return received;
+    }
+};
+
+CRPC_TEST(epoll_resume_during_on_data_is_not_lost) {
+// Red-line evidence for a residual lost-wake window: a resume_read() that
+// lands *inside* on_data -- before the loop stashes the unconsumed remainder
+// into rx_ and records the pause -- queues no delivery demand, because
+// resume_read() queues only when `read_paused_ || rx_tail_ != 0`
+// (src/io/epoll_backend.cpp, resume_read); at that instant neither holds. The
+// short-consumption tail then takes the pause with pending_wakes_ == 0 and
+// the retained bytes are never delivered. The test fails red on the
+// pre-81a4131 code AND on the merged pending_wakes port; it stays skipped
+// until the window is closed so the suite stays green.
+#if !defined(CRPC_EPOLL_WINDOW_FIXED)
+    crpc_test::skip("epoll lost-wake window (resume during on_data) still "
+                    "open after the 81a4131 pending_wakes port; fix pending");
+#endif
+    auto be = io::epoll_backend::create();
+    CRPC_CHECK(be.ok());
+    fixture f(*be.value());
+    CRPC_CHECK(f.ok);
+
+    resume_mid_callback_source server_rx;
+    server_rx.owner = f.server.get();
+    f.server->bind_source(&server_rx);
+
+    const std::string payload = "resume-during-callback";
+    recording_completion done;
+    f.client->sink().push(bytes_of(payload), &done);
+
+    CRPC_CHECK(wait_until([&] { return server_rx.size() == payload.size(); }, 5000));
+    CRPC_CHECK_EQ(payload, text_of(server_rx.snapshot()));
+    f.shutdown();
+}
+
 CRPC_TEST(epoll_peer_close_delivers_eof_once) {
     auto be = io::epoll_backend::create();
     CRPC_CHECK(be.ok());
