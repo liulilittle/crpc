@@ -181,7 +181,14 @@ public:
 // The documented SSLRequest payload: 4-byte client flags (with CLIENT_SSL),
 // 4-byte max packet size, 1-byte charset, 23 reserved zero bytes.
 constexpr std::size_t ssl_request_payload_size = 32;
+// Only the OpenSSL build can observe an SSLRequest (without TLS the client
+// never sends one), so this constant is unused in a no-OpenSSL translation
+// unit. clang's -Wunused-const-variable is part of the -Werror gate there;
+// MSVC's /W4 does not diagnose it, which is why the CI clang job found this
+// and the Windows jobs did not.
+#if defined(CRPC_HAVE_OPENSSL)
 constexpr std::uint32_t ssl_request_max_packet_size = 16u * 1024u * 1024u;
+#endif
 
 [[nodiscard]] bool wire_contains(const std::vector<std::byte>& haystack,
                                  const std::string_view needle) {

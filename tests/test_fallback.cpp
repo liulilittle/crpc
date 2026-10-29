@@ -101,8 +101,11 @@ crpc::status scripted_fallback(void* self, const fb::fallback_context&,
     return crpc::status{};
 }
 
-crpc::status noexcept_fallback(void*, const fb::fallback_context&,
-                               crpc::buffer&) noexcept {
+// Only its type is observed (the static_asserts below), so the function itself
+// is never emitted. clang reports that as -Wunneeded-internal-declaration.
+[[maybe_unused]] crpc::status noexcept_fallback(void*,
+                                                const fb::fallback_context&,
+                                                crpc::buffer&) noexcept {
     return crpc::status{};
 }
 

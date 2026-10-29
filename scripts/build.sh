@@ -102,18 +102,24 @@ SHARED_ARGS=(-DCRPC_BUILD_SHARED=OFF)
 # RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM macros cannot be compiled without the RTTI
 # checkout. Report that here instead of letting the compiler emit a wall of
 # unrelated errors in test_mvc.cpp.
+#
+# A checkout can come from either place: an explicit CRPC_RTTI_DIR (a shared
+# worktree, a vendored copy) or the third_party submodule, which is where a
+# fresh clone gets it. CMakeLists.txt already falls back to the submodule, so
+# requiring the environment variable here made a plain
+# `git clone --recursive && scripts/build.sh` fail on Linux while the same
+# thing worked through build.ps1 -- the one-click promise is per-platform, so
+# the two scripts must accept the same inputs.
 DEP_ARGS=()
 for dep in CRPC_RTTI_DIR CRPC_COROCC_DIR; do
   value="${!dep:-}"
   if [[ -n "$value" ]]; then
     DEP_ARGS+=("-D${dep}=$value")
-    log INFO "$dep=$value"
-  else
-    log WARN "$dep is not set in the environment"
+    log INFO "$dep=$value (explicit override)"
   fi
 done
-if [[ -z "${CRPC_RTTI_DIR:-}" ]]; then
-  log ERROR "CRPC_RTTI_DIR is required for the test suite: export CRPC_RTTI_DIR=/path/to/RTTI before running this script. Without it the tests that use RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot be compiled."
+if [[ -z "${CRPC_RTTI_DIR:-}" && ! -f "$SOURCE_DIR/third_party/rtti/CMakeLists.txt" ]]; then
+  log ERROR "No RTTI checkout: neither CRPC_RTTI_DIR nor third_party/rtti exists. Run \"git submodule update --init --recursive\", or export CRPC_RTTI_DIR=/path/to/RTTI. Without it the tests that use RTTI_DEFINE_TYPE/RTTI_DEFINE_ENUM cannot be compiled."
   exit 3
 fi
 
