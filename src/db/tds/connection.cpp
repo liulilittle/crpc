@@ -19,15 +19,6 @@ namespace crpc {
 namespace db {
 namespace tds {
 namespace {
-
-[[nodiscard]] std::uint8_t byte_at(span<const std::byte> data, std::size_t index) noexcept {
-    return static_cast<std::uint8_t>(data[index]);
-}
-
-[[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
-    return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()), text.size());
-}
-
 // The header's length field is big-endian and includes the header itself.
 [[nodiscard]] std::vector<std::byte> header_bytes(const packet_header& header) {
     std::vector<std::byte> out(header_size);

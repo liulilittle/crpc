@@ -60,16 +60,6 @@ std::unique_ptr<behavior_node> make_action(std::shared_ptr<script> state,
         [state](blackboard&) { return state->next(); }, name);
 }
 
-std::unique_ptr<behavior_node> make_sequence(
-    std::vector<std::unique_ptr<behavior_node>> children) {
-    return std::make_unique<sequence_node>(std::move(children));
-}
-
-std::unique_ptr<behavior_node> make_selector(
-    std::vector<std::unique_ptr<behavior_node>> children) {
-    return std::make_unique<selector_node>(std::move(children));
-}
-
 CRPC_TEST(behavior_tree_sequence_resumes_in_place) {
     // A succeeds immediately. B runs for two ticks. On the second tick A must
     // not be ticked again: the sequence is parked at child index 1.

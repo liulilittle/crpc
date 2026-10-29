@@ -29,8 +29,11 @@ namespace crpc {
 namespace fs {
 namespace {
 
-#if defined(CRPC_OS_WINDOWS)
+// Read/write calls are issued in 1 MiB slices on every platform: the slice size
+// bounds stack/VSS pressure for the chunk buffer without hurting throughput.
 constexpr std::size_t kIoChunk = 1u << 20;
+
+#if defined(CRPC_OS_WINDOWS)
 
 status win_status(DWORD code, std::string_view op, const std::string& path) {
     return status(detail::classify_win32(code, op, path));

@@ -19,14 +19,14 @@
 #include <crpc/ws/client.hpp>
 #include <crpc/ws/server.hpp>
 
+#include "test_tcp_backend.hpp"
+
 #if defined(_WIN32)
-#include <crpc/io/iocp_backend.hpp>
 // GetCurrentProcessId() below is a Win32 call. Relying on a transitive include
 // from iocp_backend.hpp happened to work in Debug and failed in Release, where
 // the include order differs -- the declaration must be asked for explicitly.
 #include <windows.h>
 #else
-#include <crpc/io/epoll_backend.hpp>
 #include <unistd.h>
 #endif
 
@@ -47,12 +47,6 @@ std::ostream& operator<<(std::ostream& os, E value) {
 using namespace crpc;
 
 namespace {
-
-#if defined(_WIN32)
-using tcp_backend = crpc::iocp_backend;
-#else
-using tcp_backend = crpc::io::epoll_backend;
-#endif
 
 [[nodiscard]] span<const std::byte> as_bytes(std::string_view text) noexcept {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(text.data()),
@@ -87,6 +81,12 @@ void run_echo_server(crpc::ws::server& srv, std::atomic<int>& accepted) {
             break;
         }
         if (ev.value().type == ws::event::kind::closed) {
+            // The stream auto-replied with its own Close frame when it decoded
+            // the client's; destroying the stream aborts the link, and an
+            // abortive close (io.hpp) discards bytes still queued in the
+            // backend's send ring. Hold briefly so the reply reaches the
+            // kernel before the teardown, like a real server's graceful close.
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
             break;
         }
         if (ev.value().type != ws::event::kind::message) {

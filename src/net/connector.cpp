@@ -48,7 +48,7 @@ std::unique_ptr<tcp_stream> build_stream(native_socket s, const stream_options& 
 // One non-blocking connect attempt against a single resolved literal.
 result<std::unique_ptr<tcp_stream>> connect_one(
     const ip_address& target_ip, u16 target_port, const ip_address& local_ip,
-    const connect_options& options, std::chrono::nanoseconds budget) {
+    u16 local_port, const connect_options& options, std::chrono::nanoseconds budget) {
     sockaddr_storage target_sa{};
     int target_len = 0;
     if (!detail::ip_to_sockaddr(target_ip, target_port, target_sa, target_len)) {
@@ -65,7 +65,10 @@ result<std::unique_ptr<tcp_stream>> connect_one(
     if (local_ip.valid()) {
         sockaddr_storage local_sa{};
         int local_len = 0;
-        if (detail::ip_to_sockaddr(local_ip, 0, local_sa, local_len)) {
+        // The requested local port must be honored: binding to port 0 here
+        // would silently replace the caller's explicit local address with an
+        // ephemeral one.
+        if (detail::ip_to_sockaddr(local_ip, local_port, local_sa, local_len)) {
             if (::bind(s, reinterpret_cast<sockaddr*>(&local_sa), local_len) != 0) {
                 const int error = detail::last_error();
                 detail::close_socket(s);
@@ -320,7 +323,8 @@ result<std::unique_ptr<tcp_stream>> connect(const address& target,
                              "connect exceeded its deadline across candidates"};
         }
         result<std::unique_ptr<tcp_stream>> linked =
-            connect_one(target_ip, target.port(), local_ip, options, remaining);
+            connect_one(target_ip, target.port(), local_ip,
+                        options.local_bind.port(), options, remaining);
         if (linked) {
             return linked;
         }

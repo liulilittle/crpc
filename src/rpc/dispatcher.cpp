@@ -7,6 +7,10 @@
 #include <crpc/wire.hpp>
 
 namespace crpc::rpc {
+
+// The claim type is nested in the table; this is the spelling dispatch uses.
+using dedup_lease = dedup_table::lease;
+
 namespace {
 
 void append_u16(buffer& out, u16 value) {
@@ -68,6 +72,52 @@ call_context build_context(const call_envelope& envelope,
     }
     return ctx;
 }
+
+// Absolute local deadline the wire deadline resolves to, or the dispatch instant
+// when the frame carries none. Shared by the dedup wait bound and the context.
+std::chrono::steady_clock::time_point wire_deadline_of(
+    const call_envelope& envelope, std::chrono::steady_clock::time_point now) {
+    if (envelope.extensions.has(trace_extension::has_deadline)) {
+        return now + std::chrono::nanoseconds(
+                         static_cast<std::chrono::nanoseconds::rep>(
+                             envelope.extensions.deadline_ns));
+    }
+    return now;
+}
+
+// Completes a leader claim at scope exit with whatever the response buffer
+// holds. Exception-neutral: during unwinding the entry is completed without a
+// payload (`canceled`), because the buffer state is undefined; a completion that
+// itself fails to allocate falls back to the allocation-free path. A duplicate
+// suspended against this leader is therefore never stranded.
+struct leader_completion {
+    leader_completion(dedup_lease& lease_ref, buffer& out, bool& has_resp, bool active) noexcept
+        : lease(lease_ref), response_out(out), has_response(has_resp), active(active) {}
+
+    ~leader_completion() {
+        if (!active || !lease.is_leader()) {
+            return;
+        }
+        if (std::uncaught_exceptions() != armed) {
+            lease.complete_failed();
+            return;
+        }
+        try {
+            lease.complete(has_response ? response_out.readable() : span<const std::byte>(),
+                           ok, code);
+        } catch (...) {
+            lease.complete_failed();
+        }
+    }
+
+    dedup_lease& lease;
+    buffer& response_out;
+    bool& has_response;
+    bool active = false;
+    bool ok = false;
+    rpc_code code = rpc_code::canceled;
+    int armed = std::uncaught_exceptions();
+};
 
 } // namespace
 
@@ -330,6 +380,12 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
 status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
                             std::chrono::steady_clock::time_point now,
                             bool& handler_ran) noexcept {
+    return dispatch(request, response_out, has_response, now, handler_ran, nullptr);
+}
+
+status dispatcher::dispatch(const frame& request, buffer& response_out, bool& has_response,
+                            std::chrono::steady_clock::time_point now, bool& handler_ran,
+                            const void* dedup_wait_key) noexcept {
     // Building the decode-failure message, the refusal errors and the success
     // response all allocate, and this function is `noexcept` (the server's
     // shard calls it). An allocation failure would reach `std::terminate`.
@@ -380,6 +436,96 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
             }
         }
 
+        call_context ctx = build_context(envelope, now);
+
+        // --- Idempotency dedup ------------------------------------------------
+        //
+        // A keyed request claims the table before the handler runs. Everything
+        // above this point is a per-request refusal and deduplicates nothing:
+        // decode failures, unknown service/method and already-expired deadlines
+        // never reach the table.
+        dedup_lease lease;
+        bool leading = false;
+        if (ctx.has_idempotency_key && !ctx.idempotency.empty()) {
+            // The suspension bound is the caller's own wire deadline (a client
+            // that has given up must not hold a shard thread) capped by the
+            // configured `max_wait`; with `max_wait <= 0` duplicates are never
+            // suspended and only the wire deadline can bind.
+            const std::chrono::steady_clock::time_point wire_deadline =
+                wire_deadline_of(envelope, now);
+            std::chrono::steady_clock::time_point wait_deadline = wire_deadline;
+            const std::chrono::milliseconds max_wait = dedup_.options().max_wait;
+            if (max_wait.count() > 0) {
+                const std::chrono::steady_clock::time_point capped = now + max_wait;
+                if (!envelope.extensions.has(trace_extension::has_deadline) ||
+                    capped < wait_deadline) {
+                    wait_deadline = capped;
+                }
+            }
+            lease = dedup_.claim(ctx.idempotency, envelope.service_id, envelope.method_id,
+                                 now, wait_deadline, dedup_wait_key, wants_response);
+            switch (lease.state()) {
+            case dedup_lease::action::leader:
+                leading = true;
+                break;
+            case dedup_lease::action::none:
+                // Table disabled or saturated: at-least-once, exactly as before.
+                break;
+            case dedup_lease::action::duplicate:
+                // One-way duplicate: the side effect already ran (or is
+                // running); there is no response to wait for.
+                return status{};
+            case dedup_lease::action::replay:
+            case dedup_lease::action::served: {
+                const std::shared_ptr<const std::vector<std::byte>> payload =
+                    lease.replay_payload();
+                if (payload != nullptr) {
+                    // A one-way replay has no response to deliver: the cached
+                    // marker only says "already executed, drop".
+                    if (wants_response) {
+                        if (!response_out.append(
+                                crpc::span<const std::byte>(payload->data(),
+                                                            payload->size()))) {
+                            return status{rpc_code::encode_error};
+                        }
+                        has_response = true;
+                    }
+                    return status{};
+                }
+                // A payload-less outcome can only be a failed or aborted
+                // leader: answer with its code. A success that does not exist
+                // is never replayed.
+                return respond_error(response_out, has_response, wants_response,
+                                     rpc_error(lease.replay_code(),
+                                               "idempotent replay: the original attempt failed"));
+            }
+            case dedup_lease::action::abandoned:
+                return respond_error(response_out, has_response, wants_response,
+                                     rpc_error(rpc_code::canceled,
+                                               "duplicate abandoned: connection closed while "
+                                               "the original call was in flight"));
+            case dedup_lease::action::expired: {
+                // The wire deadline is the more precise reason when it is the
+                // one that bound the wait; otherwise the server-side cap fired
+                // and a retry after the original completes will replay.
+                const bool wire_bound =
+                    envelope.extensions.has(trace_extension::has_deadline) &&
+                    wire_deadline <= wait_deadline;
+                if (wire_bound) {
+                    return respond_error(
+                        response_out, has_response, wants_response,
+                        rpc_error(rpc_code::deadline_exceeded,
+                                  "deadline elapsed while the original call was in flight"));
+                }
+                rpc_error refused(rpc_code::unavailable,
+                                  "duplicate wait exceeded the server's dedup wait bound");
+                refused.retryable = true;
+                return respond_error(response_out, has_response, wants_response, refused);
+            }
+            }
+        }
+        leader_completion completion(lease, response_out, has_response, leading);
+
         if (!method->enter()) {
             return respond_error(response_out, has_response, wants_response,
                                  rpc_error(rpc_code::overload,
@@ -388,7 +534,6 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
         service->enter();
         entered = true;
 
-        call_context ctx = build_context(envelope, now);
         buffer body_out;
         status handler_status;
         handler_ran = true;
@@ -406,18 +551,31 @@ status dispatcher::dispatch(const frame& request, buffer& response_out, bool& ha
         entered = false;
 
         if (!handler_status.ok()) {
+            completion.code = handler_status.error().code;
             return respond_error(response_out, has_response, wants_response,
                                  handler_status.error());
         }
         if (!wants_response) {
+            // A one-way success is cached as an empty retained marker so a
+            // replayed one-way within the window is dropped as a duplicate.
+            completion.ok = true;
             return status{};
         }
         has_response = true;
-        return encode_response(rpc_code::ok, rpc_error{}, body_out.readable(), response_out);
+        const status encoded =
+            encode_response(rpc_code::ok, rpc_error{}, body_out.readable(), response_out);
+        if (!encoded.ok()) {
+            completion.code = rpc_code::encode_error;
+            return encoded;
+        }
+        completion.ok = true;
+        return status{};
     } catch (...) {
         // Allocation failure. Release the concurrency counters if they were
         // taken, then report an internal error. The catch body performs no
-        // allocation.
+        // allocation. The `leader_completion` guard runs during unwinding and
+        // completes the dedup entry without a payload, so no duplicate stays
+        // suspended against a leader that died here.
         if (entered) {
             service->leave();
             method->leave();

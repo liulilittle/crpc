@@ -41,6 +41,11 @@ namespace redis {
 
 struct value;
 
+// A type alias, not a struct: `array_value{expr}` is list-initialisation and
+// prefers the initializer_list constructor, which wraps `expr` as a single
+// element when it converts to `value`. Use `array_value(expr)` for the
+// copy/move constructor. The other container wrappers below are structs and
+// therefore aggregate-initialise, so they are unaffected.
 using array_value = std::vector<value>;
 using map_value = std::vector<std::pair<value, value>>;
 

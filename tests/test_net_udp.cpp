@@ -26,14 +26,6 @@ namespace {
 using crpc::net::address;
 using crpc::net::udp_socket;
 
-[[nodiscard]] crpc::u16 free_udp_port() {
-    auto bound = udp_socket::bind(address::tcp("127.0.0.1", 0));
-    if (!bound) {
-        return 0;
-    }
-    return bound.value()->local().port();
-}
-
 } // namespace
 
 CRPC_TEST(net_udp_round_trip_with_source_address) {

@@ -75,12 +75,14 @@ namespace {
 // --- value helpers -----------------------------------------------------------
 
 value vnull() { return value{nullptr}; }
-value vbool(bool b) { return value{b}; }
 value vint(i64 v) { return value{v}; }
-value vreal(double v) { return value{v}; }
 value vstr(std::string s) { return value{std::move(s)}; }
 value varray(std::vector<value> items) {
-    return value{array_value{std::move(items)}};
+    // Parentheses, not braces: array_value aliases std::vector<value>, and the
+    // braced form is list-initialisation, which prefers the
+    // initializer_list<value> constructor and wraps the whole vector as a
+    // single element (value is constructible from array_value).
+    return value{array_value(std::move(items))};
 }
 value vmap(std::vector<std::pair<value, value>> entries) {
     return value{map_value{std::move(entries)}};
@@ -88,10 +90,6 @@ value vmap(std::vector<std::pair<value, value>> entries) {
 value vset(std::vector<value> items) {
     return value{set_value{std::move(items)}};
 }
-value vpush(std::vector<value> items) {
-    return value{push_value{std::move(items)}};
-}
-
 bool values_equal(const value& a, const value& b) {
     if (a.kind() != b.kind()) {
         return false;

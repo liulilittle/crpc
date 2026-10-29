@@ -285,14 +285,6 @@ double path_cost(const grid_map& g, const std::vector<std::size_t>& path,
     return total;
 }
 
-void expect_not_found(const crpc::status& s) {
-    CRPC_CHECK_FALSE(s.ok());
-    if (!s.ok()) {
-        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::not_found),
-                      static_cast<int>(s.code()));
-    }
-}
-
 template <typename T>
 void expect_not_found(const crpc::result<T>& r) {
     CRPC_CHECK_FALSE(r.ok());

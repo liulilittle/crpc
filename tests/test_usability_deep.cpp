@@ -390,9 +390,9 @@ CRPC_TEST(builder_aliases_forward_to_the_canonical_names) {
 #endif
     CRPC_CHECK(cli != nullptr);
     if (cli) {
-        // The alias reached the canonical field: the low-level connection is
-        // built with the facade's default deadline (nonzero).
-        CRPC_CHECK(cli->stats().active_connections >= 0);
+        // The alias reached the canonical field: the counter is readable and
+        // starts at zero (no connection has been opened yet).
+        CRPC_CHECK_EQ(std::size_t{0}, cli->stats().active_connections);
     }
 }
 

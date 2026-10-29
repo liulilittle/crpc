@@ -104,6 +104,25 @@ inline tcp_backend_ptr make_tcp_backend() {
 }
 #endif
 
+// iocp_backend tears its pump down in stop(); the epoll backend has no stop --
+// its destructor is the shutdown path, and every test closes its connections
+// before the backend goes out of scope.
+inline void stop_tcp_backend(tcp_backend_ptr& backend) {
+#if defined(_WIN32)
+    // iocp_backend owns a pump thread and stops it explicitly. The call must
+    // name the member, not this helper: `stop_tcp_backend(backend)` here
+    // would be an unconditional self-recursion (MSVC C4717, stack overflow at
+    // run time). Linux never sees it because the branch is compiled out.
+    if (backend != nullptr) {
+        backend->stop();
+    }
+#else
+    // The epoll backend has no stop: its destructor is the shutdown path, and
+    // every test closes its connections before the backend goes out of scope.
+    (void)backend;
+#endif
+}
+
 namespace cl = crpc::cluster;
 using crpc::rpc_code;
 
@@ -116,11 +135,6 @@ constexpr crpc::u64 k_dump = 3;
 constexpr const char* k_service_name = "distributed.tcp-echo";
 
 std::atomic<unsigned> fixture_counter{0};
-
-std::string unique_name(const char* prefix) {
-    return std::string(prefix) + "-" +
-           std::to_string(fixture_counter.fetch_add(1, std::memory_order_relaxed));
-}
 
 // Per-process candidate ports. The listener bind is retried by the fixtures,
 // so a collision with another process or another test binary only costs an
@@ -848,7 +862,7 @@ CRPC_TEST(tcp_discovery_and_route_convergence) {
     converged_client->close();
     joined_client->close();
     client->close();
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 // --- failover ----------------------------------------------------------------
@@ -909,7 +923,7 @@ CRPC_TEST(tcp_failover_to_live_provider) {
     CRPC_CHECK(stats.pre_send_retries >= 1 || stats.endpoint_open >= 1);
 
     client->close();
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 // --- health-driven discovery -------------------------------------------------
@@ -964,7 +978,7 @@ CRPC_TEST(tcp_health_evicts_and_restores_provider) {
     const route_table restored = discover(registry);
     CRPC_CHECK_EQ(std::size_t{2}, restored.endpoints.size());
 
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 // --- partition, reconnect, idempotent replay ---------------------------------
@@ -1027,7 +1041,7 @@ CRPC_TEST(tcp_idempotent_replay_converges) {
     // The IOCP backend has a known send-completion race (see §8 of
     // docs/distributed-testing.md); draining the pump here keeps the teardown
     // deterministic.
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 // --- reliable three-hop delivery and PUSH_ACK --------------------------------
@@ -1124,7 +1138,7 @@ CRPC_TEST(tcp_push_three_hops_ack_and_order) {
     hop2.stop();
     hop1.stop();
     reconnected->close();
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 // --- middle-hop partition and replay -----------------------------------------
@@ -1203,7 +1217,7 @@ CRPC_TEST(tcp_push_recovers_after_middle_hop_partition) {
     hop2.stop();
     hop1.stop();
     subscriber->close();
-    backend->stop();
+    stop_tcp_backend(backend);
 }
 
 #endif // !CRPC_DIST_TCP_UNSUPPORTED

@@ -24,10 +24,6 @@ crpc::span<const std::byte> byte_span(const std::string& s) {
         reinterpret_cast<const std::byte*>(s.data()), s.size());
 }
 
-crpc::span<const std::byte> byte_span(const char* data, std::size_t size) {
-    return crpc::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(data), size);
-}
 
 // Builds a std::u16string from an explicit code-unit list.
 std::u16string u16(const std::vector<std::uint16_t>& units) {

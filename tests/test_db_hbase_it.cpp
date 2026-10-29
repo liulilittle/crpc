@@ -27,7 +27,7 @@
 #include <crpc/db/hbase/rest.hpp>
 #include <crpc/error.hpp>
 #include <crpc/http/client.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace {
 
@@ -73,7 +73,7 @@ void report(const char* what, const crpc::rpc_error& error) {
 }
 
 struct it_session {
-    crpc::iocp_backend backend;
+    tcp_backend backend;
     std::unique_ptr<crpc::db::hbase::client> session;
 
     it_session() {
@@ -91,7 +91,7 @@ struct it_session {
         const std::uint16_t port = options.port;
         // Named `owner`: `backend` is also the member name, and shadowing it is a warning
         // here and a confusing capture later.
-        crpc::iocp_backend* owner = &this->backend;
+        tcp_backend* owner = &this->backend;
         session = std::unique_ptr<crpc::db::hbase::client>(new crpc::db::hbase::client(
             std::move(options), [owner, host, port, http_options]() {
                 crpc::http::client_options copy = http_options;

@@ -266,12 +266,31 @@ result<udp_datagram> udp_socket::recv_from(span<std::byte> buffer,
                                    count, 0, reinterpret_cast<sockaddr*>(&source_storage),
                                    &source_len);
 #else
+        // Linux reports an oversized datagram differently from Windows: a
+        // plain recvfrom(2) silently truncates to the buffer size and returns
+        // success, so the caller could never tell that bytes were dropped.
+        // MSG_TRUNC makes the return value the real datagram length (which may
+        // exceed the buffer) while still copying at most buffer.size() bytes;
+        // a length beyond the buffer therefore means the datagram was clipped
+        // and is rejected below, matching the Windows WSAEMSGSIZE branch. The
+        // two platforms use different mechanisms and must not be "unified"
+        // into one code path.
         socklen_t source_len = sizeof(source_storage);
-        const ssize_t got = ::recvfrom(self.sock, buffer.data(), buffer.size(), 0,
+        const ssize_t got = ::recvfrom(self.sock, buffer.data(), buffer.size(),
+                                       MSG_TRUNC,
                                        reinterpret_cast<sockaddr*>(&source_storage),
                                        &source_len);
 #endif
         if (got >= 0) {
+#if !defined(CRPC_OS_WINDOWS)
+            // With MSG_TRUNC the return value is the real datagram length: a
+            // length beyond the receive buffer means the datagram was
+            // truncated (Windows surfaces the same condition as WSAEMSGSIZE).
+            if (got > static_cast<ssize_t>(buffer.size())) {
+                return rpc_error{rpc_code::invalid_argument,
+                                 "datagram is larger than the receive buffer"};
+            }
+#endif
             udp_datagram datagram;
             datagram.bytes = static_cast<std::size_t>(got);
             std::string source_host;

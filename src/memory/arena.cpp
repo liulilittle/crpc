@@ -118,9 +118,23 @@ private:
 
     void* allocate_dedicated(std::size_t bytes, std::size_t alignment) {
         // The extra `alignment` bytes guarantee the aligned range fits even
-        // when the raw base address is misaligned.
-        std::unique_ptr<std::byte[]> data(
-            new (std::nothrow) std::byte[bytes + alignment]);
+        // when the raw base address is misaligned. The sum is checked first:
+        // `bytes + alignment` wraps for a request near SIZE_MAX, and a wrapped
+        // (tiny) size would hand back a buffer far smaller than `bytes` while
+        // the arena reported it as a successful allocation of `bytes`. GCC
+        // flags the wrap under -Walloc-size-larger-than= in optimized builds;
+        // refusing the request is the correct answer on every platform.
+        // PTRDIFF_MAX is the standard's ceiling for an object's size, and it
+        // is also the bound GCC needs to see: guarding only against wraparound
+        // still admits `bytes == SIZE_MAX` with `alignment == 0`, which is not
+        // an object anyone can allocate.
+        const std::size_t ceiling =
+            static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+        if (bytes > ceiling - alignment) {
+            return nullptr;
+        }
+        const std::size_t total = bytes + alignment;
+        std::unique_ptr<std::byte[]> data(new (std::nothrow) std::byte[total]);
         if (data == nullptr) {
             return nullptr;
         }
@@ -128,7 +142,7 @@ private:
             reinterpret_cast<std::uintptr_t>(data.get());
         const std::uintptr_t aligned = align_up(base, alignment);
         const std::size_t offset = static_cast<std::size_t>(aligned - base);
-        block b{std::move(data), bytes + alignment, offset + bytes};
+        block b{std::move(data), total, offset + bytes};
         huge_.push_back(std::move(b));
         return record(bytes, aligned);
     }

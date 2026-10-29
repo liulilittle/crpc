@@ -4910,18 +4910,6 @@ struct remote_breaker_fixture {
     }
 };
 
-// Runs one call to completion and returns its code. Opening a breaker needs the
-// terminal result to be recorded, so the handle must be consumed, not dropped.
-int run_one(crpc::client::stub<int, int>& stub, int argument) {
-    auto started = stub.call(argument);
-    if (!started.ok()) {
-        return static_cast<int>(started.code());
-    }
-    auto handle = std::move(started).value();
-    const auto result = handle.get();
-    return result.ok() ? 0 : static_cast<int>(result.code());
-}
-
 CRPC_TEST(fallback_rejects_a_remote_refusal_for_a_non_idempotent_call) {
     // Given: an open server breaker and a non-idempotent client call.
     remote_breaker_fixture f("crpc-fallback-remote-nonidem", false);

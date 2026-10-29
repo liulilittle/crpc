@@ -138,7 +138,8 @@ public:
         std::size_t max_frame_payload = 64u * 1024u * 1024u;
     };
 
-    explicit frame_decoder(options opt = options{}) noexcept;
+    explicit frame_decoder(options opt) noexcept;
+    frame_decoder() noexcept : frame_decoder(options{}) {}
 
     [[nodiscard]] frame_status feed(span<const std::byte> data,
                                     decoded_frame& out);
