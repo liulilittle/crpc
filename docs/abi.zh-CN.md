@@ -149,7 +149,9 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 `io::tls_config`（按值传入 `http_server::http_server` / `listen_tls`，且
 `tls_context::config` 按值返回 `tls_config`）、`rpc::method_options`（按值传入
 `method_slot` / `service_registry::register_method`）、`push::subscribe_options`
-（按值传入 `hub::subscribe`）、以及 `resilience::rate_limit_config` /
+（按值传入 `hub::subscribe`）、`db::mysql::connection_options`（按值传入导出的
+`mysql::connection` 构造函数；其内嵌 `tls` 结构体承载握手读取的 TLS 传输策略）、
+以及 `resilience::rate_limit_config` /
 `breaker_config` / `bulkhead_config` / `retry_policy`（按引用传入各自构造函数）。
 真正在本范围之外的，是**完全没有** out-of-line 入口的结构体；下列清单由
 `crpc_test_abi_docs` 维护，不靠手写。
@@ -184,6 +186,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::db::mysql::err_packet`
 - `::crpc::db::mysql::handshake`
 - `::crpc::db::mysql::handshake_response_options`
+- `::crpc::db::mysql::connection_options`
 - `::crpc::db::mysql::ok_packet`
 - `::crpc::db::mysql::binary_row`
 - `::crpc::db::mysql::prepare_ok`

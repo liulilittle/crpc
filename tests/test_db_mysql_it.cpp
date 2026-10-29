@@ -104,7 +104,11 @@ CRPC_TEST(mysql_it_select_one) {
 CRPC_TEST(mysql_it_prepared_insert_and_select) {
     (void)require_server();
     it_session session;
-    CRPC_CHECK(session.db->execute("DROP TABLE IF EXISTS it_users").ok());
+    const crpc::status dropped = session.db->execute("DROP TABLE IF EXISTS it_users");
+    if (!dropped.ok()) {
+        std::printf("  drop error: %s\n", dropped.message().c_str());
+    }
+    CRPC_CHECK(dropped.ok());
     CRPC_CHECK(session.db
                    ->execute("CREATE TABLE it_users (id BIGINT PRIMARY KEY, name VARCHAR(64), "
                              "amount DECIMAL(10,2), note TEXT)")
@@ -401,6 +405,10 @@ CRPC_TEST(mysql_it_caching_sha2_full_auth) {
 
     // First session: whatever the cache state is, it must connect.
     crpc::result<crpc::db::connection*> first_opened = factory.open();
+    if (!first_opened.ok()) {
+        std::printf("  csha2 connect error: %s\n",
+                    std::string(first_opened.error().message).c_str());
+    }
     CRPC_CHECK(first_opened.ok());
     if (!first_opened.ok()) {
         return;
@@ -444,5 +452,244 @@ CRPC_TEST(mysql_it_caching_sha2_full_auth) {
         CRPC_CHECK_EQ(static_cast<std::int64_t>(1), rows->get_int64(0).value());
     }
 }
+
+// --- TLS transport (CRPC_WITH_OPENSSL builds) --------------------------------
+//
+// The connection details are the primary at CRPC_MYSQL_HOST/PORT. The server's
+// certificate is the self-signed pair MySQL generated at install time, so the
+// TLS cases disable certificate verification -- the *default* stays on, and
+// the unit suite (test_db_mysql_tls.cpp) covers the verification-on path.
+//
+// "Connected" proves nothing about encryption: a cleartext session connects
+// just the same. The load-bearing assertion is SHOW STATUS LIKE 'Ssl_cipher'
+// -- the server's own per-session verdict that a cipher is in use.
+
+namespace {
+
+struct it_tls_options {
+    bool enabled = false;
+    bool verify_certificate = false;
+};
+
+// Opens one direct session (no pool) with the requested TLS policy. `session`
+// is null when the handshake failed; factory_open_error() then says why.
+struct tls_it_session {
+    crpc::iocp_backend backend;
+    std::unique_ptr<crpc::db::mysql::connection_factory> factory;
+    std::unique_ptr<crpc::db::mysql::connection> session;
+    std::string open_error;
+
+    tls_it_session(const it_tls_options& tls, const char* user = nullptr,
+                   const char* password = nullptr) {
+        crpc::db::mysql::connection_options options;
+        options.user = user != nullptr ? user : env_or("CRPC_MYSQL_USER", "crpc");
+        options.password = password != nullptr ? password : env_or("CRPC_MYSQL_PASSWORD", "crpc_pw");
+        options.database = env_or("CRPC_MYSQL_DB", "crpc_it");
+        options.tls_options.enabled = tls.enabled;
+        options.tls_options.verify_certificate = tls.verify_certificate;
+        const std::string host = env_or("CRPC_MYSQL_HOST", "127.0.0.1");
+        const std::string port = env_or("CRPC_MYSQL_PORT", "3306");
+        factory.reset(new crpc::db::mysql::connection_factory(
+            options, backend,
+            crpc::endpoint::tcp(host, static_cast<std::uint16_t>(std::stoi(port)))));
+        crpc::result<crpc::db::connection*> opened = factory->open();
+        if (opened.ok()) {
+            session.reset(static_cast<crpc::db::mysql::connection*>(opened.value()));
+        } else {
+            open_error = std::string(opened.error().message);
+        }
+    }
+
+    [[nodiscard]] const std::string& factory_open_error() const noexcept {
+        return open_error;
+    }
+};
+
+// Reads a single-string status value (SHOW STATUS / SELECT @@...), empty on
+// any failure.
+std::string it_scalar(crpc::db::mysql::connection& session, const char* sql) {
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status ran = session.query(sql, {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    if (!ran.ok()) {
+        std::printf("  scalar query '%s' failed: %s\n", sql, ran.error().message.c_str());
+        return std::string();
+    }
+    if (rows == nullptr || !rows->next()) {
+        std::printf("  scalar query '%s': no row\n", sql);
+        return std::string();
+    }
+    // SHOW STATUS has two columns (name, value); SELECT @@... has one.
+    const std::size_t value_column = rows->column_count() > 1 ? 1 : 0;
+    if (rows->is_null(value_column)) {
+        std::printf("  scalar query '%s': null value\n", sql);
+        return std::string();
+    }
+    return std::string(rows->get_text(value_column).value());
+}
+
+// Restores require_secure_transport=OFF no matter how the case ends: the
+// variable is global, and leaving it ON would poison every later MySQL
+// session on this server.
+struct secure_transport_guard {
+    crpc::db::mysql::connection* control = nullptr;
+    bool armed = false;
+
+    ~secure_transport_guard() {
+        if (armed && control != nullptr) {
+            crpc::db::result_set* ignored = nullptr;
+            (void)control->query("SET GLOBAL require_secure_transport=OFF", {}, &ignored);
+            crpc::db::statement_guard release(ignored);
+        }
+    }
+};
+
+} // namespace
+
+#if defined(CRPC_HAVE_OPENSSL)
+
+CRPC_TEST(mysql_it_tls_connects_and_server_reports_cipher) {
+    (void)require_server();
+    tls_it_session it({true, false});
+    CRPC_CHECK(it.session != nullptr);
+    if (it.session == nullptr) {
+        std::printf("  tls connect error: %s\n", it.factory_open_error().c_str());
+        return;
+    }
+    CRPC_CHECK(it.session->is_open());
+    CRPC_CHECK(it.session->tls_active());
+
+    // The server's verdict, not the client's flag: a cipher name here is what
+    // distinguishes "the bytes are encrypted" from "the session is open".
+    const std::string cipher = it_scalar(*it.session, "SHOW STATUS LIKE 'Ssl_cipher'");
+    std::printf("  Ssl_cipher = '%s'\n", cipher.c_str());
+    CRPC_CHECK(!cipher.empty());
+
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status ran = it.session->query("SELECT 1", {}, &rows);
+    crpc::db::statement_guard rows_guard(rows);
+    CRPC_CHECK(ran.ok());
+    if (ran.ok() && rows != nullptr) {
+        CRPC_CHECK(rows->next());
+        CRPC_CHECK_EQ(static_cast<std::int64_t>(1), rows->get_int64(0).value());
+    }
+}
+
+CRPC_TEST(mysql_it_tls_full_auth_uses_the_cleartext_path) {
+    (void)require_server();
+    // caching_sha2_password account; the FLUSH PRIVILEGES empties the server's
+    // fast-auth cache so the next login must take the full path. Over TLS that
+    // path is the cleartext password (no RSA key round trip) -- which is only
+    // reachable when the client saw the link as secure.
+    const std::string user = env_or("CRPC_MYSQL_SHA2_USER", "csha2");
+    const std::string password = env_or("CRPC_MYSQL_SHA2_PASSWORD", "csha2_pw");
+    tls_it_session warm({true, false}, user.c_str(), password.c_str());
+    CRPC_CHECK(warm.session != nullptr);
+    if (warm.session == nullptr) {
+        return;
+    }
+    crpc::db::result_set* ignored = nullptr;
+    const crpc::status flushed =
+        warm.session->query("FLUSH PRIVILEGES", {}, &ignored);
+    crpc::db::statement_guard flushed_guard(ignored);
+
+    tls_it_session cold({true, false}, user.c_str(), password.c_str());
+    CRPC_CHECK(cold.session != nullptr);
+    if (cold.session == nullptr) {
+        return;
+    }
+    CRPC_CHECK(cold.session->is_open());
+    CRPC_CHECK(cold.session->tls_active());
+    CRPC_CHECK_EQ(std::string("caching_sha2_password"), cold.session->auth_plugin());
+    if (flushed.ok()) {
+        // Full auth ran, and it ran over TLS: success here is only possible
+        // through the cleartext-password path, because the RSA branch is
+        // gated on the link NOT being secure.
+        CRPC_CHECK(cold.session->used_full_authentication());
+    }
+    const std::string cipher = it_scalar(*cold.session, "SHOW STATUS LIKE 'Ssl_cipher'");
+    CRPC_CHECK(!cipher.empty());
+}
+
+CRPC_TEST(mysql_it_require_secure_transport_on_blocks_plaintext) {
+    (void)require_server();
+    // Control session first, while the server still accepts cleartext: it
+    // both sets the variable and is the RAII restore path.
+    tls_it_session control({false, false});
+    CRPC_CHECK(control.session != nullptr);
+    if (control.session == nullptr) {
+        return;
+    }
+    crpc::db::result_set* ignored = nullptr;
+    const crpc::status enabled = control.session->query(
+        "SET GLOBAL require_secure_transport=ON", {}, &ignored);
+    crpc::db::statement_guard enabled_guard(ignored);
+    if (!enabled.ok()) {
+        // Without the SYSTEM_VARIABLES_ADMIN privilege the scenario cannot be
+        // staged on this server; skipping is honest, failing is noise.
+        crpc_test::skip("cannot SET GLOBAL require_secure_transport (privilege?)");
+    }
+    secure_transport_guard restore;
+    restore.control = control.session.get();
+    restore.armed = true;
+
+    // TLS still connects, and the server confirms the cipher.
+    tls_it_session secured({true, false});
+    CRPC_CHECK(secured.session != nullptr);
+    if (secured.session != nullptr) {
+        CRPC_CHECK(secured.session->is_open());
+        const std::string cipher =
+            it_scalar(*secured.session, "SHOW STATUS LIKE 'Ssl_cipher'");
+        CRPC_CHECK(!cipher.empty());
+    }
+
+    // Cleartext is refused with the server's own message.
+    tls_it_session plain({false, false});
+    CRPC_CHECK(plain.session == nullptr);
+    if (plain.session == nullptr) {
+        const std::string why = plain.factory_open_error();
+        std::printf("  plaintext refused: %s\n", why.c_str());
+        CRPC_CHECK(why.find("insecure transport") != std::string::npos);
+    }
+
+    // Restore now, asserted, while the control session is alive: the value
+    // must be observed back at 0, not merely assumed.
+    crpc::db::result_set* off_rows = nullptr;
+    const crpc::status disabled = control.session->query(
+        "SET GLOBAL require_secure_transport=OFF", {}, &off_rows);
+    crpc::db::statement_guard disabled_guard(off_rows);
+    CRPC_CHECK(disabled.ok());
+    const std::string restored =
+        it_scalar(*control.session, "SELECT @@GLOBAL.require_secure_transport");
+    std::printf("  require_secure_transport after restore = '%s'\n", restored.c_str());
+    CRPC_CHECK_EQ(std::string("0"), restored);
+    restore.armed = false;  // the guard stays as a crash safety net
+}
+
+#else
+
+// Without a TLS backend an enabled request must fail explicitly -- never a
+// silent cleartext login -- and the same endpoint still serves plaintext.
+CRPC_TEST(mysql_it_tls_without_backend_refuses_explicitly) {
+    (void)require_server();
+    tls_it_session secured({true, false});
+    CRPC_CHECK(secured.session == nullptr);
+    if (secured.session == nullptr) {
+        const std::string why = secured.factory_open_error();
+        CRPC_CHECK(why.find("TLS") != std::string::npos);
+        CRPC_CHECK(why.find("CRPC_WITH_OPENSSL") != std::string::npos);
+    }
+
+    tls_it_session plain({false, false});
+    CRPC_CHECK(plain.session != nullptr);
+    if (plain.session != nullptr) {
+        crpc::db::result_set* rows = nullptr;
+        const crpc::status ran = plain.session->query("SELECT 1", {}, &rows);
+        crpc::db::statement_guard rows_guard(rows);
+        CRPC_CHECK(ran.ok());
+    }
+}
+
+#endif // CRPC_HAVE_OPENSSL
 
 CRPC_TEST_MAIN()
