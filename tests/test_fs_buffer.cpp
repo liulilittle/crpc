@@ -135,5 +135,40 @@ CRPC_TEST(fs_buffer_huge_append_refuses_without_trashing) {
     CRPC_CHECK_EQ(static_cast<std::size_t>(4), b.size());
     CRPC_CHECK_EQ(std::string_view("keep"), as_text(b));
 }
+
+// The refusal above must be a policy, not the allocator happening to fail. On a
+// 32-bit build `SIZE_MAX / 4` is 1 GiB, which a 32-bit process can actually
+// allocate, so without a ceiling the buffer allocated it and then copied from
+// the caller's null pointer (access violation 0xC0000005 in memcpy, x86 Debug
+// only -- x64 always failed the 4 EiB allocation, which is why the bug hid).
+CRPC_TEST(fs_buffer_ceiling_is_a_policy_not_an_allocation_accident) {
+    byte_buffer b("keep");
+    // One byte over the documented ceiling, with a real source: the request
+    // must be refused before anything is allocated or read.
+    const std::byte source = std::byte{0x41};
+    const status over = b.append(span<const std::byte>(
+        &source, byte_buffer::default_max_capacity + 1));
+    CRPC_CHECK_FALSE(over.ok());
+    CRPC_CHECK_EQ(rpc_code::resource_exhausted, over.code());
+    CRPC_CHECK_EQ(static_cast<std::size_t>(4), b.size());
+    CRPC_CHECK_EQ(std::string_view("keep"), as_text(b));
+
+    // The same bound applies to an explicit reserve.
+    const status reserved =
+        b.reserve(byte_buffer::default_max_capacity + 1);
+    CRPC_CHECK_FALSE(reserved.ok());
+    CRPC_CHECK_EQ(rpc_code::resource_exhausted, reserved.code());
+    CRPC_CHECK_EQ(std::string_view("keep"), as_text(b));
+
+    // Exactly at the ceiling is still a size the type will accept; it may fail
+    // to allocate on a small machine, which is a different answer than the
+    // policy refusal above and must not be conflated with it.
+    byte_buffer big;
+    const status at = big.reserve(byte_buffer::default_max_capacity);
+    if (!at.ok()) {
+        CRPC_CHECK_EQ(rpc_code::resource_exhausted, at.code());
+    }
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), big.size());
+}
 CRPC_TEST_MAIN()
 

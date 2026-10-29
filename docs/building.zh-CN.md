@@ -236,9 +236,19 @@ Debug 构建遇到 CRT 断言、无效参数、纯虚调用或访问违例时可
 
 ## 9. CI 复用 <a id="s9"></a>
 
-设计的 CI 矩阵是 MSVC x64 Debug/Release、MSVC x86 Debug/Release、GCC x64、Clang x64、ASan、UBSan、TSan、fuzz smoke、黄金字节与基准报告。CI 应像开发者一样调用 `scripts/build.*` 与 `scripts/test.*`；目前没有提交 CI YAML，脚本之外没有复制构建逻辑。本地等价命令是 `.\scripts\test.ps1 -Config Both -Arch x64 -Sanitizer none` 与 `./scripts/test.sh --config Debug --arch x64 --sanitizer all --compiler clang`。
+`.github/workflows/ci.yml` 已提交，每个 job 都是「检出 + 按文档化参数调用 `scripts/build.*` / `scripts/test.*`」——脚本之外没有复制任何构建逻辑，这正是脚本作为唯一事实来源的前提（需求 25）。
 
-“零警告”声明要求构建日志中没有 `warning:` 行；即使编译器没有报错，脚本也会把警告视为失败。`.opencode/process.md` 记录的 2026-10-19 状态是 x64 Debug 与 x86 Debug 上 16 个套件全绿；请重新运行脚本确认当前代码树。
+| Job | 矩阵 |
+| --- | --- |
+| `linux` | gcc x64 与 clang x64，各 Debug 与 Release |
+| `linux-sanitizers` | `test.sh --sanitizer all`（asan + ubsan + tsan） |
+| `windows` | MSVC x64，Debug 与 Release |
+
+两个平台都跑两种优化级，因为只在 Release 出现的缺陷已经发生过两次；Linux 同时跑两个编译器，因为 clang 的 `-Werror` 诊断并不是 MSVC `/W4` 的超集：有 5 处只在 clang 报的警告（未使用的常量、未使用的内部声明）藏在 Windows 上完全干净的代码里。
+
+尚未进入 workflow、仍需本地执行的部分：MSVC x86、fuzz smoke、黄金字节与基准报告。本地等价命令是 `.\scripts\test.ps1 -Config Both -Arch x64 -Sanitizer none`、`.\scripts\build.ps1 -Config Debug -Arch x86` 与 `./scripts/test.sh --config Debug --arch x64 --sanitizer all --compiler clang`。
+
+“零警告”声明要求构建日志中没有 `warning:` 行；即使编译器没有报错，脚本也会把警告视为失败。请重新运行脚本确认当前代码树；套件数量会随子系统增加而变化，因此这里不写死数字。
 
 ## 10. 故障排查 <a id="s10"></a>
 
