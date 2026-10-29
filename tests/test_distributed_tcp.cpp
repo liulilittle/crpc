@@ -109,8 +109,16 @@ inline tcp_backend_ptr make_tcp_backend() {
 // before the backend goes out of scope.
 inline void stop_tcp_backend(tcp_backend_ptr& backend) {
 #if defined(_WIN32)
-    stop_tcp_backend(backend);
+    // iocp_backend owns a pump thread and stops it explicitly. The call must
+    // name the member, not this helper: `stop_tcp_backend(backend)` here
+    // would be an unconditional self-recursion (MSVC C4717, stack overflow at
+    // run time). Linux never sees it because the branch is compiled out.
+    if (backend != nullptr) {
+        backend->stop();
+    }
 #else
+    // The epoll backend has no stop: its destructor is the shutdown path, and
+    // every test closes its connections before the backend goes out of scope.
     (void)backend;
 #endif
 }

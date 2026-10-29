@@ -186,9 +186,10 @@ http1_reply http1_exchange(tcp_backend& backend, const endpoint& ep,
         reply.body = http1_body(data);
         return reply;
     }
+    // `skip` is [[noreturn]] (it throws skipped_case), so nothing may follow
+    // it: MSVC flags the dead `return` as C4702, which -WX turns into an error.
     crpc_test::skip("server dropped the queued response (epoll abortive-close "
                     "race, reported)");
-    return http1_reply{};
 }
 
 // --- HTTP/2 client parse state (mirrors test_http_server.cpp) ---------------
