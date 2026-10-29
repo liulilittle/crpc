@@ -60,13 +60,17 @@ inline constexpr crc32_table crc32_lookup = make_crc32_table();
     return crc32_update(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
 }
 
-[[nodiscard]] constexpr std::uint32_t crc32_of(span<const std::byte> data) noexcept {
+// Not `constexpr`: a span holds a runtime pointer, and C++17 forbids
+// `reinterpret_cast` inside a constant expression (GCC rejects it under
+// -Werror=invalid-constexpr; MSVC accepts it). The pointer overload above stays
+// constexpr, which is what a compile-time caller needs.
+[[nodiscard]] inline std::uint32_t crc32_of(span<const std::byte> data) noexcept {
     return crc32_of(reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
 }
 
 // crpc::span has no implicit qualification conversion, so a writable view is
 // narrowed explicitly where a read-only span is needed.
-[[nodiscard]] constexpr std::uint32_t crc32_of(span<std::byte> data) noexcept {
+[[nodiscard]] inline std::uint32_t crc32_of(span<std::byte> data) noexcept {
     return crc32_of(reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
 }
 
