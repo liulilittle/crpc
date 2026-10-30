@@ -1336,6 +1336,15 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
 // has no `lock.` receiver, so it never matches. That also means no entry has to
 // budget for "the definition itself counts once", which is the accounting that made
 // the previous version pass with every caller deleted.
+//
+// Known limit, stated rather than papered over: this is a text gate, so it resists
+// deletion and rename but not deliberate forgery. A decoy that declares its own
+// `struct Fake { void stop_watchdog(int); };` and a variable named `lock` would match
+// this shape without being the real call. Closing that would mean parsing the file
+// and checking the receiver type -- at which point the check is doing a compiler's
+// job, and the honest remedy is to make forgetting the call impossible instead (the
+// redis suite already pins both directions of the watchdog behaviour). This gate
+// covers the accident; the tests cover the behaviour.
 struct api_call_contract {
     // Exact text a real call site contains, including the receiver.
     const char* prefix;
