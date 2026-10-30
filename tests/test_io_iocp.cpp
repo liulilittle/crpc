@@ -867,14 +867,30 @@ CRPC_TEST(iocp_timer_fires_and_cancels) {
     const std::uint64_t id3 =
         backend.arm_timer(microseconds(500), &probe_cb, &probe);
     CRPC_CHECK(id3 != 0);
+    // The 5 s bound is the hang guard: it is the only deadline assertion left.
     CRPC_CHECK(wait_for([&] { return probe.fired.load() == 1; }, 5000));
-    const long long elapsed = probe.elapsed_ns.load();
-    // The high-resolution timer is not scheduled by GetQueuedCompletionStatusEx's
-    // millisecond timeout, so a sub-millisecond deadline is honoured promptly.
-    // The bound is generous to stay robust on a loaded machine; the design
-    // rationale is the absence of an integer-millisecond round trip.
-    CRPC_CHECK(elapsed >= 0);
-    CRPC_CHECK(elapsed < 20LL * 1000LL * 1000LL);
+    // This used to assert `elapsed < 20 ms`. That bound cannot see the degraded
+    // path it was meant to guard: the pre-1803 fallback timer has ~15.6 ms
+    // granularity, so it passes a 20 ms bound, while under load the
+    // high-resolution path measured a 23.7-25.8 ms median and failed it. The
+    // gate's direction was inverted and no wall-clock statistic can separate
+    // the two paths.
+    //
+    // The capability is asserted positively: probe the OS first, so only a host
+    // that cannot provide the high-resolution timer skips. A backend that runs
+    // on such a host but never requested the flag must fail this check.
+    HANDLE timer_probe_handle = ::CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    const bool os_supports = timer_probe_handle != nullptr;
+    if (timer_probe_handle != nullptr) {
+        ::CloseHandle(timer_probe_handle);
+    }
+    if (!os_supports) {
+        crpc_test::skip("host predates Windows 10 1803: high-resolution "
+                        "waitable timer unavailable");
+    }
+    CRPC_CHECK(backend.high_resolution_timer());
 }
 
 

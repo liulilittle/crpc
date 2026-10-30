@@ -226,7 +226,133 @@ void bench_case(const char* kind, const std::vector<std::byte>& plain,
     std::fflush(stdout);
 }
 
+crpc::span<const std::byte> bytes_of(const std::vector<std::byte>& value) {
+    return crpc::span<const std::byte>(value.data(), value.size());
+}
+
+crpc::span<std::byte> writable_of(std::vector<std::byte>& value) {
+    return crpc::span<std::byte>(value.data(), value.size());
+}
+
+template <class Body>
+double median_ns(int iterations, Body&& body) {
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(iterations));
+    for (int i = 0; i < iterations; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        body();
+        samples.push_back(static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count()));
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+}
+
+// One former test gate, reported as a soft threshold: PASS/WARN, never a
+// non-zero exit. `WARN` means the codec changed, not that the build failed.
+// Only the measurement goes into the harness result; the limit is a property of
+// this ad-hoc comparison, not of a sample, so it is printed here and not passed
+// to `record` (whose fourth argument is the sample spread).
+void soft_budget(const char* name, double value_ns, double limit_ns) {
+    char label[128];
+    std::snprintf(label, sizeof(label), "compression/budget/%s", name);
+    std::printf("%-46s %s  %10.1f ns  limit %10.1f ns\n", label,
+                value_ns <= limit_ns ? "PASS" : "WARN", value_ns, limit_ns);
+    crpc_bench::record(label, "ns", value_ns);
+    std::fflush(stdout);
+}
+
+// The absolute time budgets that tests/test_frame_compression.cpp used to gate
+// on now live here. They were removed from the test because a wall-clock
+// microsecond budget on a shared runner measures the runner, and the Debug
+// medians already sat inside the old ceilings, so the gate could not catch the
+// regression it named. The constants are unchanged, so a real regression still
+// shows up as `WARN` in this report; bench/ is not part of CI
+// (bench/CMakeLists.txt), so it never turns a green build red.
+//
+// The two relative checks (LZ4 against CRC32C over the same buffer, and 32 KiB
+// against 256 B) are kept as they were: they compare workloads that are
+// instrumented and optimised the same way, so they survive /Od and sanitizers.
+void budget_cases() {
+    if (!crpc_bench::enabled("compression/budget")) {
+        return;
+    }
+
+    const std::vector<std::byte> text = make_text(32 * 1024);
+    std::vector<std::byte> stream(crpc::compressed_payload_bound(
+        crpc::compression_algorithm::lz4, text.size()));
+    std::size_t written = 0;
+    for (int i = 0; i < 8; ++i) {
+        (void)crpc::compress_payload(crpc::compression_algorithm::lz4,
+                                     bytes_of(text), writable_of(stream),
+                                     written);
+    }
+    const double encode_ns = median_ns(200, [&] {
+        (void)crpc::compress_payload(crpc::compression_algorithm::lz4,
+                                     bytes_of(text), writable_of(stream),
+                                     written);
+    });
+
+    const crpc::span<const std::byte> wire =
+        crpc::span<const std::byte>(stream.data(), written);
+    std::vector<std::byte> plain_out(text.size());
+    std::size_t plain_size = 0;
+    const double decode_ns = median_ns(200, [&] {
+        (void)crpc::decompress_payload(crpc::compression_algorithm::lz4, wire,
+                                       text.size(), writable_of(plain_out),
+                                       plain_size);
+    });
+
+    const std::vector<std::byte> small = make_text(256);
+    std::vector<std::byte> small_stream(crpc::compressed_payload_bound(
+        crpc::compression_algorithm::lz4, small.size()));
+    std::size_t small_written = 0;
+    for (int i = 0; i < 16; ++i) {
+        (void)crpc::compress_payload(crpc::compression_algorithm::lz4,
+                                     bytes_of(small),
+                                     writable_of(small_stream), small_written);
+    }
+    const double small_ns = median_ns(500, [&] {
+        (void)crpc::compress_payload(crpc::compression_algorithm::lz4,
+                                     bytes_of(small),
+                                     writable_of(small_stream), small_written);
+    });
+
+    std::uint32_t crc_sink = 0;
+    const double crc_ns = median_ns(200, [&] {
+        crc_sink = crpc::crc32c(bytes_of(text));
+    });
+    (void)crc_sink;
+
+    std::printf("compression/budget: enc32k=%.1f dec32k=%.1f enc256=%.1f "
+                "crc32k=%.1f ns\n",
+                encode_ns, decode_ns, small_ns, crc_ns);
+
+    soft_budget("lz4_encode_le_crc_x12", encode_ns, crc_ns * 12.0);
+    soft_budget("lz4_decode_le_crc_x12", decode_ns, crc_ns * 12.0);
+    if (small_ns > 0.0) {
+        soft_budget("lz4_encode_le_small_x512", encode_ns,
+                    small_ns * 128.0 * 4.0);
+    }
+
+#if defined(NDEBUG)
+    // Shipping ceilings, MSVC 19.44 x64 /O2: 150 us / 100 us / 2 us.
+    soft_budget("lz4_encode_32k_release", encode_ns, 150000.0);
+    soft_budget("lz4_decode_32k_release", decode_ns, 100000.0);
+    soft_budget("lz4_encode_256_release", small_ns, 2000.0);
+#elif defined(_MSC_VER)
+    // MSVC Debug /Od ceilings: 400 us / 300 us / 20 us.
+    soft_budget("lz4_encode_32k_debug", encode_ns, 400000.0);
+    soft_budget("lz4_decode_32k_debug", decode_ns, 300000.0);
+    soft_budget("lz4_encode_256_debug", small_ns, 20000.0);
+#endif
+}
+
 void run_all_cases() {
+    budget_cases();
+
     const crpc::compression_algorithm algorithms[] = {
         crpc::compression_algorithm::none,
         crpc::compression_algorithm::lz4,

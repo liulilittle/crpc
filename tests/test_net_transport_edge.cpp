@@ -124,14 +124,16 @@ CRPC_TEST(net_accept_cancelled_by_close) {
 
     // Let the waiter block in select, then cancel from this thread.
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    const auto started = std::chrono::steady_clock::now();
     bound.value()->close();
-    CRPC_CHECK(crpc_test::wait_for([&] { return returned.load(); }, 4000));
+    // The wait bound is the only deadline. The old pair -- a 4000 ms wait plus a
+    // separate `elapsed < 3 s` check -- accepted a 3.5 s wake and then failed
+    // it, so a slow but correct wake was red. 2 s is the contract, and the
+    // `shutting_down` code below is what proves the semantics; a wall-clock
+    // assertion on top of it adds no signal.
+    CRPC_CHECK(crpc_test::wait_for([&] { return returned.load(); }, 2000));
     waiter.join();
-    const auto elapsed = std::chrono::steady_clock::now() - started;
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::shutting_down),
                   code.load());
-    CRPC_CHECK(elapsed < std::chrono::seconds(3));
     CRPC_CHECK_FALSE(bound.value()->is_open());
     // Idempotent.
     bound.value()->close();

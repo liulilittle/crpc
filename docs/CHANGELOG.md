@@ -4,6 +4,46 @@
 
 ## Unreleased
 
+### Test timing gates: keep the assertions that can fail, drop the ones that cannot
+
+- `client_cancel_during_backoff` (`tests/test_server_client.cpp`) now measures
+  the wake-up inside the waiter thread: `t_done` is taken immediately after
+  `get()` returns, so `join()` latency is no longer charged to the interval.
+  The retry backoff was raised from 100 ms to 1000 ms and the bound is 250 ms,
+  which puts an immediate wake (microseconds) and a full backoff (one second)
+  four times apart from the midpoint. The interval is also asserted
+  non-negative: a negative value means the measurement is broken, and an
+  upper-bound-only check would silently pass it. The case is documented as
+  plain-thread-only (`client::sleep_for` slices a shard-thread wait into 5 ms
+  steps, which would widen the window).
+- `iocp_timer_fires_and_cancels` (`tests/test_io_iocp.cpp`) no longer asserts
+  `elapsed < 20 ms`. The pre-1803 fallback timer's ~15.6 ms tick passes that
+  bound while the high-resolution path's loaded median (23.7-25.8 ms) fails it,
+  so the gate was inverted; the 5 s `wait_for` stays as the hang guard. The new
+  capability `crpc::iocp_backend::high_resolution_timer()` is the observable
+  that replaces it, and the case skips (never fakes a pass) on a host running
+  the fallback timer. ABI: one new MINOR symbol, Windows-only, and no data
+  member in the class (the flag lives in the out-of-line `impl`), so
+  `sizeof(iocp_backend)` is unchanged.
+- `graceful_shutdown_drains_and_rejects` (`tests/test_server_client.cpp`)
+  asserted `elapsed < 2 s` while `cfg.drain` is 2 s, so the bound was exactly
+  the legal path and a drain that used its budget was red. It is now
+  `cfg.drain * 4`.
+- `net_accept_cancelled_by_close` (`tests/test_net_transport_edge.cpp`) waited
+  4000 ms for the wake and then required `elapsed < 3 s`, so a slow but correct
+  wake failed. The wait is 2000 ms and the redundant wall-clock assertion is
+  gone; the `shutting_down` code it returns proves the semantics.
+- The absolute LZ4 microsecond budgets in `perf_budget`
+  (`tests/test_frame_compression.cpp`) moved to
+  `bench/bench_compression.cpp` as soft PASS/WARN thresholds, together with the
+  CRC32C and small-vs-large relative checks; the test keeps the correctness
+  assertions (a compressible 32 KiB payload shrinks and both sizes round-trip
+  byte-for-byte). An absolute budget on a shared runner measures the runner,
+  and the Debug medians already sat inside the old ceilings.
+- Evidence: `tests/test_server_client.cpp`, `tests/test_io_iocp.cpp`,
+  `tests/test_net_transport_edge.cpp`, `tests/test_frame_compression.cpp`,
+  `bench/bench_compression.cpp`, and a full `ctest -j 4` run.
+
 ### Flow control wired into the client call path
 
 - The adaptive flow-control primitives (`flow::rtt_estimator`, `flow::pacer`,

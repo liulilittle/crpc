@@ -418,6 +418,9 @@ struct iocp_backend::impl {
 
     HANDLE timer_handle = nullptr;
     HANDLE timer_wake = nullptr;
+    // Set when the high-resolution waitable timer was created; cleared when the
+    // host predates Windows 10 1803 and the standard timer is used instead.
+    std::atomic<bool> high_resolution_timer{false};
     std::thread timer_thread;
     std::atomic<bool> timer_stopping{false};
     std::mutex tmutex;
@@ -1337,12 +1340,22 @@ void iocp_backend::impl::init() noexcept {
         return;
     }
 
+    // The capability flag must describe what was *requested*, not merely that a
+    // handle came back: CreateWaitableTimerExW also succeeds with flags == 0, so
+    // keying the flag on "handle != nullptr" would silently report success after
+    // the high-resolution flag was dropped from the call. Deriving it from
+    // `timer_flags` makes that regression observable.
+    constexpr DWORD timer_flags = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
     timer_handle = ::CreateWaitableTimerExW(
-        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        nullptr, nullptr, timer_flags, TIMER_ALL_ACCESS);
     if (timer_handle == nullptr) {
         // Older than Windows 10 1803: fall back to a standard timer.  Deadlines
         // still work; only the resolution degrades.
         timer_handle = ::CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    } else {
+        high_resolution_timer.store(
+            (timer_flags & CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) != 0,
+            std::memory_order_release);
     }
     timer_wake = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (timer_handle == nullptr || timer_wake == nullptr) {
@@ -1963,6 +1976,10 @@ void iocp_backend::stop() noexcept {
 bool iocp_backend::running() const noexcept {
     return impl_ && impl_->valid.load(std::memory_order_acquire) &&
            !impl_->stopping.load(std::memory_order_acquire);
+}
+
+bool iocp_backend::high_resolution_timer() const noexcept {
+    return impl_ && impl_->high_resolution_timer.load(std::memory_order_acquire);
 }
 } // namespace crpc
 

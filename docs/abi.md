@@ -65,6 +65,15 @@ with, plus a consumer-side assertion that the size the consumer compiled against
 matches it. An accidental layout change in either direction fails that assertion
 instead of corrupting memory.
 
+The unreleased test-timing work adds one more MINOR symbol, Windows-only:
+`crpc::iocp_backend::high_resolution_timer()`, a `const noexcept` capability
+accessor that reports whether the backend created its timer with
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` or fell back to the pre-Windows-10-1803
+millisecond timer. It adds a symbol and no layout: `iocp_backend` is an exported
+class that already had out-of-line members, and the flag it reads lives in the
+out-of-line `impl` behind the existing `std::unique_ptr`, so
+`sizeof(iocp_backend)` is unchanged.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

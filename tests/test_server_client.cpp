@@ -1540,7 +1540,11 @@ CRPC_TEST(graceful_shutdown_drains_and_rejects) {
     delete thread;
 
     CRPC_CHECK(in_flight_code == 0);
-    CRPC_CHECK(elapsed < 2s);
+    // `cfg.drain` is 2 s above, so a legitimate drain may take the whole 2 s;
+    // the old `< 2s` bound was exactly the legal path and turned a drain that
+    // used its budget red. 4x the configured drain keeps a stuck stop() red
+    // while leaving every legal drain green.
+    CRPC_CHECK(elapsed < cfg.drain * 4);
     CRPC_CHECK(!f.srv->running());
 
     int after_code = -1;
@@ -2842,6 +2846,12 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
 
 // G22 Slice 2a: cancel during the backoff wait must wake the waiter at once and
 // must not issue another attempt.
+//
+// This case must keep running on a plain thread. On a shard thread
+// `client::sleep_for` cuts the backoff into 5 ms slices and re-checks the cancel
+// flag between them, so the wake-up latency would be bounded by one slice plus
+// scheduling instead of by the condition variable, and the 250 ms window below
+// would stop discriminating anything.
 CRPC_TEST(client_cancel_during_backoff) {
     fixture f;
     fixture_config cfg;
@@ -2849,8 +2859,8 @@ CRPC_TEST(client_cancel_during_backoff) {
     cfg.default_idempotent = true;
     cfg.configure_retry = true;
     cfg.retry.max_attempts = 3;
-    cfg.retry.initial_backoff = 100ms;
-    cfg.retry.max_backoff = 100ms;
+    cfg.retry.initial_backoff = 1000ms;
+    cfg.retry.max_backoff = 1000ms;
     cfg.retry.jitter_ratio = 0.0;
     cfg.retry.retry_budget = 10.0;
     CRPC_CHECK(start_inproc(f, cfg));
@@ -2872,39 +2882,61 @@ CRPC_TEST(client_cancel_during_backoff) {
 
     int code = -1;
     std::atomic<bool> returned{false};
-    std::chrono::nanoseconds latency{0};
+    // `done_us` is the getter's return time in the waiter's own timeline; the
+    // subtraction happens on this thread after `join()`, so the waiter never
+    // reads a cancel time that might not have been published yet.
+    std::atomic<long long> done_us{0};
     std::thread waiter([&] {
         auto result = handle->get();
+        // Timed in the waiter, not around `join()`: the join costs scheduler
+        // latency and would be charged to the wake-up under test.
+        const auto done = clock_type::now();
         code = result.ok() ? 0 : static_cast<int>(result.code());
+        done_us.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                          done.time_since_epoch())
+                          .count(),
+                      std::memory_order_release);
         returned.store(true, std::memory_order_release);
     });
 
     // The retry loop runs inside get(), so the synchronization point is the
-    // client's retry counter: it is incremented immediately before the 100 ms
+    // client's retry counter: it is incremented immediately before the 1000 ms
     // backoff wait. Observing it means the getter is about to block, and no
     // fixed sleep is needed. This replaces the previous 20 ms sleeps, which
     // raced both the first response and the retry loop.
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return f.cli->stats().retries >= 1; }, 2000));
-    // Diagnostic only, never a failure: on a slow host the getter may have
-    // already run out the backoff, which weakens this run but does not break
-    // the invariant under test. The retry counter above is the real sync point.
-    if (returned.load(std::memory_order_acquire)) {
-        std::printf("NOTE client_cancel_during_backoff: getter returned before "
-                    "cancel; wake-up path not exercised\n");
-    }
+    // If the getter already returned, the 1000 ms backoff window was missed,
+    // which takes a loaded host or a stalled clock. That run did not exercise
+    // the wake-up path, and the lower-bound guard below would fail on a cancel
+    // time the waiter never observed, so the case skips instead of asserting
+    // either way.
+    const bool returned_before_cancel =
+        returned.load(std::memory_order_acquire);
 
     const auto cancel_time = clock_type::now();
+    const long long cancel_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            cancel_time.time_since_epoch())
+            .count();
     handle->cancel();
     waiter.join();
-    latency = clock_type::now() - cancel_time;
 
+    if (returned_before_cancel) {
+        crpc_test::skip("getter returned before cancel; wake-up path not "
+                        "exercised");
+    }
     CRPC_CHECK(returned.load(std::memory_order_acquire));
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled), code);
-    // Half the 100 ms backoff: cancel must wake the waiter at once instead of
-    // letting the delay run out. 50 ms is the discriminating midpoint between
-    // an immediate wake and the full backoff, and must not be widened.
-    CRPC_CHECK(latency < 50ms);
+    const long long measured_us =
+        done_us.load(std::memory_order_acquire) - cancel_us;
+    // The backoff is 1000 ms, so the two outcomes are 4x apart from the
+    // midpoint: an immediate wake measures microseconds, running the delay out
+    // measures the full second. The lower bound is not redundant: a negative
+    // interval would mean the two timestamps were taken in the wrong order, and
+    // such a value would satisfy an upper-bound-only check.
+    CRPC_CHECK(measured_us >= 0);
+    CRPC_CHECK(measured_us < 250000);
     CRPC_CHECK_EQ(1, f.service.flaky_calls.load());
 
     handle.reset();
