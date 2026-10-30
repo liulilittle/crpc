@@ -14,6 +14,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -259,6 +260,60 @@ CRPC_TEST(redis_lock_zero_retry_delay_does_not_spin) {
     const std::size_t attempts_cap =
         2 * static_cast<std::size_t>(options.acquire_timeout.count());
     CRPC_CHECK(count_of(executor.executed, "SET") <= attempts_cap);
+}
+
+// The watchdog renews every handle at one third of the TTL. Without the renewal
+// thread a holder that outlives the lease silently loses the lock -- the caller
+// still believes it holds it, and the next owner can take it concurrently. This
+// case pins the renewal itself: after several periods the lease must have been
+// extended more than once and the handle must still be held.
+CRPC_TEST(redis_lock_watchdog_renews_past_one_ttl) {
+    lock_executor executor;
+    executor.set_results.push_back(true);
+    lock_options options = quick_options();
+    options.acquire_timeout = std::chrono::milliseconds(3000);
+    options.ttl = std::chrono::milliseconds(30);
+    options.retry_delay = std::chrono::milliseconds(1);
+    distributed_lock lock(executor, options);
+    lock.start_watchdog();
+
+    auto handle = lock.acquire("orders", "worker-ttl");
+    CRPC_CHECK(handle.ok());
+    if (!handle.ok()) {
+        lock.stop_watchdog();
+        return;
+    }
+    // The renewal period is one third of the TTL, so 300 ms spans several of
+    // them and more than one renewal must have landed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    CRPC_CHECK(count_of(executor.executed, "EVAL") >= 2);
+    CRPC_CHECK_EQ(std::size_t{1}, lock.held());
+    lock.stop_watchdog();
+}
+
+// The counterpart: without the watchdog nothing renews, and that is the behaviour
+// callers get by default because nothing in the library starts it. Pinning it here
+// makes the contract explicit -- an acquire() alone does not keep a lease alive past
+// its TTL, so a caller that outlives the lease must ask for renewal.
+CRPC_TEST(redis_lock_without_watchdog_lets_the_lease_lapse) {
+    lock_executor executor;
+    executor.set_results.push_back(true);
+    lock_options options = quick_options();
+    options.acquire_timeout = std::chrono::milliseconds(3000);
+    options.ttl = std::chrono::milliseconds(30);
+    options.retry_delay = std::chrono::milliseconds(1);
+    distributed_lock lock(executor, options);
+
+    auto handle = lock.acquire("orders", "worker-nowd");
+    CRPC_CHECK(handle.ok());
+    if (!handle.ok()) {
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // No renewal command was issued, so the lease ran out unobserved.
+    CRPC_CHECK_EQ(std::size_t{0}, count_of(executor.executed, "EVAL"));
 }
 
 CRPC_TEST(redis_lock_renew_uses_cas_script) {
