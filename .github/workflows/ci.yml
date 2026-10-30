@@ -146,3 +146,36 @@ jobs:
           name: logs-windows-${{ matrix.config }}
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
+
+  # bench/ is off by default and is never part of the pass/fail gate, so nothing
+  # compiled it and its code could rot into something that does not build at all --
+  # while bench/CMakeLists.txt claims it is built "so that benchmark code cannot
+  # rot". This job makes that claim true: it compiles every benchmark and runs
+  # none of them, because a shared runner cannot produce comparable numbers.
+  bench-compile:
+    name: windows/bench-compile
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+
+      # --bench turns CRPC_BUILD_BENCH on; the build target list includes the
+      # benchmark executables, so a target that no longer compiles fails here.
+      - name: Build benchmarks
+        shell: pwsh
+        run: ./scripts/build.ps1 -Config Release -Arch x64 -Jobs $env:NUMBER_OF_PROCESSORS -Bench
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-bench-compile
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore

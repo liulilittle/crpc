@@ -24,6 +24,7 @@ SANITIZER="none"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 CLEAN=0
 SHARED=0
+BENCH=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_ROOT=""
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --jobs) JOBS="$2"; shift 2 ;;
     --clean) CLEAN=1; shift ;;
     --shared) SHARED=1; shift ;;
+    --bench) BENCH=1; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -93,6 +95,8 @@ esac
 
 SHARED_ARGS=(-DCRPC_BUILD_SHARED=OFF)
 [[ $SHARED -eq 1 ]] && SHARED_ARGS=(-DCRPC_BUILD_SHARED=ON)
+BENCH_ARGS=(-DCRPC_BUILD_BENCH=OFF)
+[[ $BENCH -eq 1 ]] && BENCH_ARGS=(-DCRPC_BUILD_BENCH=ON)
 
 # Dependency checkouts are CMake cache variables (CRPC_RTTI_DIR,
 # CRPC_COROCC_DIR). The top-level CMakeLists.txt also falls back to the
@@ -148,7 +152,7 @@ for cfg in "${CONFIGS[@]}"; do
       -DCMAKE_BUILD_TYPE="$cfg" \
       -DCMAKE_C_COMPILER="$CC_COMPILER" -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
       -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON \
-      "${SHARED_ARGS[@]}" \
+      "${SHARED_ARGS[@]}" "${BENCH_ARGS[@]}" \
       "${DEP_ARGS[@]}" \
       "${ARCH_ARGS[@]}" "${SAN_ARGS[@]}" >>"$LOG" 2>&1; then
     log ERROR "configure failed ($cfg), see $LOG"

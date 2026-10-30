@@ -39,6 +39,11 @@ param(
     # documentation example that no longer builds is worse than none.
     [switch]$Examples,
 
+    # Also build the microbenchmarks. They are OFF in CMake by default and are
+    # never run by the test gate, so without this switch bench/ is never compiled
+    # at all and its soft thresholds can rot into code that does not build.
+    [switch]$Bench,
+
     # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
     # parameter defaults before $PSScriptRoot is populated, so a default of
     # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
@@ -204,6 +209,9 @@ foreach ($cfg in $configs) {
     }
     if ($Examples) {
         $configureArgs += '-DCRPC_BUILD_EXAMPLES=ON'
+    }
+    if ($Bench) {
+        $configureArgs += '-DCRPC_BUILD_BENCH=ON'
     }
 
     if ($vcvars) {
