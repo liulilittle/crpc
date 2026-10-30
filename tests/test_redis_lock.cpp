@@ -160,11 +160,12 @@ CRPC_TEST(redis_lock_acquire_retries_until_it_wins) {
     executor.set_results.push_back(true);
     lock_options options = quick_options();
     // This case pins the retry-until-success behaviour, not the budget edge, so the
-    // budget is wide on purpose. With the 30ms default a single sleep_for(5ms) that
-    // runs long is enough to exhaust the budget before the third attempt and make
-    // the case flaky: two nominal 5ms pauses already exceed 30ms on this platform.
-    // At 5000ms the retry only has to finish two short pauses well inside a budget
-    // that dwarfs any plausible scheduling delay.
+    // budget is wide on purpose. With the 30ms default a single sleep_for(5ms) whose
+    // actual duration reaches the 30ms budget is enough to end the loop before the
+    // third attempt, because the deadline is checked right before each pause, not
+    // after. The failing condition is one long pause, not two short ones summed: two
+    // 5ms pauses can total more than 30ms and still pass. At 5000ms only one pause
+    // would have to run for five seconds to end the loop early.
     options.acquire_timeout = std::chrono::milliseconds(5000);
     options.ttl = std::chrono::milliseconds(10000);
     distributed_lock lock(executor, options);
