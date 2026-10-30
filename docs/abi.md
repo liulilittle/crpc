@@ -258,7 +258,7 @@ extension.
 
 The layout invariants that are checkable without header changes live in one
 internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
-15 of the public records, an exact member count for the 15 records listed in
+16 of the public records, an exact member count for the 16 records listed in
 that file, a relative member chain over the counters of `http_statistics`,
 `client::statistics`, `client::resilience_statistics`,
 `resilience::fallback_statistics` and `server::statistics`

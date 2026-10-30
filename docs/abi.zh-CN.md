@@ -144,7 +144,7 @@ C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计�
 MINOR 扩展。
 
 无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
-它断言 15 个公开记录的标准布局属性、该文件中列出的 **15 个**记录的精确成员数量、
+它断言 16 个公开记录的标准布局属性、该文件中列出的 **16 个**记录的精确成员数量、
 `http_statistics` / `client::statistics` / `client::resilience_statistics` /
 `resilience::fallback_statistics` / `server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
 混用 `std::size_t` 与 `std::uint64_t` 的 `server::statistics` 在 32 位与 64 位
