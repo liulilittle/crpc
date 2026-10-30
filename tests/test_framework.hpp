@@ -355,11 +355,14 @@ void check_equal(const char* file, int line, const char* expression, const A& ex
     }
 }
 
-inline void check_true(const char* file, int line, const char* expression, bool value) {
+// Returns the observed value so CRPC_REQUIRE can abort a case on a failed
+// precondition. Plain CRPC_CHECK ignores the result.
+inline bool check_true(const char* file, int line, const char* expression, bool value) {
     ++check_count();
     if (!value) {
         report_failure(file, line, expression, "expected: true\n  actual:   false");
     }
+    return value;
 }
 
 inline void check_false(const char* file, int line, const char* expression, bool value) {
@@ -463,6 +466,17 @@ inline int run_all(int argc, char** argv) {
     static void crpc_test_##name()
 
 #define CRPC_CHECK(expr) ::crpc_test::check_true(__FILE__, __LINE__, #expr, (expr))
+// Aborts the current case after recording the failure. Use it for a precondition
+// whose violation would make the rest of the case dereference a null pointer or
+// otherwise crash: a second crash destroys the first failure's evidence (the
+// process dies before the runner can print which assertion failed), and under a
+// sanitizer it turns a clean assertion failure into an unreadable report.
+#define CRPC_REQUIRE(expr)                                                     \
+    do {                                                                      \
+        if (!::crpc_test::check_true(__FILE__, __LINE__, #expr, (expr))) {     \
+            return;                                                           \
+        }                                                                     \
+    } while (false)
 #define CRPC_CHECK_FALSE(expr) ::crpc_test::check_false(__FILE__, __LINE__, #expr, (expr))
 #define CRPC_CHECK_EQ(expected, actual)                                        \
     ::crpc_test::check_equal(__FILE__, __LINE__, #actual, (expected), (actual))

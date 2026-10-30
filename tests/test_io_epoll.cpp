@@ -62,10 +62,33 @@ bool wait_until(F pred, int timeout_ms = 3000) {
     return pred();
 }
 
+// Listener ports are drawn from below the kernel's ephemeral range.
+//
+// The old range (20000 + pid % 20000, plus up to 4000) reached ~44000, which
+// sits inside Linux's default `net.ipv4.ip_local_port_range` of 32768-60999.
+// Every outgoing connection this test makes takes an ephemeral port from that
+// same range, so a later listener could be asked to bind a port the kernel had
+// just handed to one of our own client sockets -- EADDRINUSE, and the fixture
+// failed. It reproduced on 15 of 30 consecutive runs on an idle machine
+// (verified against /proc/net/tcp: the TIME_WAIT entries were in 35552-35762,
+// inside both ranges).
+//
+// Staying below 32768 keeps the two spaces disjoint. The range is still
+// per-process so parallel test binaries rarely meet, and the fixture retries
+// a few candidates so a genuine clash costs one attempt instead of a case.
+constexpr int kPortFloor = 11000;
+constexpr int kPortSpan = 8000;   // 11000..18999, entirely below 32768
+
 std::uint16_t next_port() {
     static std::atomic<int> counter{0};
-    const int base = 20000 + (static_cast<int>(::getpid()) % 20000);
-    return static_cast<std::uint16_t>(base + (counter.fetch_add(7) % 4000));
+    // Both terms are offsets *within* the span, and the result is wrapped once
+    // into [kPortFloor, kPortFloor + kPortSpan). Adding the pid offset first and
+    // then wrapping would let the sum exceed the span and land outside the
+    // intended window.
+    const int pid_offset = static_cast<int>(::getpid()) % kPortSpan;
+    const int step = static_cast<int>(counter.fetch_add(7) % 1000);
+    return static_cast<std::uint16_t>(kPortFloor +
+                                      (pid_offset + step) % kPortSpan);
 }
 
 struct recording_source final : io::source {
@@ -254,21 +277,33 @@ struct fixture {
 
     fixture(io::epoll_backend& b, listen_options lo = listen_options{},
             connect_options co = connect_options{}) {
-        const std::uint16_t port = next_port();
-        ln = b.listen(endpoint::tcp("127.0.0.1", port), lo);
-        if (ln == nullptr) {
+        // A port collision with another process (or a leftover listener) is not
+        // a defect in the code under test, so it must cost another attempt, not
+        // a failed case. Only a bind that fails this many times is reported.
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const std::uint16_t port = next_port();
+            ln = b.listen(endpoint::tcp("127.0.0.1", port), lo);
+            if (ln == nullptr) {
+                continue;
+            }
+            ln->start(&acceptor);
+            client = b.connect(endpoint::tcp("127.0.0.1", port), co);
+            if (client == nullptr) {
+                ln->stop();
+                ln.reset();
+                continue;
+            }
+            if (!wait_until([&] { return acceptor.calls.load() == 1; })) {
+                client->close();
+                client.reset();
+                ln->stop();
+                ln.reset();
+                continue;
+            }
+            server = acceptor.take();
+            ok = server != nullptr;
             return;
         }
-        ln->start(&acceptor);
-        client = b.connect(endpoint::tcp("127.0.0.1", port), co);
-        if (client == nullptr) {
-            return;
-        }
-        if (!wait_until([&] { return acceptor.calls.load() == 1; })) {
-            return;
-        }
-        server = acceptor.take();
-        ok = server != nullptr;
     }
 };
 
@@ -276,7 +311,7 @@ struct fixture {
 
 CRPC_TEST(epoll_create_and_fail_closed_on_bad_endpoints) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     auto& b = *be.value();
     CRPC_CHECK(b.connect(endpoint::inproc("nope"), connect_options{}) == nullptr);
     CRPC_CHECK(b.listen(endpoint::inproc("nope"), listen_options{}) == nullptr);
@@ -285,9 +320,9 @@ CRPC_TEST(epoll_create_and_fail_closed_on_bad_endpoints) {
 
 CRPC_TEST(epoll_listen_connect_and_echo) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     echo_source echo(f.server.get());
     recording_source client_rx;
@@ -309,10 +344,10 @@ CRPC_TEST(epoll_one_mib_echo_small_queue_bounded_wakes) {
     opt.max_queued_bytes = 8192;
     opt.write_budget_bytes = 1024;
     auto be = io::epoll_backend::create(opt);
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     auto& b = *be.value();
     fixture f(b);
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     echo_source echo(f.server.get());
     recording_source client_rx;
@@ -337,9 +372,9 @@ CRPC_TEST(epoll_one_mib_echo_small_queue_bounded_wakes) {
 
 CRPC_TEST(epoll_reader_pause_and_resume) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     server_rx.credit = 0;
@@ -410,9 +445,9 @@ CRPC_TEST(epoll_resume_during_on_data_is_not_lost) {
 // bytes are never delivered: this test failed red until the window was
 // closed, and now runs unconditionally.
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     resume_mid_callback_source server_rx;
     server_rx.owner = f.server.get();
@@ -429,9 +464,9 @@ CRPC_TEST(epoll_resume_during_on_data_is_not_lost) {
 
 CRPC_TEST(epoll_peer_close_delivers_eof_once) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     f.server->bind_source(&server_rx);
@@ -447,14 +482,14 @@ CRPC_TEST(epoll_peer_close_delivers_eof_once) {
 
 CRPC_TEST(epoll_abrupt_reset_delivers_error_once) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     listen_options lo;
     lo.recv_buffer_bytes = 8192;
     connect_options co;
     co.recv_buffer_bytes = 8192;
     co.send_buffer_bytes = 8192;
     fixture f(*be.value(), lo, co);
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     server_rx.credit = 0;
@@ -483,9 +518,9 @@ CRPC_TEST(epoll_close_cancels_inflight_write_once) {
     opt.max_queued_bytes = 4096;
     opt.write_budget_bytes = 4096;
     auto be = io::epoll_backend::create(opt);
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     // A reader that never consumes bytes keeps the peer's kernel buffers full,
     // so the large push cannot drain and its completion must stay deferred.
@@ -515,14 +550,17 @@ CRPC_TEST(epoll_close_cancels_inflight_write_once) {
 
 CRPC_TEST(epoll_hundred_concurrent_connections) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     auto& b = *be.value();
 
     const std::uint16_t port = next_port();
     collecting_acceptor acceptor;
     auto listener =
         b.listen(endpoint::tcp("127.0.0.1", port), listen_options{});
-    CRPC_CHECK(listener != nullptr);
+    // listener->start below dereferences it, so a bind failure must abort the
+    // case instead of crashing on it: a crash would destroy the evidence of which
+    // assertion failed.
+    CRPC_REQUIRE(listener != nullptr);
     listener->start(&acceptor);
 
     constexpr int kN = 100;
@@ -583,9 +621,9 @@ CRPC_TEST(epoll_ten_thousand_messages_without_loss) {
     io::epoll_options opt;
     opt.max_queued_bytes = 64 * 1024;
     auto be = io::epoll_backend::create(opt);
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     f.server->bind_source(&server_rx);
@@ -632,9 +670,9 @@ void timer_probe(void* arg) noexcept {
 
 CRPC_TEST(epoll_bind_after_consumed_edge_still_delivers) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     const std::string payload = "early-bytes";
@@ -695,9 +733,9 @@ struct blocking_source final : io::source {
 
 CRPC_TEST(epoll_bind_source_null_waits_for_in_flight_delivery) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     blocking_source rx;
     f.server->bind_source(&rx);
@@ -739,9 +777,9 @@ CRPC_TEST(epoll_push_completes_only_after_kernel_accepted) {
 // been handed to the kernel (green). The second half proves the completed
 // push survives an immediate close: the peer must observe every byte.
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     fixture f(*be.value());
-    CRPC_CHECK(f.ok);
+    CRPC_REQUIRE(f.ok);
 
     recording_source server_rx;
     f.server->bind_source(&server_rx);
@@ -776,7 +814,7 @@ CRPC_TEST(epoll_push_completes_only_after_kernel_accepted) {
 
 CRPC_TEST(epoll_submillisecond_timer_fires) {
     auto be = io::epoll_backend::create();
-    CRPC_CHECK(be.ok());
+    CRPC_REQUIRE(be.ok());
     auto& b = *be.value();
 
     g_timer_fired.store(0);
