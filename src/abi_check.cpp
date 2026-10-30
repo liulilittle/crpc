@@ -882,6 +882,17 @@ static_assert(alignof(buffer) >= alignof(void*),
 static_assert(alignof(endpoint) >= alignof(void*),
               "endpoint must be pointer-aligned");
 
+// `call_slot` is an internal pooled record, not an exported aggregate, so its
+// exact layout is not pinned: it holds standard-library members whose width
+// differs between Debug and Release. What must not drift silently is its
+// growth -- it is allocated once per in-flight call, and the documented budget
+// is 128 bytes while the measured MSVC x64 figure is 440 (docs/performance.md).
+// An upper bound catches an accidental large member on every target without
+// pinning a number that legitimately varies per standard library. Raise the
+// constant only together with the measurement in docs/performance.md.
+static_assert(sizeof(rpc::call_slot) <= 512,
+              "call_slot grew past its documented ceiling; see docs/performance.md");
+
 #undef CRPC_STEP
 #undef CRPC_STEP_SAME
 #undef CRPC_STEP_MIXED
