@@ -27,11 +27,13 @@
   的纯挂死守护（实测唤醒在 200 ms 以内），冗余的墙钟断言已删除；返回的 `shutting_down`
   码才是语义的证明。
 - `perf_budget`（`tests/test_frame_compression.cpp`）中的绝对 LZ4 微秒预算移入
-  `bench/bench_compression.cpp` 作为软性 PASS/WARN 阈值，CRC32C 与大小尺寸的相对比较
+  `bench/bench_compression.cpp` 作为软性 PASS/WARN 阈值，CRC32C 的相对比较
   一并移入。CI 保留的是尺寸缩放断言：32 KiB 输入是 256 字节的 128 倍，线性工作量远低
   于 `128 * 4` 的上界，只有超线性回归才会触发它；自指测量（同一 codec、同一进程、两种
-  尺寸）使插桩对两侧对称，因此在各优化级别与 sanitizer 下都稳定。用例同时保留正确性
-  断言：可压缩的 32 KiB 输入必须缩小，两种尺寸都必须逐字节往返。
+  尺寸）使插桩对两侧对称，因此在各优化级别与 sanitizer 下都稳定。CRC32C 的相对比较留在
+  bench，因为 x64 上 `crc32c` 走的是 `_mm_crc32_u64` 内建指令，插桩对它与纯软件 LZ4
+  编码器的影响差别很大 —— 实测裕度只有 2.4-2.9 倍，低于行为断言所需的 3 倍。用例同时
+  保留正确性断言：可压缩的 32 KiB 输入必须缩小，两种尺寸都必须逐字节往返。
 - 证据：`tests/test_server_client.cpp`、`tests/test_io_iocp.cpp`、
   `tests/test_net_transport_edge.cpp`、`tests/test_frame_compression.cpp`、
   `bench/bench_compression.cpp`，以及一次全量 `ctest -j 4`。
