@@ -1321,20 +1321,31 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
 // never delivered, and nothing in the build notices: it compiles, it links, and
 // coverage is not gated. `distributed_lock::start_watchdog()` sat in that state --
 // its renewal thread was never started by anything, so a holder that outlived the
-// TTL silently lost the lock. The remedy is not to scan every export (that would be
-// mostly false positives); it is to name the methods whose absence from any call
-// site would be a defect, and fail when the list is not honoured.
+// TTL silently lost the lock.
 //
-// The scan counts occurrences in src/, tests/ and examples/ only. It cannot tell a
-// call from a definition by syntax alone, so the list below stores the expected
-// minimum number of occurrences and every entry is paired with the test case that
-// exercises it: a definition and its declaration account for zero of these, because
-// include/ is not scanned and the definition line is matched by its `Type name(`
-// spelling only once.
+// The count is scoped to files, not to the whole tree. A bare `name(` match is not
+// enough: `tests/test_pipeline_deadlock.cpp` has a local helper called
+// `stop_watchdog` that has nothing to do with the redis one, and its three call
+// sites were enough to keep the redis contract green with both real callers
+// deleted. Each entry therefore names the files where a call is meaningful, and
+// only those files are scanned for it.
+//
+// Within a file, the definition itself counts. A definition reads
+// `void distributed_lock::start_watchdog() {` and there is no syntax-level way to
+// tell it from a call without a parser, so each bound is stated as the number of
+// occurrences the named files are expected to contain, and the comment on each
+// entry spells out how that number decomposes.
 struct api_call_contract {
     const char* method;
+    // Files scanned for this method, relative to the repository root.
+    const char* const* files;
+    std::size_t file_count;
     std::size_t min_occurrences;
 };
+
+// The two files that own the lock watchdog: its implementation and its suite.
+const char* const k_redis_lock_files[] = {"src/redis/distributed_lock.cpp",
+                                          "tests/test_redis_lock.cpp"};
 
 CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
     const fs::path root = repo_root();
@@ -1343,56 +1354,35 @@ CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
         return;
     }
 
-    std::vector<std::string> corpus;
-    const char* const dirs[] = {"src", "tests", "examples"};
-    for (const char* dir : dirs) {
-        const fs::path base = root / dir;
-        if (!fs::exists(base)) {
-            continue;
-        }
-        for (const auto& entry : fs::recursive_directory_iterator(base)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const std::string ext = entry.path().extension().string();
-            if (ext != ".cpp" && ext != ".hpp" && ext != ".c") {
-                continue;
-            }
-            corpus.push_back(strip_cpp(read_text(entry.path())));
-        }
-    }
-    CRPC_CHECK(!corpus.empty());
-
-    const auto occurrences = [&corpus](const std::string& name) {
-        const std::string needle = name + "(";
-        std::size_t total = 0;
-        for (const std::string& text : corpus) {
-            std::size_t pos = 0;
-            while ((pos = text.find(needle, pos)) != std::string::npos) {
-                ++total;
-                pos += needle.size();
-            }
-        }
-        return total;
-    };
-
-    // Each entry: the method, and how many occurrences the corpus must contain.
-    // Only `src/`, `tests/` and `examples/` are scanned, and a method always occurs
-    // once in its own definition, so a method with no caller scores exactly 1. Each
-    // bound is the definition plus the call sites the suite makes; dropping the last
-    // caller drops the count to 1 and fails this check.
     const api_call_contract contracts[] = {
-        // One definition + one call in redis_lock_watchdog_renews_past_one_ttl.
-        {"start_watchdog", 2},
-        // One definition + the stop in both redis watchdog cases.
-        {"stop_watchdog", 3},
+        // start_watchdog: one definition + one call in
+        // redis_lock_watchdog_renews_past_one_ttl. Delete that call and the count
+        // drops to 1, which is the definition alone.
+        {"start_watchdog", k_redis_lock_files, 2, 2},
+        // stop_watchdog: one definition, one internal call from the destructor,
+        // and one stop in each of the two watchdog cases.
+        {"stop_watchdog", k_redis_lock_files, 2, 4},
     };
 
     for (const api_call_contract& contract : contracts) {
-        const std::size_t found = occurrences(contract.method);
+        const std::string needle = std::string(contract.method) + "(";
+        std::size_t found = 0;
+        for (std::size_t i = 0; i < contract.file_count; ++i) {
+            const fs::path path = root / contract.files[i];
+            CRPC_CHECK(fs::exists(path));
+            if (!fs::exists(path)) {
+                continue;
+            }
+            const std::string text = strip_cpp(read_text(path));
+            std::size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                ++found;
+                pos += needle.size();
+            }
+        }
         CRPC_CHECK(found >= contract.min_occurrences);
         if (found < contract.min_occurrences) {
-            std::printf("  %s occurs %zu time(s), needs %zu -- no caller?\n",
+            std::printf("  %s occurs %zu time(s) in its own files, needs %zu -- lost a caller?\n",
                         contract.method, found, contract.min_occurrences);
         }
     }
