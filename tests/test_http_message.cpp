@@ -468,8 +468,6 @@ CRPC_TEST(http_limit_body_chunked) {
 // limit is shown to be inclusive at the stated size rather than merely "somewhere
 // near" it -- the same shape the request-line and header-block limits already use.
 CRPC_TEST(http_limit_chunk_line_bytes) {
-    // A chunk-size line of exactly "4\r\n" plus extensions; the limit counts the
-    // whole line including CRLF.
     parser_limits limits;
     // The limit counts the line content, not the CRLF: one byte for "4".
     limits.chunk_line_bytes = 1;
