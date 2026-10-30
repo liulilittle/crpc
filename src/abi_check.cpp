@@ -501,9 +501,11 @@ CRPC_ABS_OFF(server::options, clock_source, 304);
 // object, so its layout is ABI-relevant even though it is not a plain aggregate
 // record. `CRPC_MEMBER_COUNT` and `offsetof` cannot be applied to it because
 // its data members are private. Its width is also not a fixed number: it is
-// `sizeof(server::options)` plus its three `std::vector` members, rounded to
-// the builder's alignment, and `std::vector` widens with the standard
-// library's debug configuration (MSVC x64: 392 bytes in Release, 416 in Debug;
+// `sizeof(server::options)` plus its three `std::vector` members and the
+// borrowed observability-chain pointer (`aop_chain_`, added with the AOP call
+// path wiring; docs/abi.md section 4 records the change), rounded to the
+// builder's alignment, and `std::vector` widens with the standard library's
+// debug configuration (MSVC x64: 392 bytes in Release, 416 in Debug;
 // x86: 304 / 312). The structural relation below catches an added, removed or
 // re-typed builder member on every target and configuration without pinning a
 // standard-library width, and the alignment assertion catches a member that
@@ -516,10 +518,12 @@ static_assert(
          sizeof(std::vector<server::listener_config>) +
          sizeof(std::vector<std::function<status(rpc::service_registry&)>>) +
          sizeof(std::vector<server_interceptor*>) +
+         sizeof(obs::interceptor_chain*) +
          alignof(server::builder) - 1) /
             alignof(server::builder) *
             alignof(server::builder),
-    "server::builder must be options plus its three vector members");
+    "server::builder must be options plus its three vector members and the "
+    "borrowed observability-chain pointer");
 static_assert(alignof(server::builder) == alignof(server::options),
               "server::builder must keep the options alignment");
 

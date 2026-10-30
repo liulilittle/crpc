@@ -45,7 +45,7 @@
 // 4. Refactoring a rejection branch is NOT a no-op. Four fields drift
 //    silently if the branch is collapsed:
 //      a. rpc_error::retryable -- send_error() sets it from is_retryable()
-//         (server.cpp, `error.retryable = is_retryable(code)`, 1065).
+//         (server.cpp, `error.retryable = is_retryable(code)`, 1142).
 //      b. rpc_error::retry_after -- the bulkhead falls back to
 //         overload_retry_after when the permit carries 0 (server.cpp,
 //         `bulkhead_permit.retry_after().count() > 0
@@ -71,11 +71,11 @@
 // 6. Four admission refusals DO write the reserved `crpc-degradable: true`
 //    response meta entry, and only when the request still has at least
 //    min_remaining_ns of wire deadline left:
-//      - the per-service breaker (`!permit.allowed()`, send_error at 1465);
-//      - the per-service rate bucket, success exit (send_error at 1525);
-//      - the per-service bulkhead (send_error at 1550);
-//      - the per-service in-flight cap (send_error at 1569).
-//    The rate bucket's OTHER exit -- deadline not met (send_error at 1514) --
+//      - the per-service breaker (`!permit.allowed()`, send_error at 1547);
+//      - the per-service rate bucket, success exit (send_error at 1607);
+//      - the per-service bulkhead (send_error at 1632);
+//      - the per-service in-flight cap (send_error at 1651).
+//    The rate bucket's OTHER exit -- deadline not met (send_error at 1596) --
 //    never sets it: a deadline miss is not degradable (fallback_eligible()
 //    rejects deadline_exceeded first). The connection-level flood bucket and
 //    the per-connection cap (both reach send_error() through the forced-error
@@ -128,16 +128,16 @@ enum class stage_kind : u8 {
     // Per-connection token bucket, before any job allocation. Load shedding:
     // the bucket exists to avoid the work of a full request, so answering with
     // a fallback value would defeat it (server.cpp submit(), `if (rate)`,
-    // 1614).
+    // 1808).
     connection_rate,
     // Per-service token bucket. Two outcomes, see reject_code()
-    // (server.cpp handle_request(), `if (guard->rate)`, 1216).
+    // (server.cpp handle_request(), `if (guard->rate)`, 1329).
     service_rate,
     // Per-service bounded concurrency (server.cpp handle_request(),
-    // `if (guard->bulkhead)`, 1268).
+    // `if (guard->bulkhead)`, 1381).
     service_bulkhead,
     // Per-service in-flight cap. Applies to probes too (server.cpp
-    // handle_request(), `if (!enter_service_cap(*guard))`, 1293).
+    // handle_request(), `if (!enter_service_cap(*guard))`, 1406).
     service_capacity,
     // Per-endpoint token bucket on the client (client_facade.cpp
     // begin_attempt(), `if (pool.rate.has_value())`, 950).
@@ -147,7 +147,7 @@ enum class stage_kind : u8 {
     // begin_attempt(), `if (pool.bulkhead.has_value())`, 980).
     endpoint_bulkhead,
     // Endpoint / service circuit breaker (server.cpp
-    // `permit = guard->breaker->allow()`, 1022; client_facade.cpp
+    // `permit = guard->breaker->allow()`, 1302; client_facade.cpp
     // `pools[index]->breaker.allow()`, 875).
     breaker,
     // Client-local: no usable endpoint was selected. This is a PRE-SEND
@@ -169,8 +169,8 @@ enum class stage_kind : u8 {
 // The three admission outcomes. RESERVED: no stage consumes this type yet. S1
 // and S2 must not change any control flow based on it -- probe semantics are
 // already expressed structurally by the `!probe` guard (server.cpp,
-// 1048) and by the position of the per-service cap outside it
-// (1126). The type exists only so a future slice does not have to
+// 1328) and by the position of the per-service cap outside it
+// (1406). The type exists only so a future slice does not have to
 // invent a second vocabulary; `probe_bypass` means "the half-open probe is
 // allowed past THIS stage", never a global pass.
 enum class admission_decision : u8 { admit, reject, probe_bypass };

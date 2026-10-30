@@ -287,9 +287,15 @@ CRPC_TEST(degradable_architecture_says_wired_but_no_fallback_execute) {
     CRPC_CHECK_FALSE(forbidden_phrase(chinese, "fallback 原语已实现，未接入调用路径"));
 
     // Other subsystems' "not wired" statements are true and must survive: the
-    // edit must not have been a blanket replacement.
-    CRPC_CHECK(has_phrase(english, "observability interceptor chain is not wired"));
-    CRPC_CHECK(has_phrase(english, "AOP not wired into the call path"));
+    // edit must not have been a blanket replacement. Flow control is still
+    // unwired; the AOP chain IS wired now (requirement 17), so the stale
+    // unwired sentences must stay out and the new status must be present.
+    CRPC_CHECK(has_phrase(
+        english, "implemented primitives, not wired into the call path"));
+    CRPC_CHECK_FALSE(
+        has_phrase(english, "observability interceptor chain is not wired"));
+    CRPC_CHECK_FALSE(has_phrase(english, "AOP not wired into the call path"));
+    CRPC_CHECK(has_phrase(english, "server call path wired"));
     CRPC_CHECK(has_phrase(english, "Flow control"));
 }
 

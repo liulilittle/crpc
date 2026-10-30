@@ -275,6 +275,18 @@ public:
                                   std::chrono::steady_clock::time_point now, bool& handler_ran,
                                   const void* dedup_wait_key) noexcept;
 
+    // Same as above with an interceptor-supplied context injection. When
+    // `context_metadata` is non-null, its entries are copied into the
+    // `call_context::metadata` the handler receives, so an observability
+    // interceptor (`obs::interceptor_chain` at `before_call`) can pass values
+    // to the application handler. Null (the server passes null whenever no
+    // interceptor populated the context) leaves the handler-visible context
+    // exactly as before: the injection costs nothing on the empty path.
+    [[nodiscard]] status dispatch(const frame& request, buffer& response_out, bool& has_response,
+                                  std::chrono::steady_clock::time_point now, bool& handler_ran,
+                                  const void* dedup_wait_key,
+                                  const metadata_list* context_metadata) noexcept;
+
     [[nodiscard]] const service_registry& registry() const noexcept { return *registry_; }
 
     // The server-side idempotency dedup table. The server calls `abandon` on

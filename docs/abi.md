@@ -468,7 +468,8 @@ functions read the private `options_` member of a consumer-allocated object, so
 its layout is ABI-relevant; it is not in the list above because it is not a plain
 aggregate record. The member-count and `offsetof` guards cannot be applied to its
 private data members, and its width is not a fixed number: it is
-`sizeof(server::options)` plus its three `std::vector` members, rounded to its
+`sizeof(server::options)` plus its three `std::vector` members and the borrowed
+`obs::interceptor_chain*` observability-chain pointer, rounded to its
 alignment, and the vector width changes with the standard library's debug
 configuration (MSVC x64: 392 bytes in Release, 416 in Debug; x86: 304 / 312).
 `src/abi_check.cpp` therefore pins the structural relation rather than an
@@ -614,6 +615,21 @@ two different "now" values.
 
 `client::set_fallback`, `client::run_fallback` and `client::record_fallbacks`
 are new exported symbols and therefore MINOR additions; they change no layout.
+
+The AOP call-path wiring (requirement 17) changes two exported surfaces. First,
+`server::builder` gained a trailing private `obs::interceptor_chain* aop_chain_`
+data member installed by the new `builder::interceptor_chain(obs::interceptor_chain&)`
+method; the encapsulated exported class's layout changes, so this is a **MAJOR**
+change under §1: `sizeof(server::builder)` grows by one pointer and the structural
+relation in `src/abi_check.cpp` was extended to the options-plus-three-vectors-
+plus-pointer form. Second, `rpc::dispatcher` gained a new `dispatch` overload
+taking a trailing `const metadata_list* context_metadata` pointer; a new overload
+is a new exported symbol (a **MINOR** addition) and the existing overloads keep
+their mangled names and behaviour, with `nullptr` meaning "no injection", which
+is what every call site without an interceptor chain passes. Neither change
+touches `server::options`, any wire format, or any cross-boundary record:
+`obs::interceptor_chain` and `obs::call_context` remain header-inline types with
+no exported data layout, and the response/error encoding is unchanged.
 `set_fallback` takes a `void*` plus a `noexcept` `retain`/`release` pair rather
 than a standard-library owning type, so the reference it keeps is created and
 destroyed by the caller's own code and no consumer-side control block crosses
