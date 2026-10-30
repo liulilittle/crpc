@@ -15,8 +15,18 @@
 //      fault address. Without a dump a Windows crash leaves nothing behind but
 //      an exit code; with one, the failure is diagnosable after the fact.
 //
-// Both are debug-build only. A Release build behaves exactly as it would
-// without this header.
+// The dialog suppression (1) is a CRT/Win32 concern and is installed in both
+// Debug and Release: a Release test run that faults must never block the
+// desktop behind a Windows Error Reporting dialog. For faults the SEH layer can
+// see -- access violation, stack overflow, pure virtual call, std::terminate,
+// abort(), invalid CRT parameter -- the filter prints a "CRASH:" line to stderr
+// and the process exits non-zero. Fail-fast faults (/GS stack-cookie checks,
+// heap corruption, _invoke_watson, exit 0xC0000409 / 0xC0000374) bypass the
+// unhandled-exception filter: those still exit non-zero and still do not show a
+// dialog (SetErrorMode covers that), but they produce no "CRASH:" line and no
+// minidump. The minidump capture (2) stays debug-build only: without a matching
+// PDB a Release dump is of little use and would drag dbghelp into every test
+// binary.
 #ifndef CRPC_TEST_FRAMEWORK_HPP
 #define CRPC_TEST_FRAMEWORK_HPP
 
@@ -35,9 +45,8 @@
 
 // --- Early CRT silencing and crash capture ----------------------------------
 
-#if defined(_MSC_VER) && defined(_DEBUG)
+#if defined(_MSC_VER)
 
-#include <crtdbg.h>
 #include <process.h>
 #include <signal.h>
 
@@ -51,12 +60,20 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+// The CRT report redirection and the minidump writer are debug-only: the
+// _CrtSetReport* calls are no-ops on the release CRT and dbghelp is only worth
+// linking when a PDB is available to symbolise the dump.
+#if defined(_DEBUG)
+#include <crtdbg.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
+#endif
 
 namespace crpc_test {
 namespace detail {
 
+#if defined(_DEBUG)
 inline char* dump_path_storage() {
     static char path[MAX_PATH] = {0};
     return path;
@@ -89,6 +106,7 @@ inline void write_minidump(EXCEPTION_POINTERS* info) {
                             &exception_info, nullptr, nullptr);
     (void)CloseHandle(file);
 }
+#endif // _DEBUG
 
 inline LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* info) {
     const DWORD code = info != nullptr && info->ExceptionRecord != nullptr
@@ -104,11 +122,13 @@ inline LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* info) {
                  static_cast<unsigned long>(GetCurrentThreadId()));
     std::fflush(stderr);
 
+#if defined(_DEBUG)
     write_minidump(info);
     if (dump_path_storage()[0] != '\0') {
         std::fprintf(stderr, "CRASH: minidump written to %s\n", dump_path_storage());
         std::fflush(stderr);
     }
+#endif
     // EXCEPTION_EXECUTE_HANDLER would swallow the crash; the process must still
     // terminate with a failure code so the caller sees a non-zero exit.
     return EXCEPTION_EXECUTE_HANDLER;
@@ -162,15 +182,17 @@ inline void on_terminate() {
 }
 
 inline int quiet_crt() {
+#if defined(_DEBUG)
     (void)_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
     (void)_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
     (void)_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
     (void)_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
     (void)_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     (void)_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-    // Write the abort message but never call report-fault (the dialog).
-    (void)_set_abort_behavior(_WRITE_ABORT_MSG,
-                              _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+    // Suppress the abort message and never call report-fault (the dialog). The
+    // SIGABRT handler below is what actually runs on abort().
+    (void)_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     (void)signal(SIGABRT, on_abort);
     (void)_set_invalid_parameter_handler(&on_invalid_parameter);
     (void)_set_purecall_handler(&on_purecall);
@@ -190,20 +212,38 @@ inline int quiet_crt() {
 // inline` members in the same translation unit. RTTI's reflected field tables
 // are exactly such members, so a test translation unit that included this
 // header silently got empty field tables. Installing the guards at the top of
-// main is equivalent for a test binary -- no test code runs before main -- and
+// main is equivalent for a test binary -- no test *case* runs before main -- and
 // has no effect on other static data.
 //
 // A test binary that does not use CRPC_TEST_MAIN must call
 // crpc_test::install_crash_guards() itself.
+//
+// KNOWN BOUNDARY -- guards do not cover static initialization. Because the
+// guards are installed as the first statement of main, a crash in a global or
+// static object's constructor (which runs before main) still reaches Windows
+// with no guard installed, and can raise the Error Reporting dialog. This is
+// true in Debug and Release alike and is not a regression of the Release fix:
+// it is inherent to installing at main. Closing it needs an initializer in
+// .CRT$XCU, which the paragraph above explains breaks RTTI's static field
+// tables in every translation unit that includes this header, so it must not
+// be done blindly. Do not read "install_crash_guards() ran" as "every crash is
+// caught": it only covers main and everything reached from it.
+//
+// KNOWN BOUNDARY -- fail-fast faults bypass the filter. __fastfail and
+// _invoke_watson (/GS stack-cookie failure, heap corruption, a report-fault
+// abort) terminate through a path that never reaches
+// SetUnhandledExceptionFilter, so unhandled_exception_filter does not run: no
+// "CRASH:" line, no minidump, only the exit code (0xC0000409, 0xC0000374). The
+// dialog is still suppressed because SetErrorMode does that, not the filter.
+// Seeing a 0xC0000409 with an empty stderr is therefore this boundary, not a
+// failed guard.
 
 } // namespace detail
 
 // Installs the CRT report redirection, the abort/invalid-parameter/purecall/
 // terminate handlers, and the minidump writer. Idempotent.
 inline void install_crash_guards() {
-#if defined(_MSC_VER) && defined(_DEBUG)
     (void)detail::quiet_crt();
-#endif
 }
 
 } // namespace crpc_test
