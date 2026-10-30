@@ -24,6 +24,11 @@
 
 以下均为增补，本身不会破坏已重建的消费方：
 
+- 流控：`crpc::rpc::client::set_flow_control`、`crpc::rpc::client::can_admit`、
+  `crpc::rpc::client::flow_snapshot`、`crpc::rpc::rpc_client_size_probe`、
+  `crpc::client::set_flow_control`，以及 `crpc::rpc::flow_controller` /
+  `flow_control_options` / `flow_state` 类型。`rpc::client` 本身增长了一个
+  指针大小的成员，这属于 MAJOR 布局变化：必须重编所有消费方（见 `abi.md` 第 1 节）。
 - `crpc::client::resilience_statistics` 与 `crpc::client::resilience_stats()`。
 - `crpc::resilience::fallback_statistics` 与 `crpc::client::fallback_stats()`。
 - `crpc::client::call<Resp>::degraded()`（header-only 访问器）。

@@ -4,6 +4,53 @@
 
 ## Unreleased
 
+### Flow control wired into the client call path
+
+- The adaptive flow-control primitives (`flow::rtt_estimator`, `flow::pacer`,
+  `flow::congestion_window`, `flow::rtt_tracker`) are now wired into
+  `rpc::client` through a connection-level `rpc::flow_controller`
+  (`include/crpc/rpc/flow_control.hpp`, `src/rpc/flow_control.cpp`). It is off by
+  default; `rpc::client::set_flow_control` installs it, and the facade exposes
+  the same call and applies it to every pooled connection, including ones opened
+  later.
+- Admission is a byte window over encoded frames. An empty window admits one
+  call unconditionally; a `ONE_WAY` call is never charged (it completes as soon
+  as it is published, so nothing could acknowledge it); a refused call carries
+  `crpc.flow_rejected` in its error metadata, which the facade classifies as a
+  local gate (never retried, never charged to the endpoint breaker).
+- Round-trip samples come from PING/PONG probes: the client sends a PING whose
+  8-byte payload is the send timestamp and the server echoes it as a PONG on
+  stream 0. At most one probe is outstanding, so probe traffic is bounded by the
+  round trip. A probe bypasses the byte window but not `max_pending_write_bytes`.
+  Flow control adds no clock read to the send path.
+- Congestion control: `theta = baseline * growth_per_mille / 1000`; a sample
+  above it is withheld from the estimator and the window is reduced at most once
+  per baseline; a floor-bound window accepts `slow_confirmations` consecutive
+  over-threshold samples as the new baseline so the loop can escape. A sample
+  below the baseline needs confirmation and the *slowest* sample of the window is
+  accepted, so one artifact cannot poison the baseline.
+- Per-lane byte quotas with idempotent `(stream_id, generation)` release on every
+  terminal path (completion, cancel, handle destroy, `fail_all` fallback). The
+  facade checks admission *before* consuming a lane sequence number, so a local
+  refusal leaves no hole in the lane. The pacer is connection-level and its rate
+  follows `window / baseline`.
+- Fixed: `rtt_tracker` and `pacer` used zero as their "not initialised"
+  sentinel, but zero is a legal timestamp, so the first probe of a clock that
+  starts at zero was unusable and a zero-anchored pacer never gained credit. The
+  sentinel is now all-ones. `pacer::set_rate` now rescales the stored credit, so
+  a rate increase takes effect on the next send instead of two refill periods
+  later.
+- Fixed: `rpc::client::start_call` rebuilt a failed `status` from its code and
+  message, dropping the metadata (including `crpc.flow_rejected`); it now
+  forwards the whole `rpc_error`.
+- ABI: `rpc::client` grew by one pointer-sized member (MAJOR); `rpc::client_options`
+  and `client::options` are unchanged. New MINOR symbols: `set_flow_control`,
+  `can_admit`, `flow_snapshot`, `rpc_client_size_probe`, and the
+  `rpc::flow_controller` / `flow_control_options` / `flow_state` types. The
+  server side is unchanged (PONG is a stateless echo). Evidence:
+  `tests/test_flow_wiring.cpp`, `tests/test_flow_clock_base.cpp`,
+  `tests/test_flow_lane_quota.cpp`.
+
 ### Server-side idempotency dedup table
 
 - The RPC server now deduplicates replayed calls. A request whose envelope

@@ -99,7 +99,7 @@ CRPC 在同一条连接、同一套帧格式、同一个执行模型上承载两
 - `io` 只依赖 `base`；RPC 层只接受 `backend_factory&`，从不判断传输是 TCP 还是进程内。
 - `rpc/client.hpp` 包含 `frame.hpp`、`io.hpp`、`rpc/call.hpp`、`rpc/dispatcher.hpp`；`rpc/dispatcher.hpp` 包含 `frame.hpp` 与 `rpc/call.hpp`。
 - `mvc/router.hpp` 包含 `http/message.hpp`、`codec.hpp`、`mvc/binding.hpp`；`http2/connection.hpp` 包含 `http2/frame.hpp`、`http2/hpack.hpp`、`http/message.hpp`。
-- `cluster`、`observability`、`push`、`flow` 今天独立于 `rpc`。`resilience` 已部分接入：`client_facade` 接入了负载均衡、每端点 rate/bulkhead/breaker、重试和 deadline；`rpc::server` 接入了准入半边流水线（连接级 rate、服务级 rate、bulkhead、breaker、并发上限）。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `call<Resp>::get()` 中、最后一次尝试被终结之后调用它，因此被服务端标记为可降级的拒绝可以由已安装的 fallback 值应答。可观测性拦截器链已接入服务端调用路径（围绕准入与 dispatch 的 `before_call`/`after_call`；客户端终态经进程级默认链观察）。流控仍未接入调用路径。
+- `cluster`、`observability`、`push`、`flow` 今天独立于 `rpc`。`resilience` 已部分接入：`client_facade` 接入了负载均衡、每端点 rate/bulkhead/breaker、重试和 deadline；`rpc::server` 接入了准入半边流水线（连接级 rate、服务级 rate、bulkhead、breaker、并发上限）。fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `call<Resp>::get()` 中、最后一次尝试被终结之后调用它，因此被服务端标记为可降级的拒绝可以由已安装的 fallback 值应答。可观测性拦截器链已接入服务端调用路径（围绕准入与 dispatch 的 `before_call`/`after_call`；客户端终态经进程级默认链观察）。流控已接入客户端调用路径：`rpc::client` 持有一个连接级控制器，负责准入、记账与释放，并由 PING/PONG 探针驱动 RTT 估计器。
 - 没有脚本强制这些方向。设计中的上下文依赖规则是评审规则；构建期依赖检查属于**已设计，未实现**。
 
 ## 5. 基础层 <a id="s5"></a>
@@ -323,7 +323,15 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `flow::pacer` 是带 2 ms 突发的字节令牌桶；`congestion_window` 只在确认时增长（自时钟），在排队信号出现时收缩；`rtt_tracker` 把发送时间戳映射为样本，并拒绝过期或倒退的 token。所有时钟都是注入的单调纳秒函数。
 
-估计器、pacer 和窗口尚未接入 `io` 或 `rpc`。集成、自适应背压和每 lane 配额属于**已设计，未实现**。
+上述原语由 `rpc::flow_controller`（`include/crpc/rpc/flow_control.hpp`、`src/rpc/flow_control.cpp`）接入 RPC 调用路径，它由 `rpc::client` 持有，并受其最内层 `map_mutex_` 保护。控制器默认关闭，通过 `rpc::client::set_flow_control` 安装；门面提供同名调用，并对每个池内连接生效（包括之后新建的连接）。`client_options` 是 ABI 固定记录，一个字节都不增长。
+
+闭环如下。准入是以编码后帧为单位的字节窗口：调用发布时按其编码帧大小记账，终止时释放同样大小。空窗口无条件放行一条调用，因为全部拒绝的窗口永远产生不了第一个测量值。`ONE_WAY` 调用从不记账：它发布后立即完成，没有任何东西能确认它。被拒绝的调用在错误 metadata 中标记 `crpc.flow_rejected`，门面据此把它归类为本地闸门（不重试、不计入端点熔断），而不是容量失败。
+
+探针是携带发送时间戳（8 字节 payload）的 PING 帧；服务端以 stream 0 原样回填 payload 的 PONG 应答。探针绕过字节窗口（同时限制自身探针的窗口将永远无法得知路径已恢复），但不绕过 `max_pending_write_bytes`。同一时刻最多一个探针在途，因此探针流量由往返时间界定，而不是由调用速率决定。流控不给发送路径增加任何时钟读取：连接复用 `begin_call` 已经读取的时间戳。
+
+估计器只由探针回包驱动，且排队时延在样本可能改变基线**之前**、针对当前基线计算。超过 `theta = baseline * growth_per_mille / 1000`（默认 1 ms 基线对应 122 us）的样本是拥塞证据而非路径测量，因此不喂给估计器；窗口每个基线周期最多收缩一次，且当它停在底部后，连续 `slow_confirmations` 个超阈样本会被接受为新基线，使环路能离开底部。低于基线的样本与向上偏移一样需要确认，且接受确认窗口内**最慢**的值：接受最快值会让一个伪影永久毒化基线，因为此后每个诚实样本都会高于（被砸穿的）阈值而永远不被回喂。
+
+每 lane 字节配额保存在同一控制器中，并以幂等的 `(stream_id, generation)` 键释放，因此同一调用既完成又在拆连时失败也不会重复释放。单位是**编码后帧字节**，不是 payload 字节：包含帧头、ORDERED 扩展、调用信封以及可选的 trace/deadline/幂等块，`rpc::client::predicted_frame_size` 返回的正是这个数。门面在消耗 lane 序号**之前**检查准入（`client::lane_reserve`）：本地被拒绝的调用绝不能在该 lane 留下空洞，因为服务端只能靠等满 gap 定时器来消解空洞。pacer 是连接级的，绝不按 lane 复制（按 lane 复制会把发送速率乘以 lane 数），其速率跟随 `window / baseline`；否则 pacer 自带的 1 MiB/s 默认值会让 64 KiB 窗口每帧耗时约 60 ms。
 
 ## 18. 需求映射 <a id="s18"></a>
 
@@ -350,7 +358,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 韧性策略 | `resilience/*` | 已实现的原语；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现并接入客户端门面；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
 | 推送 hub/流 | `push/*` | 已实现；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump，SSE 与长轮询已接入 `http_server` |
 | 追踪/日志/AOP | `observability/*` | 已实现；服务端调用路径已接线（`before_call`/`after_call`，含短路、异常边界与零成本空链）；客户端终态经 diagnostics 默认链观察；serialize/retry/breaker/connect 钩点未接线 |
-| 流控 | `flow/estimator.hpp` | 已实现原语，未接入调用路径 |
+| 流控 | `flow/estimator.hpp`、`rpc/flow_control.hpp` | 已实现并接入 `rpc::client`：字节窗口、PING/PONG 探针、估计器、每 lane 配额、连接级 pacer |
 | 分片/协程/MPSC | 设计规格 §4 | 已设计，未实现 |
 
 ## 19. 状态矩阵 <a id="s19"></a>
@@ -368,7 +376,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现并接入客户端门面；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
 | 可观测性 | 部分 | `test_observability.cpp`、`test_aop_wiring.cpp`；服务端调用路径已接线（`before_call`/`after_call`、短路、异常边界、零成本空链；metadata 注入 handler 上下文），客户端终态经 diagnostics 默认链观察，无指标 |
 | 推送 | 已实现 | `test_push.cpp`、`test_push_e2e.cpp`、`test_http_sse.cpp`；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump；SSE 与长轮询已接入 `http_server` |
-| 流控 | 部分 | `test_flow.cpp`；未接入传输 |
+| 流控 | 已实现 | `test_flow.cpp`、`test_flow_wiring.cpp`、`test_flow_clock_base.cpp`、`test_flow_lane_quota.cpp`；已接入 `rpc::client`（字节窗口、PING/PONG 探针、每 lane 配额、连接级 pacer） |
 | 分片/协程 | 已设计 | 无 `shard` 类型或 `coro_rt_*` 调用 |
 | 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：none/lz4/gzip/deflate/lz77/zip 已实现并测试（`test_frame_compression.cpp`，61 个用例），zstd 保留且 fail-closed；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
 | Redis 客户端 | 已实现（shared 构建已覆盖 Redis 头导出，`CRPC_BUILD_SHARED=ON` 下 `ctest -R 'redis\|abi_docs\|shared_link'` 通过） | `test_redis_*.cpp` 覆盖 RESP2/3、连接池、pipeline、事务、Pub/Sub、Streams、cluster、Sentinel、类型化辅助与 RTTI 绑定；`test_redis_header_conflict.cpp` 钉住 `stream_entry` 与 `redis_stream_entry` 的区分。已测配置为静态构建；shared 构建受支持，API 相同，且其 Redis 头导出已覆盖。 |

@@ -162,7 +162,10 @@ private:
     config cfg_;
     u64 rate_ = 0;
     u64 credit_ = 0;
-    u64 last_refill_ns_ = 0;
+    // All-ones means "not anchored yet". Zero cannot be used: a monotonic clock
+    // is allowed to start at zero, and `refill(0)` would then write the
+    // sentinel back and the bucket would never gain credit.
+    u64 last_refill_ns_ = ~0ull;
 };
 
 // --- Congestion window ------------------------------------------------------
@@ -232,11 +235,19 @@ private:
 class CRPC_API rtt_tracker {
 public:
     // Records a send and returns a token to be handed back on acknowledgement.
+    //
+    // The token is the send timestamp itself. Zero is a legal timestamp (a
+    // monotonic clock may start at zero), so a zero token is a real token and
+    // `on_ack` accepts it; only all-ones means "no token". A tracker can hold
+    // exactly one outstanding token, so with several probes in flight it
+    // cannot express which one a reply belongs to: it records the oldest send
+    // and does not detect a reordering among several outstanding sends.
     u64 on_send(u64 now_ns) noexcept;
 
     // Computes the sample for a token. Returns false when the token is stale
-    // (older than the window) or out of order; the caller must then ignore the
-    // sample rather than feed a fabricated one to the estimator.
+    // (older than the window) or older than the reply instant; the caller must
+    // then ignore the sample rather than feed a fabricated one to the
+    // estimator.
     bool on_ack(u64 now_ns, u64 token_ns, u64& sample_ns) noexcept;
 
     void reset() noexcept;
@@ -247,7 +258,11 @@ public:
 
 private:
     u64 last_send_ns_ = 0;
-    u64 oldest_outstanding_ns_ = 0;
+    // All-ones means "nothing outstanding". Zero is a legal timestamp, so it
+    // cannot be the sentinel; `~0ull` can never be a timestamp, because it is
+    // the value a nanosecond counter reaches only after 584 years and is
+    // reserved here as "illegal".
+    u64 oldest_outstanding_ns_ = ~0ull;
 };
 
 } // namespace flow
