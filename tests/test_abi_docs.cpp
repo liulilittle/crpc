@@ -1323,29 +1323,28 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
 // its renewal thread was never started by anything, so a holder that outlived the
 // TTL silently lost the lock.
 //
-// The count is scoped to files, not to the whole tree. A bare `name(` match is not
-// enough: `tests/test_pipeline_deadlock.cpp` has a local helper called
-// `stop_watchdog` that has nothing to do with the redis one, and its three call
-// sites were enough to keep the redis contract green with both real callers
-// deleted. Each entry therefore names the files where a call is meaningful, and
-// only those files are scanned for it.
+// Counting bare `name(` is not enough, twice over. A same-named helper in another
+// file inflated the count (tests/test_pipeline_deadlock.cpp defines its own
+// `stop_watchdog`), and scoping to files did not help because a same-named helper
+// can be added to the very file being watched. What is counted here is therefore
+// the call shape, not the identifier: an entry states the exact prefix that a real
+// call site must contain (`lock.start_watchdog(`), so a decoy has to be spelled as
+// a call on a `lock` object -- at which point it is the real call and there is
+// nothing left to bypass.
 //
-// Within a file, the definition itself counts. A definition reads
-// `void distributed_lock::start_watchdog() {` and there is no syntax-level way to
-// tell it from a call without a parser, so each bound is stated as the number of
-// occurrences the named files are expected to contain, and the comment on each
-// entry spells out how that number decomposes.
+// Definitions are excluded by construction: `void distributed_lock::start_watchdog()`
+// has no `lock.` receiver, so it never matches. That also means no entry has to
+// budget for "the definition itself counts once", which is the accounting that made
+// the previous version pass with every caller deleted.
 struct api_call_contract {
-    const char* method;
-    // Files scanned for this method, relative to the repository root.
+    // Exact text a real call site contains, including the receiver.
+    const char* prefix;
     const char* const* files;
     std::size_t file_count;
-    std::size_t min_occurrences;
+    std::size_t min_calls;
 };
 
-// The two files that own the lock watchdog: its implementation and its suite.
-const char* const k_redis_lock_files[] = {"src/redis/distributed_lock.cpp",
-                                          "tests/test_redis_lock.cpp"};
+const char* const k_redis_lock_test[] = {"tests/test_redis_lock.cpp"};
 
 CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
     const fs::path root = repo_root();
@@ -1354,18 +1353,16 @@ CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
         return;
     }
 
+    // Each prefix is a call on a `distributed_lock` object named `lock`, which is
+    // how every site in the suite spells it. The two watchdog cases are the only
+    // callers: one renews past a TTL, the other proves the lease lapses without it.
     const api_call_contract contracts[] = {
-        // start_watchdog: one definition + one call in
-        // redis_lock_watchdog_renews_past_one_ttl. Delete that call and the count
-        // drops to 1, which is the definition alone.
-        {"start_watchdog", k_redis_lock_files, 2, 2},
-        // stop_watchdog: one definition, one internal call from the destructor,
-        // and one stop in each of the two watchdog cases.
-        {"stop_watchdog", k_redis_lock_files, 2, 4},
+        {"lock.start_watchdog(", k_redis_lock_test, 1, 1},
+        {"lock.stop_watchdog(", k_redis_lock_test, 1, 2},
     };
 
     for (const api_call_contract& contract : contracts) {
-        const std::string needle = std::string(contract.method) + "(";
+        const std::string needle = contract.prefix;
         std::size_t found = 0;
         for (std::size_t i = 0; i < contract.file_count; ++i) {
             const fs::path path = root / contract.files[i];
@@ -1380,10 +1377,10 @@ CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
                 pos += needle.size();
             }
         }
-        CRPC_CHECK(found >= contract.min_occurrences);
-        if (found < contract.min_occurrences) {
-            std::printf("  %s occurs %zu time(s) in its own files, needs %zu -- lost a caller?\n",
-                        contract.method, found, contract.min_occurrences);
+        CRPC_CHECK(found >= contract.min_calls);
+        if (found < contract.min_calls) {
+            std::printf("  %s occurs %zu time(s), needs %zu -- lost a caller?\n",
+                        contract.prefix, found, contract.min_calls);
         }
     }
 }
