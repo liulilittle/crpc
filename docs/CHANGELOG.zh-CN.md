@@ -4,6 +4,38 @@
 
 ## 未发布
 
+### 测试时间断言：保留能失败的断言，删掉不能失败的
+
+- `client_cancel_during_backoff`（`tests/test_server_client.cpp`）现在在等待线程内部
+  测量唤醒：`t_done` 在 `get()` 返回后立即取值，`join()` 的调度延迟不再计入区间。
+  重试退避由 100 ms 提高到 1000 ms，上界为 250 ms，使立即唤醒（微秒级）与完整退避
+  （一秒）分别落在中点两侧约四倍处。区间同时断言非负：负值说明测量本身坏了，而只查
+  上界会静默放过它。该用例注明只能在 plain 线程运行：在协程之外的 shard 线程上调用
+  `get()` 会直接以 `failed_precondition` 失败，用例根本到不了取消路径；而 shard 等待
+  被切成 5 ms 的片，唤醒延迟由切片而非条件变量通知决定。
+- `iocp_timer_fires_and_cancels`（`tests/test_io_iocp.cpp`）不再断言
+  `elapsed < 20 ms`。1803 之前的回退定时器约 15.6 ms 的 tick 能通过该上界，而高分辨率
+  路径在有负载时的中位数（23.7-25.8 ms）反而失败，方向是反的；5 s 的 `wait_for` 保留为
+  挂死守护。替代它的是新能力 `crpc::iocp_backend::high_resolution_timer()`：在只能跑
+  回退定时器的主机上用例跳过（绝不伪装通过）。ABI：新增一个 MINOR 符号，仅限 Windows，
+  类中不增加数据成员（标志位于 out-of-line `impl`），`sizeof(iocp_backend)` 不变。
+- `graceful_shutdown_drains_and_rejects`（`tests/test_server_client.cpp`）曾断言
+  `elapsed < 2 s`，而 `cfg.drain` 就是 2 s：上界恰好等于合法路径，用满预算的 drain
+  必然是红的。现改为 `cfg.drain * 4`。
+- `net_accept_cancelled_by_close`（`tests/test_net_transport_edge.cpp`）曾等待 4000 ms
+  判唤醒，却又要求 `elapsed < 3 s`，于是慢而正确的唤醒被判红。现在这个等待是 4000 ms
+  的纯挂死守护（实测唤醒在 200 ms 以内），冗余的墙钟断言已删除；返回的 `shutting_down`
+  码才是语义的证明。
+- `perf_budget`（`tests/test_frame_compression.cpp`）中的绝对 LZ4 微秒预算移入
+  `bench/bench_compression.cpp` 作为软性 PASS/WARN 阈值，CRC32C 与大小尺寸的相对比较
+  一并移入。CI 保留的是尺寸缩放断言：32 KiB 输入是 256 字节的 128 倍，线性工作量远低
+  于 `128 * 4` 的上界，只有超线性回归才会触发它；自指测量（同一 codec、同一进程、两种
+  尺寸）使插桩对两侧对称，因此在各优化级别与 sanitizer 下都稳定。用例同时保留正确性
+  断言：可压缩的 32 KiB 输入必须缩小，两种尺寸都必须逐字节往返。
+- 证据：`tests/test_server_client.cpp`、`tests/test_io_iocp.cpp`、
+  `tests/test_net_transport_edge.cpp`、`tests/test_frame_compression.cpp`、
+  `bench/bench_compression.cpp`，以及一次全量 `ctest -j 4`。
+
 ### 流控接入客户端调用路径
 
 - 自适应流控原语（`flow::rtt_estimator`、`flow::pacer`、`flow::congestion_window`、`flow::rtt_tracker`）现已通过连接级 `rpc::flow_controller`（`include/crpc/rpc/flow_control.hpp`、`src/rpc/flow_control.cpp`）接入 `rpc::client`。默认关闭；`rpc::client::set_flow_control` 安装它，门面提供同名调用并对每个池内连接生效（包括之后新建的连接）。

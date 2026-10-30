@@ -30,6 +30,11 @@
   `flow_control_options` / `flow_state` 类型。`rpc::client` 本身增长了一个
   指针大小的成员，这属于 MAJOR 布局变化：必须重编所有消费方（见 `abi.md` 第 1 节）。
 - `crpc::client::resilience_statistics` 与 `crpc::client::resilience_stats()`。
+- `crpc::iocp_backend::high_resolution_timer()`（仅 Windows）：一个
+  `const noexcept` 访问器，报告后端创建定时器时用的是
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`，还是回退到了 Windows 10 1803
+  之前的毫秒级定时器。它只增加一个导出符号，不给类增加数据成员（标志位于
+  out-of-line `impl`），因此 `sizeof(crpc::iocp_backend)` 不变。
 - `crpc::resilience::fallback_statistics` 与 `crpc::client::fallback_stats()`。
 - `crpc::client::call<Resp>::degraded()`（header-only 访问器）。
 - `crpc::client::set_fallback`、`crpc::client::run_fallback` 与

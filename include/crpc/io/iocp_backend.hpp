@@ -131,6 +131,17 @@ public:
 
     [[nodiscard]] bool running() const noexcept;
 
+    // Whether this backend arms its timer with
+    // `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)`.  It is
+    // false when the host predates Windows 10 1803 and the backend fell back to
+    // a standard millisecond timer: deadlines are still honoured, only the
+    // resolution degrades to the legacy ~15.6 ms tick.  The value is derived
+    // from the flags the backend requested, not from the existence of a timer
+    // handle (that API also succeeds with flags == 0), so dropping the flag is
+    // observable.  A caller that needs to reason about sub-millisecond timer
+    // accuracy asks this instead of timing the timer and guessing.
+    [[nodiscard]] bool high_resolution_timer() const noexcept;
+
     // The implementation type is public only so the out-of-line definitions in
     // the translation unit can name it; it has no public members and no user of
     // this header ever needs to mention it.

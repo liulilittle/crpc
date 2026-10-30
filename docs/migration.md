@@ -47,6 +47,12 @@ These are additive and do not by themselves break a consumer that is rebuilt:
   `rpc::client` itself grew by one pointer-sized member, which is a MAJOR layout
   change: rebuild every consumer (see `abi.md` §1).
 - `crpc::client::resilience_statistics` and `crpc::client::resilience_stats()`.
+- `crpc::iocp_backend::high_resolution_timer()` (Windows only): a
+  `const noexcept` accessor that reports whether the backend created its timer
+  with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` or fell back to the
+  pre-Windows-10-1803 millisecond timer. It adds one exported symbol and no
+  data member to the class (the flag lives in the out-of-line `impl`), so
+  `sizeof(crpc::iocp_backend)` is unchanged.
 - `crpc::resilience::fallback_statistics` and `crpc::client::fallback_stats()`.
 - `crpc::client::call<Resp>::degraded()` (header-only accessor).
 - `crpc::client::set_fallback`, `crpc::client::run_fallback` and
