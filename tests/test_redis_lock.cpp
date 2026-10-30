@@ -158,7 +158,16 @@ CRPC_TEST(redis_lock_acquire_retries_until_it_wins) {
     executor.set_results.push_back(false);
     executor.set_results.push_back(false);
     executor.set_results.push_back(true);
-    distributed_lock lock(executor, quick_options());
+    lock_options options = quick_options();
+    // This case pins the retry-until-success behaviour, not the budget edge, so the
+    // budget is wide on purpose. With the 30ms default a single sleep_for(5ms) that
+    // runs long is enough to exhaust the budget before the third attempt and make
+    // the case flaky: two nominal 5ms pauses already exceed 30ms on this platform.
+    // At 5000ms the retry only has to finish two short pauses well inside a budget
+    // that dwarfs any plausible scheduling delay.
+    options.acquire_timeout = std::chrono::milliseconds(5000);
+    options.ttl = std::chrono::milliseconds(10000);
+    distributed_lock lock(executor, options);
 
     auto handle = lock.acquire("orders", "worker-3");
     CRPC_CHECK(handle.ok());
@@ -167,6 +176,37 @@ CRPC_TEST(redis_lock_acquire_retries_until_it_wins) {
         CRPC_CHECK_EQ(std::uint64_t{3}, handle.value().fence());
         CRPC_CHECK_EQ(std::size_t{3}, count_of(executor.executed, "SET"));
     }
+}
+
+CRPC_TEST(redis_lock_acquire_uses_last_slack_before_deadline) {
+    lock_executor executor;
+    executor.set_results.push_back(false);
+    executor.set_results.push_back(true);
+    lock_options options = quick_options();
+    // The retry delay R (2000ms) is deliberately larger than the budget A (200ms),
+    // so the outcome is pure arithmetic and never depends on how long a sleep runs.
+    //
+    // Old code decided whether to retry with `now + R >= deadline`, which is
+    // `0 + 2000 >= 200` on the first iteration: always true, so it gave up after a
+    // single attempt and returned deadline_exceeded. It issued SET once and never
+    // reached the attempt that would have won.
+    //
+    // The fixed loop asks only whether the budget is already spent, so it sleeps
+    // `min(R, A - now)`, which clamps to about A, and then re-enters the loop body,
+    // where try_acquire runs before the deadline check. The second attempt is
+    // therefore sent even if that sleep overshot the deadline; only the attempt
+    // count and the fence are asserted, never elapsed time.
+    options.acquire_timeout = std::chrono::milliseconds(200);
+    options.retry_delay = std::chrono::milliseconds(2000);
+    distributed_lock lock(executor, options);
+
+    auto handle = lock.acquire("orders", "worker-3b");
+    CRPC_CHECK(handle.ok());
+    if (handle.ok()) {
+        // The second attempt won, so the fence is the second value consumed.
+        CRPC_CHECK_EQ(std::uint64_t{2}, handle.value().fence());
+    }
+    CRPC_CHECK_EQ(std::size_t{2}, count_of(executor.executed, "SET"));
 }
 
 CRPC_TEST(redis_lock_acquire_times_out) {

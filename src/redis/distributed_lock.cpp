@@ -283,10 +283,20 @@ result<lock_handle> distributed_lock::acquire(std::string_view resource, std::st
         if (attempt.error().code != rpc_code::failed_precondition) {
             return attempt.error();
         }
-        if (std::chrono::steady_clock::now() + impl_->options.retry_delay >= deadline) {
+        // Give up only when the budget is already spent. Predicting whether one
+        // more delay would fit drops the last attempt, and the last attempt is
+        // usually the one that wins: the holder released during that final window.
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             return rpc_error{rpc_code::deadline_exceeded, "timed out acquiring the lock"};
         }
-        std::this_thread::sleep_for(impl_->options.retry_delay);
+        // Never sleep past the deadline: sleeping the full retry_delay can overshoot
+        // by up to retry_delay, and the bound below is what makes the last attempt
+        // land inside the budget instead of being dropped before it is tried.
+        const auto remaining = deadline - now;
+        std::this_thread::sleep_for(remaining < impl_->options.retry_delay
+                                        ? remaining
+                                        : impl_->options.retry_delay);
     }
 }
 
