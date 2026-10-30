@@ -38,6 +38,8 @@ MAJOR.MINOR.PATCH
 
 `rpc::client` 不能在头文件里放 `static_assert(sizeof(client) == N)`：它持有标准库成员，宽度取决于标准库配置而非本库（MSVC Debug 与 Release 不同；上文 `rpc_error`、`status`、`buffer`、`endpoint` 同理）。因此绊线是 out-of-line 的 `rpc::rpc_client_size_probe()`（报告库构建时的尺寸），加上消费者侧断言其编译期尺寸与之相等。任一方向的意外布局变化都会让该断言失败，而不是在运行时破坏内存。
 
+未发布的时间断言改造再增加一个 MINOR 符号，仅限 Windows：`crpc::iocp_backend::high_resolution_timer()`，一个 `const noexcept` 能力访问器，报告后端创建定时器时用的是 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`，还是回退到了 Windows 10 1803 之前的毫秒级定时器。它只增加符号、不改变布局：`iocp_backend` 本就是带 out-of-line 成员的导出类，该访问器读取的标志位于现有 `std::unique_ptr` 之后的 out-of-line `impl` 内，因此 `sizeof(iocp_backend)` 不变。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

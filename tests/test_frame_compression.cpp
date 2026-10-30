@@ -1414,6 +1414,25 @@ CRPC_TEST(tc30_header_accepts_what_the_whole_frame_rejects) {
                   static_cast<int>(rpc_code::protocol_error));
 }
 
+namespace {
+
+// Median of `iterations` timed runs: a single fastest sample is not a budget
+// (it hides a bimodal implementation) and a single sample is noise.
+template <typename Body>
+std::chrono::nanoseconds median_of(int iterations, Body&& body) {
+    std::vector<std::chrono::nanoseconds> samples;
+    samples.reserve(static_cast<std::size_t>(iterations));
+    for (int i = 0; i < iterations; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        body();
+        samples.push_back(std::chrono::steady_clock::now() - start);
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+}
+
+} // namespace
+
 // --- Correctness at the sizes the old budgets used ---------------------------
 
 // The timings this case used to gate now live in bench/bench_compression.cpp as
@@ -1461,6 +1480,31 @@ CRPC_TEST(perf_budget) {
                    .ok());
     CRPC_CHECK_EQ(small_size, small.size());
     CRPC_CHECK(std::memcmp(small_out.data(), small.data(), small.size()) == 0);
+
+    // Scaling guard, kept in CI: it is self-referential (same codec, same
+    // process, two sizes), so the instrumentation is symmetric and the ratio is
+    // stable across optimisation levels and sanitizers, unlike an absolute
+    // microsecond budget. 32 KiB is 128x the 256-byte input, so linear work lands
+    // far below the ceiling and only a superlinear regression trips it.
+    for (int i = 0; i < 8; ++i) {
+        (void)compress_payload(compression_algorithm::lz4, as_span(text),
+                               as_writable_span(stream), stream_size);
+    }
+    const auto encode_ns = median_of(200, [&] {
+        (void)compress_payload(compression_algorithm::lz4, as_span(text),
+                               as_writable_span(stream), stream_size);
+    });
+    for (int i = 0; i < 16; ++i) {
+        (void)compress_payload(compression_algorithm::lz4, as_span(small),
+                               as_writable_span(small_stream), small_written);
+    }
+    const auto small_ns = median_of(500, [&] {
+        (void)compress_payload(compression_algorithm::lz4, as_span(small),
+                               as_writable_span(small_stream), small_written);
+    });
+    if (small_ns.count() > 0) {
+        CRPC_CHECK(encode_ns.count() <= small_ns.count() * 128 * 4);
+    }
 }
 
 // The "no allocation per frame" property is proven by a counting allocator, not

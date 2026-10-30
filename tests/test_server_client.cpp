@@ -2847,11 +2847,13 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
 // G22 Slice 2a: cancel during the backoff wait must wake the waiter at once and
 // must not issue another attempt.
 //
-// This case must keep running on a plain thread. On a shard thread
-// `client::sleep_for` cuts the backoff into 5 ms slices and re-checks the cancel
-// flag between them, so the wake-up latency would be bounded by one slice plus
-// scheduling instead of by the condition variable, and the 250 ms window below
-// would stop discriminating anything.
+// This case must keep running on a plain thread. Calling `get()` from a shard
+// thread that is not inside a coroutine fails with `failed_precondition`
+// (client_facade.hpp, the `waited.code()` check in get()), so the case would
+// never reach the cancel-during-backoff path it exists to pin. The plain-thread
+// path is also the one that waits on the call's condition variable, which is
+// what `cancel()` notifies; a shard wait is sliced into 5 ms steps instead, so
+// its wake-up latency is bounded by a slice rather than by the notification.
 CRPC_TEST(client_cancel_during_backoff) {
     fixture f;
     fixture_config cfg;
