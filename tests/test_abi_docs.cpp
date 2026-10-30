@@ -1337,14 +1337,24 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
 // budget for "the definition itself counts once", which is the accounting that made
 // the previous version pass with every caller deleted.
 //
-// Known limit, stated rather than papered over: this is a text gate, so it resists
-// deletion and rename but not deliberate forgery. A decoy that declares its own
-// `struct Fake { void stop_watchdog(int); };` and a variable named `lock` would match
-// this shape without being the real call. Closing that would mean parsing the file
-// and checking the receiver type -- at which point the check is doing a compiler's
-// job, and the honest remedy is to make forgetting the call impossible instead (the
-// redis suite already pins both directions of the watchdog behaviour). This gate
-// covers the accident; the tests cover the behaviour.
+// Known limit, stated rather than papered over: this is a text scan, so a
+// deliberately crafted same-shape fake satisfies the count without calling the real
+// method:
+//
+//     struct FakeLock { void start_watchdog(); };
+//     FakeLock lock;  lock.start_watchdog();
+//
+// That is out of scope. The check exists to catch an accidental deletion of the last
+// caller, not to resist forgery, and closing it would mean resolving the receiver's
+// type here -- a compiler's job, done worse. What makes the limit acceptable is that
+// the forgery does not produce a green result: the behavioural assertion in
+// redis_lock_watchdog_renews_past_one_ttl (`count_of(executor.executed, "EVAL") >= 2`)
+// fails the moment the real call disappears, and no amount of naming can fake a
+// renewal command. A guard is acceptable when being fooled still leaves the suite
+// red, not when it is unbreakable.
+//
+// Read this as a travel warning, not a security gate: it is not evidence that the
+// watchdog is protected, only that nobody deleted its last caller by accident.
 struct api_call_contract {
     // Exact text a real call site contains, including the receiver.
     const char* prefix;
