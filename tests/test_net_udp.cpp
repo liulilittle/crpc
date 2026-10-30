@@ -229,4 +229,102 @@ CRPC_TEST(net_udp_local_reports_bound_address) {
     }
 }
 
+// `join_multicast` and `leave_multicast` are advertised in the header next to
+// `set_broadcast`, which is tested; the two multicast halves were never called by
+// anything, so their Windows and POSIX branches had never run once.
+//
+// Two layers, because they fail for different reasons and only one of them depends
+// on the host:
+//
+//   * the state transition is unconditional. Joining puts the socket into the group,
+//     so leaving then succeeds; leaving a group the socket is not in fails with
+//     EADDRNOTAVAIL on both platforms. That asymmetry is observable without any
+//     multicast routing, and it is what proves the two calls actually change socket
+//     state rather than returning ok unconditionally.
+//
+//   * delivery needs a host that routes group traffic. A container without a
+//     multicast route, or a firewall that drops it, is not a library defect, so that
+//     half skips -- the same rule the broadcast case follows.
+CRPC_TEST(net_udp_multicast_join_receives_and_leave_stops) {
+    // A group in the administratively scoped range (239.0.0.0/8), which needs no
+    // coordination and is the conventional choice for local tests.
+    auto parsed_group = crpc::net::ip_address::parse("239.255.42.99");
+    CRPC_CHECK(parsed_group.ok());
+    if (!parsed_group.ok()) {
+        return;
+    }
+    const crpc::net::ip_address group = parsed_group.value();
+    CRPC_CHECK(group.valid());
+
+    auto receiver = udp_socket::bind(address::tcp("0.0.0.0", 0));
+    CRPC_CHECK(receiver.ok());
+    if (!receiver.ok()) {
+        return;
+    }
+    auto& rx = receiver.value();
+    const crpc::u16 rx_port = rx->local().port();
+    CRPC_CHECK(rx_port != 0);
+
+    const crpc::status joined = rx->join_multicast(group, 0);
+    if (!joined.ok()) {
+        crpc_test::skip("this host cannot join an IPv4 multicast group");
+        return;
+    }
+
+    // Leaving a group the socket just joined must succeed.
+    CRPC_CHECK(rx->leave_multicast(group, 0).ok());
+    // Leaving it a second time must not: the socket is no longer a member. This is
+    // what shows the first leave was not a no-op.
+    CRPC_CHECK_FALSE(rx->leave_multicast(group, 0).ok());
+
+    // Join again for the delivery half, so the socket is in the group if the host
+    // can deliver.
+    if (!rx->join_multicast(group, 0).ok()) {
+        crpc_test::skip("re-joining the multicast group failed on this host");
+        return;
+    }
+
+    auto sender = udp_socket::bind(address::tcp("127.0.0.1", 0));
+    CRPC_CHECK(sender.ok());
+    if (!sender.ok()) {
+        (void)rx->leave_multicast(group, 0);
+        return;
+    }
+    auto& tx = sender.value();
+
+    const std::byte payload[] = {std::byte{'m'}, std::byte{'c'}, std::byte{'a'},
+                                 std::byte{'s'}, std::byte{'t'}};
+    const crpc::status sent = tx->send_to(
+        crpc::span<const std::byte>(payload),
+        address::tcp(group.to_string(), rx_port), std::chrono::milliseconds(400));
+    if (!sent.ok()) {
+        (void)rx->leave_multicast(group, 0);
+        crpc_test::skip("local multicast send is not permitted on this host");
+        return;
+    }
+
+    std::byte buffer[8];
+    auto datagram = rx->recv_from(crpc::span<std::byte>(buffer), std::chrono::seconds(2));
+    if (!datagram.ok()) {
+        (void)rx->leave_multicast(group, 0);
+        crpc_test::skip("multicast datagram was not delivered on this host");
+        return;
+    }
+    CRPC_CHECK_EQ(std::size_t{5}, datagram.value().bytes);
+    for (std::size_t i = 0; i < 5; ++i) {
+        CRPC_CHECK(buffer[i] == payload[i]);
+    }
+
+    // After leaving, group traffic must no longer be delivered here.
+    CRPC_CHECK(rx->leave_multicast(group, 0).ok());
+    const crpc::status sent_after = tx->send_to(
+        crpc::span<const std::byte>(payload),
+        address::tcp(group.to_string(), rx_port), std::chrono::milliseconds(400));
+    if (sent_after.ok()) {
+        auto late = rx->recv_from(crpc::span<std::byte>(buffer),
+                                  std::chrono::milliseconds(500));
+        CRPC_CHECK_FALSE(late.ok());
+    }
+}
+
 CRPC_TEST_MAIN()
