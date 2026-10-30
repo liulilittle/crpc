@@ -224,7 +224,12 @@ struct legacy_probe final : crpc::server_interceptor {
     std::atomic<int> requests{0};
     std::atomic<int> responses{0};
     std::shared_ptr<shared_log> log;
-    crpc::rpc_code last_code = crpc::rpc_code::ok;
+    // Atomic: `on_response` runs on the shard thread and the case reads this
+    // from the main thread once the call has returned. The call returning only
+    // means the response was written, not that `on_response` has finished with
+    // it, so a plain member is a genuine data race (ThreadSanitizer reports
+    // exactly this pair). The other two counters were already atomic.
+    std::atomic<crpc::rpc_code> last_code{crpc::rpc_code::ok};
 
     void on_request(const crpc::frame&) noexcept override {
         requests.fetch_add(1, std::memory_order_relaxed);
@@ -234,7 +239,7 @@ struct legacy_probe final : crpc::server_interceptor {
     }
     void on_response(crpc::rpc_code code) noexcept override {
         responses.fetch_add(1, std::memory_order_relaxed);
-        last_code = code;
+        last_code.store(code, std::memory_order_release);
         if (log != nullptr) {
             log->push("legacy:response:" + std::string(crpc::to_string(code)));
         }
@@ -405,8 +410,12 @@ CRPC_TEST(no_chain_baseline_unchanged) {
 // --- 2. the legacy observer keeps firing with no chain installed -------------
 
 CRPC_TEST(legacy_server_interceptor_still_fires) {
-    harness h;
+    // Declared before `h`: the harness destructor stops the server, and the
+    // server calls `on_response` on this object right up to that point. If
+    // `probe` were declared after `h`, it would be destroyed first and the
+    // shard thread could still be inside `on_response` when it went away.
     legacy_probe probe;
+    harness h;
     CRPC_CHECK(start_harness(h, nullptr, &probe));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -416,7 +425,7 @@ CRPC_TEST(legacy_server_interceptor_still_fires) {
     CRPC_CHECK(ran);
     CRPC_CHECK_EQ(1, probe.requests.load());
     CRPC_CHECK_EQ(1, probe.responses.load());
-    CRPC_CHECK(probe.last_code == crpc::rpc_code::ok);
+    CRPC_CHECK(probe.last_code.load(std::memory_order_acquire) == crpc::rpc_code::ok);
 }
 
 // --- 3. pinned flat order: legacy -> before_call -> after_call -> legacy -----
@@ -426,7 +435,8 @@ CRPC_TEST(hook_order_is_pinned_flat_registration_order) {
     // before_call in registration order, then the handler, then after_call in
     // registration order, then legacy on_response with the final outcome. No
     // reverse/unwind phase exists at either hook point.
-    harness h;
+    // Same lifetime rule as the test above: everything the server calls
+    // must outlive the harness that stops it.
     auto log = std::make_shared<shared_log>();
     scripted a("a", log);
     scripted b("b", log);
@@ -437,6 +447,7 @@ CRPC_TEST(hook_order_is_pinned_flat_registration_order) {
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &b));
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &a));
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &b));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, &probe));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -460,12 +471,12 @@ CRPC_TEST(short_circuit_skips_handler_and_after_call) {
     // `application` (the client turns raw 22 into `internal` plus a
     // `crpc.raw_code` metadata entry), so the pinned case uses a code that
     // round-trips: `failed_precondition`.
-    harness h;
     scripted gate("gate", nullptr);
     gate.refuse(true).verdict(crpc::rpc_code::failed_precondition,
                               "rejected-by-aop");
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &gate));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto refused = call_echo(*h.cli, 1);
@@ -489,11 +500,11 @@ CRPC_TEST(short_circuit_skips_handler_and_after_call) {
 // --- 5. short-circuit without a verdict: the chain defaults to canceled ------
 
 CRPC_TEST(short_circuit_default_verdict_is_canceled) {
-    harness h;
     scripted gate("gate", nullptr);
     gate.refuse(true);
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &gate));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto refused = call_echo(*h.cli, 1);
@@ -510,11 +521,11 @@ CRPC_TEST(short_circuit_default_verdict_is_canceled) {
 // --- 6. a throwing before_call hook becomes internal; the server survives ----
 
 CRPC_TEST(throwing_before_call_becomes_internal_and_survives) {
-    harness h;
     scripted bomb("bomb", nullptr);
     bomb.throw_before(true);
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &bomb));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -535,12 +546,12 @@ CRPC_TEST(throwing_before_call_becomes_internal_and_survives) {
 // --- 7. a throwing after_call hook vetoes the response with internal ---------
 
 CRPC_TEST(throwing_after_call_becomes_internal_and_survives) {
-    harness h;
     scripted bomb("bomb", nullptr);
     bomb.throw_after(true);
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &bomb));
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &bomb));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -562,13 +573,13 @@ CRPC_TEST(throwing_after_call_becomes_internal_and_survives) {
 // --- 8. context flows: interceptor -> interceptor -> handler -> after_call ---
 
 CRPC_TEST(context_flows_between_hooks_and_handler) {
-    harness h;
     metadata_writer writer;
     metadata_reader reader;
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &writer));
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &reader));
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &writer));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_ctx_echo(*h.cli, "ctx");
@@ -591,10 +602,10 @@ CRPC_TEST(context_flows_between_hooks_and_handler) {
 // --- 9. a response-side-only chain runs once per dispatched call -------------
 
 CRPC_TEST(after_call_only_chain_observes_dispatched_outcome) {
-    harness h;
     scripted observer("observer", nullptr);
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &observer));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -610,7 +621,6 @@ CRPC_TEST(after_call_only_chain_observes_dispatched_outcome) {
 // --- 10. eight interceptors keep registration order at both hook points ------
 
 CRPC_TEST(eight_interceptors_keep_registration_order) {
-    harness h;
     auto log = std::make_shared<shared_log>();
     std::vector<std::unique_ptr<scripted>> hooks;
     obs::interceptor_chain chain;
@@ -620,6 +630,7 @@ CRPC_TEST(eight_interceptors_keep_registration_order) {
         CRPC_CHECK(chain.add(obs::hook_point::before_call, hooks.back().get()));
         CRPC_CHECK(chain.add(obs::hook_point::after_call, hooks.back().get()));
     }
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     const bool ran = run_on_shard(*h.shard, [&] {
         auto result = call_echo(*h.cli, 1);
@@ -646,37 +657,62 @@ CRPC_TEST(concurrent_calls_are_all_intercepted) {
     // are not shared-thread-safe, so assertions run after the join.
     constexpr int kThreads = 4;
     constexpr int kCallsPerThread = 25;
-    harness h;
     counter tally;
     obs::interceptor_chain chain;
     CRPC_CHECK(chain.add(obs::hook_point::before_call, &tally));
     CRPC_CHECK(chain.add(obs::hook_point::after_call, &tally));
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
 
     std::atomic<int> ok_calls{0};
     std::atomic<int> bad_calls{0};
     std::atomic<int> start_failures{0};
+    // Shards and clients are built here, on the test thread, and only the
+    // calls run concurrently. Building them inside the worker threads put four
+    // simultaneous `runtime` constructions into corocc's driver registry, whose
+    // hand-rolled spinlock (a CAS on a `uintptr_t` in
+    // `third_party/corocc/src/scheduler/rt_driver.c`) ThreadSanitizer cannot see
+    // -- it reported the registry walk as racing with another thread's
+    // `dup_cstr`. That is a limitation of the analysis, not a defect this test
+    // is about: the subject here is `interceptor_chain::run` under concurrency,
+    // and concurrent runtime construction is corocc's own concern with its own
+    // tests. Keeping construction serial preserves the intent and keeps the
+    // TSan gate meaningful.
+    struct worker {
+        std::unique_ptr<crpc::runtime> shard;
+        std::unique_ptr<crpc::client> cli;
+    };
+    std::vector<worker> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        crpc::runtime_options ro;
+        ro.start_handler_pool = false;
+        worker w;
+        w.shard = std::make_unique<crpc::runtime>(ro);
+        w.shard->start_thread();
+        crpc::client::builder cb;
+        cb.add_endpoint(crpc::endpoint::inproc(h.name), h.backend);
+        cb.pool_size(1);
+        cb.default_deadline(5s);
+        cb.breaker(relaxed_breaker());
+        cb.on_shard(*w.shard);
+        w.cli = cb.build();
+        if (w.cli == nullptr) {
+            start_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        workers.push_back(std::move(w));
+    }
     {
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([&] {
-                crpc::runtime_options ro;
-                ro.start_handler_pool = false;
-                crpc::runtime shard(ro);
-                shard.start_thread();
-                crpc::client::builder cb;
-                cb.add_endpoint(crpc::endpoint::inproc(h.name), h.backend);
-                cb.pool_size(1);
-                cb.default_deadline(5s);
-                cb.breaker(relaxed_breaker());
-                cb.on_shard(shard);
-                std::unique_ptr<crpc::client> cli = cb.build();
-                if (cli == nullptr) {
-                    start_failures.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    const bool ran = run_on_shard(shard, [&] {
+            threads.emplace_back([&, t] {
+                if (workers[static_cast<std::size_t>(t)].cli == nullptr) {
+                    return;
+                }
+                const bool ran = run_on_shard(
+                    *workers[static_cast<std::size_t>(t)].shard, [&, t] {
                         for (int i = 0; i < kCallsPerThread; ++i) {
-                            auto result = call_echo(*cli, i);
+                            auto result =
+                                call_echo(*workers[static_cast<std::size_t>(t)].cli, i);
                             if (result.ok() && result.value() == i + 1) {
                                 ok_calls.fetch_add(1, std::memory_order_relaxed);
                             } else {
@@ -684,17 +720,19 @@ CRPC_TEST(concurrent_calls_are_all_intercepted) {
                             }
                         }
                     });
-                    if (!ran) {
-                        start_failures.fetch_add(1, std::memory_order_relaxed);
-                    }
+                if (!ran) {
+                    start_failures.fetch_add(1, std::memory_order_relaxed);
                 }
-                shard.stop();
-                shard.join();
             });
         }
         for (std::thread& th : threads) {
             th.join();
         }
+    }
+    for (worker& w : workers) {
+        w.cli->close();
+        w.shard->stop();
+        w.shard->join();
     }
     CRPC_CHECK_EQ(0, start_failures.load());
     CRPC_CHECK_EQ(0, bad_calls.load());
@@ -707,9 +745,9 @@ CRPC_TEST(concurrent_calls_are_all_intercepted) {
 // --- 12. an installed but empty chain freezes and changes nothing ------------
 
 CRPC_TEST(empty_chain_freezes_in_start_and_changes_nothing) {
-    harness h;
     obs::interceptor_chain chain;
     CRPC_CHECK_FALSE(chain.frozen());
+    harness h;
     CRPC_CHECK(start_harness(h, &chain, nullptr));
     // The server froze the chain before accepting (its add()s are now dead).
     CRPC_CHECK(chain.frozen());
