@@ -711,6 +711,16 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
         request.header.flags = slot.one_way ? frame_flag_unreliable : 0;
         request.header.stream_id = slot.stream_id;
         request.payload = span<const std::byte>(payload_scratch_.data(), payload_written);
+        // Ordered delivery opt-in: a lane token on the context becomes the
+        // frame's ORDERED extension. `lane_id == 0` is sent as-is; the server
+        // treats it (and a missing token) as "no ordering", which keeps the
+        // wire honest about what the caller asked for.
+        if (ctx.lane.has_value()) {
+            request.header.flags =
+                static_cast<u8>(request.header.flags | frame_flag_ordered);
+            request.ordered.lane_id = ctx.lane->lane_id;
+            request.ordered.lane_seq = ctx.lane->seq;
+        }
 
         const std::size_t frame_size = encoded_frame_size(request);
         if (out_.size() - out_sent_ + frame_size > options_.max_pending_write_bytes) {

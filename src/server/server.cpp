@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <deque>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -22,6 +23,7 @@
 #include <crpc/resilience/admission.hpp>
 #include <crpc/resilience/fallback.hpp>
 #include <crpc/rpc/call.hpp>
+#include <crpc/rpc/lane_queue.hpp>
 
 namespace crpc {
 namespace {
@@ -47,6 +49,13 @@ to_time_point(resilience::clock_source source) noexcept {
 // burst of oversized frames cannot pin a large block for the server's life.
 inline constexpr std::size_t send_pool_max_ops_default = 8192;
 inline constexpr std::size_t send_buffer_retain_bytes_default = 1u << 20; // 1 MiB
+
+// Default bounded wait for a gap in an ordered lane. Not a `server::options`
+// field: growing that struct is a MAJOR ABI break (docs/abi.md §4) and the
+// send-path pool set the precedent of an environment override for exactly
+// this kind of tuning knob. `CRPC_LANE_GAP_TIMEOUT_MS` overrides it; zero
+// skips a missing sequence as soon as the gap is observed.
+inline constexpr std::size_t lane_gap_timeout_default_ms = 5000;
 
 // Overridable through the environment so a test or a benchmark can exercise a
 // small cap and a small retain limit without a recompile. Read once, when the
@@ -100,6 +109,25 @@ void schedule_detach_connection(server_connection* sc) noexcept;
 // error. Defined after `server::impl` (it needs the full type); safe to call
 // from the early teardown paths that run before the impl is complete.
 void abandon_dedup_waiters(server::impl* owner, const void* wait_key) noexcept;
+
+// --- ordered-lane bridge (defined after `server_connection`) -----------------
+//
+// The scheduler owns the ordering state; the server owns the timer wheel and
+// the drop path. These four functions are the seam: the scheduler calls the
+// hooks with `(lane_id, expected_seq, deadline)` and the connection resolves
+// them against its shard's runtime. The gap-timer payload lives in a
+// per-lane holder owned by the connection, so no timer ever points into the
+// scheduler's internal state and a late callback re-validates through
+// `lane_queue::skip_gap`.
+u64 lane_queue_now_hook(void* ctx) noexcept;
+bool lane_gap_arm_hook(void* ctx, u64 lane_id, u64 expected_seq,
+                       u64 deadline_ns) noexcept;
+void lane_gap_cancel_hook(void* ctx, u64 lane_id) noexcept;
+void run_lane_gap_timer(void* ctx) noexcept;
+// Releases one buffered (never run) lane call: answers it with an explicit
+// error while the transport still allows one and gives back its in-flight
+// accounting. Called by `lane_queue::fail_all`.
+void drop_lane_item(void* payload) noexcept;
 
 class send_op_pool;
 
@@ -229,6 +257,19 @@ struct request_job {
     bool forced_error = false;
     rpc_code forced_code = rpc_code::ok;
     std::chrono::milliseconds forced_retry_after{0};
+    // Ordered-lane identity copied from the frame (ORDERED flag + extension).
+    // Zero `lane_id` means unordered: the request follows the pre-lane path.
+    bool lane_ordered = false;
+    u64 lane_id = 0;
+    u64 lane_seq = 0;
+    // Set when the lane scheduler took ownership of a parked call: the job
+    // is then released by the drain (after it finally runs), by the gap-timer
+    // drain, or by the teardown drop path -- never here.
+    bool lane_parked = false;
+    // Set when the lane drain hands a parked call back to `handle_request`:
+    // the call has already consumed its position, so it skips admission and
+    // skips the end-of-call drain (the outer drain loop owns the lane).
+    bool lane_dequeued = false;
 };
 
 // One immutable admission record per registered service, built in `start()`
@@ -325,6 +366,29 @@ struct server_connection {
     std::unordered_map<std::string, u32> push_stream_by_topic;
     std::optional<pending_message> pending_push;
     buffer push_scratch;
+
+    // --- ordered lanes -------------------------------------------------------
+    // One serial queue per (connection, lane_id) -- requirement 11. All state
+    // is guarded by `lane_mutex`; admissions and drains run on the
+    // connection's shard thread, while teardown (`on_terminal`, `close_all`,
+    // the destructor, `stop()`) may fail every lane from another thread.
+    // Parked calls hold the connection's in-flight accounting, which is what
+    // bounds the buffer (the per-connection in-flight cap).
+    std::mutex lane_mutex;
+    rpc::lane_queue lanes;
+
+    // One outstanding gap timer per lane id ever seen. The map is
+    // append-only: a node's address is the runtime timer key and must stay
+    // valid for the connection's life. A holder outliving its lane is inert --
+    // the timer callback re-validates through `lane_queue::skip_gap`.
+    struct lane_gap_timer {
+        // No strong reference: the runtime's keep-alive token holds the
+        // connection across the callback window.
+        std::weak_ptr<server_connection> conn;
+        u64 lane_id = 0;
+        u64 expected_seq = 0;
+    };
+    std::map<u64, lane_gap_timer> lane_gap_timers;
 
     server_connection() = default;
     ~server_connection();
@@ -456,6 +520,13 @@ struct server::impl {
     u16 next_push_topic_id = 1;
     u32 next_push_stream_id = 1;
 
+    // Bounded wait for a gap in an ordered lane (requirement 11). A missing
+    // sequence blocks its lane for at most this long before the scheduler
+    // skips it and execution resumes; see rpc/lane_queue.hpp for the full
+    // semantics. Overridable through the environment so a test can exercise
+    // the timeout without waiting for the default; read once, here.
+    std::chrono::milliseconds lane_gap_timeout{lane_gap_timeout_default_ms};
+
     std::atomic<u64> push_published{0};
     std::atomic<u64> push_delivered{0};
     std::atomic<u64> push_overflow_dropped{0};
@@ -479,7 +550,10 @@ struct server::impl {
           send_pool(env_size_or("CRPC_SEND_POOL_MAX_OPS",
                                 send_pool_max_ops_default),
                     env_size_or("CRPC_SEND_BUFFER_RETAIN_BYTES",
-                                send_buffer_retain_bytes_default)) {
+                                send_buffer_retain_bytes_default)),
+          lane_gap_timeout(std::chrono::milliseconds(
+              env_size_or("CRPC_LANE_GAP_TIMEOUT_MS",
+                          lane_gap_timeout_default_ms))) {
         // An invalid clock keeps the pre-injection behaviour without making
         // `server::options`'s default construction call into the library (see
         // the field comment in server.hpp).
@@ -603,6 +677,17 @@ struct server::impl {
             auto sc = std::make_shared<server_connection>();
             sc->owner = this;
             sc->shard = shards[index].get();
+            // Ordered-lane scheduler wiring (requirement 11). The hooks run on
+            // the connection's shard for admissions and drains; `fail_all`
+            // may be called from the reader or control thread at teardown.
+            rpc::lane_queue::options lane_opts;
+            lane_opts.gap_timeout = lane_gap_timeout;
+            lane_opts.now = &lane_queue_now_hook;
+            lane_opts.now_ctx = sc.get();
+            lane_opts.arm = &lane_gap_arm_hook;
+            lane_opts.cancel = &lane_gap_cancel_hook;
+            lane_opts.timer_ctx = sc.get();
+            sc->lanes.set_options(lane_opts);
             if (opt.resilience_enabled && opt.per_connection_rate) {
                 sc->rate = std::make_unique<resilience::rate_limiter>(
                     *opt.per_connection_rate, opt.clock_source);
@@ -624,6 +709,29 @@ struct server::impl {
 
     void notify_drained() noexcept {
         drain_cv.notify_all();
+    }
+
+    // Drops every buffered ordered-lane call on every live connection. The
+    // `drop` callback answers each one with an explicit error while the
+    // transport still allows it (see `drop_lane_item`), so a client does not
+    // wait out its deadline for a call the server will never run. Called
+    // from `stop()` before the drain and from every connection teardown path.
+    void fail_all_lanes() noexcept {
+        try {
+            std::vector<std::shared_ptr<server_connection>> snapshot;
+            {
+                std::lock_guard<std::mutex> lk(connections_mutex);
+                snapshot = connections;
+            }
+            for (const std::shared_ptr<server_connection>& sc : snapshot) {
+                std::lock_guard<std::mutex> lk(sc->lane_mutex);
+                (void)sc->lanes.fail_all();
+            }
+        } catch (...) {
+            // The snapshot copy allocated; an allocation failure during
+            // teardown degrades to "the per-connection paths fail their own
+            // lanes", which `on_terminal` and the destructor still do.
+        }
     }
 
     void complete_call(const std::shared_ptr<server_connection>& sc, bool counted) noexcept {
@@ -1154,17 +1262,148 @@ struct server::impl {
         frame request;
         request.header = job.header;
         request.payload = job.payload.readable();
+        // The dispatcher rebuilds the handler's context from this frame, and
+        // the lane token travels in the ordered extension: submit() copied it
+        // into the job beside the payload, and it must reach the frame here,
+        // or a handler would observe lane 0/seq 0 while the scheduler still
+        // ordered the call correctly.
+        if (job.lane_ordered) {
+            request.ordered.lane_id = job.lane_id;
+            request.ordered.lane_seq = job.lane_seq;
+        }
 
-        for (server_interceptor* interceptor : interceptors) {
-            if (interceptor != nullptr) {
-                interceptor->on_request(request);
+        // One `on_request` per frame: a call the lane scheduler parked and
+        // later drained re-enters here, and the interceptor has already seen
+        // the frame at arrival.
+        if (!job.lane_dequeued) {
+            for (server_interceptor* interceptor : interceptors) {
+                if (interceptor != nullptr) {
+                    interceptor->on_request(request);
+                }
             }
         }
 
-        // Per-service cap and breaker. A malformed envelope is left to the
-        // dispatcher, which produces the decode_error response.
+        // The envelope is decoded once here, before the lane gate: the
+        // duplicate rule below needs the idempotency key, and the admitted
+        // pipeline reuses the result. A drained call re-decodes its own
+        // payload, which is a small bounded copy.
         call_envelope envelope;
         const bool decoded = decode_call_envelope(request.payload, envelope).ok();
+
+        // Ordered-lane admission (requirement 11; semantics in
+        // rpc/lane_queue.hpp). A frame with the ORDERED extension and a
+        // non-zero lane id consumes its `(lane_id, seq)` position before any
+        // admission stage runs, so a locally refused call still keeps the
+        // lane's sequence contiguous. The three outcomes:
+        //   duplicate -> the position was already consumed. A replay that
+        //                carries an idempotency key is a retry of a known
+        //                logical call: it bypasses the gate and lets the
+        //                dispatcher's dedup table wait for / replay the
+        //                leader, so a client retrying a slow lane call gets
+        //                the original outcome instead of a refusal. Without
+        //                a key a replay would double-apply side effects the
+        //                lane promises to order exactly once, so it is
+        //                rejected without running the handler;
+        //   buffered  -> parked behind its predecessor or a gap; the lane
+        //                drain or the gap timer owns the call from here and
+        //                the in-flight accounting stays held;
+        //   run_now   -> execute immediately; the drain after the call
+        //                releases the buffered successors in seq order.
+        bool lane_run_now = false;
+        if (job.lane_ordered && job.lane_id != 0 && !job.lane_dequeued) {
+            rpc::lane_queue::item work;
+            work.seq = job.lane_seq;
+            work.payload = &job;
+            work.drop = &drop_lane_item;
+            rpc::lane_queue::admission verdict;
+            {
+                std::lock_guard<std::mutex> lk(sc->lane_mutex);
+                verdict = sc->lanes.admit(job.lane_id, work);
+            }
+            if (verdict == rpc::lane_queue::admission::duplicate) {
+                const bool keyed = decoded && envelope.extensions.has(
+                                                     trace_extension::has_idempotency_key);
+                bool parked = false;
+                if (keyed) {
+                    std::lock_guard<std::mutex> lk(sc->lane_mutex);
+                    parked = sc->lanes.is_parked(job.lane_id, job.lane_seq);
+                }
+                // A replay without a key would double-apply side effects the
+                // lane promises to order exactly once, and a replay of a call
+                // that is still parked would execute ahead of it (the dedup
+                // table has no entry for an undispatched call). Both are
+                // refused without running the handler. Only a keyed replay of
+                // an already-finished position reaches the dispatcher, where
+                // the dedup table replays or waits for the recorded outcome.
+                if (!keyed || parked) {
+                    if (wants_response) {
+                        send_error(sc, job.header.stream_id,
+                                   rpc_code::failed_precondition,
+                                   std::chrono::milliseconds(0),
+                                   parked ? "lane seq is still queued"
+                                          : "lane seq already consumed");
+                    }
+                    complete_call(sc, job.counted);
+                    return;
+                }
+                // A keyed replay keeps the consumed position untouched and
+                // never drains: it is not a lane participant this time.
+            } else if (verdict == rpc::lane_queue::admission::buffered) {
+                // Ownership transferred to the scheduler: run_job must not
+                // delete this job (see the flag's contract on request_job).
+                job.lane_parked = true;
+                return;
+            } else {
+                lane_run_now = true;
+            }
+        }
+
+        handle_admitted_request(job, request, envelope, decoded);
+
+        if (lane_run_now) {
+            // The call finished (any outcome -- even a local admission
+            // refusal consumed its position). Run the buffered successors
+            // that are next in sequence, in order, on this thread.
+            lane_drain(*sc, job.lane_id);
+        }
+    }
+
+    // Runs every parked call of `lane_id` whose turn has come, in ascending
+    // seq order, on the calling thread. A drained call re-enters
+    // `handle_request` with `lane_dequeued` set, so it never re-admits and
+    // never re-drains: this loop is the only driver. No shard thread ever
+    // waits inside a call for its predecessor -- the predecessor's completion
+    // (or the gap timer) is what triggers the next pop.
+    void lane_drain(server_connection& sc, u64 lane_id) noexcept {
+        for (;;) {
+            std::optional<rpc::lane_queue::item> next;
+            {
+                std::lock_guard<std::mutex> lk(sc.lane_mutex);
+                next = sc.lanes.pop_runnable(lane_id);
+            }
+            if (!next.has_value()) {
+                return;
+            }
+            request_job* parked = static_cast<request_job*>(next->payload);
+            parked->lane_dequeued = true;
+            handle_request(*parked);
+            std::unique_ptr<request_job> reclaim(parked);
+        }
+    }
+
+    // The admitted-request pipeline: everything from the push-control branch
+    // through the response, the counters and the in-flight release. Every
+    // exit path releases the accounting exactly once; a lane call that exits
+    // early (breaker open, bulkhead full, deadline refused) has still
+    // consumed its lane position, and the caller drains the lane afterwards.
+    // The envelope arrives pre-decoded from `handle_request` (the lane gate
+    // needs it first); `decoded` is false for a malformed envelope, which the
+    // dispatcher answers with the canonical decode_error.
+    void handle_admitted_request(request_job& job, const frame& request,
+                                 const call_envelope& envelope,
+                                 bool decoded) noexcept {
+        const std::shared_ptr<server_connection>& sc = job.conn;
+        const bool wants_response = job.header.type != frame_type::one_way;
         const u64 service_id = decoded ? envelope.service_id : 0;
 
         if (decoded && service_id == push::push_control_service_id) {
@@ -1432,9 +1671,16 @@ struct server::impl {
     }
 
     static void run_job(void* ctx) noexcept {
+        // A parked ordered-lane call transfers ownership to the lane
+        // scheduler: the drain deletes it after it finally runs, the teardown
+        // drop path deletes it if it never will. Releasing it here would hand
+        // the scheduler a dangling pointer.
         std::unique_ptr<request_job> job(static_cast<request_job*>(ctx));
         if (job->conn && job->conn->owner != nullptr) {
             job->conn->owner->handle_request(*job);
+        }
+        if (job->lane_parked) {
+            (void)job.release();
         }
     }
 
@@ -1482,6 +1728,12 @@ struct server::impl {
         for (const std::shared_ptr<server_connection>& sc : snapshot) {
             sc->closed.store(true, std::memory_order_release);
             sc->detach_scheduled.store(true, std::memory_order_release);
+            // Release the ordered-lane buffers before the transport goes
+            // away; `drop_lane_item` sees `closed` and skips the send.
+            {
+                std::lock_guard<std::mutex> lk(sc->lane_mutex);
+                (void)sc->lanes.fail_all();
+            }
             // Detach first: the hub must never target a connection that is
             // about to be closed (and later destroyed). The control thread
             // holds no client mutex here, so a synchronous detach is safe.
@@ -1509,6 +1761,96 @@ void run_push_ack_task(void* ctx) noexcept {
 
 void drop_push_ack_task(void* ctx) noexcept {
     delete static_cast<push_ack_task*>(ctx);
+}
+
+// --- ordered-lane bridge -----------------------------------------------------
+
+u64 lane_queue_now_hook(void* ctx) noexcept {
+    auto* sc = static_cast<server_connection*>(ctx);
+    if (sc == nullptr || sc->shard == nullptr) {
+        return 0;
+    }
+    return sc->shard->now_ns();
+}
+
+bool lane_gap_arm_hook(void* ctx, u64 lane_id, u64 expected_seq,
+                       u64 deadline_ns) noexcept {
+    auto* sc = static_cast<server_connection*>(ctx);
+    if (sc == nullptr || sc->shard == nullptr || sc->owner == nullptr) {
+        return false;
+    }
+    // The runtime keeps this token alive across the wheel-pop and the
+    // callback, which keeps the connection (and with it the holder the timer
+    // points at) alive for exactly as long as the timer can fire.
+    const std::shared_ptr<server_connection> keep = sc->self.lock();
+    if (!keep) {
+        return false;
+    }
+    try {
+        server_connection::lane_gap_timer& holder = sc->lane_gap_timers[lane_id];
+        holder.conn = keep;
+        holder.lane_id = lane_id;
+        holder.expected_seq = expected_seq;
+        return sc->shard->arm_timer(&holder, deadline_ns, &run_lane_gap_timer,
+                                    &holder,
+                                    std::shared_ptr<void>(keep, &holder));
+    } catch (...) {
+        // The map node allocation failed. The lane stays blocked behind the
+        // gap (fail closed toward ordering, not toward skipping); the next
+        // drain retries.
+        return false;
+    }
+}
+
+void lane_gap_cancel_hook(void* ctx, u64 lane_id) noexcept {
+    auto* sc = static_cast<server_connection*>(ctx);
+    if (sc == nullptr || sc->shard == nullptr) {
+        return;
+    }
+    // The holder is never erased (the wheel may still reference its address),
+    // so this only removes the scheduled callback.
+    const auto it = sc->lane_gap_timers.find(lane_id);
+    if (it != sc->lane_gap_timers.end()) {
+        sc->shard->cancel_timer(&it->second);
+    }
+}
+
+void run_lane_gap_timer(void* ctx) noexcept {
+    auto* holder = static_cast<server_connection::lane_gap_timer*>(ctx);
+    const std::shared_ptr<server_connection> sc = holder->conn.lock();
+    if (!sc || sc->owner == nullptr ||
+        sc->closed.load(std::memory_order_acquire)) {
+        return;
+    }
+    bool skipped = false;
+    {
+        std::lock_guard<std::mutex> lk(sc->lane_mutex);
+        skipped = sc->lanes.skip_gap(holder->lane_id, holder->expected_seq);
+    }
+    if (skipped) {
+        sc->owner->lane_drain(*sc, holder->lane_id);
+    }
+}
+
+void drop_lane_item(void* payload) noexcept {
+    std::unique_ptr<request_job> job(static_cast<request_job*>(payload));
+    const std::shared_ptr<server_connection>& sc = job->conn;
+    if (sc == nullptr || sc->owner == nullptr) {
+        return;
+    }
+    // A parked call that is dropped instead of run still deserves an answer
+    // while the transport can carry one: the caller would otherwise wait out
+    // its deadline for a side effect that never happened. A closed
+    // connection has nothing to answer; the client observes the loss itself.
+    if (!sc->closed.load(std::memory_order_acquire) &&
+        job->header.type != frame_type::one_way) {
+        sc->owner->send_error(sc, job->header.stream_id, rpc_code::shutting_down,
+                              std::chrono::milliseconds(0),
+                              "ordered lane call was dropped");
+    }
+    if (job->counted) {
+        sc->owner->complete_call(sc, true);
+    }
 }
 
 void server::impl::run_detach_task(void* ctx) noexcept {
@@ -1562,6 +1904,14 @@ server_connection::~server_connection() {
     // Records still waiting for their turn are owned by the pool; give them
     // back before the connection goes away.
     release_send_queue();
+    // Ordered-lane buffers: release every parked call while the owner (and
+    // its in-flight accounting) is still alive. The scheduler destructor
+    // would drop the payloads without this context, so the explicit pass is
+    // what makes the teardown path answer and un-count them.
+    {
+        std::lock_guard<std::mutex> lk(lane_mutex);
+        (void)lanes.fail_all();
+    }
     // Last-resort abandon: the reader path (`on_terminal`) and the send-failure
     // path normally end suspended duplicates already, but a connection object
     // can also be torn down without either having run. Idempotent; the dedup
@@ -1582,6 +1932,14 @@ server_connection::~server_connection() {
 void server_connection::on_terminal() noexcept {
     if (closed.exchange(true, std::memory_order_acq_rel)) {
         return;
+    }
+    // The transport is gone: parked ordered-lane calls can never be answered,
+    // so release them (silently -- `drop_lane_item` skips the send on a
+    // closed connection) instead of holding their in-flight accounting until
+    // the object dies.
+    {
+        std::lock_guard<std::mutex> lk(lane_mutex);
+        (void)lanes.fail_all();
     }
     // The reader observed EOF or a transport error: this connection will not
     // deliver anything again. End every dedup duplicate that is suspended in
@@ -1738,6 +2096,13 @@ void server_connection::submit(frame& request) noexcept {
     job->conn = self.lock();
     job->header = request.header;
     job->counted = true;
+    // Ordered-lane identity: carried beside the payload so the shard's
+    // handler can admit the call without re-reading the extension.
+    job->lane_ordered = (request.header.flags & frame_flag_ordered) != 0;
+    if (job->lane_ordered) {
+        job->lane_id = request.ordered.lane_id;
+        job->lane_seq = request.ordered.lane_seq;
+    }
     if (!job->conn ||
         !shard->submit(&server::impl::run_job, job, &server::impl::drop_job)) {
         delete job;
@@ -1994,6 +2359,11 @@ void server::stop() noexcept {
     // until the drain deadline. GOAWAY is sent after the drain because the
     // low-level client treats it as a terminal frame for every in-flight call.
     impl_->shutting_down.store(true, std::memory_order_release);
+    // Ordered-lane buffers never run during the drain: their predecessors may
+    // be long gone and nothing will pop them. Drop every parked call now,
+    // while the transports are still alive to carry the explicit error, so
+    // the drain below is not held up by accounting no one will release.
+    impl_->fail_all_lanes();
     {
         std::unique_lock<std::mutex> lk(impl_->drain_mutex);
         impl_->drain_cv.wait_for(lk, impl_->opt.drain_timeout, [this] {

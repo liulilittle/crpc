@@ -72,6 +72,11 @@ MAJOR.MINOR.PATCH
 
 `client::call<Resp>` 只持有一个成员，即 `std::shared_ptr<client_detail::call_state<Resp>>`，因此其大小恒为某个 `T` 的 `sizeof(std::shared_ptr<T>)`——x64 上 16 字节、x86 上 8 字节——无论 `call_state` 里有什么。这份稳定性只覆盖句柄，不覆盖它指向的堆对象：该对象的大小仍取决于分配它时所用的头文件，上文实测的正是这种情况。
 
+`rpc::lane_queue`（`rpc/lane_queue.hpp`）与此同类：header-only 类，不带
+`CRPC_API`，接在服务端请求路径上，测试可直接包含。它没有任何 `CRPC_API`
+签名，因此其内嵌记录不会进入跨边界清单；其布局由消费者编译所用的
+头文件决定，与其他 header-only 组件一致。
+
 ## 3. 符号可见性
 
 - 每个导出符号都用 `CRPC_API` 声明（见 `include/crpc/config.hpp`）。

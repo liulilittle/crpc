@@ -93,6 +93,10 @@ endforeach()
 # runtimes and waits for deadlines to expire). It needs more than the default
 # hang window, and it is a wall-clock-bound test rather than a compute one.
 set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 300)
+# The lane E2E suite drives real shard runtimes plus one bounded gap wait of
+# 3 s; on a saturated box every runtime-driven wait slows down together, so
+# the suite gets the same headroom as the server/client suite.
+set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 300)
 
 # --- C ABI smoke test --------------------------------------------------------
 # Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is
