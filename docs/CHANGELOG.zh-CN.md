@@ -4,6 +4,17 @@
 
 ## 未发布
 
+### 流控接入客户端调用路径
+
+- 自适应流控原语（`flow::rtt_estimator`、`flow::pacer`、`flow::congestion_window`、`flow::rtt_tracker`）现已通过连接级 `rpc::flow_controller`（`include/crpc/rpc/flow_control.hpp`、`src/rpc/flow_control.cpp`）接入 `rpc::client`。默认关闭；`rpc::client::set_flow_control` 安装它，门面提供同名调用并对每个池内连接生效（包括之后新建的连接）。
+- 准入是以编码帧为单位的字节窗口。空窗口无条件放行一条调用；`ONE_WAY` 调用从不记账（发布后立即完成，无人能确认它）；被拒绝的调用在错误 metadata 中携带 `crpc.flow_rejected`，门面据此归类为本地闸门（不重试、不计入端点熔断）。
+- 往返样本来自 PING/PONG 探针：客户端发送 payload 为发送时间戳（8 字节）的 PING，服务端以 stream 0 上的 PONG 原样回填。同一时刻最多一个探针在途，探针流量由往返时间界定。探针绕过字节窗口，但不绕过 `max_pending_write_bytes`。流控不给发送路径增加任何时钟读取。
+- 拥塞控制：`theta = baseline * growth_per_mille / 1000`；超过它的样本不喂给估计器，且窗口每个基线周期最多收缩一次；停在底部的窗口连续 `slow_confirmations` 个超阈样本会被接受为新基线，使环路能离开底部。低于基线的样本需要确认，且接受窗口内**最慢**的样本，因此单个伪影无法毒化基线。
+- 每 lane 字节配额，在所有终止路径（完成、取消、句柄析构、`fail_all` 兜底）上以幂等的 `(stream_id, generation)` 键释放。门面在消耗 lane 序号**之前**检查准入，因此本地拒绝不会在该 lane 留下空洞。pacer 是连接级的，其速率跟随 `window / baseline`。
+- 修复：`rtt_tracker` 与 `pacer` 曾用 0 作为"未初始化"哨兵，但 0 是合法时间戳，导致从 0 起跑的时钟的第一个探针不可用、以 0 锚定的 pacer 永远拿不到信用。哨兵现改为全 1。`pacer::set_rate` 现在等比缩放已有信用，速率上调在下次发送即生效，而不是两个 refill 周期之后。
+- 修复：`rpc::client::start_call` 曾用 code 与 message 重建失败的 `status`，丢弃 metadata（包括 `crpc.flow_rejected`）；现在转发完整 `rpc_error`。
+- ABI：`rpc::client` 增长一个指针大小的成员（MAJOR）；`rpc::client_options` 与 `client::options` 不变。新增 MINOR 符号：`set_flow_control`、`can_admit`、`flow_snapshot`、`rpc_client_size_probe`，以及 `rpc::flow_controller` / `flow_control_options` / `flow_state` 类型。服务端零改动（PONG 是无状态回填）。证据：`tests/test_flow_wiring.cpp`、`tests/test_flow_clock_base.cpp`、`tests/test_flow_lane_quota.cpp`。
+
 ### 服务端幂等去重表
 
 - RPC 服务端现在会对重放调用去重。信封携带非空 `call_id`（R6 三元组

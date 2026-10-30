@@ -27,6 +27,17 @@ MAJOR.MINOR.PATCH
 
 2.0.0 属于 MAJOR 变更：`http::http_statistics` 的布局增长（第 4 节），`server::options` 的布局同样增长（第 4 节）。1.0.0 布局（`bd006b2`）是最后一个兼容版本；2.0.0 与 1.0.x 二进制不向前兼容。
 
+未发布的流控接线在 2.0.0 之上恰好再增加一次 MAJOR：`rpc::client` 增长了一个指针大小的成员（其持有的流控控制器），因此 `sizeof` 变化，所有消费者必须重编。这是本次变更中**唯一**的 MAJOR：`rpc::client_options` 与 `client::options` 的字段与偏移全部不变，`src/abi_check.cpp` 中四处 `rpc::client_options` 守卫零改动。新增符号均为 MINOR：
+
+- `rpc::client::set_flow_control(const rpc::flow_control_options&)`
+- `rpc::client::can_admit(u64, std::size_t)`
+- `rpc::client::flow_snapshot()`
+- `rpc::rpc_client_size_probe()`
+- `client::set_flow_control(const rpc::flow_control_options&)`
+- `rpc::flow_controller`、`rpc::flow_control_options`、`rpc::flow_state`
+
+`rpc::client` 不能在头文件里放 `static_assert(sizeof(client) == N)`：它持有标准库成员，宽度取决于标准库配置而非本库（MSVC Debug 与 Release 不同；上文 `rpc_error`、`status`、`buffer`、`endpoint` 同理）。因此绊线是 out-of-line 的 `rpc::rpc_client_size_probe()`（报告库构建时的尺寸），加上消费者侧断言其编译期尺寸与之相等。任一方向的意外布局变化都会让该断言失败，而不是在运行时破坏内存。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

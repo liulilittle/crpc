@@ -40,6 +40,12 @@ consumer.
 
 These are additive and do not by themselves break a consumer that is rebuilt:
 
+- Flow control: `crpc::rpc::client::set_flow_control`,
+  `crpc::rpc::client::can_admit`, `crpc::rpc::client::flow_snapshot`,
+  `crpc::rpc::rpc_client_size_probe`, `crpc::client::set_flow_control`, and the
+  `crpc::rpc::flow_controller` / `flow_control_options` / `flow_state` types.
+  `rpc::client` itself grew by one pointer-sized member, which is a MAJOR layout
+  change: rebuild every consumer (see `abi.md` §1).
 - `crpc::client::resilience_statistics` and `crpc::client::resilience_stats()`.
 - `crpc::resilience::fallback_statistics` and `crpc::client::fallback_stats()`.
 - `crpc::client::call<Resp>::degraded()` (header-only accessor).

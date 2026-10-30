@@ -41,6 +41,30 @@ forward-compatible. The change, the old and new mangled names, and the rebuild
 requirement are recorded in [CHANGELOG.md](CHANGELOG.md) and [migration.md](migration.md),
 as §8.3 requires.
 
+The unreleased flow-control wiring adds exactly one more MAJOR break:
+`rpc::client` grew by one pointer-sized member (an owned flow controller), so
+its `sizeof` changed and every consumer must be rebuilt. It is the only MAJOR in
+this change: `rpc::client_options` and `client::options` keep every field and
+every offset, so the four `rpc::client_options` guards in `src/abi_check.cpp`
+are unchanged. The new symbols are MINOR additions:
+
+- `rpc::client::set_flow_control(const rpc::flow_control_options&)`
+- `rpc::client::can_admit(u64, std::size_t)`
+- `rpc::client::flow_snapshot()`
+- `rpc::rpc_client_size_probe()`
+- `client::set_flow_control(const rpc::flow_control_options&)`
+- `rpc::flow_controller`, `rpc::flow_control_options`, `rpc::flow_state`
+
+`rpc::client` cannot carry a header-side `static_assert(sizeof(client) == N)`:
+it owns standard-library members, so its width is a property of the standard
+library configuration rather than of this library (MSVC Debug and Release
+differ; the same reasoning already applies to `rpc_error`, `status`, `buffer`
+and `endpoint` above). The tripwire is therefore the out-of-line
+`rpc::rpc_client_size_probe()`, which reports the size the library was built
+with, plus a consumer-side assertion that the size the consumer compiled against
+matches it. An accidental layout change in either direction fails that assertion
+instead of corrupting memory.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

@@ -156,11 +156,43 @@ void pacer::set_rate(u64 bytes_per_second) noexcept {
     if (bytes_per_second > cfg_.max_rate_bytes_per_second) {
         bytes_per_second = cfg_.max_rate_bytes_per_second;
     }
+    if (rate_ != 0 && bytes_per_second != rate_) {
+        // Rescale the stored credit with the rate so the bucket keeps its fill
+        // fraction. Changing only `rate_` would leave the old (smaller) burst
+        // credit in place, and an increased rate would then take two refill
+        // periods to be felt: large frames are throttled meanwhile even though
+        // the window just opened up. A decrease is handled by the same path:
+        // the rescaled credit is then clamped to the smaller burst, so a
+        // reduced rate cannot be circumvented by a burst of old credit.
+        //
+        // A full bucket is promoted to the new burst exactly (rather than
+        // rescaled, which would round a few bytes off), so raising the rate
+        // makes the new burst available on the next send instead of on the
+        // second refill.
+        //
+        // No overflow: credit_ is capped at `rate * burst_ns / 1e9`, and
+        // `rate <= max_rate_bytes_per_second = 8 GiB/s` with `burst_ns = 2e6`,
+        // so credit_ <= 1.72e7. The first product is therefore
+        // `1.72e7 * 1e9 = 1.72e16`, and the second is
+        // `credit_ns * bytes_per_second <= 1.72e7 * 8.6e9 = 1.48e17`. Both are
+        // far below the u64 ceiling of 1.8e19.
+        const u64 old_burst = rate_ * cfg_.burst_ns / 1'000'000'000ull;
+        const u64 new_burst = bytes_per_second * cfg_.burst_ns / 1'000'000'000ull;
+        if (credit_ >= old_burst) {
+            credit_ = new_burst;
+        } else {
+            const u64 credit_ns = credit_ * 1'000'000'000ull / rate_;
+            credit_ = credit_ns * bytes_per_second / 1'000'000'000ull;
+            if (credit_ > new_burst) {
+                credit_ = new_burst;
+            }
+        }
+    }
     rate_ = bytes_per_second;
 }
 
 void pacer::refill(u64 now_ns) noexcept {
-    if (last_refill_ns_ == 0) {
+    if (last_refill_ns_ == ~0ull) {
         last_refill_ns_ = now_ns;
         return;
     }
@@ -294,14 +326,17 @@ void congestion_window::reset() noexcept {
 
 u64 rtt_tracker::on_send(u64 now_ns) noexcept {
     last_send_ns_ = now_ns;
-    if (oldest_outstanding_ns_ == 0) {
+    if (oldest_outstanding_ns_ == ~0ull) {
         oldest_outstanding_ns_ = now_ns;
     }
     return now_ns;
 }
 
 bool rtt_tracker::on_ack(u64 now_ns, u64 token_ns, u64& sample_ns) noexcept {
-    if (token_ns == 0 || now_ns < token_ns) {
+    // Zero is a legal token: a monotonic clock may start at zero, and rejecting
+    // it would make the first probe of such a clock unusable. Only all-ones is
+    // "no token", and that never reaches here as a real send timestamp.
+    if (now_ns < token_ns) {
         return false;
     }
     const u64 sample = now_ns - token_ns;
@@ -310,14 +345,14 @@ bool rtt_tracker::on_ack(u64 now_ns, u64 token_ns, u64& sample_ns) noexcept {
     }
     sample_ns = sample;
     if (token_ns == oldest_outstanding_ns_) {
-        oldest_outstanding_ns_ = 0;
+        oldest_outstanding_ns_ = ~0ull;
     }
     return true;
 }
 
 void rtt_tracker::reset() noexcept {
     last_send_ns_ = 0;
-    oldest_outstanding_ns_ = 0;
+    oldest_outstanding_ns_ = ~0ull;
 }
 
 } // namespace flow

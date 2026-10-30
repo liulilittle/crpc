@@ -94,7 +94,8 @@
 | [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp) | `cluster::election` | 选主原语。 |
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | 健康检查器。 |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | 基于索引的目录 watch/订阅。 |
-| [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::estimator` | 自适应流控。 |
+| [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`、`flow::pacer`、`flow::congestion_window`、`flow::rtt_tracker` | 自适应流控原语。 |
+| [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`、`rpc::flow_control_options`、`rpc::flow_state` | 连接级流控：字节窗口、PING/PONG 探针、每 lane 配额、pacer。 |
 
 ## 编解码与序列化
 

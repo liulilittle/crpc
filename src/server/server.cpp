@@ -2125,6 +2125,20 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
         if (value.header.type == frame_type::request ||
             value.header.type == frame_type::one_way) {
             submit(value);
+        } else if (value.header.type == frame_type::ping) {
+            // Echo the probe back verbatim so the sender can compute its own
+            // round trip. The reply is a PONG on stream 0 with the same 8-byte
+            // payload; a wrongly sized probe is ignored rather than echoed,
+            // because echoing arbitrary bytes would let a peer reflect a
+            // malformed frame into the connection. This is stateless and needs
+            // no per-connection state, so the server keeps its ABI.
+            if (value.payload.size() != 8) {
+                continue;
+            }
+            const std::shared_ptr<server_connection> keep = self.lock();
+            if (keep) {
+                (void)owner->send_payload(keep, 0, frame_type::pong, value.payload);
+            }
         } else if (value.header.type == frame_type::push_ack) {
             if (value.payload.size() != push::push_ack_size) {
                 // A wrong-sized acknowledgement is a protocol violation; fail

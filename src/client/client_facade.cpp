@@ -322,6 +322,23 @@ struct client::impl {
     // pre-S4 call path.
     std::atomic<bool> fallback_configured{false};
 
+    // Flow control configuration. It lives in the implementation, not in
+    // `client::options`, so the exported `client` and its option record keep
+    // their layout. New connections read it in `acquire_slot`; an existing
+    // connection is updated by `client::set_flow_control`.
+    std::mutex flow_mutex;
+    rpc::flow_control_options flow_options{};
+    bool flow_enabled = false;
+
+    // Ordered-lane pins: which connection each lane is bound to. Guarded by the
+    // client's `lane_mutex_` (the same lock that guards `lane_next_seq_`), and
+    // stored as a weak reference so a pin never extends a connection's life. A
+    // lane with no pin (never used, or its connection died) is re-pinned by the
+    // next call that completes selection.
+    std::unordered_map<u64, std::weak_ptr<client_detail::connection_slot>> lane_pins;
+    // Pool index of each pin, so a pinned call does not have to scan the pools.
+    std::unordered_map<u64, std::size_t> lane_pin_pool;
+
     struct endpoint_pool {
         endpoint_pool(endpoint ep, backend_factory* backend,
                       const resilience::breaker_config& config,
@@ -546,6 +563,8 @@ void client::close() noexcept {
             }
         }
     }
+    // Every pinned connection is now closed, so the pins can never be reused.
+    clear_lane_pins();
     // Cancel the deadline timer and release the slot for every attempt that is
     // still active; detach its owner so a handle that outlives the client can
     // never call back into it.
@@ -907,7 +926,7 @@ resilience::fallback_outcome client::run_fallback(
 bool client::begin_attempt(
     client_detail::call_core& core,
     const std::shared_ptr<client_detail::call_state_base>& keep,
-    rpc_error& failure) {
+    rpc_error& failure, const lane_pin* pinned, std::size_t* pool_index_out) {
     // A new attempt starts un-degraded. This is the only point every attempt
     // passes through, including the two early returns below; clearing here (as
     // well as in reset_for_attempt()) means a second get() cannot inherit the
@@ -969,7 +988,31 @@ bool client::begin_attempt(
     // never untried within one attempt, so the whole loop stays O(pool_count)
     // instead of rescanning the tried prefix on every iteration.
     std::size_t fallback_cursor = 0;
-    for (std::size_t iteration = 0; iteration < pool_count; ++iteration) {
+    if (pinned != nullptr && pinned->pool_index < pool_count) {
+        // An ordered lane is pinned to one connection, so selection is not the
+        // balancer's: the lane must be sent on the connection that carries its
+        // sequence stream. The pin's endpoint still passes through its own
+        // breaker (and the rate/bulkhead gates below), so resilience semantics
+        // are unchanged. The deliberate trade-off is that an open breaker on the
+        // pinned endpoint fails this lane's calls instead of moving them to
+        // another endpoint: ordering outranks availability here.
+        tried.mark(pinned->pool_index);
+        resilience::breaker_permit permit = impl_->pools[pinned->pool_index]->breaker.allow();
+        if (permit.allowed()) {
+            chosen = std::move(permit);
+            chosen_index = pinned->pool_index;
+        } else {
+            any_rejected = true;
+            const std::chrono::milliseconds hint = permit.retry_after();
+            if (hint.count() > 0) {
+                min_hint = hint;
+                have_hint = true;
+            }
+            fallback_cursor = pool_count;
+        }
+    }
+    for (std::size_t iteration = 0; iteration < pool_count && chosen_index == pool_count;
+         ++iteration) {
         std::size_t index = pool_count;
         const result<resilience::instance> selected = impl_->balancer->select(impl_->view);
         if (selected.ok()) {
@@ -1037,6 +1080,9 @@ bool client::begin_attempt(
     }
 
     impl::endpoint_pool& pool = *impl_->pools[chosen_index];
+    if (pool_index_out != nullptr) {
+        *pool_index_out = chosen_index;
+    }
     const bool is_probe = chosen.is_probe();
     if (is_probe) {
         probe_admitted_.fetch_add(1, std::memory_order_relaxed);
@@ -1176,7 +1222,8 @@ bool client::begin_attempt(
 }
 
 std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
-    client_detail::call_core& core, rpc_error& failure) {
+    client_detail::call_core& core, rpc_error& failure,
+    client_detail::connection_slot* preferred) {
     auto* pool = static_cast<impl::endpoint_pool*>(core.pool);
     if (pool == nullptr) {
         core.origin = client_detail::failure_origin::local_lifecycle;
@@ -1194,6 +1241,35 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     std::vector<std::shared_ptr<client_detail::connection_slot>> dead;
     std::uint32_t best_in_flight = 0;
     bool saturated = false;
+    // A pinned lane must use the connection that carries its sequence stream.
+    // Take that exact slot when it is still usable, even if another slot in the
+    // pool is less loaded: ordering is per connection, and switching would
+    // silently break it.
+    if (preferred != nullptr) {
+        for (const std::shared_ptr<client_detail::connection_slot>& candidate : pool->slots) {
+            if (candidate.get() != preferred) {
+                continue;
+            }
+            const bool healthy = candidate->healthy.load(std::memory_order_acquire);
+            const std::uint32_t in_flight =
+                candidate->in_flight.load(std::memory_order_acquire);
+            const bool under_cap = options_.max_inflight_per_connection == 0 ||
+                                   in_flight < options_.max_inflight_per_connection;
+            bool open = false;
+            {
+                std::lock_guard<std::recursive_mutex> slot_lock(candidate->mutex);
+                open = candidate->conn != nullptr && candidate->conn->is_open();
+            }
+            if (healthy && under_cap && open) {
+                candidate->in_flight.fetch_add(1, std::memory_order_acq_rel);
+                pool->in_flight.fetch_add(1, std::memory_order_acq_rel);
+                return candidate;
+            }
+            // The pinned connection is gone. Fall through to normal selection;
+            // the caller re-pins the lane on whatever it gets.
+            break;
+        }
+    }
     for (const std::shared_ptr<client_detail::connection_slot>& candidate : pool->slots) {
         if (!candidate->healthy.load(std::memory_order_acquire)) {
             if (candidate->in_flight.load(std::memory_order_acquire) == 0) {
@@ -1278,6 +1354,21 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     co.client_id = client_id_;
     co.client_epoch = 1;
     slot->conn = std::make_unique<rpc::client>(std::move(raw), co);
+    {
+        // A connection opened after `set_flow_control` inherits the live
+        // configuration, so enabling flow control is not a race against the
+        // first connect.
+        rpc::flow_control_options flow;
+        bool enabled = false;
+        {
+            std::lock_guard<std::mutex> flow_lk(impl_->flow_mutex);
+            flow = impl_->flow_options;
+            enabled = impl_->flow_enabled;
+        }
+        if (enabled) {
+            slot->conn->set_flow_control(flow);
+        }
+    }
     slot->guarded = std::make_unique<client_detail::connection_slot::guarded_source>(slot.get());
     slot->guarded->detach(slot->conn.get());
     raw_ptr->bind_source(slot->guarded.get());
@@ -1286,6 +1377,145 @@ std::shared_ptr<client_detail::connection_slot> client::acquire_slot(
     pool->in_flight.fetch_add(1, std::memory_order_acq_rel);
     pool->had_connection = true;
     return slot;
+}
+
+std::optional<client::lane_pin> client::resolve_lane_pin(u64 lane_id) {
+    std::lock_guard<std::mutex> lk(lane_mutex_);
+    const auto it = impl_->lane_pins.find(lane_id);
+    if (it == impl_->lane_pins.end()) {
+        return std::nullopt;
+    }
+    const std::shared_ptr<client_detail::connection_slot> slot = it->second.lock();
+    if (slot == nullptr || !slot->healthy.load(std::memory_order_acquire) ||
+        slot->conn == nullptr || !slot->conn->is_open()) {
+        // The pinned connection is gone. Drop the pin; the caller re-pins on the
+        // connection selection picks next. The lane's sequence counter is
+        // deliberately NOT reset: a reused number would look like a fresh lane
+        // position on the new connection and could re-execute a call that
+        // already ran on the old one.
+        impl_->lane_pins.erase(it);
+        impl_->lane_pin_pool.erase(lane_id);
+        return std::nullopt;
+    }
+    const auto pool_it = impl_->lane_pin_pool.find(lane_id);
+    if (pool_it == impl_->lane_pin_pool.end()) {
+        return std::nullopt;
+    }
+    lane_pin pin;
+    pin.pool_index = pool_it->second;
+    pin.slot = slot;
+    return pin;
+}
+
+void client::publish_lane_pin(
+    u64 lane_id, std::size_t pool_index,
+    const std::shared_ptr<client_detail::connection_slot>& slot) {
+    if (lane_id == 0 || slot == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(lane_mutex_);
+    // Reclaim entries whose connection is gone. Pinning is on the call path, so
+    // this is the natural place to keep the map from growing with dead
+    // connections; the idle reaper is a static tick and cannot take this lock.
+    for (auto it = impl_->lane_pins.begin(); it != impl_->lane_pins.end();) {
+        if (it->second.expired()) {
+            impl_->lane_pin_pool.erase(it->first);
+            it = impl_->lane_pins.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Do not overwrite an existing live pin: another call may have published one
+    // while this call was connecting, and the first one to bind wins.
+    const auto it = impl_->lane_pins.find(lane_id);
+    if (it != impl_->lane_pins.end() && !it->second.expired()) {
+        return;
+    }
+    impl_->lane_pins[lane_id] = slot;
+    impl_->lane_pin_pool[lane_id] = pool_index;
+}
+
+void client::clear_lane_pins() noexcept {
+    std::lock_guard<std::mutex> lk(lane_mutex_);
+    impl_->lane_pins.clear();
+    impl_->lane_pin_pool.clear();
+}
+
+void client::lane_unreserve(u64 lane_id, u64 seq) noexcept {
+    if (lane_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(lane_mutex_);
+    const auto it = lane_next_seq_.find(lane_id);
+    // Only the last allocation may be returned: if another caller already took
+    // the next number, rewinding would hand the same number out twice.
+    if (it != lane_next_seq_.end() && it->second == seq + 1) {
+        it->second = seq;
+    }
+}
+
+std::optional<u64> client::lane_reserve(u64 lane_id, std::size_t frame_size) {
+    // Admission is checked against the lane's *pinned* connection, which is also
+    // the connection the call will be sent on. Checking any other connection
+    // would refuse a call whose real destination is empty (and the refusal would
+    // already have consumed a sequence number).
+    //
+    // No I/O happens under `lane_mutex_`: if the lane has no pin yet, the
+    // sequence number is taken without a pre-check and the connection is pinned
+    // once selection has picked one. A refusal on that first call is rolled back
+    // by `lane_unreserve`, so it still leaves no hole.
+    std::lock_guard<std::mutex> lk(lane_mutex_);
+    const auto it = impl_->lane_pins.find(lane_id);
+    if (it != impl_->lane_pins.end()) {
+        const std::shared_ptr<client_detail::connection_slot> slot = it->second.lock();
+        const bool usable = slot != nullptr && slot->healthy.load(std::memory_order_acquire) &&
+                            slot->conn != nullptr && slot->conn->is_open();
+        if (usable && !slot->conn->can_admit(lane_id, frame_size)) {
+            // The pinned connection is healthy but full: refuse. Re-pinning here
+            // would turn congestion into load balancing, and each connection has
+            // its own window, so the effective window would become N x window.
+            return std::nullopt;
+        }
+        if (!usable) {
+            impl_->lane_pins.erase(it);
+            impl_->lane_pin_pool.erase(lane_id);
+        }
+    }
+    return lane_next_seq_[lane_id]++;
+}
+
+void client::set_flow_control(const rpc::flow_control_options& options) {
+    // `charge_table_capacity == 0` means "follow the call-slot capacity". The
+    // slot pool is what bounds the number of simultaneously admitted calls, so
+    // a table sized from it can always index every live charge. Filling it here
+    // (rather than inside the controller) is what makes the documented default
+    // actually follow `slot_capacity` instead of a hard-coded number.
+    rpc::flow_control_options resolved = options;
+    if (resolved.charge_table_capacity == 0) {
+        resolved.charge_table_capacity = static_cast<u32>(
+            options_.slot_capacity == 0 ? 1 : options_.slot_capacity);
+    }
+    // Publish the configuration first so a connection opened concurrently with
+    // this call picks it up, then apply it to the connections that already
+    // exist. Doing it in the other order would leave a window where a new
+    // connection silently misses the configuration.
+    {
+        std::lock_guard<std::mutex> lk(impl_->flow_mutex);
+        impl_->flow_options = resolved;
+        impl_->flow_enabled = resolved.enabled;
+    }
+    std::vector<std::shared_ptr<client_detail::connection_slot>> snapshot;
+    for (const std::unique_ptr<impl::endpoint_pool>& pool : impl_->pools) {
+        std::lock_guard<std::mutex> plk(pool->mutex);
+        for (const std::shared_ptr<client_detail::connection_slot>& slot : pool->slots) {
+            snapshot.push_back(slot);
+        }
+    }
+    for (const std::shared_ptr<client_detail::connection_slot>& slot : snapshot) {
+        if (slot->conn != nullptr) {
+            slot->conn->set_flow_control(resolved);
+        }
+    }
 }
 
 void client::release_slot(
@@ -1727,12 +1957,18 @@ void client::evict_idle(const std::shared_ptr<impl>& impl,
                 if (!closed_now) {
                     continue;
                 }
-                std::lock_guard<std::mutex> lk(pool->mutex);
-                const auto it = std::find(pool->slots.begin(), pool->slots.end(), slot);
-                if (it != pool->slots.end()) {
-                    pool->slots.erase(it);
-                    --count;
+                {
+                    std::lock_guard<std::mutex> lk(pool->mutex);
+                    const auto it = std::find(pool->slots.begin(), pool->slots.end(), slot);
+                    if (it != pool->slots.end()) {
+                        pool->slots.erase(it);
+                        --count;
+                    }
                 }
+                // The evicted slot pin is left to expire: resolve_lane_pin
+                // rejects an expired pin on use, and publish_lane_pin prunes
+                // expired entries (it runs on a client thread and can take the
+                // lane lock, which this static tick cannot).
             }
         }
     } catch (...) {

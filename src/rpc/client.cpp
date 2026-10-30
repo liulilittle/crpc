@@ -20,6 +20,13 @@ u32 next_candidate(u32& counter) noexcept {
     return counter;
 }
 
+// The flow controller works in raw nanoseconds from the steady-clock epoch,
+// because a probe token travels on the wire and must be a plain integer.
+u64 duration_ns_since_epoch(std::chrono::steady_clock::time_point point) noexcept {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count());
+}
+
 } // namespace
 
 // Recursive write lock with a deferred failure report. The outermost release
@@ -129,6 +136,64 @@ void client::close() noexcept {
     }
 }
 
+void client::set_flow_control(const flow_control_options& options) {
+    // `charge_table_capacity == 0` means "follow this connection's call-slot
+    // capacity", which is exactly what the header promises. The facade resolves
+    // it too, but a caller that uses the low-level client directly must get the
+    // same behaviour: a hard-coded fallback would silently cap concurrency far
+    // below `slot_capacity`.
+    flow_control_options resolved = options;
+    if (resolved.charge_table_capacity == 0) {
+        resolved.charge_table_capacity = options_.slot_capacity == 0 ? 1 : options_.slot_capacity;
+    }
+    std::unique_ptr<flow_controller> fresh;
+    if (resolved.enabled) {
+        fresh = std::make_unique<flow_controller>(resolved);
+    }
+    std::lock_guard<std::mutex> map(map_mutex_);
+    // Replacing or removing the controller is a configuration act, so it is
+    // safe to do at any time: no call can be mid-charge here, because the
+    // charge is decided and recorded under this same lock.
+    flow_ = std::move(fresh);
+}
+
+bool client::can_admit(u64 lane_id, std::size_t bytes) noexcept {
+    std::lock_guard<std::mutex> map(map_mutex_);
+    if (flow_ == nullptr) {
+        return true;
+    }
+    const auto now = options_.clock(options_.clock_ctx);
+    flow_->observe_now(duration_ns_since_epoch(now));
+    return flow_->can_admit(lane_id, bytes);
+}
+
+flow_state client::flow_snapshot() const {
+    std::lock_guard<std::mutex> map(map_mutex_);
+    if (flow_ == nullptr) {
+        rpc::flow_state off;
+        off.enabled = false;
+        return off;
+    }
+    return flow_->snapshot();
+}
+
+u64 client::lane_used(u64 lane_id) const noexcept {
+    std::lock_guard<std::mutex> map(map_mutex_);
+    if (flow_ == nullptr) {
+        return 0;
+    }
+    return flow_->lane_used(lane_id);
+}
+
+std::size_t rpc_client_size_probe() noexcept {
+    // Out of line on purpose: the caller compares the size it compiled against
+    // with the size this library was built with. An accidental layout change
+    // (an added member, a changed member type, a different standard-library
+    // debug configuration) then fails the consumer's assertion instead of
+    // corrupting memory at run time.
+    return sizeof(client);
+}
+
 // --- Reader ------------------------------------------------------------------
 
 std::size_t client::on_data(span<const std::byte> data) noexcept {
@@ -231,6 +296,9 @@ void client::handle_frame(const frame& value) {
     case frame_type::ping:
         handle_ping(value);
         break;
+    case frame_type::pong:
+        handle_pong(value);
+        break;
     case frame_type::goaway:
         handle_goaway(value);
         break;
@@ -270,10 +338,11 @@ void client::handle_response(const frame& value) {
     }
     if (!decoded.ok()) {
         finish(*slot, call_state::failed, rpc_code::decode_error,
-               rpc_error(rpc_code::decode_error, "response decode failed"), span<const std::byte>());
+               rpc_error(rpc_code::decode_error, "response decode failed"), span<const std::byte>(),
+               false);
         return;
     }
-    finish(*slot, call_state::completed, code, std::move(error), body);
+    finish(*slot, call_state::completed, code, std::move(error), body, true);
 }
 
 void client::handle_push(const frame& value) {
@@ -410,6 +479,23 @@ void client::handle_ping(const frame& value) {
     flush_write();
 }
 
+void client::handle_pong(const frame& value) {
+    // A probe reply carries the send timestamp back verbatim. Only `map_mutex_`
+    // is taken: the flow controller is protected by it, and taking any other
+    // lock here would put a new edge into the four-lock order (this path runs
+    // from the reader, whose only safe inner lock is the map).
+    if (value.payload.size() != 8) {
+        return;
+    }
+    const u64 token = endian::load_le64(value.payload.data());
+    std::lock_guard<std::mutex> map(map_mutex_);
+    if (flow_ == nullptr) {
+        return;
+    }
+    const auto now = options_.clock(options_.clock_ctx);
+    flow_->on_probe_reply(token, duration_ns_since_epoch(now));
+}
+
 void client::handle_goaway(const frame&) {
     if (closed_.load(std::memory_order_acquire)) {
         return;
@@ -498,6 +584,43 @@ void client::flush_pending() {
 
 void client::enqueue_raw(span<const std::byte> bytes) {
     (void)out_.append(bytes);
+}
+
+bool client::stage_probe(u64 token) {
+    // Called with the write lock and `map_mutex_` held (from `start_request`).
+    // The probe is deliberately not charged to the byte window: it exists to
+    // measure the path, and a window that also gated its own probes could never
+    // learn that the path recovered. It is still bounded by
+    // `max_pending_write_bytes`, because an unbounded probe would be a way to
+    // grow the output queue without limit.
+    //
+    // Returns false when the PING was not staged, so the caller can roll the
+    // probe reservation back. Without that rollback a single dropped probe would
+    // leave the "one probe outstanding" flag set forever and no probe would ever
+    // be sent again.
+    if (closed_.load(std::memory_order_acquire) || conn_ == nullptr) {
+        return false;
+    }
+    std::byte payload[8];
+    endian::store_le64(payload, token);
+    frame ping;
+    ping.header.type = frame_type::ping;
+    ping.header.stream_id = 0;
+    ping.payload = span<const std::byte>(payload, sizeof(payload));
+    const std::size_t size = encoded_frame_size(ping);
+    if (out_.size() - out_sent_ + size > options_.max_pending_write_bytes) {
+        return false;
+    }
+    frame_scratch_.clear();
+    if (!frame_scratch_.reserve(size)) {
+        return false;
+    }
+    std::size_t written = 0;
+    if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), ping, written).ok()) {
+        return false;
+    }
+    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    return true;
 }
 
 void client::send_rst(u32 stream_id, rpc_code code) {
@@ -604,7 +727,8 @@ call_id client::next_call_id() {
 }
 
 call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context& ctx,
-                              rpc_error& failure) {
+                              rpc_error& failure,
+                              std::chrono::steady_clock::time_point& now_out) {
     // The slot fields, the stream-id allocation (which probes in_flight_) and
     // the closed check are all map state.
     std::lock_guard<std::mutex> map(map_mutex_);
@@ -619,6 +743,7 @@ call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context&
     }
 
     const auto now = options_.clock(options_.clock_ctx);
+    now_out = now;
     if (ctx.has_deadline && ctx.deadline <= now) {
         pool_.release(slot);
         failure = rpc_error(rpc_code::deadline_exceeded, "deadline already passed");
@@ -650,47 +775,115 @@ call_slot* client::begin_call(u64 service_id, u64 method_id, const call_context&
     return slot;
 }
 
-status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
-                             span<const std::byte> body, const call_context& ctx) {
-    call_envelope envelope;
-    envelope.service_id = service_id;
-    envelope.method_id = method_id;
+namespace {
+
+// Everything that decides which envelope blocks a REQUEST carries. One builder
+// serves both the real send path and the size prediction, so the two can never
+// disagree about the byte count.
+struct envelope_inputs {
+    u64 service_id = 0;
+    u64 method_id = 0;
+    span<const std::byte> body;
+    const obs::trace_context* trace = nullptr;
+    bool has_deadline = false;
+    u64 deadline_ns = 0;
+    bool has_idempotency_key = false;
+    span<const std::byte> idempotency_key;
+};
+
+void build_envelope(const envelope_inputs& in, call_envelope& envelope) noexcept {
+    envelope.service_id = in.service_id;
+    envelope.method_id = in.method_id;
     envelope.codec = codec_id::crpc_binary;
-    envelope.body = body;
+    envelope.body = in.body;
 
     trace_extension& ext = envelope.extensions;
     ext.flags = 0;
-    if (ctx.trace.valid()) {
+    if (in.trace != nullptr && in.trace->valid()) {
         ext.flags = static_cast<u8>(ext.flags | trace_extension::has_trace_id |
                                     trace_extension::has_span_id);
-        ext.trace_id = ctx.trace.trace.bytes;
-        ext.span_id = ctx.trace.span.bytes;
-        if (ctx.trace.parent.valid()) {
+        ext.trace_id = in.trace->trace.bytes;
+        ext.span_id = in.trace->span.bytes;
+        if (in.trace->parent.valid()) {
             ext.flags = static_cast<u8>(ext.flags | trace_extension::has_parent_span_id);
-            ext.parent_span_id = ctx.trace.parent.bytes;
+            ext.parent_span_id = in.trace->parent.bytes;
         }
     }
-    if (slot.has_deadline) {
-        // The wire carries the time left, not an absolute instant: steady-clock
-        // epochs are per process, so an absolute value means nothing on the
-        // peer (P12, design section 8.5). A deadline that has already elapsed
-        // is sent as zero so the server rejects without executing.
+    if (in.has_deadline) {
         ext.flags = static_cast<u8>(ext.flags | trace_extension::has_deadline);
-        const auto now = options_.clock(options_.clock_ctx);
-        ext.deadline_ns = slot.deadline > now
-                              ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                     slot.deadline - now)
-                                                     .count())
-                              : 0;
+        ext.deadline_ns = in.deadline_ns;
     }
-    const std::array<std::byte, 32> key = slot.idem.encode();
-    if (ctx.idempotent || ctx.has_idempotency_key) {
+    if (in.has_idempotency_key) {
         ext.flags = static_cast<u8>(ext.flags | trace_extension::has_idempotency_key);
-        ext.idempotency_key = span<const std::byte>(key.data(), key.size());
+        ext.idempotency_key = in.idempotency_key;
     }
     if (ext.flags != 0) {
         envelope.call_flags = static_cast<u8>(envelope.call_flags | call_flag_has_extensions);
     }
+}
+
+} // namespace
+
+std::size_t client::predicted_frame_size(u64 service_id, u64 method_id,
+                                         span<const std::byte> body,
+                                         const call_context& ctx) noexcept {
+    // Uses the same envelope builder and the same `encoded_call_envelope_size`
+    // as `start_request`, so this is exact rather than approximate. An upper
+    // bound would refuse a call that would have fitted, and would make the
+    // pre-check and the real charge disagree about the same lane.
+    envelope_inputs in;
+    in.service_id = service_id;
+    in.method_id = method_id;
+    in.body = body;
+    in.trace = &ctx.trace;
+    in.has_deadline = ctx.has_deadline;
+    in.deadline_ns = 0; // the field is 8 bytes whatever the value
+    in.has_idempotency_key = ctx.idempotent || ctx.has_idempotency_key;
+    // `start_request` always sends the canonical 32-byte call id, so only the
+    // presence of the block matters for the size.
+    static const std::array<std::byte, 32> key{};
+    in.idempotency_key = span<const std::byte>(key.data(), key.size());
+
+    call_envelope envelope;
+    build_envelope(in, envelope);
+
+    frame request;
+    request.header.type = ctx.mode == delivery_mode::unreliable ? frame_type::one_way
+                                                                : frame_type::request;
+    request.header.flags = ctx.lane.has_value() ? frame_flag_ordered : 0;
+    request.payload = span<const std::byte>(nullptr, encoded_call_envelope_size(envelope));
+    return encoded_frame_size(request);
+}
+
+status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
+                             span<const std::byte> body, const call_context& ctx,
+                             const std::chrono::steady_clock::time_point& started_at) {
+    // The wire carries the time left, not an absolute instant: steady-clock
+    // epochs are per process, so an absolute value means nothing on the peer
+    // (P12, design section 8.5). A deadline that has already elapsed is sent as
+    // zero so the server rejects without executing.
+    u64 deadline_ns = 0;
+    if (slot.has_deadline) {
+        const auto now = options_.clock(options_.clock_ctx);
+        deadline_ns = slot.deadline > now
+                          ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 slot.deadline - now)
+                                                 .count())
+                          : 0;
+    }
+    const std::array<std::byte, 32> key = slot.idem.encode();
+
+    envelope_inputs in;
+    in.service_id = service_id;
+    in.method_id = method_id;
+    in.body = body;
+    in.trace = &ctx.trace;
+    in.has_deadline = slot.has_deadline;
+    in.deadline_ns = deadline_ns;
+    in.has_idempotency_key = ctx.idempotent || ctx.has_idempotency_key;
+    in.idempotency_key = span<const std::byte>(key.data(), key.size());
+    call_envelope envelope;
+    build_envelope(in, envelope);
 
     {
         write_lock w(*this);
@@ -745,13 +938,64 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
             if (closed_.load(std::memory_order_acquire)) {
                 return status{rpc_code::shutting_down};
             }
+            // Flow control is charged and released on this exact path, so it is
+            // decided here, under the same lock that publishes the slot: a
+            // charge that was decided outside the publish could be released
+            // before it was ever recorded.
+            const u64 lane = ctx.lane.has_value() ? ctx.lane->lane_id : 0;
+            if (flow_ != nullptr && !slot.one_way) {
+                flow_->observe_now(duration_ns_since_epoch(started_at));
+                if (!flow_->can_admit(lane, frame_size)) {
+                    // A local admission refusal. The marker is what lets the
+                    // facade classify it as `local_gate` (never retried, never
+                    // counted against the endpoint) instead of a capacity
+                    // failure, and what lets a caller tell "not now" from "no".
+                    rpc_error refused(rpc_code::resource_exhausted,
+                                      "flow control refused the call");
+                    refused.metadata.set("crpc.flow_rejected", "1");
+                    return status{std::move(refused)};
+                }
+            }
+            if (flow_ != nullptr && !slot.one_way) {
+                // Charge first: if the charge table cannot index this call,
+                // nothing has been published or appended yet, so the refusal is
+                // simply an early return. An unindexed charge could never be
+                // released and would leak window bytes until the connection
+                // stopped admitting anything.
+                if (!flow_->on_admitted(lane, frame_size, slot.stream_id, slot.generation)) {
+                    rpc_error refused(rpc_code::resource_exhausted,
+                                      "flow control charge table exhausted");
+                    refused.metadata.set("crpc.flow_rejected", "1");
+                    return status{std::move(refused)};
+                }
+            }
             if (!out_.append(span<const std::byte>(frame_scratch_.data(), frame_written))) {
+                if (flow_ != nullptr && !slot.one_way) {
+                    flow_->release(slot.stream_id, slot.generation, false);
+                }
                 return status{rpc_code::resource_exhausted};
             }
             slot.written = true;
             in_flight_.emplace(slot.stream_id, &slot);
             if (slot.has_deadline) {
                 deadlines_.emplace(slot.deadline, &slot);
+            }
+            if (flow_ != nullptr && !slot.one_way) {
+                // A probe is staged, not flushed: flushing here would drain the
+                // peer synchronously and take `completion_mutex_` while the map
+                // lock is held, which is the documented ABBA cycle. The caller
+                // flushes outside every lock.
+                const u64 token = flow_->begin_probe();
+                if (token != ~0ull) {
+                    // If the PING cannot be staged (write bound, closed
+                    // connection) the reservation must be rolled back: leaving
+                    // it outstanding would stop every future probe.
+                    if (stage_probe(token)) {
+                        flow_->confirm_probe_staged();
+                    } else {
+                        flow_->abort_probe();
+                    }
+                }
             }
         }
         set_state(slot, call_state::sent);
@@ -767,13 +1011,13 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
         // used in this file), claims the terminal state, removes the in-flight
         // entry and runs the callback with the map lock released (CF-1).
         finish(slot, call_state::completed, rpc_code::ok, rpc_error{},
-               span<const std::byte>());
+               span<const std::byte>(), false);
     }
     return status{};
 }
 
 void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
-                    span<const std::byte> body) {
+                    span<const std::byte> body, bool acknowledged) {
     // Hold the completion lock from before the claim until after the callback
     // returns, so a handle destructor cannot detach and recycle the slot while
     // this path still touches it (CF-1). `completion_mutex_` is the outer lock
@@ -788,7 +1032,7 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
     }
     {
         std::lock_guard<std::mutex> map(map_mutex_);
-        remove_in_flight(slot);
+        remove_in_flight(slot, acknowledged);
     }
     // The atomic claim inside invoke_callback decides whether `then` or this
     // completion path runs the callback exactly once.
@@ -809,7 +1053,9 @@ void client::cancel_slot(call_slot& slot) noexcept {
                           span<const std::byte>());
         if (won) {
             written = slot.written;
-            remove_in_flight(slot);
+            // A cancellation never received a response, so it returns the
+            // window bytes without growing the window.
+            remove_in_flight(slot, false);
         }
     }
     if (!won) {
@@ -850,37 +1096,65 @@ bool client::fail_all(rpc_code code, std::string_view message) {
     }
     for (;;) {
         call_slot* victim = nullptr;
+        // The release key is captured here, under the map lock, together with
+        // the victim. It is never re-read from the slot later: `finish` runs the
+        // user callback, which may recycle the slot (a sibling destroy), and a
+        // recycled slot's generation belongs to a different call.
+        u32 victim_stream_id = 0;
+        u32 victim_generation = 0;
         {
             std::lock_guard<std::mutex> map(map_mutex_);
             if (in_flight_.empty()) {
                 deadlines_.clear();
                 break;
             }
+            victim_stream_id = in_flight_.begin()->first;
             victim = in_flight_.begin()->second;
+            victim_generation = victim != nullptr ? victim->generation : 0;
         }
         if (victim != nullptr) {
             try {
                 finish(*victim, call_state::failed, code,
-                       rpc_error(code, std::string(message)), span<const std::byte>());
+                       rpc_error(code, std::string(message)), span<const std::byte>(), false);
             } catch (...) {
                 // Allocation failure while building the failure error. The
                 // client is closed; drop this slot's completion.
             }
         }
         // Guarantee progress even when `finish` lost the claim or threw: drop
-        // the entry that was picked if it is still the head of the map.
+        // the entry that was picked if it is still the head of the map. The
+        // flow charge is released here too, because this path skips
+        // `remove_in_flight`; the `(stream_id, generation)` key makes the
+        // release idempotent when `finish` already ran it.
         std::lock_guard<std::mutex> map(map_mutex_);
         if (!in_flight_.empty() && in_flight_.begin()->second == victim) {
             in_flight_.erase(in_flight_.begin());
+            if (flow_ != nullptr && victim != nullptr) {
+                flow_->release(victim_stream_id, victim_generation, false);
+            }
         }
+    }
+    if (flow_ != nullptr) {
+        // A reconnect starts from a clean estimate: the path may be entirely
+        // different, and carrying the old baseline over would begin the new
+        // connection with the wrong window. `reset` also restores slow start,
+        // which is the correct state for a path nobody has measured yet.
+        std::lock_guard<std::mutex> map(map_mutex_);
+        flow_->reset();
     }
     return true;
 }
 
-void client::remove_in_flight(call_slot& slot) {
+void client::remove_in_flight(call_slot& slot, bool acknowledged) {
     const auto it = in_flight_.find(slot.stream_id);
     if (it != in_flight_.end() && it->second == &slot) {
         in_flight_.erase(it);
+    }
+    if (flow_ != nullptr) {
+        // Give the window bytes back. The key is `(stream_id, generation)`, so
+        // this is idempotent against the `fail_all` fallback and a recycled
+        // stream id (a new generation) is never released by a stale call.
+        flow_->release(slot.stream_id, slot.generation, acknowledged);
     }
     remove_deadline(slot);
 }
@@ -957,7 +1231,7 @@ void client::poll() noexcept {
                 error.metadata.set("unknown_side_effect", "1");
             }
             finish(*victim, call_state::timed_out, rpc_code::deadline_exceeded,
-                   std::move(error), span<const std::byte>());
+                   std::move(error), span<const std::byte>(), false);
         }
     } catch (...) {
         // Allocation failure while building a deadline error. The client stays
@@ -1010,7 +1284,8 @@ void client::release_slot_under_lock(call_slot* slot) noexcept {
     // `pool_.release`.
     completion_guard lk(*this);
     std::lock_guard<std::mutex> map(map_mutex_);
-    remove_in_flight(*slot);
+    // A handle destroyed without a terminal claim never received a response.
+    remove_in_flight(*slot, false);
     pool_.release(slot);
 }
 

@@ -1698,16 +1698,68 @@ public:
 
             [[nodiscard]] rpc::rpc_result<client::call<Resp>> call(
                 const Req& request, rpc::call_context ctx = {}) {
-                if (lane_id_ != 0) {
-                    ctx.lane = rpc::lane_token{lane_id_, owner_->next_lane_seq(lane_id_)};
-                }
+                // Encode first: the lane sequence number must only be consumed
+                // once the call is known to be admissible, because a consumed
+                // number that never reaches the wire is a permanent hole in the
+                // lane. The admission estimate is an upper bound on the encoded
+                // frame (payload plus the fixed header plus the ordered
+                // extension), not the exact wire size: the connection re-checks
+                // the exact size when it charges the call.
                 buffer encoded;
                 const status encoded_status = rpc::call_codec<Req>::encode(request, encoded);
                 if (!encoded_status.ok()) {
                     return rpc::rpc_result<client::call<Resp>>(encoded_status.error());
                 }
-                return owner_->template start_encoded<Resp>(service_id_, method_id_,
-                                                            encoded.readable(), std::move(ctx));
+                std::optional<u64> seq;
+                if (lane_id_ != 0) {
+                    // The exact wire size, from the same function the
+                    // connection uses when it charges the call. An upper bound
+                    // would be safe against a hole but would refuse calls that
+                    // would have fitted, and it would make the pre-check and the
+                    // real charge disagree about the same lane.
+                    //
+                    // The prediction context mirrors what `normalize_context`
+                    // will set: a default deadline becomes an explicit one, and
+                    // a default-idempotent client sends the call id. Both add
+                    // envelope bytes, so omitting them would under-predict.
+                    rpc::call_context predicted = ctx;
+                    predicted.lane = rpc::lane_token{lane_id_, 0};
+                    if (!predicted.has_deadline &&
+                        owner_->options_.default_deadline.count() > 0) {
+                        predicted.has_deadline = true;
+                    }
+                    predicted.idempotent =
+                        predicted.idempotent || owner_->options_.default_idempotent ||
+                        predicted.has_idempotency_key;
+                    const std::size_t frame_size = rpc::client::predicted_frame_size(
+                        service_id_, method_id_, encoded.readable(), predicted);
+                    seq = owner_->lane_reserve(lane_id_, frame_size);
+                    if (!seq.has_value()) {
+                        rpc_error refused(rpc_code::resource_exhausted,
+                                          "flow control refused the call");
+                        refused.metadata.set("crpc.flow_rejected", "1");
+                        return rpc::rpc_result<client::call<Resp>>(std::move(refused));
+                    }
+                    ctx.lane = rpc::lane_token{lane_id_, *seq};
+                }
+                rpc::rpc_result<client::call<Resp>> started =
+                    owner_->template start_encoded<Resp>(service_id_, method_id_,
+                                                         encoded.readable(), std::move(ctx));
+                if (!started.ok() && lane_id_ != 0) {
+                    // The number never reached the wire, so give it back: a
+                    // consumed number that is never sent is a permanent hole in
+                    // the lane, which the server can only resolve by waiting out
+                    // its gap timer.
+                    //
+                    // Every failure here is pre-send: `start_call` has not
+                    // published the slot, so no frame for this sequence exists.
+                    // That includes a flow-control refusal, a saturated slot
+                    // pool, a full write queue and a closed client. Rolling all
+                    // of them back also removes the "check passed, send refused"
+                    // hole that an exact-size pre-check could otherwise create.
+                    owner_->lane_unreserve(lane_id_, *seq);
+                }
+                return started;
             }
 
         private:
@@ -1767,6 +1819,16 @@ public:
 
     // Closes every pooled connection and cancels in-flight calls.
     void close() noexcept;
+
+    // Installs (or removes) connection-level flow control. It is applied to
+    // every pooled connection immediately and to every connection this client
+    // opens later, so it is a live configuration, not a build-time one. Passing
+    // `options.enabled == false` removes the controller.
+    //
+    // This is a MINOR ABI addition (a new symbol) rather than an option field
+    // on purpose: `client::options` and `rpc::client_options` are ABI-pinned
+    // records and must not grow a byte.
+    void set_flow_control(const rpc::flow_control_options& options);
 
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
@@ -1927,11 +1989,35 @@ private:
         const noexcept;
 
     void normalize_context(client_detail::call_core& core, const rpc::call_context& ctx);
+    // A lane's pinned connection. An ordered lane is only ordered within one
+    // connection, so a lane that the load balancer spreads across several
+    // connections silently loses its ordering guarantee. The pin fixes that:
+    // once a lane has a connection it keeps using it while that connection is
+    // healthy.
+    struct lane_pin {
+        std::size_t pool_index = 0;
+        std::shared_ptr<client_detail::connection_slot> slot;
+    };
+    // Resolves the lane's pinned connection, if any. Returns an empty optional
+    // when the lane has no usable pin (never used, or the pinned connection died
+    // or was evicted); the caller then goes through normal selection and
+    // publishes the connection it ends up on.
+    [[nodiscard]] std::optional<lane_pin> resolve_lane_pin(u64 lane_id);
+    void publish_lane_pin(u64 lane_id, std::size_t pool_index,
+                          const std::shared_ptr<client_detail::connection_slot>& slot);
+    void clear_lane_pins() noexcept;
+    // Returns the lane counter to its previous value when `seq` was the last
+    // number handed out. A locally refused call must not consume a sequence
+    // number: the number never reaches the wire, and the server could only
+    // resolve the gap by waiting out its gap timer.
+    void lane_unreserve(u64 lane_id, u64 seq) noexcept;
     bool begin_attempt(client_detail::call_core& core,
                       const std::shared_ptr<client_detail::call_state_base>& keep,
-                      rpc_error& failure);
+                      rpc_error& failure, const lane_pin* pinned = nullptr,
+                      std::size_t* pool_index_out = nullptr);
     std::shared_ptr<client_detail::connection_slot> acquire_slot(
-        client_detail::call_core& core, rpc_error& failure);
+        client_detail::call_core& core, rpc_error& failure,
+        client_detail::connection_slot* preferred = nullptr);
     void release_slot(const std::shared_ptr<client_detail::connection_slot>& slot,
                       rpc_code code) noexcept;
     void finish_attempt(client_detail::call_core& core, rpc_code code,
@@ -1968,14 +2054,22 @@ private:
     void notify_waiter() noexcept;
     rpc::call_id make_call_id() noexcept;
 
-    // Allocates the next `seq` for one ordered lane (0, 1, 2, ...). The
-    // counter is shared by every `lane(lane_id)` caller of this client and
-    // grows monotonically; the server consumes it in order and rejects a
-    // number it has already seen as a duplicate.
-    [[nodiscard]] u64 next_lane_seq(u64 lane_id) {
-        std::lock_guard<std::mutex> lk(lane_mutex_);
-        return lane_next_seq_[lane_id]++;
-    }
+    // Reserves the next `seq` for one ordered lane (0, 1, 2, ...), but only
+    // when the call is admissible. The counter is shared by every
+    // `lane(lane_id)` caller of this client and grows monotonically; the server
+    // consumes it in order and rejects a number it has already seen as a
+    // duplicate.
+    //
+    // The admission check runs against the lane's *pinned* connection, which is
+    // also the connection the call is sent on, and it runs *before* the counter
+    // increments. A call refused locally must not consume a sequence number:
+    // the number never reaches the wire, and the server could only resolve the
+    // gap by waiting out its gap timer.
+    //
+    // `frame_size` is the exact encoded frame size (`predicted_frame_size`), not
+    // an upper bound: the pre-check and the connection's own charge must agree
+    // about the same lane.
+    [[nodiscard]] std::optional<u64> lane_reserve(u64 lane_id, std::size_t frame_size);
     static void deadline_tick(const std::shared_ptr<impl>& impl,
                               std::chrono::nanoseconds idle_eviction) noexcept;
     static void evict_idle(const std::shared_ptr<impl>& impl,
@@ -2130,17 +2224,37 @@ status client::issue(
     const std::shared_ptr<client_detail::call_state<Resp>>& st,
     rpc_error& failure) {
     client_detail::call_core& core = st->core;
+    // An ordered lane must be sent on the connection it is pinned to, otherwise
+    // the load balancer would spread one lane over several connections and the
+    // per-connection ordering guarantee would silently not hold. The pin is
+    // resolved from the context, so no public signature has to carry a
+    // `connection_slot`.
+    std::optional<lane_pin> pinned;
+    const u64 lane_id = core.ctx.lane.has_value() ? core.ctx.lane->lane_id : 0;
+    if (lane_id != 0) {
+        pinned = resolve_lane_pin(lane_id);
+    }
+    std::size_t pool_index = 0;
     // The registration keeps `st` alive until the attempt is finalized, so
     // close() can walk its snapshot without racing this handle's destructor.
-    if (!begin_attempt(core, st, failure)) {
+    if (!begin_attempt(core, st, failure, pinned ? &*pinned : nullptr, &pool_index)) {
         return status{failure};
     }
     // On every failure below the attempt is left registered with its permit
     // held; the caller (get() or start_encoded()) decides whether it is a
     // retried attempt (ignore) or the terminal result (record once).
-    std::shared_ptr<client_detail::connection_slot> slot = acquire_slot(core, failure);
+    client_detail::connection_slot* preferred = pinned ? pinned->slot.get() : nullptr;
+    std::shared_ptr<client_detail::connection_slot> slot =
+        acquire_slot(core, failure, preferred);
     if (!slot) {
         return status{failure};
+    }
+    // Pin the lane to the connection it is actually about to use. Doing it here
+    // (after selection, before sending) is what makes the *next* call's
+    // pre-check look at the right connection.
+    if (lane_id != 0) {
+        const std::size_t pinned_pool = pinned ? pinned->pool_index : pool_index;
+        publish_lane_pin(lane_id, pinned_pool, slot);
     }
     // close() may have finalized the attempt between the registration and this
     // point. finalize_active() then saw a null `core.slot` and could not
@@ -2173,9 +2287,22 @@ status client::issue(
         rpc::rpc_result<rpc::call<Resp>> started = slot->conn->template start_call<Resp>(
             core.service_id, core.method_id, core.request.readable(), core.ctx, false);
         if (!started.ok()) {
-            core.origin = started.error().code == rpc_code::resource_exhausted
-                              ? client_detail::failure_origin::local_capacity
-                              : client_detail::failure_origin::endpoint_pre_send;
+            // A flow-control refusal is the caller's own quota or the byte
+            // window: nothing was sent, the endpoint is healthy, and retrying
+            // immediately would just consume the budget again. Classifying it
+            // as `local_gate` is what makes `should_retry` answer false and
+            // keeps the endpoint breaker untouched. The marker is set by the
+            // connection; it is the only signal that distinguishes "flow says
+            // not now" from a genuine capacity failure, because both report
+            // `resource_exhausted`.
+            const std::string* marker = started.error().metadata.find("crpc.flow_rejected");
+            if (marker != nullptr && !marker->empty() && *marker != "0") {
+                core.origin = client_detail::failure_origin::local_gate;
+            } else {
+                core.origin = started.error().code == rpc_code::resource_exhausted
+                                  ? client_detail::failure_origin::local_capacity
+                                  : client_detail::failure_origin::endpoint_pre_send;
+            }
             failure = started.error();
             return status{failure};
         }

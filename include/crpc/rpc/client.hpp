@@ -99,9 +99,12 @@
 #include <crpc/push/wire.hpp>
 #include <crpc/rpc/call.hpp>
 #include <crpc/rpc/dispatcher.hpp>
+#include <crpc/rpc/flow_control.hpp>
 #include <crpc/span.hpp>
 
 namespace crpc::rpc {
+
+class flow_controller;
 
 // Monotonic clock source. Injected so a test can control time; the default
 // reads `std::chrono::steady_clock`.
@@ -131,6 +134,15 @@ struct client_options {
 // smaller than the id space, so the loop terminates.
 [[nodiscard]] CRPC_API u32 allocate_stream_id(u32& counter, bool (*in_flight)(void* ctx, u32 id),
                                               void* ctx) noexcept;
+
+// Size of `rpc::client` as seen by this translation unit. The class owns
+// standard-library members, so its width is a property of the standard library
+// configuration rather than of this library (MSVC Debug and Release differ);
+// a header-side `static_assert(sizeof(client) == N)` would therefore be wrong
+// on one of them. This out-of-line probe lets a consumer assert the size it was
+// compiled against against the size the library was built with, which is the
+// tripwire for an accidental layout change in either direction.
+[[nodiscard]] CRPC_API std::size_t rpc_client_size_probe() noexcept;
 
 // --- Allocation-free call maps -----------------------------------------------
 //
@@ -535,16 +547,21 @@ public:
         // encode/publish path takes the write lock. No lock is held across the
         // two, so a close between them is caught by the publish-time re-check.
         rpc_error failure;
-        call_slot* slot = begin_call(service_id, method_id, ctx, failure);
+        std::chrono::steady_clock::time_point begun{};
+        call_slot* slot = begin_call(service_id, method_id, ctx, failure, begun);
         if (slot == nullptr) {
             return rpc_result<call<Resp>>(std::move(failure));
         }
-        const status written = start_request(*slot, service_id, method_id, request_body, ctx);
+        const status written =
+            start_request(*slot, service_id, method_id, request_body, ctx, begun);
         if (!written.ok()) {
             // The slot was never published to the in-flight map, so it can be
-            // recycled directly.
+            // recycled directly. The whole `rpc_error` is forwarded, not a
+            // rebuilt one: a local admission refusal carries its reason in
+            // `metadata` (`crpc.flow_rejected`), and rebuilding from code and
+            // message would silently drop it.
             pool_.release(slot);
-            return rpc_result<call<Resp>>(rpc_error(written.code(), written.message()));
+            return rpc_result<call<Resp>>(written.error());
         }
         call<Resp> handle;
         handle.slot_ = slot;
@@ -591,6 +608,53 @@ public:
     // Advances the injected clock and expires overdue calls. Idempotent; a
     // client with no deadlines does nothing.
     void poll() noexcept;
+
+    // --- Flow control -------------------------------------------------------
+    //
+    // The controller lives in `rpc::client`, not in the facade, because the
+    // byte window has to be charged and released on the exact path that
+    // publishes and retires a frame. `client_options` is ABI-pinned and does
+    // not grow a byte, so the controller is installed through this method
+    // instead of an option field. Passing a disabled option set (or calling
+    // this with `options.enabled == false`) removes it again, which is what
+    // makes "enabled vs disabled" observable from a test.
+    //
+    // Flow control is off by default: a client that never asks for it keeps
+    // exactly the previous behaviour and pays no clock read.
+    void set_flow_control(const flow_control_options& options);
+
+    // True when a call of `bytes` on `lane_id` may be admitted right now.
+    // Taking the sequence number for a lane call must be conditional on this
+    // (see `client_facade.hpp`'s `lane_reserve`): a refused call that had
+    // already consumed a sequence would leave a permanent hole in the lane,
+    // which the server can only resolve by waiting out its gap timer.
+    //
+    // A refused call is not an error condition of the connection; it is the
+    // caller's own quota or the window, and retrying it later is correct.
+    [[nodiscard]] bool can_admit(u64 lane_id, std::size_t bytes) noexcept;
+
+    // Diagnostics snapshot. Returns a plain record (no standard-library
+    // members), so it can cross the shared-library boundary by value.
+    [[nodiscard]] flow_state flow_snapshot() const;
+
+    // Bytes currently charged to `lane_id` on this connection, or zero. The
+    // per-lane view is a scalar accessor rather than a list so that
+    // `flow_snapshot` stays free of standard containers.
+    [[nodiscard]] u64 lane_used(u64 lane_id) const noexcept;
+
+    // Exact encoded size of the REQUEST frame for these arguments, without
+    // sending it. The context is taken as given: a caller that applies its own
+    // defaults (the facade resolves the default deadline and default
+    // idempotency before calling this) gets the exact size, and `start_request`
+    // charges exactly this size because both derive it from the same
+    // `encoded_call_envelope_size` call.
+    //
+    // An upper bound would be safe against a sequence hole but would refuse
+    // calls that would have fitted, which is a functional regression and makes
+    // the pre-check and the real charge disagree about the same lane.
+    [[nodiscard]] static std::size_t predicted_frame_size(u64 service_id, u64 method_id,
+                                                          span<const std::byte> body,
+                                                          const call_context& ctx) noexcept;
 
     [[nodiscard]] u32 in_flight() const noexcept {
         std::lock_guard<std::mutex> lk(map_mutex_);
@@ -640,6 +704,10 @@ private:
     void handle_frame(const frame& value);
     void handle_response(const frame& value);
     void handle_ping(const frame& value);
+    // Handles a probe reply. Takes only `map_mutex_` (the innermost lock): the
+    // sample is fed to the flow controller, which is protected by it, and no
+    // other lock may be taken from here.
+    void handle_pong(const frame& value);
     void handle_goaway(const frame& value);
     void handle_push(const frame& value);
     void handle_push_ack(const frame& value);
@@ -659,14 +727,36 @@ private:
     void enqueue_raw(span<const std::byte> bytes);
     void send_rst(u32 stream_id, rpc_code code);
     void send_push_ack(u32 stream_id, u64 seq);
+    // Stages one PING carrying `token`. Called from inside the write lock (the
+    // caller already holds it), so it must not take it again, and it does not
+    // flush: the caller's `flush_pending()` sends it together with the request,
+    // outside every lock that a completion could need. The probe bypasses the
+    // byte window (it is not charged) but not `max_pending_write_bytes`, which
+    // is what keeps a stalled sink bounded.
+    //
+    // Returns false when the PING was not staged; the caller must then abort the
+    // probe reservation (`flow_->abort_probe()`), or no probe would ever be sent
+    // again.
+    [[nodiscard]] bool stage_probe(u64 token);
 
     // --- call lifecycle ---
+    // `now_out` receives the clock reading `begin_call` makes anyway (it has to
+    // decide whether an explicit deadline already passed). The caller hands it
+    // to `start_request` so the flow controller can timestamp its probe without
+    // a second clock read: flow control must not add a clock read to the send
+    // path.
     call_slot* begin_call(u64 service_id, u64 method_id, const call_context& ctx,
-                          rpc_error& failure);
+                          rpc_error& failure, std::chrono::steady_clock::time_point& now_out);
     status start_request(call_slot& slot, u64 service_id, u64 method_id,
-                         span<const std::byte> body, const call_context& ctx);
+                         span<const std::byte> body, const call_context& ctx,
+                         const std::chrono::steady_clock::time_point& now);
+    // `acknowledged` says whether this termination carries a real response from
+    // the peer. Only such a termination is an acknowledgement for the
+    // self-clocked window; a local timeout, a cancellation, a teardown and a
+    // ONE_WAY completion (which never has a response) all release the window
+    // bytes without growing it.
     void finish(call_slot& slot, call_state terminal, rpc_code code, rpc_error error,
-                span<const std::byte> body);
+                span<const std::byte> body, bool acknowledged);
     void cancel_slot(call_slot& slot) noexcept;
     // RAII holder of `completion_mutex_`. Tracks the nesting depth so the
     // outermost release can flush RSTs that were queued while the lock was
@@ -701,7 +791,7 @@ private:
     // `std::string` parameter at the call site would allocate there.
     bool fail_all(rpc_code code, std::string_view message);
     void protocol_failure();
-    void remove_in_flight(call_slot& slot);
+    void remove_in_flight(call_slot& slot, bool acknowledged);
     void remove_deadline(call_slot& slot);
     call_id next_call_id();
 
@@ -713,6 +803,11 @@ private:
 
     std::unique_ptr<connection> conn_;
     client_options options_;
+    // Connection-level flow control. Null unless `set_flow_control` installed
+    // it, which is the default: an unconfigured client pays nothing. All of its
+    // state is protected by `map_mutex_` (the innermost lock), so it is never a
+    // lock holder and cannot participate in the four-lock order.
+    std::unique_ptr<flow_controller> flow_;
     call_slot_pool pool_;
     frame_decoder decoder_;
     buffer payload_scratch_;

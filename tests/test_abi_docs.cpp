@@ -27,6 +27,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <crpc/rpc/client.hpp>
+
 #include "test_framework.hpp"
 
 namespace {
@@ -1221,6 +1223,23 @@ CRPC_TEST(abi_docs_section_2_does_not_call_internal_layout_invisible) {
     CRPC_CHECK(has_phrase(chinese, "成员偏移仍被头内代码烘焙进消费方"));
     CRPC_CHECK(has_phrase(chinese, "没有 vptr 的普通结构体"));
     CRPC_CHECK(has_phrase(chinese, "只覆盖句柄，不覆盖它指向的堆对象"));
+}
+
+// The flow-control change grows `rpc::client` by one pointer-sized member, which
+// is a MAJOR layout change that a header-side `static_assert` cannot pin: the
+// class owns standard-library members, so its width follows the standard library
+// configuration (MSVC Debug and Release differ). The tripwire is the out-of-line
+// size probe plus this consumer-side assertion: if the size this translation unit
+// compiled against and the size the library was built with ever disagree, the
+// build is mixing headers and a binary.
+CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
+    const std::size_t consumer_size = sizeof(crpc::rpc::client);
+    const std::size_t library_size = crpc::rpc::rpc_client_size_probe();
+    CRPC_CHECK_EQ(consumer_size, library_size);
+    // A flow controller is one pointer: the class must be at least as wide as a
+    // pointer more than its own scratch state, which is not asserted here (the
+    // members are private); the probe relation above is the contract.
+    CRPC_CHECK(library_size > 0);
 }
 
 CRPC_TEST_MAIN()
