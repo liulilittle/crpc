@@ -51,7 +51,9 @@ struct lock_options {
     std::chrono::milliseconds acquire_timeout{5000};
 
     // Pause between attempts. Small enough to be responsive, large enough not to
-    // hammer the server.
+    // hammer the server. Values below one millisecond are raised to one: a zero
+    // pause would make the retry loop spin and burn a core until the budget runs
+    // out, so the floor is part of the contract, not an implementation detail.
     std::chrono::milliseconds retry_delay{50};
 
     // Key prefixes. Separating the fence key from the lock key means a lock and

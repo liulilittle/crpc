@@ -1,6 +1,7 @@
 // CRPC -- Redis distributed lock implementation.
 #include <crpc/redis/distributed_lock.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -293,10 +294,13 @@ result<lock_handle> distributed_lock::acquire(std::string_view resource, std::st
         // Never sleep past the deadline: sleeping the full retry_delay can overshoot
         // by up to retry_delay, and the bound below is what makes the last attempt
         // land inside the budget instead of being dropped before it is tried.
+        // A zero pause would turn this into a spin that burns a core until the
+        // budget runs out, so the pause has a floor. The floor is a pause, not a
+        // policy change: it only bounds how often the server is asked, which is
+        // exactly what a caller asking for no delay is trying to avoid.
+        const auto pause = std::max(impl_->options.retry_delay, std::chrono::milliseconds(1));
         const auto remaining = deadline - now;
-        std::this_thread::sleep_for(remaining < impl_->options.retry_delay
-                                        ? remaining
-                                        : impl_->options.retry_delay);
+        std::this_thread::sleep_for(remaining < pause ? remaining : pause);
     }
 }
 

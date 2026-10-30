@@ -233,6 +233,34 @@ CRPC_TEST(redis_lock_acquire_times_out) {
     CRPC_CHECK_EQ(std::size_t{0}, lock.held());
 }
 
+// A zero pause must not turn the retry loop into a spin. The bound below is a
+// command count, not a duration, so it does not depend on how fast the host is:
+// a paced loop issues roughly one SET per retry_delay, while an unpaced one issues
+// as many as the executor can answer for the whole budget.
+CRPC_TEST(redis_lock_zero_retry_delay_does_not_spin) {
+    lock_executor executor;
+    lock_options options = quick_options();
+    options.acquire_timeout = std::chrono::milliseconds(200);
+    options.retry_delay = std::chrono::milliseconds(0);
+    distributed_lock lock(executor, options);
+
+    auto handle = lock.acquire("orders", "worker-spin");
+    CRPC_CHECK_FALSE(handle.ok());
+    if (!handle.ok()) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::deadline_exceeded),
+                      static_cast<int>(handle.error().code));
+    }
+    // The bound is derived from the budget, not guessed: a one-millisecond floor
+    // admits about one attempt per millisecond, so 200 ms of budget admits about 201.
+    // An unthrottled loop reaches thousands in the same window (13k measured), so the
+    // two are two orders of magnitude apart. Doubling the budget rather than adding a
+    // few attempts keeps that separation while leaving room for scheduling noise: a cap
+    // of exactly 202 would turn a single off-by-one in the deadline comparison red.
+    const std::size_t attempts_cap =
+        2 * static_cast<std::size_t>(options.acquire_timeout.count());
+    CRPC_CHECK(count_of(executor.executed, "SET") <= attempts_cap);
+}
+
 CRPC_TEST(redis_lock_renew_uses_cas_script) {
     lock_executor executor;
     executor.set_results.push_back(true);
