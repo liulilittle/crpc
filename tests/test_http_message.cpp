@@ -462,6 +462,111 @@ CRPC_TEST(http_limit_body_chunked) {
     expect_code(parser.error(), rpc_code::resource_exhausted);
 }
 
+// The three chunked framing limits are enforced in src/http/message.cpp but no
+// test set them: `chunk_line_bytes`, `trailer_block_bytes` and `trailer_count` had
+// code and no coverage. Each is checked at its boundary as well as past it, so the
+// limit is shown to be inclusive at the stated size rather than merely "somewhere
+// near" it -- the same shape the request-line and header-block limits already use.
+CRPC_TEST(http_limit_chunk_line_bytes) {
+    // A chunk-size line of exactly "4\r\n" plus extensions; the limit counts the
+    // whole line including CRLF.
+    parser_limits limits;
+    // The limit counts the line content, not the CRLF: one byte for "4".
+    limits.chunk_line_bytes = 1;
+    http_parser accepted(http_parser::kind::request, limits);
+    expect_status(feed_text(accepted,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n\r\n"),
+                  parse_status::message_complete);
+    CRPC_CHECK_EQ(accepted.get_request().body, "body");
+
+    limits.chunk_line_bytes = 0; // one short of the single-byte size line
+    http_parser rejected(http_parser::kind::request, limits);
+    expect_status(feed_text(rejected,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n\r\n"),
+                  parse_status::error);
+    expect_code(rejected.error(), rpc_code::resource_exhausted);
+    CRPC_CHECK(rejected.error().message.find("chunk line") != std::string::npos);
+}
+
+// An oversized chunk extension is the realistic way to exceed the line limit: the
+// size itself is one byte, the extension is unbounded in the grammar.
+CRPC_TEST(http_limit_chunk_line_bytes_rejects_long_extension) {
+    parser_limits limits;
+    limits.chunk_line_bytes = 16;
+    http_parser parser(http_parser::kind::request, limits);
+    std::string wire =
+        "POST / HTTP/1.1\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "4;";
+    wire.append(64, 'x');
+    wire += "\r\nbody\r\n0\r\n\r\n";
+    expect_status(feed_text(parser, wire), parse_status::error);
+    expect_code(parser.error(), rpc_code::resource_exhausted);
+}
+
+CRPC_TEST(http_limit_trailer_count) {
+    parser_limits limits;
+    limits.trailer_count = 1;
+    http_parser accepted(http_parser::kind::request, limits);
+    expect_status(feed_text(accepted,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n"
+                             "X-One: 1\r\n"
+                             "\r\n"),
+                  parse_status::message_complete);
+    CRPC_CHECK_EQ(accepted.get_request().trailers.size(), static_cast<std::size_t>(1));
+
+    http_parser rejected(http_parser::kind::request, limits);
+    expect_status(feed_text(rejected,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n"
+                             "X-One: 1\r\n"
+                             "X-Two: 2\r\n"
+                             "\r\n"),
+                  parse_status::error);
+    expect_code(rejected.error(), rpc_code::resource_exhausted);
+    CRPC_CHECK(rejected.error().message.find("trailer") != std::string::npos);
+}
+
+CRPC_TEST(http_limit_trailer_block_bytes) {
+    parser_limits limits;
+    // The limit counts each trailer line including its CRLF: 8 + 2.
+    limits.trailer_block_bytes = 10;
+    http_parser accepted(http_parser::kind::request, limits);
+    expect_status(feed_text(accepted,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n"
+                             "X-One: 1\r\n"
+                             "\r\n"),
+                  parse_status::message_complete);
+
+    limits.trailer_block_bytes = 9;
+    http_parser rejected(http_parser::kind::request, limits);
+    expect_status(feed_text(rejected,
+                             "POST / HTTP/1.1\r\n"
+                             "Transfer-Encoding: chunked\r\n"
+                             "\r\n"
+                             "4\r\nbody\r\n0\r\n"
+                             "X-One: 1\r\n"
+                             "\r\n"),
+                  parse_status::error);
+    expect_code(rejected.error(), rpc_code::resource_exhausted);
+    CRPC_CHECK(rejected.error().message.find("trailer block") != std::string::npos);
+}
+
 CRPC_TEST(http_expect_100_continue_flag) {
     http_parser parser;
     expect_status(feed_text(parser,
