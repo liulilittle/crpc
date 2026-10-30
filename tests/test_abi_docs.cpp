@@ -1044,7 +1044,7 @@ CRPC_TEST(abi_docs_english_states_the_guard_facts) {
     const std::string text = read_text(root / "docs" / "abi.md");
 
     // Counts and scope wording.
-    CRPC_CHECK(has_phrase(text, "16 of the public records"));
+    CRPC_CHECK(has_phrase(text, "15 of the public records"));
     CRPC_CHECK(has_phrase(text, "an exact member count for the 16 records"));
     CRPC_CHECK(has_phrase(text, "have **no compile-time layout guard at all**"));
 
@@ -1076,6 +1076,79 @@ CRPC_TEST(abi_docs_english_states_the_guard_facts) {
         text, "MSVC, GCC and Clang alike"));
 }
 
+// The two counts in the prose are different numbers and have been confused once:
+// `is_standard_layout` is asserted for every record that can carry it, while
+// `CRPC_MEMBER_COUNT` also covers `rpc_error`, which deliberately gets no
+// standard-layout assertion (src/abi_check.cpp explains why). Deriving both from
+// the source and matching them against the document is the only way a rewrite
+// cannot silently collapse the two into one number.
+CRPC_TEST(abi_docs_counts_match_abi_check_source) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::string src =
+        strip_cpp(read_text(root / "src" / "abi_check.cpp"));
+    CRPC_CHECK(!src.empty());
+    const auto count_at_line_start = [&src](const std::string& key) {
+        std::size_t total = 0;
+        std::size_t pos = 0;
+        while ((pos = src.find(key, pos)) != std::string::npos) {
+            const bool at_start =
+                pos == 0 || src[pos - 1] == '\n';
+            if (at_start) {
+                ++total;
+            }
+            pos += key.size();
+        }
+        return total;
+    };
+    const std::size_t member_counts = count_at_line_start("CRPC_MEMBER_COUNT(");
+    const std::size_t standard_layouts =
+        count_at_line_start("static_assert(std::is_standard_layout<");
+    // Both guards exist, and rpc_error is the record that carries only one.
+    CRPC_CHECK(standard_layouts >= 1);
+    CRPC_CHECK(member_counts >= 1);
+    CRPC_CHECK(member_counts > standard_layouts);
+
+    const std::string en = read_text(root / "docs" / "abi.md");
+    const std::string zh = read_text(root / "docs" / "abi.zh-CN.md");
+    const std::string en_phrase =
+        std::to_string(standard_layouts) + " of the public records";
+    const std::string en_count =
+        "an exact member count for the " + std::to_string(member_counts) + " records";
+    const std::string zh_phrase =
+        std::to_string(standard_layouts) + " 个公开记录";
+    const std::string zh_count =
+        "**" + std::to_string(member_counts) + " 个**记录的精确成员数量";
+    CRPC_CHECK(has_phrase(en, en_phrase.c_str()));
+    CRPC_CHECK(has_phrase(en, en_count.c_str()));
+    CRPC_CHECK(has_phrase(zh, zh_phrase.c_str()));
+    CRPC_CHECK(has_phrase(zh, zh_count.c_str()));
+
+    // The same number appears in more than one sentence, and only one of them was
+    // updated the first time round, which left the document contradicting itself.
+    // Pin every place that states the member-count total, and forbid the stale
+    // standard-layout total from being reused for it.
+    const std::string en_member_sentence =
+        "among the " + std::to_string(member_counts) + " member-counted records";
+    const std::string en_stale_sentence =
+        "among the " + std::to_string(standard_layouts) + " member-counted records";
+    CRPC_CHECK(has_phrase(en, en_member_sentence.c_str()));
+    CRPC_CHECK_FALSE(has_phrase(en, en_stale_sentence.c_str()));
+
+    // The Chinese document carries the same sentence in its own wording, and it
+    // was missed when the English one was corrected. Guard it symmetrically: a
+    // one-sided guard lets the other language drift back to the stale number.
+    const std::string zh_member_sentence =
+        "就 " + std::to_string(member_counts) + "\r\n  个有成员数量护栏的记录而言";
+    const std::string zh_stale_sentence =
+        "就 " + std::to_string(standard_layouts) + "\r\n  个有成员数量护栏的记录而言";
+    CRPC_CHECK(has_phrase(zh, zh_member_sentence.c_str()));
+    CRPC_CHECK_FALSE(has_phrase(zh, zh_stale_sentence.c_str()));
+}
+
 CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
     const fs::path root = repo_root();
     CRPC_CHECK(!root.empty());
@@ -1086,7 +1159,7 @@ CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {
     CRPC_CHECK(!text.empty());
 
     // Counts and scope wording, mirroring the English document.
-    CRPC_CHECK(has_phrase(text, "16 个公开记录"));
+    CRPC_CHECK(has_phrase(text, "15 个公开记录"));
     CRPC_CHECK(has_phrase(text, "**16 个**记录的精确成员数量"));
     CRPC_CHECK(has_phrase(text, "**没有任何编译期布局护栏**"));
 

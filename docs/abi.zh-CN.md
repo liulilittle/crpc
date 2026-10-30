@@ -144,7 +144,7 @@ C ABI。为每个结构体在头文件中增加 `sizeof`/`alignof` 断言是计�
 MINOR 扩展。
 
 无需改动头文件即可检查的布局不变量集中在一个内部翻译单元 `src/abi_check.cpp`：
-它断言 16 个公开记录的标准布局属性、该文件中列出的 **16 个**记录的精确成员数量、
+它断言 15 个公开记录的标准布局属性、该文件中列出的 **16 个**记录的精确成员数量、
 `http_statistics` / `client::statistics` / `client::resilience_statistics` /
 `resilience::fallback_statistics` / `server::statistics` 各计数器的相对成员链（链条按每个成员自身的宽度推进，因此
 混用 `std::size_t` 与 `std::uint64_t` 的 `server::statistics` 在 32 位与 64 位
@@ -381,7 +381,7 @@ vector 的重排与其它护栏看不见的变更一样，仍按第 7 节属 MAJ
   存在相对链的记录**。成员数量在此**不提供任何覆盖**：重排不会改变成员数量，因此
   对重排恒为盲。`rpc_error` 没有相对链，所以 `rpc_error` 内部的重排不会被捕获。
 - 重命名：若记录存在相对链，则由该链捕获；在 `rpc_error` 中则由 `src/abi_check.cpp` 的成员类型断言捕获。
-  成员数量护栏**不校验名字**——结构化绑定只是按声明顺序为每个成员引入一个本地名字。唯一没有相对链的跨 ABI 记录是 `rpc_error`（就 15
+  成员数量护栏**不校验名字**——结构化绑定只是按声明顺序为每个成员引入一个本地名字。唯一没有相对链的跨 ABI 记录是 `rpc_error`（就 16
   个有成员数量护栏的记录而言；§4 中无护栏的记录则根本没有链，`status` 没有公开数据成员，改名不可能发生），因此 `rpc_error`
   中的改名不由链捕获。四个 HTTP/2 值类型 `http2::h2_error`、`http2::connection_options`、
   `http2::stream_snapshot`、`http2::window_credit` **都有** `CRPC_AFTER` 链，

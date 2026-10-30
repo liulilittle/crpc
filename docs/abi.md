@@ -258,7 +258,7 @@ extension.
 
 The layout invariants that are checkable without header changes live in one
 internal translation unit, `src/abi_check.cpp`: it asserts standard-layout for
-16 of the public records, an exact member count for the 16 records listed in
+15 of the public records, an exact member count for the 16 records listed in
 that file, a relative member chain over the counters of `http_statistics`,
 `client::statistics`, `client::resilience_statistics`,
 `resilience::fallback_statistics` and `server::statistics`
@@ -523,7 +523,7 @@ difference matters when judging whether a given change is caught:
   caught by the member-type assertions in `src/abi_check.cpp`. The member-count
   guard does **not** validate names: a structured binding only binds one local
   name per member in declaration order. The only cross-ABI record with no
-  relative chain is `rpc_error` among the 15 member-counted records (the
+  relative chain is `rpc_error` among the 16 member-counted records (the
   unguarded records in §4 have no chain at all, and `status` has no public data
   member, so a rename cannot occur there), so a rename in `rpc_error` is not
   caught by a chain. The four HTTP/2 value types `http2::h2_error`,
