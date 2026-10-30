@@ -14,8 +14,10 @@
   four times apart from the midpoint. The interval is also asserted
   non-negative: a negative value means the measurement is broken, and an
   upper-bound-only check would silently pass it. The case is documented as
-  plain-thread-only (`client::sleep_for` slices a shard-thread wait into 5 ms
-  steps, which would widen the window).
+  plain-thread-only: calling `get()` from a shard thread that is not inside a
+  coroutine fails with `failed_precondition`, so the case would never reach the
+  path it exists to pin. The plain-thread path is the one that waits on the
+  call's condition variable; a shard wait is sliced into 5 ms steps instead.
 - `iocp_timer_fires_and_cancels` (`tests/test_io_iocp.cpp`) no longer asserts
   `elapsed < 20 ms`. The pre-1803 fallback timer's ~15.6 ms tick passes that
   bound while the high-resolution path's loaded median (23.7-25.8 ms) fails it,
@@ -31,15 +33,24 @@
   `cfg.drain * 4`.
 - `net_accept_cancelled_by_close` (`tests/test_net_transport_edge.cpp`) waited
   4000 ms for the wake and then required `elapsed < 3 s`, so a slow but correct
-  wake failed. The wait is 2000 ms and the redundant wall-clock assertion is
-  gone; the `shutting_down` code it returns proves the semantics.
+  wake failed. The redundant wall-clock assertion is gone, and the wait is a
+  pure hang guard at 4000 ms -- widening it costs nothing now that nothing reads
+  the elapsed time; the `shutting_down` code it returns proves the semantics.
 - The absolute LZ4 microsecond budgets in `perf_budget`
   (`tests/test_frame_compression.cpp`) moved to
   `bench/bench_compression.cpp` as soft PASS/WARN thresholds, together with the
-  CRC32C and small-vs-large relative checks; the test keeps the correctness
-  assertions (a compressible 32 KiB payload shrinks and both sizes round-trip
-  byte-for-byte). An absolute budget on a shared runner measures the runner,
-  and the Debug medians already sat inside the old ceilings.
+  CRC32C ratios; an absolute budget on a shared runner measures the runner, and
+  the Debug medians already sat inside the old ceilings. The self-referential
+  size-scaling guard stays in CI: 32 KiB is 128x the 256-byte input, so linear
+  work lands far below the `128 * 4` ceiling and only a superlinear regression
+  trips it, and because both sides are the same codec in one process the
+  instrumentation is symmetric, which keeps the ratio stable under /Od and the
+  sanitizers. The CRC32C ratios stay in bench because `crc32c` uses the
+  `_mm_crc32_u64` intrinsics on x64, which instrumentation touches very
+  differently from the software LZ4 encoder -- measured headroom was 2.4-2.9x,
+  below the 3x a behavioural assertion needs. The test keeps the correctness
+  assertions too (a compressible 32 KiB payload shrinks and both sizes
+  round-trip byte-for-byte).
 - Evidence: `tests/test_server_client.cpp`, `tests/test_io_iocp.cpp`,
   `tests/test_net_transport_edge.cpp`, `tests/test_frame_compression.cpp`,
   `bench/bench_compression.cpp`, and a full `ctest -j 4` run.
