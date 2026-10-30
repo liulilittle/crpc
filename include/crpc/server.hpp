@@ -166,6 +166,13 @@ public:
         std::size_t shards = 1;
         runtime_options runtime{};
         // Per-connection in-flight cap. Zero disables the cap.
+        //
+        // This is also what bounds the ordered-lane buffer: a call parked behind a
+        // missing sequence or a gap keeps its in-flight slot until it runs or is
+        // dropped, so the number of parked calls per connection cannot exceed this
+        // cap. With zero the lane buffer is bounded only by the peer (bandwidth
+        // times gap_timeout), so zero means "disable the protection", not "lift an
+        // arbitrary limit".
         std::size_t per_connection_inflight = 1024;
         // Per-service in-flight cap. Zero disables the cap.
         std::size_t per_service_inflight = 65536;
