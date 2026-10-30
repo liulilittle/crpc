@@ -2767,8 +2767,14 @@ CRPC_TEST(client_remote_retry_after_is_honored) {
 
 // G22 Slice 2 follow-up (audit P2-1): `retries_delayed_by_hint` counts only the
 // retries whose delay the hint actually determined. Here the policy backoff
-// (500 ms) is longer than the server hint (~167 ms), so the wait is
+// (250 ms) is longer than the server hint (~167 ms), so the wait is
 // policy-driven and the counter must stay at zero even though a retry happened.
+// The hint-vs-backoff confusion is caught by the counter assertion below, not by
+// any elapsed-time bound: the two waits differ by ~83 ms, and the platforms
+// inflate a nominal 250 ms sleep very differently (Windows adds ~73 ms of timer
+// tick, a high-resolution timer adds almost nothing), so no single wall-clock
+// threshold separates them on both. The time bound this case used to carry was
+// deleted for that reason -- measured low enough to pass the defect on Windows.
 CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
     fixture f;
     fixture_config cfg;
@@ -2790,7 +2796,6 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
 
     int code = -1;
     crpc::u32 attempts = 0;
-    std::chrono::nanoseconds elapsed{0};
     const bool ran = run_on_shard(
         *f.shard,
         [&] {
@@ -2811,7 +2816,6 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
             } else {
                 return;
             }
-            const auto begin = clock_type::now();
             auto started = echo.call(2, ctx);
             if (!started.ok()) {
                 code = static_cast<int>(started.code());
@@ -2819,7 +2823,6 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
             }
             auto handle = std::move(started).value();
             auto result = handle.get();
-            elapsed = clock_type::now() - begin;
             code = result.ok() ? 0 : static_cast<int>(result.code());
             attempts = handle.attempts();
         },
@@ -2828,8 +2831,6 @@ CRPC_TEST(client_hint_below_backoff_is_not_counted_as_hint_delay) {
     CRPC_CHECK(ran);
     CRPC_CHECK_EQ(0, code);
     CRPC_CHECK_EQ(static_cast<crpc::u32>(2), attempts);
-    // The wait is the 250 ms policy backoff, not the ~167 ms hint.
-    CRPC_CHECK(elapsed >= 200ms);
     // One retry for the measured call, plus possibly one for the burn call
     // (whose first attempt is always refused by the empty bucket).
     CRPC_CHECK(f.cli->stats().retries >= 1);
