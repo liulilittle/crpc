@@ -1315,4 +1315,87 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
     CRPC_CHECK(library_size > 0);
 }
 
+// --- Public API call sites -------------------------------------------------
+//
+// An exported method that no code ever calls is a promise that was declared and
+// never delivered, and nothing in the build notices: it compiles, it links, and
+// coverage is not gated. `distributed_lock::start_watchdog()` sat in that state --
+// its renewal thread was never started by anything, so a holder that outlived the
+// TTL silently lost the lock. The remedy is not to scan every export (that would be
+// mostly false positives); it is to name the methods whose absence from any call
+// site would be a defect, and fail when the list is not honoured.
+//
+// The scan counts occurrences in src/, tests/ and examples/ only. It cannot tell a
+// call from a definition by syntax alone, so the list below stores the expected
+// minimum number of occurrences and every entry is paired with the test case that
+// exercises it: a definition and its declaration account for zero of these, because
+// include/ is not scanned and the definition line is matched by its `Type name(`
+// spelling only once.
+struct api_call_contract {
+    const char* method;
+    std::size_t min_occurrences;
+};
+
+CRPC_TEST(abi_docs_exported_helpers_have_call_sites) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+
+    std::vector<std::string> corpus;
+    const char* const dirs[] = {"src", "tests", "examples"};
+    for (const char* dir : dirs) {
+        const fs::path base = root / dir;
+        if (!fs::exists(base)) {
+            continue;
+        }
+        for (const auto& entry : fs::recursive_directory_iterator(base)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::string ext = entry.path().extension().string();
+            if (ext != ".cpp" && ext != ".hpp" && ext != ".c") {
+                continue;
+            }
+            corpus.push_back(strip_cpp(read_text(entry.path())));
+        }
+    }
+    CRPC_CHECK(!corpus.empty());
+
+    const auto occurrences = [&corpus](const std::string& name) {
+        const std::string needle = name + "(";
+        std::size_t total = 0;
+        for (const std::string& text : corpus) {
+            std::size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                ++total;
+                pos += needle.size();
+            }
+        }
+        return total;
+    };
+
+    // Each entry: the method, and how many occurrences the corpus must contain.
+    // Only `src/`, `tests/` and `examples/` are scanned, and a method always occurs
+    // once in its own definition, so a method with no caller scores exactly 1. Each
+    // bound is the definition plus the call sites the suite makes; dropping the last
+    // caller drops the count to 1 and fails this check.
+    const api_call_contract contracts[] = {
+        // One definition + one call in redis_lock_watchdog_renews_past_one_ttl.
+        {"start_watchdog", 2},
+        // One definition + the stop in both redis watchdog cases.
+        {"stop_watchdog", 3},
+    };
+
+    for (const api_call_contract& contract : contracts) {
+        const std::size_t found = occurrences(contract.method);
+        CRPC_CHECK(found >= contract.min_occurrences);
+        if (found < contract.min_occurrences) {
+            std::printf("  %s occurs %zu time(s), needs %zu -- no caller?\n",
+                        contract.method, found, contract.min_occurrences);
+        }
+    }
+}
+
 CRPC_TEST_MAIN()
