@@ -3051,7 +3051,14 @@ CRPC_TEST(client_all_open_retries_pre_send) {
     cfg.breaker.failure_ratio_threshold = 0.5;
     cfg.breaker.slow_call_threshold = 5s;
     cfg.breaker.slow_call_ratio_threshold = 1.0;
-    cfg.breaker.open_duration = 50ms;
+    // The breaker must still be open when the second call is issued, and that gap
+    // is a few milliseconds on an idle host but was measured up to ~120 ms under
+    // load. At 50 ms any scheduling hiccup closed the breaker early, so the second
+    // call was admitted instead of rejected and four state assertions went red for
+    // a reason this case does not test. 500 ms keeps the window 4x above the
+    // measured stall while staying well under the 2 s call deadline, so the
+    // deadline cannot expire first and mask the rejection.
+    cfg.breaker.open_duration = 500ms;
     CRPC_CHECK(start_inproc(f, cfg));
 
     int first_code = -1;
