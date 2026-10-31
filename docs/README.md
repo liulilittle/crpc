@@ -2,50 +2,49 @@
 
 [简体中文](README.zh-CN.md) | **English**
 
-This is the entry point for all CRPC documentation. Every document exists in two
-languages; the pairs are linked at the top of each file.
+This is the entry point for the English documentation. Every document also
+exists in Chinese as a separate file, linked from the top of each page; a page
+never mixes the two languages.
 
 ## Index
 
-| # | Document | 中文 |
-|---|---|---|
-| 1 | [Design specification](superpowers/specs/2026-10-19-crpc-design.md) | [设计规格](superpowers/specs/2026-10-19-crpc-design.zh-CN.md) |
-| 2 | [ABI policy](abi.md) | [ABI 策略](abi.zh-CN.md) |
-| 3 | [Architecture overview](architecture.md) | [架构概览](architecture.zh-CN.md) |
-| 4 | [Wire protocol](protocol.md) | [线上协议](protocol.zh-CN.md) |
-| 5 | [Build and test](building.md) | [构建与测试](building.zh-CN.md) |
-| 6 | [Engineering principles](principles.md) | [工程原则](principles.zh-CN.md) |
-| 7 | [Performance report](performance.md) | [性能报告](performance.zh-CN.md) |
-| 8 | [Migration guide](migration.md) | [迁移指南](migration.zh-CN.md) |
-| 9 | [API reference](api/README.md) | [API 参考](api/README.zh-CN.md) |
-| 10 | [Tutorial](tutorial.md) | [教程](tutorial.zh-CN.md) |
-| 11 | [Examples](../examples/README.md) | [示例](../examples/README.zh-CN.md) |
-| 12 | [Release notes](CHANGELOG.md) | [发布说明](CHANGELOG.zh-CN.md) |
-| 13 | [Distributed testing and benchmarks](distributed-testing.md) | [分布式测试与基准](distributed-testing.zh-CN.md) |
-| 14 | [Redis client](redis-client.md) | [Redis 客户端](redis-client.zh-CN.md) |
-
-All documents in the index are present. Their per-module status is recorded in
-the status matrix of document 3 and in the design specification's chapter 21; a
-missing entry or a broken link is a documentation defect, not an oversight.
+| # | Document |
+|---|---|
+| 1 | [ABI policy](abi.md) |
+| 2 | [Architecture](architecture.md) |
+| 3 | [Wire protocol](protocol.md) |
+| 4 | [Build and test](building.md) |
+| 5 | [Engineering principles](principles.md) |
+| 6 | [Performance report](performance.md) |
+| 7 | [Migration guide](migration.md) |
+| 8 | [API reference](api/README.md) |
+| 9 | [Tutorial](tutorial.md) |
+| 10 | [Examples](../examples/README.md) |
+| 11 | [Release notes](CHANGELOG.md) |
+| 12 | [Distributed testing and benchmarks](distributed-testing.md) |
+| 13 | [Redis client](redis-client.md) |
+| 14 | [Database client](db-client.md) |
+| 15 | [Memcached client](memcached-client.md) |
+| 16 | [Proxy headers](proxy-headers.md) |
+| 17 | [Oracle TTC evidence](oracle-ttc-evidence.md) |
+| 18 | [TDS TLS evidence](tds-tls-evidence.md) |
 
 ## Reading order
 
-- **Using the library**: 10 (tutorial) → 9 (API reference) → 3 (architecture) → 4
-  (protocol) → the design specification's service API chapter. Add 14 (Redis
-  client) when the program talks to Redis.
-- **Measuring and reproducing**: 7 (performance) → 13 (distributed testing and
+- **Using the library**: 9 (tutorial) → 8 (API reference) → 2 (architecture) → 3
+  (protocol). Add 13 (Redis client) when the program talks to Redis.
+- **Measuring and reproducing**: 6 (performance) → 12 (distributed testing and
   benchmarks).
-- **Contributing**: 6 (principles) → 1 (design specification) → 5 (build and
-  test).
-- **Integrating at the binary level**: 2 (ABI policy).
+- **Contributing**: 5 (principles) → 2 (architecture) → 4 (build and test).
+- **Integrating at the binary level**: 1 (ABI policy).
 
 ## Status legend
+
+The status matrix in document 2 (architecture) is the single authoritative
+per-module status record.
 
 | Mark | Meaning |
 |---|---|
 | implemented | Code exists, tests pass, documented. |
 | partial | Code exists and is tested, but a documented part is missing. |
-| specified | Design frozen, no code yet. |
-
-The design specification's chapter 21 carries the authoritative per-module
-status.
+| specified | Documented behaviour without a code path. |

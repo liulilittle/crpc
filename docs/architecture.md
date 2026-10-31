@@ -1,6 +1,6 @@
 # CRPC architecture
 
-[绠€浣撲腑鏂嘳(architecture.zh-CN.md) | **English**
+[简体中文](architecture.zh-CN.md) | **English**
 
 Version 2.0 / 2026-10-24
 
@@ -33,11 +33,11 @@ This document describes the layers, the transport contract, the execution model,
 
 ## 1. Scope and status <a id="s1"></a>
 
-CRPC is a C++17 framework for large server systems. Its public surface is header-first: `include/crpc/**` defines every type a consumer names, and `src/**` contains the out-of-line implementation. The project is at v1.0: the core modules and the CRPC/HTTP server facades are implemented and tested; several distribution and end-to-end features remain primitive-level (搂18). There is no install target and no checked-in CI configuration yet.
+CRPC is a C++17 framework for large server systems. Its public surface is header-first: `include/crpc/**` defines every type a consumer names, and `src/**` contains the out-of-line implementation. The project is at v1.0: the core modules and the CRPC/HTTP server facades are implemented and tested; several distribution and end-to-end features remain primitive-level (§18). There is no install target and no checked-in CI configuration yet.
 
-- **implemented** 鈥?code exists, compiles, and has a test suite in `tests/`.
-- **partial** 鈥?code exists and is tested, but a documented part is missing.
-- **specified, not implemented** 鈥?the design freezes the behaviour, but no code path provides it.
+- **implemented** — code exists, compiles, and has a test suite in `tests/`.
+- **partial** — code exists and is tested, but a documented part is missing.
+- **specified, not implemented** — the design freezes the behaviour, but no code path provides it.
 
 The authoritative target is [the design specification](superpowers/specs/2026-10-19-crpc-design.md). If this document and the specification disagree, the code wins for a factual statement about today and the specification wins for the target contract.
 
@@ -104,13 +104,13 @@ Rules that hold today:
 
 ## 5. Base layer <a id="s5"></a>
 
-`config.hpp` rejects an unsupported target at compile time: 8-bit bytes, exactly 8/16/32/64-bit integers, IEEE-754 float and double, and a known host byte order. It defines `u8`鈥u64`, `i8`鈥i64`, `CRPC_API`, and the platform macros used by the backends.
+`config.hpp` rejects an unsupported target at compile time: 8-bit bytes, exactly 8/16/32/64-bit integers, IEEE-754 float and double, and a known host byte order. It defines `u8`…u64`, `i8`…i64`, `CRPC_API`, and the platform macros used by the backends.
 
 `span<T>` is the C++17 stand-in for `std::span`: two words, trivially copyable, borrowed, bounds-clamping on `subspan`. `as_bytes`/`as_writable_bytes` are the only reinterpretation helpers and require a trivially copyable element type.
 
 `buffer` is the only dynamic byte container. It grows geometrically (1.5x), has a caller-supplied ceiling (64 MiB by default), keeps capacity across `clear()`, and reports allocation failure through `failed()` instead of throwing.
 
-`error.hpp` defines `rpc_code` (0鈥?1), `rpc_error` (code, message, retryable, retry-after, ordered metadata), `status` for void results, and `result<T>` for value-or-error. Nothing in the library throws across a coroutine, thread or ABI boundary; `result<T>` does not require `T` to be default-constructible.
+`error.hpp` defines `rpc_code` (0–21), `rpc_error` (code, message, retryable, retry-after, ordered metadata), `status` for void results, and `result<T>` for value-or-error. Nothing in the library throws across a coroutine, thread or ABI boundary; `result<T>` does not require `T` to be default-constructible.
 
 `endian.hpp` and `wire.hpp` are the only sanctioned way to touch bytes. Multi-byte integers use explicit little-endian load/store, never a struct `memcpy`, bit-field or unaligned `reinterpret_cast`. `byte_reader` and `byte_writer` are total: every read returns a value or `rpc_code::protocol_error`, every write succeeds or reports `rpc_code::encode_error`.
 
@@ -118,10 +118,10 @@ Rules that hold today:
 
 The transport is two interfaces wide, plus lifecycle objects:
 
-- `io::source` 鈥?backend to framework: `on_data(span) -> size_t`, `on_eof()`, `on_error(std::error_code)`.
-- `io::sink` 鈥?framework to backend: `push(span, completion*)`.
-- `io::completion` 鈥?exactly one `complete(io_result)` per push.
-- `connection` / `listener` / `backend_factory` 鈥?establishment, close, cancellation, options, `bind_source`, `resume_read`.
+- `io::source` — backend to framework: `on_data(span) -> size_t`, `on_eof()`, `on_error(std::error_code)`.
+- `io::sink` — framework to backend: `push(span, completion*)`.
+- `io::completion` — exactly one `complete(io_result)` per push.
+- `connection` / `listener` / `backend_factory` — establishment, close, cancellation, options, `bind_source`, `resume_read`.
 
 `on_data` returns a **credit**, not a boolean: `n == data.size()` consumes everything; `0 < n < data.size()` consumes a prefix, retains the tail and delivers it only after `resume_read()`; `0` pauses reading. This is the whole backpressure mechanism, and there is no source-side completion object. `resume_read()` is on `connection`, outside the two interfaces; the design records that placement as open issue O2, and the code follows it.
 
@@ -189,7 +189,7 @@ Evidence: `include/crpc/runtime.hpp:55-69`, `src/runtime/runtime.cpp:108-118,246
 
 `rpc::method_traits` derives request/response types from a member pointer; the typed trampoline decodes with `call_codec<T>` and encodes the response. `call_codec` has no primary definition for an unsupported type, so a missing specialization is a compile error rather than a silent empty payload. The typed registration path is implemented (`service_registry::register_service`/`register_method` and `register_typed_method`), and the RTTI-driven declaration macros (`CRPC_ROUTE`, `CRPC_HTTP_*`, `CRPC_FROM_*`) live in `mvc/attributes.hpp` for the MVC/HTTP side. They are macros over an explicitly named controller and member, not a separate code-generation step. Evidence: `include/crpc/rpc/dispatcher.hpp:167-174,226-289,316-322`; `include/crpc/mvc/attributes.hpp:45-90`.
 
-The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in 搂14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side pipeline is wired per endpoint. The fallback primitives are implemented: the server advertises `crpc-degradable` at four pre-execution rejection points, but `fallback_execute` is still never called from the server. Evidence: `src/server/server.cpp:317-403,905-1168,1362-1408`; `include/crpc/server.hpp:78-217`.
+The server connection loop is implemented in `src/server/server.cpp`. `server::start()` freezes the registry, builds an immutable per-service guard table, creates the shard runtimes and starts every listener; the accept sink wraps each accepted `connection` in a `reader_source` and binds it; `reader_source::on_data` feeds the `frame_decoder` and submits `REQUEST`/`ONE_WAY` frames to the shard's handler pool. `server::impl::handle_request` validates the service against the frozen registry, applies the server admission pipeline described in §14, calls `rpc::dispatcher::dispatch`, and queues the `RESPONSE` or error frame on the connection's bounded send path. The client-side pipeline is wired per endpoint. The fallback primitives are implemented: the server advertises `crpc-degradable` at four pre-execution rejection points, but `fallback_execute` is still never called from the server. Evidence: `src/server/server.cpp:317-403,905-1168,1362-1408`; `include/crpc/server.hpp:78-217`.
 
 ## 10. Call state machine <a id="s10"></a>
 
@@ -288,11 +288,11 @@ The retry budget above assumes the server never executes a replayed call twice. 
 
 Only successful responses are cached. A failed completion is an uncached tombstone: its concurrent duplicates still receive the leader's error, but a later replay re-executes, which is what keeps the client retry policy meaningful. A replayed `ONE_WAY` duplicate is dropped silently (no response exists to wait for).
 
-Bounds and eviction (all configurable through `dedup_options`): capacity 4096 entries with LRU eviction (the least recently used *completed* entry yields; in-flight entries are pinned; a table saturated with in-flight entries degrades to at-least-once bypass, never a hang and never unbounded memory 鈥?the per-client FIFO ring of the original sketch is unbounded in the number of clients, which is why LRU was chosen); a monotonic (steady-clock) TTL of 5 minutes from the dispatch instant defines the dedup window, never a wall clock; a 16 KiB per-entry cap on cached responses (larger responses are handed to the duplicates suspended at completion but not retained for replays); a 30 s cap (and always the request's own wire deadline) on suspending a duplicate, so a shard thread is never held indefinitely; `max_wait <= 0` disables suspension entirely (in-flight duplicates are refused immediately with a retryable error). An entry whose `client_epoch` belongs to a restarted client can never shadow a new-epoch call 鈥?the epoch is part of the key 鈥?and ages out through the same TTL/LRU bounds.
+Bounds and eviction (all configurable through `dedup_options`): capacity 4096 entries with LRU eviction (the least recently used *completed* entry yields; in-flight entries are pinned; a table saturated with in-flight entries degrades to at-least-once bypass, never a hang and never unbounded memory — the per-client FIFO ring of the original sketch is unbounded in the number of clients, which is why LRU was chosen); a monotonic (steady-clock) TTL of 5 minutes from the dispatch instant defines the dedup window, never a wall clock; a 16 KiB per-entry cap on cached responses (larger responses are handed to the duplicates suspended at completion but not retained for replays); a 30 s cap (and always the request's own wire deadline) on suspending a duplicate, so a shard thread is never held indefinitely; `max_wait <= 0` disables suspension entirely (in-flight duplicates are refused immediately with a retryable error). An entry whose `client_epoch` belongs to a restarted client can never shadow a new-epoch call — the epoch is part of the key — and ages out through the same TTL/LRU bounds.
 
 Waiters are interruptible: the server hands the connection pointer to `dispatch` as the wait key, and connection teardown (`on_terminal`, send failure, connection destruction) calls `dedup_table::abandon`, ending suspended duplicates with an explicit `canceled` error instead of stranding them.
 
-Documented limits: the guarantee holds inside the window `min(TTL, LRU lifetime)` 鈥?a replay after eviction/expiry re-executes, so the client retry budget and the server window must be sized together; the table is per process (multi-shard servers share it through the one dispatcher, so the guarantee is process-wide), and independent server processes/nodes each dedup on their own 鈥?routing a `call_id` to one node is a load-balancer concern, not solved here. Evidence: `tests/test_rpc_dedup.cpp` (13 cases: exactly-once replay, concurrent duplicates, independence, no-key regression, expiry re-execution, oversized non-cached, abandon on disconnect, capacity bound, failure tombstone, one-way duplicate, bypass, two end-to-end server cases).
+Documented limits: the guarantee holds inside the window `min(TTL, LRU lifetime)` — a replay after eviction/expiry re-executes, so the client retry budget and the server window must be sized together; the table is per process (multi-shard servers share it through the one dispatcher, so the guarantee is process-wide), and independent server processes/nodes each dedup on their own — routing a `call_id` to one node is a load-balancer concern, not solved here. Evidence: `tests/test_rpc_dedup.cpp` (13 cases: exactly-once replay, concurrent duplicates, independence, no-key regression, expiry re-execution, oversized non-cached, abandon on disconnect, capacity bound, failure tombstone, one-way duplicate, bypass, two end-to-end server cases).
 
 ## 15. Observability <a id="s15"></a>
 
@@ -305,7 +305,7 @@ Documented limits: the guarantee holds inside the window `min(TTL, LRU lifetime)
 - **Header-inline boundary:** `obs::interceptor_chain::run` (`include/crpc/observability/interceptor.hpp:194-231`) and the MVC handler adapter `mvc::invoke_http` (`include/crpc/mvc/router.hpp:385-399`). With C++ exceptions (`__cpp_exceptions` or `_CPPUNWIND` defined) a throw is caught by the layer and converted to `rpc_code::internal`: `run()` stops and returns false, and `invoke_http` writes the HTTP 500 `internal error` response, so nothing escapes into the RPC or HTTP path. Without exception support (`-fno-exceptions`, or MSVC with no `/EH` option or with `/EHc-`, `/EHs-`, `/EHa-`, `/EHs-c-`, `/EHa-c-`) there is no `try`/`catch` at all: a throwing hook or handler leaves the call site, and the outcome is not defined by this library (see the paragraph after the list). In practice a caller that has its own `try`/`catch` may still catch it; otherwise the process calls `std::terminate`.
 - **Library translation-unit boundary:** `mvc::router::handle` (`src/mvc/router.cpp:617-659`, declared `noexcept`) and `rpc::dispatcher::dispatch` (`src/rpc/dispatcher.cpp:366-372`). These frames are prebuilt and follow the *library's* flags, not the consumer's. A library built with exceptions surrounds route invocation and the handler call with `try`/`catch (...)`, so a throwing handler is caught inside the library and becomes HTTP 500 `internal error` or `rpc_code::internal`; it does not terminate, and the consumer cannot observe the throw. A library built without exception support has no such frames: the same throw is undefined behaviour and in practice terminates.
 
-This is a limitation of `-fno-exceptions`, not a guarantee of this library: the standard does not define a `throw` compiled without unwind information. In practice it may end in `std::terminate`, or a caller-side `try`/`catch` may still catch it, but stack unwinding and destruction do not run normally 鈥?frames compiled without exception support carry no cleanups, so their local objects (and any lock or permit they own) are not destroyed. A caller-side `try`/`catch` around a no-exception boundary is therefore not a supported recovery mechanism.
+This is a limitation of `-fno-exceptions`, not a guarantee of this library: the standard does not define a `throw` compiled without unwind information. In practice it may end in `std::terminate`, or a caller-side `try`/`catch` may still catch it, but stack unwinding and destruction do not run normally — frames compiled without exception support carry no cleanups, so their local objects (and any lock or permit they own) are not destroyed. A caller-side `try`/`catch` around a no-exception boundary is therefore not a supported recovery mechanism.
 
 The contract therefore requires hook and handler implementations never to throw: callbacks are `noexcept` by policy ([principles](principles.md#s8), "noexcept on callbacks").
 
