@@ -6,7 +6,7 @@
 
 ### MySQL：删除 private 且无人调用的 `set_autocommit`
 
-- 删除了 private 且无人调用的 `mysql::connection::set_autocommit`。导出表减少一个私有符号；无公开 API 变更，因为该成员是私有且消费者无法命名。
+- 删除了 private 且无人调用的 `mysql::connection::set_autocommit`。静态归档中该私有 out-of-line 符号已消失，共享库构建下对应的 `/EXPORT` 指令也随之少一条。无公开 API 变更：该成员是私有且消费者无法命名。
 
 ### 测试时间断言：保留能失败的断言，删掉不能失败的
 

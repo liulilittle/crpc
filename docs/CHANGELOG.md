@@ -6,7 +6,7 @@
 
 ### MySQL: remove the private, uncalled `set_autocommit`
 
-- Removed the private, uncalled `mysql::connection::set_autocommit`. The export table loses one private symbol; no public API changes, because the member was private and could not be named by a consumer.
+- Removed the private, uncalled `mysql::connection::set_autocommit`. One private out-of-line symbol is gone from the static archive, and the matching `/EXPORT` directive is gone from a shared build. No public API changes: the member was private and could not be named by a consumer.
 
 ### Test timing gates: keep the assertions that can fail, drop the ones that cannot
 
