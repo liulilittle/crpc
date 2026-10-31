@@ -862,6 +862,75 @@ CRPC_TEST(mysql_truncated_binary_trailing_ok_keeps_the_transaction_state) {
     CRPC_CHECK(no_rows.session->in_transaction());
 }
 
+// The binary twin of `mysql_truncated_deprecate_eof_keeps_the_transaction_state`.
+// `read_binary_result` decodes the DEPRECATE_EOF terminator with the same
+// two-length-encoded-integer walk, so it needs the same guards: without them the
+// failed read leaves `ok_offset` past the bogus prefix and the four bytes there are
+// applied as a status word, which would clear the transaction and make the pool
+// skip its ROLLBACK.
+CRPC_TEST(mysql_truncated_binary_deprecate_eof_keeps_the_transaction_state) {
+    harness h("caching_sha2_password", 2,
+              server_capabilities | mask(capability::deprecate_eof));
+    CRPC_CHECK((h.session->negotiated_capabilities() & mask(capability::deprecate_eof)) != 0);
+    push_ok(h.raw, 0, 0x0001);
+    CRPC_CHECK(h.session->begin().ok());
+    CRPC_CHECK(h.session->in_transaction());
+
+    // `call()` is the public way into the binary result path. With DEPRECATE_EOF the
+    // prepare reply and the execute reply carry no closing EOF after their column
+    // definitions, so neither script queues one.
+    h.raw->push(packet(prepare_ok_payload(76, 1, 0), 1));
+    h.raw->push(packet(column_payload("id", 8), 2));
+    h.raw->push(packet({std::byte{1}}, 1));
+    h.raw->push(packet(column_payload("id", 8), 2));
+    // Nine bytes: header, then a lone 0xfb -- a NULL marker where an integer is
+    // required -- then zero padding. The first length-encoded read fails, so the
+    // four bytes at the resulting offset are not a status word and must not be
+    // applied.
+    std::vector<std::byte> malformed;
+    malformed.push_back(std::byte{0xfe});
+    malformed.push_back(std::byte{0xfb});
+    for (int i = 0; i < 7; ++i) {
+        malformed.push_back(std::byte{0});
+    }
+    h.raw->push(packet(malformed, 3));
+
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status called = h.session->call("CALL p()", {}, &rows);
+    std::unique_ptr<crpc::db::result_set> owned(rows);
+    CRPC_CHECK(called.ok());
+    CRPC_CHECK(h.session->in_transaction());
+
+    // The other direction: a structurally complete OK terminator -- nine bytes so it
+    // reaches the DEPRECATE_EOF branch rather than the short-EOF one -- that reports
+    // IN_TRANS=0 must still be applied. Otherwise "keep the previous value" would
+    // degenerate into "never update".
+    harness closing("caching_sha2_password", 2,
+                    server_capabilities | mask(capability::deprecate_eof));
+    push_ok(closing.raw, 0, 0x0001);
+    CRPC_CHECK(closing.session->begin().ok());
+    CRPC_CHECK(closing.session->in_transaction());
+
+    closing.raw->push(packet(prepare_ok_payload(77, 1, 0), 1));
+    closing.raw->push(packet(column_payload("id", 8), 2));
+    closing.raw->push(packet({std::byte{1}}, 1));
+    closing.raw->push(packet(column_payload("id", 8), 2));
+    // 0xfe header, affected=0, last_insert_id=0, status=0x0000 (IN_TRANS clear),
+    // warnings=0, then padding up to the nine-byte threshold.
+    std::vector<std::byte> terminator;
+    terminator.push_back(std::byte{0xfe});
+    for (int i = 0; i < 8; ++i) {
+        terminator.push_back(std::byte{0});
+    }
+    closing.raw->push(packet(terminator, 3));
+
+    crpc::db::result_set* closed_rows = nullptr;
+    const crpc::status closed_call = closing.session->call("CALL p()", {}, &closed_rows);
+    std::unique_ptr<crpc::db::result_set> owned_closed(closed_rows);
+    CRPC_CHECK(closed_call.ok());
+    CRPC_CHECK_FALSE(closing.session->in_transaction());
+}
+
 CRPC_TEST(mysql_error_packet_keeps_the_transaction_state_of_an_idle_autocommit_session) {
     // autocommit=0 as the server reports it on the authentication OK.
     harness off("caching_sha2_password", 0x0000);
@@ -1011,6 +1080,83 @@ CRPC_TEST(mysql_pool_release_rolls_back_then_resets_the_session) {
     const std::size_t steady = raw->writes.size();
     CRPC_CHECK(second.value()->reset_session().ok());
     CRPC_CHECK_EQ(steady, raw->writes.size());
+}
+
+CRPC_TEST(mysql_release_rolls_back_after_a_packet_without_a_status_word) {
+    // Same single-session scripted server as R1-d: the handshake reports status
+    // 0x0000, so this connection starts with autocommit off.
+    auto handshake = std::make_shared<std::vector<std::vector<std::byte>>>();
+    handshake->push_back(packet(greeting_payload("caching_sha2_password"), 0));
+    handshake->push_back(packet(ok_payload(0, 0x0000), 2));
+
+    scripted_channel* raw = nullptr;
+    connection_options options;
+    options.user = "root";
+    options.password = "";
+    crpc::db::mysql::channel_factory factory(
+        options,
+        [&raw, handshake]() -> crpc::result<std::unique_ptr<crpc::db::mysql::channel>> {
+            auto link = std::unique_ptr<scripted_channel>(new scripted_channel);
+            for (const std::vector<std::byte>& frame : *handshake) {
+                link->push(frame);
+            }
+            raw = link.get();
+            return crpc::result<std::unique_ptr<crpc::db::mysql::channel>>(
+                std::unique_ptr<crpc::db::mysql::channel>(link.release()));
+        });
+
+    crpc::db::pool_options pool_options;
+    pool_options.min_size = 0;
+    pool_options.max_size = 1;
+    pool_options.max_idle = 1;
+    pool_options.validate_on_borrow = false;
+    pool_options.acquire_timeout = std::chrono::seconds(5);
+    crpc::db::pool connections(pool_options, factory);
+
+    auto lease = connections.acquire();
+    CRPC_CHECK(lease.ok());
+    if (!lease.ok()) {
+        return;
+    }
+
+    // Autocommit is off: the INSERT opens the transaction and the server says so.
+    crpc::db::result_set* inserted = nullptr;
+    push_ok(raw, 1, 0x0001);
+    CRPC_CHECK(lease.value()->query("INSERT INTO t VALUES (1)", {}, &inserted).ok());
+    std::unique_ptr<crpc::db::result_set> owned_insert(inserted);
+    CRPC_CHECK(lease.value()->in_transaction());
+
+    // A result set whose terminator is a one-byte 0xfe: it carries no status word,
+    // so the old one must stand.
+    raw->push(packet({std::byte{1}}, 1));
+    raw->push(packet(column_payload("id", 8), 2));
+    raw->push(packet(eof_payload(0x0001), 3));
+    std::vector<std::byte> row;
+    crpc::db::mysql::append_lenenc_string(row, "1");
+    raw->push(packet(row, 4));
+    raw->push(packet({std::byte{0xfe}}, 5));
+    crpc::db::result_set* selected = nullptr;
+    CRPC_CHECK(lease.value()->query("SELECT id FROM t", {}, &selected).ok());
+    std::unique_ptr<crpc::db::result_set> owned_select(selected);
+    CRPC_CHECK(lease.value()->in_transaction());
+
+    // Release: ROLLBACK ends the transaction, then SET autocommit=1 restores the
+    // session. The core assertion is the first frame: if the status word had been
+    // wiped, `in_transaction()` would be false and the pool would skip the ROLLBACK
+    // and go straight to the implicit commit that `SET autocommit=1` performs.
+    push_ok(raw, 0, 0x0000);
+    push_ok(raw, 0, 0x0002);
+    const std::size_t before = raw->writes.size();
+    CRPC_CHECK(lease.value().release().ok());
+    const std::size_t written = raw->writes.size() - before;
+    CRPC_CHECK_EQ(std::size_t{2}, written);
+    const std::string first_release =
+        written > 0 ? frame_sql(raw->writes[before]) : std::string("<no frame>");
+    CRPC_CHECK_EQ(std::string("ROLLBACK"), first_release);
+    if (written == 2) {
+        CRPC_CHECK_EQ(std::string("SET autocommit=1"),
+                      frame_sql(raw->writes[before + 1]));
+    }
 }
 
 CRPC_TEST_MAIN()
