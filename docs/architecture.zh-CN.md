@@ -264,7 +264,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 每个请求的顺序：
 
-1. `submit`（连接 reader）在 per-connection 在途上限之前、任何业务分配之前执行可选的**连接级**令牌桶。拒绝返回 `resource_exhausted` + `retry_after`（HTTP 429）；此时只分配必要的 forced-reject job。这是连接级洪泛保护，不是服务级 rate 阶段。
+1. `submit`（连接 reader）在 per-connection 在途上限之前、任何业务分配之前执行可选的**连接级**令牌桶。拒绝返回 `resource_exhausted` + `retry_after`（HTTP 429）；此时只分配必要的 forced-reject job。这是连接级洪泛保护，不是服务级 rate 阶段。连接级上限为 0 即关闭该检查：此时有序通道缓冲只受对端的发送速率与 `gap_timeout` 约束，所以 0 是「去掉保护」，而不是「解除某个人为限制」。
 2. `handle_request` **先**检查 breaker。open 直接返回 `unavailable`（503）及其 `retry_after`。半开探针令牌会跳过服务级 rate 与 bulkhead 阶段，受 `half_open_max_probes` 限制，因此饱和的 rate 桶或 bulkhead 不会饿死 breaker。服务级在途上限是真实容量边界，探针同样受其约束：cap 满时探针返回 `overload`。探针仍受连接级令牌桶约束，不保证跨连接的探针供给。
 3. closed 路径：服务级 rate（可选、感知 deadline；若等待会越过调用 deadline 则返回 `deadline_exceeded`，HTTP 504）-> 服务级 bulkhead（满载返回 `overload`，429）-> 现有服务级在途上限 -> `rpc::dispatcher::dispatch`。
 4. 结果分类：本地准入（rate、bulkhead、连接池、并发上限）与应用错误调用 `ignore()`；`internal`、`unavailable`、`not_acknowledged` 调用 `failure()`；`deadline_exceeded` 在 handler 已运行时记 `slow()`、在 dispatcher 执行前拒绝时记 `ignore()`；`ok` 由 permit 实测耗时分为 `success` 或 `slow`。
