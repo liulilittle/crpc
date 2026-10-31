@@ -1246,4 +1246,142 @@ CRPC_TEST(tds_login_reply_commit_zeroes_the_echoed_descriptor) {
     CRPC_CHECK(echoes_fixture);
 }
 
+// N4-j: the batch/RPC reply loop (`read_reply`) is a second decode point for the
+// server's transaction boundary. A COMMIT decoded there must zero the descriptor as
+// well, or the very next batch carries the closed transaction's descriptor in its
+// AllHeaders block and the server rejects it with "should come with valid
+// transaction descriptor".
+CRPC_TEST(tds_commit_by_sql_zeroes_the_echoed_descriptor) {
+    bytes batch_request;
+    auto respond = login_server();
+    auto session = open_with([respond, &batch_request](packet_type type,
+                                                      crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        // Keep only the latest request: the assertion below is about the message
+        // sent *after* the transaction closed.
+        batch_request.assign(payload.begin(), payload.end());
+        bytes reply;
+        if (contains_utf16(batch_request, "BEGIN TRANSACTION")) {
+            put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                                   transaction_descriptor_fixture);
+        } else if (contains_utf16(batch_request, "COMMIT TRANSACTION")) {
+            put_transaction_change(reply, crpc::db::tds::env_change_type::commit_transaction,
+                                   transaction_descriptor_fixture);
+        }
+        put_done(reply, 0, 0);
+        return reply;
+    });
+
+    CRPC_CHECK_FALSE(session->in_transaction());
+    result_set* begun = nullptr;
+    const crpc::status began = session->query("BEGIN TRANSACTION", {}, &begun);
+    crpc::db::statement_guard begun_guard(begun);
+    CRPC_CHECK(static_cast<bool>(began));
+    // The BEGIN reply handed out the fixture descriptor, so `in_transaction()` and the
+    // echo below have something real to clear.
+    CRPC_CHECK(session->in_transaction());
+
+    result_set* ended = nullptr;
+    const crpc::status committed = session->query("COMMIT TRANSACTION", {}, &ended);
+    crpc::db::statement_guard ended_guard(ended);
+    CRPC_CHECK(static_cast<bool>(committed));
+    CRPC_CHECK_FALSE(session->in_transaction());
+
+    result_set* rows = nullptr;
+    const crpc::status ran = session->query("SELECT 1", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(ran));
+
+    // Same AllHeaders layout as N4-i: [0..3] total (LE32), [4..7] header_length,
+    // [8] the transaction descriptor's header type, [10..17] the descriptor, and the
+    // payload at [22]. The framing checks keep a wrong offset from passing vacuously.
+    CRPC_REQUIRE(batch_request.size() > 22);
+    CRPC_CHECK_EQ(std::uint8_t{0x16}, byte_at(batch_request, 0));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(batch_request, 1));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(batch_request, 3));
+    CRPC_CHECK_EQ(std::uint8_t{0x02}, byte_at(batch_request, 8));
+    CRPC_CHECK_EQ(std::uint8_t{0x53}, byte_at(batch_request, 22)); // 'S' of "SELECT 1"
+
+    bool descriptor_is_zero = true;
+    for (std::size_t i = 10; i < 18; ++i) {
+        descriptor_is_zero = descriptor_is_zero && byte_at(batch_request, i) == 0;
+    }
+    CRPC_CHECK(descriptor_is_zero);
+    bool echoes_the_fixture = true;
+    for (std::size_t i = 0; i < transaction_descriptor_fixture.size(); ++i) {
+        echoes_the_fixture = echoes_the_fixture &&
+                             batch_request[10 + i] == transaction_descriptor_fixture[i];
+    }
+    CRPC_CHECK_FALSE(echoes_the_fixture);
+}
+
+// N4-k: `query_streaming` decodes the reply with its own pull decoder, and that is
+// the third place a transaction boundary is observed. A COMMIT consumed there must
+// zero the descriptor too -- the streaming path is reachable through
+// `db::connection*`, so this is not private to a caller that never streams.
+CRPC_TEST(tds_streaming_commit_zeroes_the_echoed_descriptor) {
+    bytes batch_request;
+    auto respond = login_server();
+    auto session = open_with([respond, &batch_request](packet_type type,
+                                                      crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        batch_request.assign(payload.begin(), payload.end());
+        bytes reply;
+        if (contains_utf16(batch_request, "BEGIN TRANSACTION")) {
+            put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                                   transaction_descriptor_fixture);
+        } else if (contains_utf16(batch_request, "COMMIT TRANSACTION")) {
+            put_transaction_change(reply, crpc::db::tds::env_change_type::commit_transaction,
+                                   transaction_descriptor_fixture);
+        }
+        put_done(reply, 0, 0);
+        return reply;
+    });
+
+    CRPC_CHECK_FALSE(session->in_transaction());
+    result_set* begun = nullptr;
+    const crpc::status began = session->query("BEGIN TRANSACTION", {}, &begun);
+    crpc::db::statement_guard begun_guard(begun);
+    CRPC_CHECK(static_cast<bool>(began));
+    CRPC_CHECK(session->in_transaction());
+
+    // `prime()` pulls tokens until the reply ends, so the ENVCHANGE(commit) and the
+    // terminal DONE are both decoded before `query_streaming` returns: the descriptor
+    // has to be zero by then, without a `next()` call.
+    result_set* ended = nullptr;
+    const crpc::status committed =
+        session->query_streaming("COMMIT TRANSACTION", {}, &ended);
+    crpc::db::statement_guard ended_guard(ended);
+    CRPC_CHECK(static_cast<bool>(committed));
+    CRPC_CHECK_FALSE(session->in_transaction());
+
+    result_set* rows = nullptr;
+    const crpc::status ran = session->query("SELECT 1", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(ran));
+
+    CRPC_REQUIRE(batch_request.size() > 22);
+    CRPC_CHECK_EQ(std::uint8_t{0x16}, byte_at(batch_request, 0));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(batch_request, 1));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(batch_request, 3));
+    CRPC_CHECK_EQ(std::uint8_t{0x02}, byte_at(batch_request, 8));
+    CRPC_CHECK_EQ(std::uint8_t{0x53}, byte_at(batch_request, 22)); // 'S' of "SELECT 1"
+
+    bool descriptor_is_zero = true;
+    for (std::size_t i = 10; i < 18; ++i) {
+        descriptor_is_zero = descriptor_is_zero && byte_at(batch_request, i) == 0;
+    }
+    CRPC_CHECK(descriptor_is_zero);
+    bool echoes_the_fixture = true;
+    for (std::size_t i = 0; i < transaction_descriptor_fixture.size(); ++i) {
+        echoes_the_fixture = echoes_the_fixture &&
+                             batch_request[10 + i] == transaction_descriptor_fixture[i];
+    }
+    CRPC_CHECK_FALSE(echoes_the_fixture);
+}
+
 CRPC_TEST_MAIN()
