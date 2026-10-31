@@ -156,10 +156,13 @@ restores `autocommit` itself: `ROLLBACK` ends the transaction but leaves the
 session variable alone, so a rolled-back `autocommit=0` session would put the next
 borrower's statements into an implicit transaction that its own release rolls
 back. The clean state is deliberately not the server's global default: a server
-started with `--autocommit=0` would hand the next borrower the same trap. A
-connection whose session cannot be reset is closed rather than reused. A backend
-with no session state resets for free; MySQL sends one `SET autocommit=1` only when
-the session is not already at that state.
+started with `--autocommit=0` would hand the next borrower the same trap. Note that
+normalisation happens on return, not on open: the very first lease of a connection
+still runs under whatever default the server gave it, and only its release puts the
+session into the clean state. A connection whose session cannot be reset is closed
+rather than reused. Only MySQL implements the reset today; a backend with no session
+state resets for free. MySQL sends one `SET autocommit=1` only when the session is
+not already at that state.
 
 ## Limits
 
