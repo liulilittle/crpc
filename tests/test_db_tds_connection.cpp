@@ -8,6 +8,7 @@
 #include "test_framework.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -151,6 +152,22 @@ void put_packet_size_change(bytes& out, std::string_view new_size) {
     put_u8(body, static_cast<std::uint8_t>(crpc::db::tds::env_change_type::packet_size));
     put_b_varchar(body, new_size);
     put_b_varchar(body, "4096");
+    put_u8(out, static_cast<std::uint8_t>(token_type::envchange));
+    put_u16_le(out, static_cast<std::uint16_t>(body.size()));
+    out.insert(out.end(), body.begin(), body.end());
+}
+
+// ENVCHANGE(begin_transaction|commit_transaction|rollback_transaction).
+// Payload: one length byte, the descriptor bytes, then the old value as b_varchar.
+void put_transaction_change(bytes& out, crpc::db::tds::env_change_type type,
+                            const std::array<std::byte, 8>& descriptor) {
+    bytes body;
+    put_u8(body, static_cast<std::uint8_t>(type));
+    put_u8(body, static_cast<std::uint8_t>(descriptor.size()));
+    for (const std::byte value : descriptor) {
+        put_u8(body, static_cast<std::uint8_t>(value));
+    }
+    put_b_varchar(body, "");
     put_u8(out, static_cast<std::uint8_t>(token_type::envchange));
     put_u16_le(out, static_cast<std::uint16_t>(body.size()));
     out.insert(out.end(), body.begin(), body.end());
@@ -907,6 +924,137 @@ CRPC_TEST(tds_rpc_query_refuses_an_output_parameter) {
     CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::invalid_argument),
                   static_cast<int>(ran.error().code));
     CRPC_CHECK(raw == nullptr);
+}
+
+// --- N4: the server's ENVCHANGE transaction boundary is authoritative --------
+
+namespace {
+
+constexpr std::array<std::byte, 8> transaction_descriptor_fixture{
+    std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44},
+    std::byte{0x55}, std::byte{0x66}, std::byte{0x77}, std::byte{0x88}};
+
+} // namespace
+
+CRPC_TEST(tds_begin_transaction_by_sql_is_visible_to_in_transaction) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK_FALSE(session->in_transaction());
+    result_set* rows = nullptr;
+    const crpc::status ran = session->query("BEGIN TRANSACTION", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(ran));
+    CRPC_CHECK(session->in_transaction());
+}
+
+CRPC_TEST(tds_commit_transaction_by_sql_clears_in_transaction) {
+    int batches = 0;
+    auto respond = login_server();
+    auto session = open_with([respond, &batches](packet_type type,
+                                                 crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        ++batches;
+        put_transaction_change(reply,
+                               batches == 1 ? crpc::db::tds::env_change_type::begin_transaction
+                                            : crpc::db::tds::env_change_type::commit_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    result_set* first = nullptr;
+    const crpc::status began = session->query("BEGIN TRANSACTION", {}, &first);
+    crpc::db::statement_guard first_guard(first);
+    CRPC_CHECK(static_cast<bool>(began));
+    CRPC_CHECK(session->in_transaction());
+    result_set* second = nullptr;
+    const crpc::status ended = session->query("COMMIT TRANSACTION", {}, &second);
+    crpc::db::statement_guard second_guard(second);
+    CRPC_CHECK(static_cast<bool>(ended));
+    CRPC_CHECK_FALSE(session->in_transaction());
+}
+
+CRPC_TEST(tds_begin_keeps_the_latch_without_an_envchange) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK_FALSE(session->in_transaction());
+    // The scripted reply carries no ENVCHANGE, so only `begin()`'s own latch can
+    // report the transaction; deleting that latch makes this red.
+    CRPC_CHECK(static_cast<bool>(session->begin()));
+    CRPC_CHECK(session->in_transaction());
+}
+
+CRPC_TEST(tds_pool_release_rolls_back_a_transaction_opened_by_sql) {
+    auto requests = std::make_shared<std::vector<bytes>>();
+    int batches = 0;
+    crpc::db::tds::channel_factory factory(
+        options_for_tests(), [requests, &batches]() -> crpc::result<std::unique_ptr<channel>> {
+            auto link = std::make_unique<scripted_channel>(
+                [requests, &batches](packet_type type,
+                                     crpc::span<const std::byte> payload) -> bytes {
+                    bytes reply;
+                    if (type == packet_type::prelogin) {
+                        crpc::db::tds::prelogin answer;
+                        answer.encryption = crpc::db::tds::encryption_mode::not_supported;
+                        (void)crpc::db::tds::encode_prelogin(reply, answer);
+                        return reply;
+                    }
+                    if (type == packet_type::login7) {
+                        put_login_ack(reply);
+                        put_packet_size_change(reply, "8192");
+                        put_done(reply, 0, 0);
+                        return reply;
+                    }
+                    if (type != packet_type::sql_batch) {
+                        return reply;
+                    }
+                    requests->emplace_back(payload.begin(), payload.end());
+                    ++batches;
+                    put_transaction_change(
+                        reply,
+                        batches == 1 ? crpc::db::tds::env_change_type::begin_transaction
+                                     : crpc::db::tds::env_change_type::rollback_transaction,
+                        transaction_descriptor_fixture);
+                    put_done(reply, 0, 0);
+                    return reply;
+                });
+            return crpc::result<std::unique_ptr<channel>>(std::move(link));
+        });
+    crpc::db::pool_options options;
+    options.min_size = 0;
+    options.max_size = 1;
+    options.max_idle = 1;
+    options.validate_on_borrow = false;
+    crpc::db::pool connections(options, factory);
+    auto acquired = connections.acquire();
+    CRPC_CHECK(static_cast<bool>(acquired));
+    crpc::db::pool::lease lease = std::move(acquired.value());
+    result_set* rows = nullptr;
+    const crpc::status began = lease->query("BEGIN TRANSACTION", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(began));
+    CRPC_CHECK(lease->in_transaction());
+    CRPC_CHECK(static_cast<bool>(lease.release()));
+    CRPC_CHECK_EQ(std::size_t{2}, requests->size());
+    CRPC_CHECK(contains_utf16(requests->back(), "ROLLBACK TRANSACTION"));
 }
 
 CRPC_TEST_MAIN()

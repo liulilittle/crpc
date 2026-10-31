@@ -360,9 +360,13 @@ status connection::perform_handshake() {
                 if (item.env.type == env_change_type::begin_transaction) {
                     descriptor_ = item.env.new_descriptor;
                     has_descriptor_ = true;
+                    // Same authority rule as read_reply: a login reply may already
+                    // report an open transaction.
+                    in_transaction_ = true;
                 } else if (item.env.type == env_change_type::commit_transaction ||
                            item.env.type == env_change_type::rollback_transaction) {
                     has_descriptor_ = false;
+                    in_transaction_ = false;
                 }
                 break;
             case token::kind::error:
@@ -547,10 +551,15 @@ status connection::read_reply(result_set** out, std::vector<return_value>* writt
                 if (item.env.type == env_change_type::begin_transaction) {
                     descriptor_ = item.env.new_descriptor;
                     has_descriptor_ = true;
+                    // The server's reported transaction boundary is the authoritative
+                    // value; the latch in begin() only covers scripted replies that
+                    // omit the ENVCHANGE.
+                    in_transaction_ = true;
                 } else if (item.env.type == env_change_type::commit_transaction ||
                            item.env.type == env_change_type::rollback_transaction) {
                     has_descriptor_ = false;
                     descriptor_.fill(0);
+                    in_transaction_ = false;
                 }
                 break;
             default:
