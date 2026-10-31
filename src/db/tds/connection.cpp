@@ -366,6 +366,7 @@ status connection::perform_handshake() {
                 } else if (item.env.type == env_change_type::commit_transaction ||
                            item.env.type == env_change_type::rollback_transaction) {
                     has_descriptor_ = false;
+                    descriptor_.fill(0);
                     in_transaction_ = false;
                 }
                 break;

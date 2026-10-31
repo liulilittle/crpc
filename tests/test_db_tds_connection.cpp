@@ -1103,4 +1103,147 @@ CRPC_TEST(tds_login_reply_reports_an_open_transaction) {
     CRPC_CHECK(session->in_transaction());
 }
 
+// N4-g: a login reply may open and then close a transaction. The later ENVCHANGE
+// must win, so the handshake's commit branch is the one that runs.
+CRPC_TEST(tds_login_reply_closing_a_transaction_clears_in_transaction) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::login7) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_login_ack(reply);
+        put_packet_size_change(reply, "8192");
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_transaction_change(reply, crpc::db::tds::env_change_type::commit_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_FALSE(session->in_transaction());
+}
+
+// N4-h: the same rule for ROLLBACK, which shares the handshake branch.
+CRPC_TEST(tds_login_reply_rollback_clears_in_transaction) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::login7) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_login_ack(reply);
+        put_packet_size_change(reply, "8192");
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_transaction_change(reply, crpc::db::tds::env_change_type::rollback_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_FALSE(session->in_transaction());
+}
+
+// N4-i: closing the login reply's transaction must also clear the descriptor it
+// opened. That descriptor is not private bookkeeping: `all_headers()` writes it
+// into the head block ahead of every later batch, so a stale one is echoed to the
+// server as if the session were still inside that transaction.
+CRPC_TEST(tds_login_reply_commit_zeroes_the_echoed_descriptor) {
+    bytes request;
+    auto respond = login_server();
+    auto session = open_with([respond, &request](packet_type type,
+                                                 crpc::span<const std::byte> payload) {
+        if (type == packet_type::sql_batch) {
+            request.assign(payload.begin(), payload.end());
+            bytes reply;
+            put_done(reply, 0, 0);
+            return reply;
+        }
+        if (type != packet_type::login7) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_login_ack(reply);
+        put_packet_size_change(reply, "8192");
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_transaction_change(reply, crpc::db::tds::env_change_type::commit_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK_FALSE(session->in_transaction());
+
+    result_set* rows = nullptr;
+    const crpc::status ran = session->query("SELECT 1", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(ran));
+
+    // The AllHeaders layout from `all_headers()`: [0..3] total (LE32), [4..7]
+    // header_length (LE32), [8] the transaction descriptor's header type,
+    // [10..17] the descriptor itself, and the payload starts at [22]. The framing
+    // checks stop a wrong offset from passing vacuously: the high bytes catch a
+    // widened length whose low byte still reads 0x16, and the last one pins the
+    // payload's first byte right behind the head block.
+    CRPC_REQUIRE(request.size() > 22);
+    CRPC_CHECK_EQ(std::uint8_t{0x16}, byte_at(request, 0));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(request, 1));
+    CRPC_CHECK_EQ(std::uint8_t{0x00}, byte_at(request, 3));
+    CRPC_CHECK_EQ(std::uint8_t{0x02}, byte_at(request, 8));
+    CRPC_CHECK_EQ(std::uint8_t{0x53}, byte_at(request, 22)); // 'S' of "SELECT 1"
+
+    bool descriptor_is_zero = true;
+    for (std::size_t i = 10; i < 18; ++i) {
+        descriptor_is_zero = descriptor_is_zero && byte_at(request, i) == 0;
+    }
+    CRPC_CHECK(descriptor_is_zero);
+    bool echoes_the_fixture = true;
+    for (std::size_t i = 0; i < transaction_descriptor_fixture.size(); ++i) {
+        echoes_the_fixture =
+            echoes_the_fixture && request[10 + i] == transaction_descriptor_fixture[i];
+    }
+    CRPC_CHECK_FALSE(echoes_the_fixture);
+
+    // Reverse guard: without a commit the echoed descriptor must still be the
+    // fixture's. Otherwise "all zero" above could simply mean this block is never
+    // written at all.
+    bytes opened_request;
+    auto opened_respond = login_server();
+    auto opened = open_with([opened_respond, &opened_request](
+                                packet_type type, crpc::span<const std::byte> payload) {
+        if (type == packet_type::sql_batch) {
+            opened_request.assign(payload.begin(), payload.end());
+            bytes reply;
+            put_done(reply, 0, 0);
+            return reply;
+        }
+        if (type != packet_type::login7) {
+            return opened_respond(type, payload);
+        }
+        bytes reply;
+        put_login_ack(reply);
+        put_packet_size_change(reply, "8192");
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK(opened->is_open());
+    CRPC_CHECK(opened->in_transaction());
+    result_set* opened_rows = nullptr;
+    const crpc::status opened_ran = opened->query("SELECT 1", {}, &opened_rows);
+    crpc::db::statement_guard opened_guard(opened_rows);
+    CRPC_CHECK(static_cast<bool>(opened_ran));
+    CRPC_REQUIRE(opened_request.size() >= 22);
+    bool echoes_fixture = true;
+    for (std::size_t i = 0; i < transaction_descriptor_fixture.size(); ++i) {
+        echoes_fixture =
+            echoes_fixture && opened_request[10 + i] == transaction_descriptor_fixture[i];
+    }
+    CRPC_CHECK(echoes_fixture);
+}
+
 CRPC_TEST_MAIN()
