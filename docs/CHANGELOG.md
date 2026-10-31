@@ -4,9 +4,13 @@
 
 ## Unreleased
 
+### MySQL: transaction state follows the server, not a local guess
+
+- `in_transaction()` now reports the server's `SERVER_STATUS_IN_TRANS` from the last completed command instead of a local flag that only `begin()`/`commit()`/`rollback()` maintained. Consequences for a session running with `autocommit = 0`: the pool rolls back the implicit transaction instead of handing it to the next borrower; `commit()` commits it instead of returning `failed_precondition`; and a DDL statement that implicitly commits no longer leaves a phantom transaction behind. Two flags keep the two questions apart: `explicit_txn_` (did *we* begin one) gates `begin()`, `server_txn_` (did the server say so) answers the pool. An `ERR` packet carries no status word, so after a failed statement the previous status stands; when the session runs with `autocommit = 0` the transaction survives the error, so the connection is treated as having uncommitted work and the pool rolls it back instead of handing it on.
+
 ### MySQL: remove the private, uncalled `set_autocommit`
 
-- Removed the private, uncalled `mysql::connection::set_autocommit`. One private out-of-line symbol is gone from the static archive, and the matching `/EXPORT` directive is gone from a shared build. No public API changes: the member was private and could not be named by a consumer.
+- Removed the private, uncalled `mysql::connection::set_autocommit`. Three private helpers (`apply_status`, `apply_error`, `has_uncommitted_work`) take its place. `__declspec(dllexport)` on a class exports its private members too, inline definitions included, so the net effect on a shared build is one fewer and three more private symbols. No public API changes: none of them can be named by a consumer.
 
 ### Test timing gates: keep the assertions that can fail, drop the ones that cannot
 

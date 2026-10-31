@@ -229,6 +229,56 @@ private:
     [[nodiscard]] status read_message(std::vector<std::byte>& payload);
     [[nodiscard]] status send_message(span<const std::byte> payload, std::uint8_t sequence);
     [[nodiscard]] status run_query(std::string_view sql, result_set** out);
+    // The only writer of `status_flags_` and, with `apply_error`, one of the two
+    // writers of `server_txn_`; also the only place that clears `explicit_txn_`
+    // from a protocol packet. (`explicit_txn_` has other writers: `begin()` sets
+    // it, commit/rollback/fail/close clear it.)
+    //
+    // `flags` must come from a packet that really carried a status word: a short
+    // EOF carries none, and the callers keep the previous value in that case (a stale
+    // "in transaction" costs one harmless ROLLBACK; a wiped one costs the rollback
+    // itself, which leaks uncommitted work into the pool).
+    //
+    // A middle packet of a multi-result command is not that command's conclusion,
+    // so it updates `status_flags_` (the MORE_RESULTS test needs the fresh value)
+    // but leaves the transaction state alone.
+    void apply_status(std::uint16_t flags) noexcept {
+        status_flags_ = flags;
+        if ((flags & static_cast<std::uint16_t>(server_status::more_results)) != 0) {
+            return;
+        }
+        const bool in_txn =
+            (flags & static_cast<std::uint16_t>(server_status::in_transaction)) != 0;
+        server_txn_ = in_txn;
+        // The server ending the transaction ends ours too (DDL implicit commit,
+        // COMMIT issued as text, autocommit=1). It never *starts* the latch.
+        if (!in_txn) {
+            explicit_txn_ = false;
+        }
+    }
+
+    // An ERR packet carries no status word, so the previous one stands. Under
+    // autocommit=0 the server keeps the transaction for a statement-level error
+    // such as 1205 (lock wait timeout): InnoDB rolls back only that statement, and
+    // the transaction and its locks survive. An error must therefore not make the
+    // session look idle -- assume there is work to roll back rather than let the
+    // pool hand it on. (A deadlock, 1213, rolls back the whole transaction; the
+    // assumption then costs one harmless ROLLBACK.)
+    //
+    // Both this and `apply_status` are the only writers of `server_txn_`, and both
+    // are driven by a decoded protocol reply.
+    void apply_error() noexcept {
+        if ((status_flags_ &
+             static_cast<std::uint16_t>(server_status::autocommit)) == 0) {
+            server_txn_ = true;
+        }
+    }
+
+    // One meaning, one place: is there work a COMMIT or ROLLBACK must finish?
+    // Readers: in_transaction() (the pool's P3 path), commit(), rollback().
+    [[nodiscard]] bool has_uncommitted_work() const noexcept {
+        return open_ && (explicit_txn_ || server_txn_);
+    }
 // Executes a prepared statement and decodes its reply (binary protocol).
     // `allow_more_results` exists for CALL: a procedure returns its result set and
     // then a trailing OK, and refusing the trailing packet would leave the stream
@@ -250,9 +300,20 @@ private:
     std::uint32_t capabilities_ = 0;
     std::string auth_plugin_;
     std::uint16_t status_flags_ = 0;
-    // Set once a transaction is open, so the pool's rollback path is exact even
-    // when the server does not report `SERVER_STATUS_IN_TRANS`.
-    bool in_transaction_ = false;
+    // Two facts, two writers, two readers -- never one field for both.
+    //
+    // `explicit_txn_` is the latch of *our* begin(): set after START TRANSACTION
+    // was answered, cleared by commit/rollback/fail/close and by the server
+    // saying the transaction ended. Only `begin()` consults it: a server-side
+    // implicit transaction must not block a new START TRANSACTION, because MySQL
+    // implicitly commits it first.
+    bool explicit_txn_ = false;
+    // `server_txn_` is the IN_TRANS bit of the most recent packet that actually
+    // carried a status word for a completed command. Written by the two decoded
+    // protocol-reply paths (`apply_status`, and `apply_error` which only ever sets
+    // it). It is what tells the pool there is uncommitted work when
+    // the session runs with autocommit=0 and the caller never called begin().
+    bool server_txn_ = false;
     bool open_ = false;
     std::uint8_t sequence_ = 0;
     // Shared with every prepared-statement handle; reset when the session closes.

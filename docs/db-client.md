@@ -147,6 +147,11 @@ caller reads a row (the cursor is materialised). The pool bounds live connection
 protocol is desynchronised is closed by the caller (`lease::discard()`), never
 returned.
 
+A connection handed back with an open transaction is rolled back first. That includes
+a transaction the caller never opened: with `autocommit=0` the server starts one
+implicitly on the first statement, and returning the connection mid-transaction
+would leak its locks into whichever caller borrows it next.
+
 ## Limits
 
 * A result set is materialised, bounded by `max_result_rows` / `max_result_bytes`;

@@ -216,7 +216,8 @@ connection::~connection() { close(); }
 
 void connection::fail(const status& error) noexcept {
     open_ = false;
-    in_transaction_ = false;
+    explicit_txn_ = false;
+    server_txn_ = false;
     if (link_) {
         link_->close();
     }
@@ -483,7 +484,7 @@ status connection::authenticate(const handshake& greeting) {
             if (!decoded_ok) {
                 return decoded_ok;
             }
-            status_flags_ = ok.status_flags;
+            apply_status(ok.status_flags);
             return status{};
         }
         case packet_kind::err: {
@@ -663,6 +664,10 @@ status connection::ping() {
         return read;
     }
     const span<const std::byte> payload_view(reply.data(), reply.size());
+    // COM_PING does not change the transaction, so its reply is not fed to
+    // apply_status/apply_error. Applying its OK would be actively wrong:
+    // an IN_TRANS=0 ping would clear a real uncommitted flag and let the
+    // pool skip the rollback.
     if (classify(payload_view, false) == packet_kind::err) {
         err_packet err;
         (void)decode_err(payload_view, err);
@@ -671,20 +676,20 @@ status connection::ping() {
     return status{};
 }
 
-bool connection::in_transaction() const noexcept { return open_ && in_transaction_; }
+bool connection::in_transaction() const noexcept { return has_uncommitted_work(); }
 
 status connection::begin() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
     }
-    if (in_transaction_) {
+    if (explicit_txn_) {
         return status{rpc_code::failed_precondition, "a transaction is already open"};
     }
     const status started = run_query("START TRANSACTION", nullptr);
     if (!started) {
         return started;
     }
-    in_transaction_ = true;
+    explicit_txn_ = true;
     return status{};
 }
 
@@ -703,14 +708,14 @@ status connection::begin(isolation_level level) {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
     }
-    if (in_transaction_) {
+    if (explicit_txn_) {
         return status{rpc_code::failed_precondition, "a transaction is already open"};
     }
     const status started = run_query(sql, nullptr);
     if (!started) {
         return started;
     }
-    in_transaction_ = true;
+    explicit_txn_ = true;
     return status{};
 }
 
@@ -728,13 +733,14 @@ status connection::commit() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
     }
-    if (!in_transaction_) {
+    if (!has_uncommitted_work()) {
         return status{rpc_code::failed_precondition, "no transaction is open"};
     }
     const status committed = run_query("COMMIT", nullptr);
     // The transaction is over even if COMMIT failed: the server has already ended
     // it, and claiming otherwise would make the pool roll back nothing.
-    in_transaction_ = false;
+    explicit_txn_ = false;
+    server_txn_ = false;
     return committed;
 }
 
@@ -742,11 +748,12 @@ status connection::rollback() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};
     }
-    if (!in_transaction_) {
+    if (!has_uncommitted_work()) {
         return status{};
     }
     const status rolled_back = run_query("ROLLBACK", nullptr);
-    in_transaction_ = false;
+    explicit_txn_ = false;
+    server_txn_ = false;
     return rolled_back;
 }
 
@@ -850,6 +857,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
             // discarded rather than returned as if complete. `server_failure` keeps the
             // raw provider code and SQLSTATE, which is what distinguishes TiDB 9007
             // (optimistic write conflict) from MySQL 1205 (lock wait timeout).
+            apply_error();
             return status{server_failure(err)};
         }
         if (kind == packet_kind::local_infile) {
@@ -865,7 +873,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
             if (!decoded) {
                 return decoded;
             }
-            status_flags_ = ok.status_flags;
+            apply_status(ok.status_flags);
             list->add(std::unique_ptr<result_set>(new memory_result_set(
                 {}, static_cast<std::int64_t>(ok.affected_rows))));
             if ((status_flags_ & static_cast<std::uint16_t>(server_status::more_results)) == 0) {
@@ -941,9 +949,11 @@ status connection::run_query(std::string_view sql, result_set** out) {
             // A short 0xfe packet ends the row stream (EOF); with DEPRECATE_EOF the
             // terminator is an OK packet whose header is 0xfe and carries a status.
             if (first == 0xfe && row_view.size() < 9) {
+                // A short EOF carries no status word; keep the previous one.
                 eof_packet eof;
-                (void)decode_eof(row_view, eof);
-                status_flags_ = eof.status_flags;
+                if (row_view.size() >= 5 && decode_eof(row_view, eof).ok()) {
+                    apply_status(eof.status_flags);
+                }
                 break;
             }
             // With CLIENT_DEPRECATE_EOF the row stream ends with an OK packet whose
@@ -953,10 +963,12 @@ status connection::run_query(std::string_view sql, result_set** out) {
                 std::size_t ok_offset = 1;
                 std::uint64_t ignored = 0;
                 bool ignored_null = false;
-                (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-                (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-                if (ok_offset + 4 <= row_view.size()) {
-                    status_flags_ = read_u16(row_view, ok_offset);
+                const status rows_read =
+                    read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+                const status id_read =
+                    read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+                if (rows_read.ok() && id_read.ok() && ok_offset + 4 <= row_view.size()) {
+                    apply_status(read_u16(row_view, ok_offset));
                 }
                 break;
             }
@@ -968,6 +980,7 @@ status connection::run_query(std::string_view sql, result_set** out) {
                 }
                 // A mid-result-set error is the server's answer; the partial rows are
                 // discarded rather than returned as if complete.
+                apply_error();
                 return status{map_error_code(err.code), err.message};
             }
 
@@ -1064,19 +1077,23 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
         }
         const std::uint8_t first = byte_at(row_view, 0);
         if (first == 0xfe && row_view.size() < 9) {
+            // A short EOF carries no status word; keep the previous one.
             eof_packet eof;
-            (void)decode_eof(row_view, eof);
-            status_flags_ = eof.status_flags;
+            if (row_view.size() >= 5 && decode_eof(row_view, eof).ok()) {
+                apply_status(eof.status_flags);
+            }
             break;
         }
         if ((capabilities_ & mask(capability::deprecate_eof)) != 0 && first == 0xfe) {
             std::size_t ok_offset = 1;
             std::uint64_t ignored = 0;
             bool ignored_null = false;
-            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-            (void)read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
-            if (ok_offset + 4 <= row_view.size()) {
-                status_flags_ = read_u16(row_view, ok_offset);
+            const status rows_read =
+                read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+            const status id_read =
+                read_lenenc_int(row_view, ok_offset, false, ignored, ignored_null);
+            if (rows_read.ok() && id_read.ok() && ok_offset + 4 <= row_view.size()) {
+                apply_status(read_u16(row_view, ok_offset));
             }
             break;
         }
@@ -1086,6 +1103,7 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
             if (!decoded) {
                 return decoded;
             }
+            apply_error();
             return status{server_failure(err)};
         }
 
@@ -1122,13 +1140,15 @@ status connection::read_binary_result(std::uint64_t column_count, result_set** o
             if (!decoded) {
                 return decoded;
             }
+            apply_error();
             return status{server_failure(err)};
         }
         if (!trailing_view.empty() &&
             static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
             ok_packet ok;
-            (void)decode_ok(trailing_view, capabilities_, ok);
-            status_flags_ = ok.status_flags;
+            if (decode_ok(trailing_view, capabilities_, ok).ok()) {
+                apply_status(ok.status_flags);
+            }
         }
     }
     if (out != nullptr) {
@@ -1170,6 +1190,7 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
         if (!decoded) {
             return decoded;
         }
+        apply_error();
         return status{server_failure(err)};
     }
     if (classify(payload, false) == packet_kind::ok) {
@@ -1178,7 +1199,7 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
         if (!decoded) {
             return decoded;
         }
-        status_flags_ = ok.status_flags;
+        apply_status(ok.status_flags);
         // A procedure with no result set still ends with two OK packets when the
         // call was made through a prepared statement. Leaving the second one in the
         // stream would make the next command read it as its own answer.
@@ -1198,13 +1219,15 @@ status connection::execute_prepared(std::uint32_t statement_id, span<const param
                 if (!err_decoded) {
                     return err_decoded;
                 }
+                apply_error();
                 return status{server_failure(err)};
             }
             if (!trailing_view.empty() &&
                 static_cast<std::uint8_t>(trailing_view[0]) == 0x00) {
                 ok_packet trailing_ok;
-                (void)decode_ok(trailing_view, capabilities_, trailing_ok);
-                status_flags_ = trailing_ok.status_flags;
+                if (decode_ok(trailing_view, capabilities_, trailing_ok).ok()) {
+                    apply_status(trailing_ok.status_flags);
+                }
             }
         }
         if (out != nullptr) {
@@ -1565,6 +1588,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         if (!decoded) {
             return decoded;
         }
+        apply_error();
         return status{server_failure(err)};
     }
     if (!payload.empty() && static_cast<std::uint8_t>(payload[0]) == 0x00) {
@@ -1575,7 +1599,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         if (!decoded) {
             return decoded;
         }
-        status_flags_ = ok.status_flags;
+        apply_status(ok.status_flags);
         if (out != nullptr) {
             *out = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
         }
@@ -1632,6 +1656,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
         if (!decoded) {
             return decoded;
         }
+        apply_error();
         return status{server_failure(err)};
     }
     ok_packet ok;
@@ -1639,7 +1664,7 @@ status connection::load_data(std::string_view load_sql, local_data_source& sourc
     if (!decoded) {
         return decoded;
     }
-    status_flags_ = ok.status_flags;
+    apply_status(ok.status_flags);
     if (out != nullptr) {
         *out = new memory_result_set({}, static_cast<std::int64_t>(ok.affected_rows));
     }
@@ -1880,7 +1905,8 @@ void prepared_statement::close() noexcept {
 
 void connection::close() noexcept {
     open_ = false;
-    in_transaction_ = false;
+    explicit_txn_ = false;
+    server_txn_ = false;
     // Expires every prepared-statement handle without touching them: the server
     // drops all statements when the session ends, and a handle must not call into a
     // connection that is being destroyed.

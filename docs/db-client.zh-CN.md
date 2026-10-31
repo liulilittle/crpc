@@ -130,6 +130,10 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 （`max_size`）、空闲连接（`max_idle`）、空闲时长（`idle_timeout`）与总年龄（`max_lifetime`），
 借出前会 PING。协议已错位的连接由调用方 `lease::discard()` 关闭，绝不归还。
 
+归还时若仍有未结束的事务，先回滚再入空闲集。这包括调用方从未显式开启的事务：
+在 `autocommit=0` 下，服务端会在第一条语句时隐式开启一个事务，此时把连接还回去
+会把它的锁泄漏给下一个借用者。
+
 ## 限制
 
 * 结果集是物化的，受 `max_result_rows` / `max_result_bytes` 约束；超限以 `resource_exhausted`

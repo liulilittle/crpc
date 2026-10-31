@@ -4,9 +4,13 @@
 
 ## 未发布
 
+### MySQL：事务状态以服务端为准，不再依赖本地猜测
+
+- `in_transaction()` 现在报告最近一条已完成命令的服务端 `SERVER_STATUS_IN_TRANS` 位，而不再使用只由 `begin()`/`commit()`/`rollback()` 维护的本地标志。对 `autocommit = 0` 的会话：连接池会回滚那个隐式事务，而不是把它交给下一个借用者；`commit()` 会提交它，而不是返回 `failed_precondition`；触发隐式提交的 DDL 也不再留下幻影事务。两个标志把两个问题分开：`explicit_txn_`（是否由我们开启）服务于 `begin()` 的闸，`server_txn_`（服务端是否这么说）用于回答池。两个标志把两个问题分开：`explicit_txn_`（是否由我们开启）服务于 `begin()` 的闸，`server_txn_`（服务端是否这么说）用于回答池。`ERR` 包不携带状态字，因此语句失败后沿用上一个状态；在 `autocommit = 0` 下事务在错误后仍然存在，连接因此被视为"有未提交工作"，池会回滚它而不是交给下一个借用者。
+
 ### MySQL：删除 private 且无人调用的 `set_autocommit`
 
-- 删除了 private 且无人调用的 `mysql::connection::set_autocommit`。静态归档中该私有 out-of-line 符号已消失，共享库构建下对应的 `/EXPORT` 指令也随之少一条。无公开 API 变更：该成员是私有且消费者无法命名。
+- 删除了 private 且无人调用的 `mysql::connection::set_autocommit`，由三个私有辅助（`apply_status`、`apply_error`、`has_uncommitted_work`）承担其职责。类上的 `__declspec(dllexport)` 会连同 private 成员一起导出（inline 定义也不例外），因此共享库构建下净效果是少一个、多三个私有符号。无公开 API 变更：它们都无法被消费者命名。
 
 ### 测试时间断言：保留能失败的断言，删掉不能失败的
 
