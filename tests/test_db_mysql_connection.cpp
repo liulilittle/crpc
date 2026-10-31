@@ -8,6 +8,7 @@
 #include "test_framework.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <crpc/db/connection.hpp>
 #include <crpc/db/mysql/channel.hpp>
 #include <crpc/db/mysql/connection.hpp>
 #include <crpc/db/mysql/protocol.hpp>
@@ -864,21 +866,151 @@ CRPC_TEST(mysql_error_packet_keeps_the_transaction_state_of_an_idle_autocommit_s
     // autocommit=0 as the server reports it on the authentication OK.
     harness off("caching_sha2_password", 0x0000);
     CRPC_CHECK_FALSE(off.session->in_transaction());
-    off.raw->push(packet(err_payload(1213, "Deadlock found"), 1));
+    off.raw->push(packet(err_payload(1205, "Lock wait timeout exceeded"), 1));
     crpc::db::result_set* rows = nullptr;
     CRPC_CHECK_FALSE(off.session->query("INSERT INTO t VALUES (1)", {}, &rows).ok());
     std::unique_ptr<crpc::db::result_set> owned(rows);
-    // InnoDB rolled back the statement only; the transaction and its locks survive,
-    // so the pool must send a ROLLBACK rather than hand the session on.
+    // 1205 rolls back the statement only: InnoDB keeps the transaction and its
+    // locks, so the pool must send a ROLLBACK rather than hand the session on.
+    // (A deadlock, 1213, would roll back the whole transaction; the client cannot
+    // tell the two apart from an ERR packet, so the inference stays conservative
+    // and a deadlock costs one harmless ROLLBACK.)
     CRPC_CHECK(off.session->in_transaction());
 
     // The same error in an autocommit=1 session is not an inferred transaction.
     harness on;
-    on.raw->push(packet(err_payload(1213, "Deadlock found"), 1));
+    on.raw->push(packet(err_payload(1205, "Lock wait timeout exceeded"), 1));
     crpc::db::result_set* on_rows = nullptr;
     CRPC_CHECK_FALSE(on.session->query("INSERT INTO t VALUES (1)", {}, &on_rows).ok());
     std::unique_ptr<crpc::db::result_set> owned_on(on_rows);
     CRPC_CHECK_FALSE(on.session->in_transaction());
+}
+
+// --- R1: session state is restored before a connection is reused -------------
+//
+// `autocommit` is a session variable: ROLLBACK ends the transaction, it does not
+// put the session back to the defaults the connection was opened with. A pooled
+// `autocommit=0` session would make the next borrower's statements join an
+// implicit transaction, and the next release would roll them back -- silent data
+// loss. `reset_session()` closes that gap; these cases pin its shape.
+
+CRPC_TEST(mysql_reset_session_restores_autocommit) {
+    // The handshake reports status 0x0000 (autocommit off).
+    harness h("caching_sha2_password", 0x0000);
+    const std::size_t before = h.raw->writes.size();
+    // `SET autocommit=1` also commits, so the pool rolls back first; this case
+    // only pins the frame the reset itself writes.
+    push_ok(h.raw, 0, 0x0002);
+    const crpc::status reset = h.session->reset_session();
+    CRPC_CHECK(reset.ok());
+    CRPC_CHECK_EQ(before + 1, h.raw->writes.size());
+    if (h.raw->writes.size() == before + 1) {
+        CRPC_CHECK_EQ(std::string("SET autocommit=1"),
+                      frame_sql(h.raw->writes.back()));
+    }
+}
+
+CRPC_TEST(mysql_reset_session_is_free_when_autocommit_is_on) {
+    // The handshake reports status 0x0002 (autocommit on), which is the common
+    // case. Resetting must not turn every release into an extra round trip.
+    harness h;
+    const std::size_t before = h.raw->writes.size();
+    CRPC_CHECK(h.session->reset_session().ok());
+    CRPC_CHECK_EQ(before, h.raw->writes.size());
+}
+
+CRPC_TEST(mysql_reset_session_after_close_is_refused) {
+    harness h;
+    h.session->close();
+    const std::size_t before = h.raw->writes.size();
+    const crpc::status reset = h.session->reset_session();
+    CRPC_CHECK_FALSE(reset.ok());
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::shutting_down),
+                  static_cast<int>(reset.code()));
+    CRPC_CHECK_EQ(before, h.raw->writes.size());
+}
+
+CRPC_TEST(mysql_pool_release_rolls_back_then_resets_the_session) {
+    // One scripted server session: the handshake reports status 0x0000, so this
+    // connection starts with autocommit off.
+    auto handshake = std::make_shared<std::vector<std::vector<std::byte>>>();
+    handshake->push_back(packet(greeting_payload("caching_sha2_password"), 0));
+    handshake->push_back(packet(ok_payload(0, 0x0000), 2));
+
+    scripted_channel* raw = nullptr;
+    connection_options options;
+    options.user = "root";
+    options.password = "";
+    crpc::db::mysql::channel_factory factory(
+        options,
+        [&raw, handshake]() -> crpc::result<std::unique_ptr<crpc::db::mysql::channel>> {
+            auto link = std::unique_ptr<scripted_channel>(new scripted_channel);
+            for (const std::vector<std::byte>& frame : *handshake) {
+                link->push(frame);
+            }
+            raw = link.get();
+            return crpc::result<std::unique_ptr<crpc::db::mysql::channel>>(
+                std::unique_ptr<crpc::db::mysql::channel>(link.release()));
+        });
+
+    crpc::db::pool_options pool_options;
+    pool_options.min_size = 0;
+    pool_options.max_size = 1;
+    pool_options.max_idle = 1;
+    // Validation would add a COM_PING frame; this case is about the release
+    // path, so it is disabled rather than scripted around.
+    pool_options.validate_on_borrow = false;
+    pool_options.acquire_timeout = std::chrono::seconds(5);
+    crpc::db::pool connections(pool_options, factory);
+
+    crpc::db::connection* first_connection = nullptr;
+    {
+        auto lease = connections.acquire();
+        CRPC_CHECK(lease.ok());
+        if (!lease.ok()) {
+            return;
+        }
+        first_connection = lease.value().get();
+        CRPC_CHECK_FALSE(lease.value()->in_transaction());
+
+        crpc::db::result_set* inserted = nullptr;
+        // Autocommit is off: this INSERT opens the transaction the caller never
+        // asked for, and the server says so.
+        push_ok(raw, 1, 0x0001);
+        CRPC_CHECK(
+            lease.value()->query("INSERT INTO t VALUES (1)", {}, &inserted).ok());
+        std::unique_ptr<crpc::db::result_set> owned(inserted);
+        CRPC_CHECK(lease.value()->in_transaction());
+
+        // ROLLBACK ends the transaction but leaves autocommit off; the reset
+        // must follow it with SET autocommit=1.
+        push_ok(raw, 0, 0x0000);
+        push_ok(raw, 0, 0x0002);
+        const std::size_t before = raw->writes.size();
+        CRPC_CHECK(lease.value().release().ok());
+        CRPC_CHECK_EQ(before + 2, raw->writes.size());
+        if (raw->writes.size() == before + 2) {
+            CRPC_CHECK_EQ(std::string("ROLLBACK"), frame_sql(raw->writes[before]));
+            CRPC_CHECK_EQ(std::string("SET autocommit=1"),
+                          frame_sql(raw->writes[before + 1]));
+        }
+    }
+
+    auto second = connections.acquire();
+    CRPC_CHECK(second.ok());
+    if (!second.ok()) {
+        return;
+    }
+    // The pool reused the connection instead of opening another one.
+    CRPC_CHECK_EQ(std::uint64_t{1}, connections.opened());
+    CRPC_CHECK(second.value().get() == first_connection);
+    CRPC_CHECK_FALSE(second.value()->in_transaction());
+
+    // The session really was restored: resetting again is a zero-round-trip
+    // no-op, because the status word now carries autocommit=1.
+    const std::size_t steady = raw->writes.size();
+    CRPC_CHECK(second.value()->reset_session().ok());
+    CRPC_CHECK_EQ(steady, raw->writes.size());
 }
 
 CRPC_TEST_MAIN()

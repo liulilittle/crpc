@@ -4,9 +4,15 @@
 
 ## 未发布
 
+### MySQL：连接池归还连接时复位会话（`autocommit`）
+
+- `autocommit=0` 不再跨租约泄漏。池在把连接放回空闲集之前已经会回滚未结束的事务，但 `autocommit` 是 `ROLLBACK` 不会复位的会话变量：下一个借用者的语句会加入一个无人提交的隐式事务，并在它归还时被回滚——静默丢数据。`db::connection` 新增 `reset_session()`；池在回滚成功后调用它，`mysql::connection` 在会话尚未处于默认值时会发送 `SET autocommit=1`。
+- 代价是每次归还**可能**多一次往返，且仅当会话最近一条完成命令没有报告 `autocommit=1` 时才发；常见情形仍是零往返复位。无法复位会话的连接会被关闭而不会放回空闲集，因为清理不了的会话不该交给下一个借用者。
+- ABI：`db::connection` 新增虚函数 = vtable 变更 = MAJOR，所有消费者必须重编。默认实现返回 `status{}`，其它后端无需改动。
+
 ### MySQL：事务状态以服务端为准，不再依赖本地猜测
 
-- `in_transaction()` 现在报告最近一条已完成命令的服务端 `SERVER_STATUS_IN_TRANS` 位，而不再使用只由 `begin()`/`commit()`/`rollback()` 维护的本地标志。对 `autocommit = 0` 的会话：连接池会回滚那个隐式事务，而不是把它交给下一个借用者；`commit()` 会提交它，而不是返回 `failed_precondition`；触发隐式提交的 DDL 也不再留下幻影事务。两个标志把两个问题分开：`explicit_txn_`（是否由我们开启）服务于 `begin()` 的闸，`server_txn_`（服务端是否这么说）用于回答池。两个标志把两个问题分开：`explicit_txn_`（是否由我们开启）服务于 `begin()` 的闸，`server_txn_`（服务端是否这么说）用于回答池。`ERR` 包不携带状态字，因此语句失败后沿用上一个状态；在 `autocommit = 0` 下事务在错误后仍然存在，连接因此被视为"有未提交工作"，池会回滚它而不是交给下一个借用者。
+- `in_transaction()` 现在报告最近一条已完成命令的服务端 `SERVER_STATUS_IN_TRANS` 位，而不再使用只由 `begin()`/`commit()`/`rollback()` 维护的本地标志。对 `autocommit = 0` 的会话：连接池会回滚那个隐式事务，而不是把它交给下一个借用者；`commit()` 会提交它，而不是返回 `failed_precondition`；触发隐式提交的 DDL 也不再留下幻影事务。两个标志把两个问题分开：`explicit_txn_`（是否由我们开启）服务于 `begin()` 的闸，`server_txn_`（服务端是否这么说）用于回答池。`ERR` 包不携带状态字，因此语句失败后沿用上一个状态；在 `autocommit = 0` 下事务在错误后仍然存在，连接因此被视为"有未提交工作"，池会回滚它而不是交给下一个借用者。
 
 ### MySQL：删除 private 且无人调用的 `set_autocommit`
 

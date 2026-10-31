@@ -74,6 +74,19 @@ class that already had out-of-line members, and the flag it reads lives in the
 out-of-line `impl` behind the existing `std::unique_ptr`, so
 `sizeof(iocp_backend)` is unchanged.
 
+The unreleased database-pool session-reset work adds one more MAJOR break:
+`db::connection` gained a virtual member function, `reset_session()`. Inserting it
+after `rollback()` moves every later vtable slot, so the vtable layout of
+`db::connection` and of every derived class changed, and all consumers must be
+recompiled. It has to be virtual on the base class because the pool only ever
+holds a `db::connection*` and cannot know whether the connection behind it keeps
+session state at all. The default implementation returns `status{}` and touches
+nothing, so the mongo, ODBC and TDS adapters pay nothing for it
+(`mysql::connection` overrides it, because `autocommit` is a session variable
+that `ROLLBACK` does not restore; TiDB inherits the override). The default also
+keeps this a MAJOR rather than a source break: no existing subclass has to
+change.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

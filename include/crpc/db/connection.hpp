@@ -160,6 +160,17 @@ public:
     [[nodiscard]] virtual status commit() = 0;
     [[nodiscard]] virtual status rollback() = 0;
 
+    // Restores the session state the next borrower is entitled to assume: a known
+    // clean state, not whatever the last borrower left behind. It need not be the
+    // state a freshly opened connection would have -- a server started with
+    // `--autocommit=0` hands out sessions that are already surprising, and copying
+    // that default would put the next borrower back in the same trap.
+    //
+    // The pool calls this before a connection goes back to the idle set, after it
+    // has rolled back any open transaction. A backend that cannot change session
+    // state, or that has none, keeps the default and costs nothing.
+    [[nodiscard]] virtual status reset_session() { return status{}; }
+
     // Starts a transaction at a requested isolation level. The default forwards to
     // `begin()` for `unspecified` and reports `no_such_method` otherwise, so a
     // backend that does not model isolation levels keeps compiling and working

@@ -40,6 +40,8 @@ MAJOR.MINOR.PATCH
 
 未发布的时间断言改造再增加一个 MINOR 符号，仅限 Windows：`crpc::iocp_backend::high_resolution_timer()`，一个 `const noexcept` 能力访问器，报告后端创建定时器时用的是 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`，还是回退到了 Windows 10 1803 之前的毫秒级定时器。它只增加符号、不改变布局：`iocp_backend` 本就是带 out-of-line 成员的导出类，该访问器读取的标志位于现有 `std::unique_ptr` 之后的 out-of-line `impl` 内，因此 `sizeof(iocp_backend)` 不变。
 
+未发布的数据库连接池会话复位在 2.0.0 之上再增加一次 MAJOR：`db::connection` 新增虚函数 `reset_session()`。它插在 `rollback()` 之后，会移动其后所有虚表槽位，因此 `db::connection` 及其所有派生类的 vtable 布局改变，所有消费者必须重编。它必须加在基类上：池只持有 `db::connection*`，无从知道背后的连接是否保有会话状态。默认实现返回 `status{}` 且什么都不碰，因此 mongo、ODBC、TDS 适配器零成本（`mysql::connection` 覆写它，因为 `autocommit` 是 `ROLLBACK` 不会复位的会话变量；TiDB 继承该覆写）。默认实现也让这次变更停留在 MAJOR 而不是源码破坏：已有的子类无需改动。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

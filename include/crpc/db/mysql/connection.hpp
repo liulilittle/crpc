@@ -137,6 +137,7 @@ public:
 
     [[nodiscard]] status ping() override;
     [[nodiscard]] bool in_transaction() const noexcept override;
+    [[nodiscard]] status reset_session() override;
 
     [[nodiscard]] status begin() override;
     [[nodiscard]] status begin(isolation_level level) override;
@@ -265,8 +266,14 @@ private:
     // pool hand it on. (A deadlock, 1213, rolls back the whole transaction; the
     // assumption then costs one harmless ROLLBACK.)
     //
+    // The test reads the status word of the last *completed* command; an ERR
+    // packet carries none, so a missing autocommit bit is inferred conservatively.
+    // The decision errs in one direction only -- at worst one harmless extra
+    // ROLLBACK -- and the next completed command's status word heals it.
+    //
     // Both this and `apply_status` are the only writers of `server_txn_`, and both
-    // are driven by a decoded protocol reply.
+    // are driven by a decoded protocol reply; `apply_error` only ever sets it
+    // (never clears it).
     void apply_error() noexcept {
         if ((status_flags_ &
              static_cast<std::uint16_t>(server_status::autocommit)) == 0) {

@@ -138,12 +138,16 @@ namespace {
     if (!conn.is_open()) {
         return false;
     }
-    if (!conn.in_transaction()) {
-        return true;
-    }
     // A connection handed back mid-transaction would leak its locks into whichever
     // caller borrows it next.
-    return conn.rollback().ok();
+    if (conn.in_transaction() && !conn.rollback().ok()) {
+        return false;
+    }
+    // Rolling back ends the transaction, not the session state that produced it:
+    // an `autocommit=0` session would make the next borrower's statements join an
+    // implicit transaction nobody commits, and the next release would roll them
+    // back. Restore the session before the connection becomes reusable.
+    return conn.reset_session().ok();
 }
 
 } // namespace

@@ -678,6 +678,20 @@ status connection::ping() {
 
 bool connection::in_transaction() const noexcept { return has_uncommitted_work(); }
 
+status connection::reset_session() {
+    if (!open_) {
+        return status{rpc_code::shutting_down, "mysql connection is closed"};
+    }
+    // The common case is zero round trips: the session still has the autocommit
+    // setting it was opened with.
+    if ((status_flags_ & static_cast<std::uint16_t>(server_status::autocommit)) != 0) {
+        return status{};
+    }
+    // `SET autocommit=1` also commits an open transaction, which is why the pool
+    // rolls back first and this runs only after that succeeded.
+    return run_query("SET autocommit=1", nullptr);
+}
+
 status connection::begin() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};

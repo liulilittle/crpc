@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### MySQL: reset the session when a pooled connection is returned
+
+- `autocommit=0` no longer leaks across leases. The pool already rolled back an open transaction before returning a connection to the idle set, but `autocommit` is a session variable that `ROLLBACK` does not restore: the next borrower's statements joined an implicit transaction nobody committed, and its release rolled them back -- silent data loss. `db::connection` gained `reset_session()`; the pool now calls it after a successful rollback, and `mysql::connection` sends `SET autocommit=1` when the session is not already at the default.
+- The cost is at most one extra round trip per release, and only for a session whose last completed command did not report `autocommit=1`; the common case still resets with zero round trips. A connection whose session cannot be reset is closed rather than returned to the idle set, because a session that cannot be cleaned is not safe to hand on.
+- ABI: `db::connection` gained a virtual member function, which is a vtable change -- MAJOR. Every consumer must recompile. The default implementation returns `status{}`, so other backends need no change.
+
 ### MySQL: transaction state follows the server, not a local guess
 
 - `in_transaction()` now reports the server's `SERVER_STATUS_IN_TRANS` from the last completed command instead of a local flag that only `begin()`/`commit()`/`rollback()` maintained. Consequences for a session running with `autocommit = 0`: the pool rolls back the implicit transaction instead of handing it to the next borrower; `commit()` commits it instead of returning `failed_precondition`; and a DDL statement that implicitly commits no longer leaves a phantom transaction behind. Two flags keep the two questions apart: `explicit_txn_` (did *we* begin one) gates `begin()`, `server_txn_` (did the server say so) answers the pool. An `ERR` packet carries no status word, so after a failed statement the previous status stands; when the session runs with `autocommit = 0` the transaction survives the error, so the connection is treated as having uncommitted work and the pool rolls it back instead of handing it on.
