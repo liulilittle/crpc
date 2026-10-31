@@ -14,7 +14,7 @@ server push over one connection, one frame format and one coroutine model.
 
 | Document | English | 中文 |
 |---|---|---|
-| Design specification | [docs/superpowers/specs/2026-10-19-crpc-design.md](docs/superpowers/specs/2026-10-19-crpc-design.md) | [中文](docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md) |
+| Design | [docs/design.md](docs/design.md) | [中文](docs/design.zh-CN.md) |
 | ABI policy | [docs/abi.md](docs/abi.md) | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) | [架构概览](docs/architecture.zh-CN.md) |
 | Wire protocol | [docs/protocol.md](docs/protocol.md) | [线上协议](docs/protocol.zh-CN.md) |

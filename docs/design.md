@@ -1,7 +1,11 @@
-# CRPC Design Specification (English)
-[中文版 / Chinese version](2026-10-19-crpc-design.zh-CN.md)
+# CRPC Design (English)
+[简体中文](design.zh-CN.md) | **English**
 
-Version 1.0 / 2026-10-19 / normative source: `.opencode/ruling.md` (W11 final ruling). Precedence: ruling > `audit-arch-a.md` > `audit-rtti-b.md`.
+Version 1.0 / 2026-10-19
+
+This document is the consolidated design record. It reconciles two independent design reviews that preceded it, cited in the text as **A** and **B**; neither is shipped with the repository, so a citation such as "A §3.5" records where a decision came from and is not a link. The §-numbered sections of this document are the authoritative statement of the design; [Architecture](architecture.md) records what the code implements today. Where this document and the code disagree, the code and its tests are authoritative. Decision identifiers such as R1, R5 or R6 tag numbered rules of that review record; the section that carries the tag is where the rule is stated in full.
+
+The sketches below describe internal machinery rather than public API. `class epoll_connection` is a real internal class defined in `src/`; `class epoll_listener` and `class shard` are illustrative names this document uses for internal structure and do not exist in the headers at all. A qualified name that appears only here is therefore a design sketch, not a missing public symbol. Every name this document claims as *public* is checked against the headers by `tests/test_docs_lint.cpp`.
 ## Contents
 | # | Section |
 |---|---|
@@ -343,7 +347,7 @@ per shard: 1 OS thread
          + 64 handler coroutines with 64 KiB stacks
 threads = n_shards + 1 acceptor (Windows) + blocking pool (default 0)
 ```
-Coroutines are M:N over threads, but a shard's runtime is pumped by exactly one thread. `coro_rt_pump` refuses a second concurrent pump (`pump_active`, `[READ:F:\corocc\src\scheduler\rt_driver.c:458]`), and a LOOP runtime has exactly one worker (`[READ:F:\corocc\src\scheduler\rt.c:804]`). Handler coroutines are long-lived workers, not one per request: this avoids the 256 KiB default stack (`[READ:F:\corocc\include\corocc\coro.h:38]`) and the 256-entry default-size stack cache (`[READ:F:\corocc\src\scheduler\rt.h:167]`).
+Coroutines are M:N over threads, but a shard's runtime is pumped by exactly one thread. `coro_rt_pump` refuses a second concurrent pump (`pump_active`, `[READ:third_party/corocc/src\scheduler\rt_driver.c:458]`), and a LOOP runtime has exactly one worker (`[READ:third_party/corocc/src\scheduler\rt.c:804]`). Handler coroutines are long-lived workers, not one per request: this avoids the 256 KiB default stack (`[READ:third_party/corocc/include\corocc\coro.h:38]`) and the 256-entry default-size stack cache (`[READ:third_party/corocc/src\scheduler\rt.h:167]`).
 ### 4.2 Runtime construction
 ```cpp
 struct shard_driver_ops {
@@ -379,7 +383,7 @@ void shard::start() {
     }
 }
 ```
-Evidence for the API: `coro_rt_create` `[READ:F:\corocc\include\corocc\coro_rt.h:299]`; LOOP flag `[READ:F:\corocc\include\corocc\coro_rt_driver.h:46]`; driver registration `[READ:F:\corocc\include\corocc\coro_rt_driver.h:146]`; default driver `[READ:F:\corocc\include\corocc\coro_rt_driver.h:185]`; pump `[READ:F:\corocc\include\corocc\coro_rt_driver.h:258]`; `coro_attr_default` `[READ:F:\corocc\include\corocc\coro.h:149]`; `coro_rt_spawn` `[READ:F:\corocc\include\corocc\coro_rt.h:339]`; semaphore `[READ:F:\corocc\include\corocc\coro_rt.h:631]`, `:639`, `:654`; destroy refuses live coroutines `[READ:F:\corocc\include\corocc\coro_rt.h:304]`.
+Evidence for the API: `coro_rt_create` `[READ:third_party/corocc/include\corocc\coro_rt.h:299]`; LOOP flag `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:46]`; driver registration `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:146]`; default driver `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:185]`; pump `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:258]`; `coro_attr_default` `[READ:third_party/corocc/include\corocc\coro.h:149]`; `coro_rt_spawn` `[READ:third_party/corocc/include\corocc\coro_rt.h:339]`; semaphore `[READ:third_party/corocc/include\corocc\coro_rt.h:631]`, `:639`, `:654`; destroy refuses live coroutines `[READ:third_party/corocc/include\corocc\coro_rt.h:304]`.
 ### 4.3 Loop body
 ```cpp
 void shard::run() {
@@ -423,7 +427,7 @@ bool shard::post(task t) noexcept {
     return true;
 }
 ```
-`coro_rt_sem_post` is safe from any thread and signals activity through the driver wake callback (`[READ:F:\corocc\src\scheduler\rt_sync.c:469]`, `[READ:F:\corocc\src\scheduler\rt.c:208]`). A completion on shard A for a call owned by shard B must not touch B's runtime; it posts to B.
+`coro_rt_sem_post` is safe from any thread and signals activity through the driver wake callback (`[READ:third_party/corocc/src\scheduler\rt_sync.c:469]`, `[READ:third_party/corocc/src\scheduler\rt.c:208]`). A completion on shard A for a call owned by shard B must not touch B's runtime; it posts to B.
 ### 4.6 Shutdown order
 1. `listener.stop()`: no new accepts.
 2. Broadcast `GOAWAY`; stop admitting new calls (`shutting_down`).
@@ -432,7 +436,7 @@ bool shard::post(task t) noexcept {
 5. Close all connections: cancel I/O, wait for both in-flight operations, then close the handle.
 6. Pump until `coro_rt_pending(rt) == 0`, with a hard deadline; then cancel scopes and pump again.
 7. `coro_rt_destroy(rt)`; `CORO_EBUSY` means a coroutine is still alive, so repeat step 6.
-8. Unregister the driver after the runtime is destroyed; unregister returns `CORO_EBUSY` while attached (`[READ:F:\corocc\include\corocc\coro_rt_driver.h:151]`).
+8. Unregister the driver after the runtime is destroyed; unregister returns `CORO_EBUSY` while attached (`[READ:third_party/corocc/include\corocc\coro_rt_driver.h:151]`).
 9. Release epoll/IOCP, timerfd, eventfd, and the MPSC storage.
 ### 4.7 Timer precision
 ```cpp
@@ -468,7 +472,7 @@ for (int i = 0; i < n; ++i) {
     connection* c = lookup_alive(tok);
     if (c == nullptr) continue;
     const std::uint32_t e = events[i].events;
-    if (e & (EPOLLERR | EPOLLHUP)) { c->fail(errc::connection_aborted); continue; }
+    if (e & (EPOLLERR | EPOLLHUP)) { c->fail(std::errc::connection_aborted); continue; }
     if (e & EPOLLRDHUP) c->peer_half_closed_ = true;
     if (e & EPOLLIN) c->read_loop();
     if (e & EPOLLOUT) c->write_loop();
@@ -630,7 +634,7 @@ Every `OVERLAPPED` has exactly one owner and the owner releases it in the comple
 | Win32 / Winsock | Meaning | Mapping |
 |---|---|---|
 | `ERROR_OPERATION_ABORTED` (995) | Local cancel | `std::errc::operation_canceled` |
-| `ERROR_CONNECTION_ABORTED` (1236) | Connection aborted | `std::errc::connection_aborted` |
+| `ERROR_CONNECTION_ABORTED` (1236) | Connection aborted | `std::std::errc::connection_aborted` |
 | `ERROR_HANDLE_EOF` (38) | Peer closed | EOF |
 | `WSAECONNRESET` (10054) | RST | `std::errc::connection_reset` |
 | `WSAECONNREFUSED` (10061) | Refused | `std::errc::connection_refused` |
@@ -687,7 +691,7 @@ Byte order is fixed by A §30.1, the single wire authority. Every multi-byte fie
 | 0x0B | `PUSH` | non-zero | Push envelope plus body |
 | 0x0C | `PUSH_ACK` | non-zero | `push_seq` u64 |
 
-Numeric values are fixed by this specification for the first time. They consolidate the union of A §9.2, A §23 and B §4.2.1; changing them is a wire break.
+Numeric values are fixed by this document for the first time. They consolidate the union of A §9.2, A §23 and B §4.2.1; changing them is a wire break.
 ### 7.4 Flags
 | Bit | Name | Meaning |
 |---|---|---|
@@ -932,7 +936,7 @@ enum class rpc_code : std::uint16_t {
     unknown_side_effect = 18, internal = 19, shutting_down = 20
 };
 ```
-Numeric values are the declaration order and are stable forever. The larger table in B §14.1 is superseded by R6; no code may be added, renamed, or renumbered without a new ruling.
+Numeric values are the declaration order and are stable forever. The larger table in B §14.1 is superseded by R6; no code may be added, renamed, or renumbered without a new design decision.
 ### 9.2 `rpc_error` and `rpc_result`
 ```cpp
 using metadata_map = std::vector<std::pair<std::string, std::string>>;
@@ -1068,22 +1072,22 @@ rpc_code binary_encode(const t& v, buffer& out) {
                           std::make_index_sequence<std::tuple_size_v<members_t>>{});
 }
 ```
-`fields_of<t>::members` is a `std::tuple` of member pointers with constant initialization (`[READ:F:\RTTI\include\rtti\reflection.hpp:5449]`). Cold paths (HTTP binding, management, debugging) may use `field_access_base::set_value`/`get_value` (`[READ:F:\RTTI\include\rtti\reflection.hpp:451]`, `:461`, `:463`).
+`fields_of<t>::members` is a `std::tuple` of member pointers with constant initialization (`[READ:third_party/rtti/include\rtti\reflection.hpp:5449]`). Cold paths (HTTP binding, management, debugging) may use `field_access_base::set_value`/`get_value` (`[READ:third_party/rtti/include\rtti\reflection.hpp:451]`, `:461`, `:463`).
 
-Derived types are rejected by crpc-binary with a `static_assert`: `RTTI_DEFINE_TYPE_DERIVED` places base fields outside `members` (D12, `[READ:F:\RTTI\include\rtti\reflection.hpp:5490]`). Text formats may still encode derived types through the virtual path.
+Derived types are rejected by crpc-binary with a `static_assert`: `RTTI_DEFINE_TYPE_DERIVED` places base fields outside `members` (D12, `[READ:third_party/rtti/include\rtti\reflection.hpp:5490]`). Text formats may still encode derived types through the virtual path.
 ### 10.4 Text and schema formats
 | Format | Decode | Encode | Evidence |
 |---|---|---|---|
-| JSON | `json::parse` then `rtti::from_value` (preserves offset) | `rtti::to_value` then `json::serialize(document)` | `[READ:F:\RTTI\include\rtti\json.hpp:170]`, `:174`, `[READ:F:\RTTI\include\rtti\convert.hpp:1354]`, `:1414` |
-| XML | `xml::parse_as<t>` | `rtti::to_value` then `xml::serialize(document)` | `[READ:F:\RTTI\include\rtti\xml.hpp:220]`, `:216` |
-| INI | `ini::parse_as<t>` | `rtti::to_value` then `ini::serialize(document)` | `[READ:F:\RTTI\include\rtti\ini.hpp:346]`, `:320` |
-| TOML | `toml::parse_as<t>` | `rtti::to_value` then `toml::serialize(document)` | `[READ:F:\RTTI\include\rtti\toml.hpp:297]`, `:271` |
-| protobuf | `rtti::proto::parse_as<t>(bytes, cfg)` | `rtti::proto::serialize<t>(obj, out)` | `[READ:F:\RTTI\include\rtti\proto.hpp:2700]`, `:2679` |
-| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, rtti::flat::schema_of<t>(), out, cfg)` | `[READ:F:\RTTI\include\rtti\flat.hpp:346]`, `:290` |
+| JSON | `json::parse` then `rtti::from_value` (preserves offset) | `rtti::to_value` then `json::serialize(document)` | `[READ:third_party/rtti/include\rtti\json.hpp:170]`, `:174`, `[READ:third_party/rtti/include\rtti\convert.hpp:1354]`, `:1414` |
+| XML | `xml::parse_as<t>` | `rtti::to_value` then `xml::serialize(document)` | `[READ:third_party/rtti/include\rtti\xml.hpp:220]`, `:216` |
+| INI | `ini::parse_as<t>` | `rtti::to_value` then `ini::serialize(document)` | `[READ:third_party/rtti/include\rtti\ini.hpp:346]`, `:320` |
+| TOML | `toml::parse_as<t>` | `rtti::to_value` then `toml::serialize(document)` | `[READ:third_party/rtti/include\rtti\toml.hpp:297]`, `:271` |
+| protobuf | `rtti::proto::parse_as<t>(bytes, cfg)` | `rtti::proto::serialize<t>(obj, out)` | `[READ:third_party/rtti/include\rtti\proto.hpp:2700]`, `:2679` |
+| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, rtti::flat::schema_of<t>(), out, cfg)` | `[READ:third_party/rtti/include\rtti\flat.hpp:346]`, `:290` |
 
-Two-phase encoding is mandatory for text formats because the convenience `serialize<T>` returns an empty string on conversion failure (D9, `[READ:F:\RTTI\include\rtti\json.hpp:222]`). Two-phase decoding is mandatory for JSON because `parse_as` loses the byte offset (D8, `[READ:F:\RTTI\include\rtti\json.hpp:193]`).
+Two-phase encoding is mandatory for text formats because the convenience `serialize<T>` returns an empty string on conversion failure (D9, `[READ:third_party/rtti/include\rtti\json.hpp:222]`). Two-phase decoding is mandatory for JSON because `parse_as` loses the byte offset (D8, `[READ:third_party/rtti/include\rtti\json.hpp:193]`).
 
-protobuf and FlatBuffers require an explicit user specialization of `rtti::proto::schema<t>` (`[READ:F:\RTTI\include\rtti\proto.hpp:432]`) or `rtti::flat::schema<t>` (`[READ:F:\RTTI\include\rtti\flat.hpp:198]`). The primary template is empty, so an unregistered type silently encodes to zero bytes. CRPC must therefore require a `schema_hash` and fail registration when the schema count is zero for a type used on those formats (D13). FlatBuffers typed encode goes through a DOM, so no zero-copy claim is made (D14).
+protobuf and FlatBuffers require an explicit user specialization of `rtti::proto::schema<t>` (`[READ:third_party/rtti/include\rtti\proto.hpp:432]`) or `rtti::flat::schema<t>` (`[READ:third_party/rtti/include\rtti\flat.hpp:198]`). The primary template is empty, so an unregistered type silently encodes to zero bytes. CRPC must therefore require a `schema_hash` and fail registration when the schema count is zero for a type used on those formats (D13). FlatBuffers typed encode goes through a DOM, so no zero-copy claim is made (D14).
 ### 10.5 Limits, endianness, error mapping
 | Limit | Default | Over-limit |
 |---|---|---|
@@ -1093,7 +1097,7 @@ protobuf and FlatBuffers require an explicit user specialization of `rtti::proto
 | Text document | 8 MiB | `resource_exhausted` |
 | RTTI format depth | 32 (configured) | `decode_error` |
 
-All integer and floating-point wire values are explicit LE; text formats are UTF-8 without BOM and locale-independent. The binary layout has no alignment or padding requirement: every field is encoded and decoded byte-wise, so a reader never performs an aligned load and a writer never inserts padding. `rtti::error_code` values (`[READ:F:\RTTI\include\rtti\error.hpp:15]`) map to `rpc_code::decode_error` on input and `encode_error` on output, with the original code in `metadata["rtti_code"]`. Schema mismatch is `failed_precondition` when `strict_schema = true`; otherwise decoding proceeds by field id and the mismatch is counted.
+All integer and floating-point wire values are explicit LE; text formats are UTF-8 without BOM and locale-independent. The binary layout has no alignment or padding requirement: every field is encoded and decoded byte-wise, so a reader never performs an aligned load and a writer never inserts padding. `rtti::error_code` values (`[READ:third_party/rtti/include\rtti\error.hpp:15]`) map to `rpc_code::decode_error` on input and `encode_error` on output, with the original code in `metadata["rtti_code"]`. Schema mismatch is `failed_precondition` when `strict_schema = true`; otherwise decoding proceeds by field id and the mismatch is counted.
 ## 11. Service API and stubs <a id="s11"></a>
 ### 11.1 Declaration macros (R8)
 ```cpp
@@ -1131,7 +1135,7 @@ Field binding attributes are RTTI attributes:
 #define CRPC_FROM_FORM(name)    RTTI_ATTR("FromForm", name)
 #define CRPC_FROM_FILE(name)    RTTI_ATTR("FromFile", name)
 ```
-They are used inside `RTTI_DEFINE_FIELD_ATTRS`, for example `RTTI_DEFINE_FIELD_ATTRS(get_user_req, RTTI_FIELD_ATTR_ENTRY(id, CRPC_FROM_ROUTE("id")))`. This uses only public RTTI APIs (`[READ:F:\RTTI\include\rtti\reflection.hpp:6791]`, `:6766`, `:1142`).
+They are used inside `RTTI_DEFINE_FIELD_ATTRS`, for example `RTTI_DEFINE_FIELD_ATTRS(get_user_req, RTTI_FIELD_ATTR_ENTRY(id, CRPC_FROM_ROUTE("id")))`. This uses only public RTTI APIs (`[READ:third_party/rtti/include\rtti\reflection.hpp:6791]`, `:6766`, `:1142`).
 ### 11.2 Method traits and invocation
 ```cpp
 namespace crpc::rpc {
@@ -1358,7 +1362,7 @@ The route tree is represented at v1 scale as an exact-match table plus a pre-sor
 | Verb mismatch | 405 with `Allow` |
 | No match | 404 |
 
-DTO binding walks `rtti::fields<req>()` (`[READ:F:\RTTI\include\rtti\reflection.hpp:884]`) and reads field attributes. `FromRoute`, `FromQuery`, `FromHeader`, `FromForm` take the named source; `FromBody` or no attribute takes the body document. A missing required field is 400 with the field name; a missing `std::optional` is left empty; unknown body keys are ignored unless `strict_body = true`. Integer parsing uses `std::from_chars` and must consume every character; enums use `rtti::enum_table<t>` labels first, then numeric values (`[READ:F:\RTTI\include\rtti\reflection.hpp:1837]`). Conversion failure is 400 with `crpc_code = invalid_argument`.
+DTO binding walks `rtti::fields<req>()` (`[READ:third_party/rtti/include\rtti\reflection.hpp:884]`) and reads field attributes. `FromRoute`, `FromQuery`, `FromHeader`, `FromForm` take the named source; `FromBody` or no attribute takes the body document. A missing required field is 400 with the field name; a missing `std::optional` is left empty; unknown body keys are ignored unless `strict_body = true`. Integer parsing uses `std::from_chars` and must consume every character; enums use `rtti::enum_table<t>` labels first, then numeric values (`[READ:third_party/rtti/include\rtti\reflection.hpp:1837]`). Conversion failure is 400 with `crpc_code = invalid_argument`.
 ### 13.3 Responses
 | Handler result | Default |
 |---|---|
@@ -1683,7 +1687,7 @@ Every defect found during implementation is pinned before it is fixed:
 4. **Flip to green**: the same test passes; keep it as a permanent regression guard.
 5. **Never delete or weaken** the pinned test; extend it if the defect has more branches.
 
-This follows the project rule that a failure must be proven before the fix and that the test must not be removed afterwards (`[READ:F:\crpc\.opencode\memory.md:90]`).
+The project rule is that a failure must be proven before the fix, and that the test must not be removed afterwards.
 ### 19.4 Sanitizer matrix
 | Tool | Targets | Job |
 |---|---|---|
@@ -1755,7 +1759,7 @@ Release gates (R11): zero errors and zero warnings on x86 and x64; ASan/LSan/UBS
 | # | Issue | Impact | Blocking point / plan |
 |---|---|---|---|
 | O1 | R6 has no `permission_denied`, `unauthenticated`, `already_exists`, `out_of_range`, `unimplemented`, `data_loss`, or `not_leader` | HTTP 401/403/409/422/501 and registry leader hints cannot be expressed as `rpc_code` | Bridge: HTTP layer sets the status directly and records `metadata["http.status"]`; registry returns `unavailable` plus `metadata["leader"]`. Requires ruling confirmation before M3/M5 freeze. |
-| O2 | R1 defines `source::on_data` returning a credit but names no resume entry point | Without a resume path, ET retains a tail forever | This spec places `connection::resume_read()` outside `source`/`sink`; requires ruling confirmation that this does not violate the two-interface rule. |
+| O2 | R1 defines `source::on_data` returning a credit but names no resume entry point | Without a resume path, ET retains a tail forever | `connection::resume_read()` sits outside `source`/`sink`, which keeps the two-interface rule intact. |
 | O3 | A §30.1 flags differ from B §4.2.1 flags | Reusing B's constants would corrupt the wire | A is adopted; B's bit assignment is superseded. Any existing B-based code must be rewritten. |
 | O4 | A §31.1 puts the compression algorithm in flags bits 5-7; B §21.6 puts it in the first payload byte | Interoperability break | A is adopted; B's layout is superseded. |
 | O5 | Frame type numeric values were never fixed by an earlier document | Independent implementations could disagree | Values are fixed in §7.3 and committed as golden bytes; any change is a wire break. |

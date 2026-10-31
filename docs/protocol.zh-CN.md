@@ -4,7 +4,7 @@
 
 版本 2.0 / 2026-10-24
 
-本文规定 TCP 与进程内后端承载的 CRPC 二进制流。帧布局取自 `include/crpc/frame.hpp` 与 `src/frame/frame.cpp`；调用信封与响应布局取自同一个头文件以及 `src/rpc/client.cpp` / `src/rpc/dispatcher.cpp`。HTTP/2 映射取自 `http2/*`。设计规格与代码不一致时，两者都会写明，并注明代码是当前行为。
+本文规定 TCP 与进程内后端承载的 CRPC 二进制流。帧布局取自 `include/crpc/frame.hpp` 与 `src/frame/frame.cpp`；调用信封与响应布局取自同一个头文件以及 `src/rpc/client.cpp` / `src/rpc/dispatcher.cpp`。HTTP/2 映射取自 `http2/*`。设计与代码不一致时，两者都会写明，并注明代码是当前行为。
 
 ## 目录
 
@@ -39,7 +39,7 @@
 
 CRPC 二进制协议是带长度前缀的多路复用帧流。一帧由 16 字节固定头、可选的 16 字节有序扩展和负载组成。帧层不了解 RPC 方法；`REQUEST`、`RESPONSE`、`ONE_WAY` 的负载携带调用信封。
 
-权威来源：`include/crpc/frame.hpp` 规定字段宽度、数值、标志、限制与 CRC；`src/frame/frame.cpp` 规定校验顺序与信封编码；`src/rpc/client.cpp` 规定客户端写什么、接受什么；`src/rpc/dispatcher.cpp` 规定响应编码。设计规格 §7 是目标契约。有一处偏差需要明确：信封使用 64 位 service/method id 和不同的扩展布局（§8、§9）。截止时间按设计使用相对值（§9）。
+权威来源：`include/crpc/frame.hpp` 规定字段宽度、数值、标志、限制与 CRC；`src/frame/frame.cpp` 规定校验顺序与信封编码；`src/rpc/client.cpp` 规定客户端写什么、接受什么；`src/rpc/dispatcher.cpp` 规定响应编码。设计 §7 是目标契约。有一处偏差需要明确：信封使用 64 位 service/method id 和不同的扩展布局（§8、§9）。截止时间按设计使用相对值（§9）。
 
 ## 2. 字节序与对齐 <a id="s2"></a>
 

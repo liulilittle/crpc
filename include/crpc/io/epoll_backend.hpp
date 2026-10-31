@@ -4,7 +4,7 @@
 // to nothing so a Windows build of the library still compiles.  The whole
 // implementation lives in `src/io/epoll_backend.cpp`.
 //
-// Design summary (see `docs/superpowers/specs/2026-10-19-crpc-design.md` §5 and
+// Design summary (see `docs/design.md` §5 and
 // `.opencode/ruling.md` R3/R4/R18):
 //
 //   * Every fd is registered edge-triggered and is drained to `EAGAIN`:

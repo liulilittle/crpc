@@ -1,7 +1,11 @@
-# CRPC 设计规格（中文版）
-[English version / 英文版](2026-10-19-crpc-design.md)
+# CRPC 设计（中文版）
+[English](design.md) | **简体中文**
 
-版本 1.0 / 2026-10-19 / 规范来源：`.opencode/ruling.md`（W11 最终裁决）。优先级：裁决 > `audit-arch-a.md` > `audit-rtti-b.md`。
+版本 1.0 / 2026-10-19
+
+本文档是设计结论的汇总记录：它整合了此前两份独立的设计评审，正文中以 **A** 与 **B** 指代；这两份评审都不随仓库发布，因此"A §3.5"这类引用只是说明该决定的来源，不是链接。本文档中带 § 编号的章节是设计的权威陈述；[架构](architecture.zh-CN.md)记录代码今天实现了什么。若本文档与代码不一致，以代码及其测试为准。R1、R5、R6 这类编号指代该评审记录中的编号规则；带有该编号的章节即该规则的完整陈述处。
+
+下文的代码片段描述的是内部机制，而非公开 API：`class epoll_connection` 是 `src/` 中真实存在的内部类；`class epoll_listener` 与 `class shard` 是本文档为描述内部结构而使用的示意名，在头文件中并不存在。因此只出现在本文档中的限定名属于设计草图，不是缺失的公开符号。本文档声称为**公开**的每个名字，都由 `tests/test_docs_lint.cpp` 对着头文件校验。
 ## 目录
 | # | 章节 |
 |---|---|
@@ -343,7 +347,7 @@ per shard: 1 OS thread
          + 64 handler coroutines with 64 KiB stacks
 threads = n_shards + 1 acceptor (Windows) + blocking pool (default 0)
 ```
-协程在 M:N 意义上多于线程，但一个分片的 runtime 只由一个线程 pump。`coro_rt_pump` 拒绝第二个并发 pump（`pump_active`，`[READ:F:\corocc\src\scheduler\rt_driver.c:458]`），LOOP runtime 只有一个 worker（`[READ:F:\corocc\src\scheduler\rt.c:804]`）。handler 协程是长期存活的工作者，不是每请求一个：这避开 256 KiB 默认栈（`[READ:F:\corocc\include\corocc\coro.h:38]`）与 256 项默认尺寸栈缓存（`[READ:F:\corocc\src\scheduler\rt.h:167]`）。
+协程在 M:N 意义上多于线程，但一个分片的 runtime 只由一个线程 pump。`coro_rt_pump` 拒绝第二个并发 pump（`pump_active`，`[READ:third_party/corocc/src\scheduler\rt_driver.c:458]`），LOOP runtime 只有一个 worker（`[READ:third_party/corocc/src\scheduler\rt.c:804]`）。handler 协程是长期存活的工作者，不是每请求一个：这避开 256 KiB 默认栈（`[READ:third_party/corocc/include\corocc\coro.h:38]`）与 256 项默认尺寸栈缓存（`[READ:third_party/corocc/src\scheduler\rt.h:167]`）。
 ### 4.2 runtime 构造
 ```cpp
 struct shard_driver_ops {
@@ -379,7 +383,7 @@ void shard::start() {
     }
 }
 ```
-API 证据：`coro_rt_create` `[READ:F:\corocc\include\corocc\coro_rt.h:299]`；LOOP 标志 `[READ:F:\corocc\include\corocc\coro_rt_driver.h:46]`；驱动注册 `[READ:F:\corocc\include\corocc\coro_rt_driver.h:146]`；默认驱动 `[READ:F:\corocc\include\corocc\coro_rt_driver.h:185]`；pump `[READ:F:\corocc\include\corocc\coro_rt_driver.h:258]`；`coro_attr_default` `[READ:F:\corocc\include\corocc\coro.h:149]`；`coro_rt_spawn` `[READ:F:\corocc\include\corocc\coro_rt.h:339]`；信号量 `[READ:F:\corocc\include\corocc\coro_rt.h:631]`、`:639`、`:654`；销毁时拒绝存活协程 `[READ:F:\corocc\include\corocc\coro_rt.h:304]`。
+API 证据：`coro_rt_create` `[READ:third_party/corocc/include\corocc\coro_rt.h:299]`；LOOP 标志 `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:46]`；驱动注册 `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:146]`；默认驱动 `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:185]`；pump `[READ:third_party/corocc/include\corocc\coro_rt_driver.h:258]`；`coro_attr_default` `[READ:third_party/corocc/include\corocc\coro.h:149]`；`coro_rt_spawn` `[READ:third_party/corocc/include\corocc\coro_rt.h:339]`；信号量 `[READ:third_party/corocc/include\corocc\coro_rt.h:631]`、`:639`、`:654`；销毁时拒绝存活协程 `[READ:third_party/corocc/include\corocc\coro_rt.h:304]`。
 ### 4.3 主循环
 ```cpp
 void shard::run() {
@@ -423,7 +427,7 @@ bool shard::post(task t) noexcept {
     return true;
 }
 ```
-`coro_rt_sem_post` 可在任意线程调用，并通过驱动 wake 回调发出活动信号（`[READ:F:\corocc\src\scheduler\rt_sync.c:469]`、`[READ:F:\corocc\src\scheduler\rt.c:208]`）。分片 A 上完成一个属于分片 B 的调用时，不得触碰 B 的 runtime，必须投递到 B。
+`coro_rt_sem_post` 可在任意线程调用，并通过驱动 wake 回调发出活动信号（`[READ:third_party/corocc/src\scheduler\rt_sync.c:469]`、`[READ:third_party/corocc/src\scheduler\rt.c:208]`）。分片 A 上完成一个属于分片 B 的调用时，不得触碰 B 的 runtime，必须投递到 B。
 ### 4.6 关停顺序
 1. `listener.stop()`：不再 accept。
 2. 广播 `GOAWAY`；停止接受新调用（`shutting_down`）。
@@ -432,7 +436,7 @@ bool shard::post(task t) noexcept {
 5. 关闭所有连接：取消 I/O，等待两个在途操作，再关闭句柄。
 6. 持续 pump 直到 `coro_rt_pending(rt) == 0`，设硬超时；超时则取消 scope 再 pump。
 7. `coro_rt_destroy(rt)`；返回 `CORO_EBUSY` 表示仍有协程存活，重复第 6 步。
-8. runtime 销毁后再注销驱动；驱动仍被 attach 时注销返回 `CORO_EBUSY`（`[READ:F:\corocc\include\corocc\coro_rt_driver.h:151]`）。
+8. runtime 销毁后再注销驱动；驱动仍被 attach 时注销返回 `CORO_EBUSY`（`[READ:third_party/corocc/include\corocc\coro_rt_driver.h:151]`）。
 9. 释放 epoll/IOCP、timerfd、eventfd 与 MPSC 存储。
 ### 4.7 定时精度
 ```cpp
@@ -468,7 +472,7 @@ for (int i = 0; i < n; ++i) {
     connection* c = lookup_alive(tok);
     if (c == nullptr) continue;
     const std::uint32_t e = events[i].events;
-    if (e & (EPOLLERR | EPOLLHUP)) { c->fail(errc::connection_aborted); continue; }
+    if (e & (EPOLLERR | EPOLLHUP)) { c->fail(std::errc::connection_aborted); continue; }
     if (e & EPOLLRDHUP) c->peer_half_closed_ = true;
     if (e & EPOLLIN) c->read_loop();
     if (e & EPOLLOUT) c->write_loop();
@@ -630,7 +634,7 @@ DisconnectEx(sock, &op->ov, TF_REUSE_SOCKET, 0);          // overlapped
 | Win32 / Winsock | 含义 | 映射 |
 |---|---|---|
 | `ERROR_OPERATION_ABORTED` (995) | 本地取消 | `std::errc::operation_canceled` |
-| `ERROR_CONNECTION_ABORTED` (1236) | 连接中止 | `std::errc::connection_aborted` |
+| `ERROR_CONNECTION_ABORTED` (1236) | 连接中止 | `std::std::errc::connection_aborted` |
 | `ERROR_HANDLE_EOF` (38) | 对端关闭 | EOF |
 | `WSAECONNRESET` (10054) | RST | `std::errc::connection_reset` |
 | `WSAECONNREFUSED` (10061) | 拒绝 | `std::errc::connection_refused` |
@@ -687,7 +691,7 @@ RPC 层只看到 `source`、`sink`、`connection`，无法分辨底层后端。
 | 0x0B | `PUSH` | 非零 | 推送信封加消息体 |
 | 0x0C | `PUSH_ACK` | 非零 | `push_seq` u64 |
 
-数值由本规格首次固定，是对 A §9.2、A §23 与 B §4.2.1 并集的整合；修改即 wire 破坏。
+数值由本文档首次固定，是对 A §9.2、A §23 与 B §4.2.1 并集的整合；修改即 wire 破坏。
 ### 7.4 flags
 | 位 | 名称 | 含义 |
 |---|---|---|
@@ -932,7 +936,7 @@ enum class rpc_code : std::uint16_t {
     unknown_side_effect = 18, internal = 19, shutting_down = 20
 };
 ```
-数值即声明顺序，永久稳定。B §14.1 的更大表被 R6 取代；没有新裁决不得增加、改名或重排任何码。
+数值即声明顺序，永久稳定。B §14.1 的更大表被 R6 取代；不得在没有新设计决定的情况下增加、改名或重排任何码。
 ### 9.2 `rpc_error` 与 `rpc_result`
 ```cpp
 using metadata_map = std::vector<std::pair<std::string, std::string>>;
@@ -1068,22 +1072,22 @@ rpc_code binary_encode(const t& v, buffer& out) {
                           std::make_index_sequence<std::tuple_size_v<members_t>>{});
 }
 ```
-`fields_of<t>::members` 是成员指针的 `std::tuple`，常量初始化（`[READ:F:\RTTI\include\rtti\reflection.hpp:5449]`）。冷路径（HTTP 绑定、管理面、调试）可以使用 `field_access_base::set_value`/`get_value`（`[READ:F:\RTTI\include\rtti\reflection.hpp:451]`、`:461`、`:463`）。
+`fields_of<t>::members` 是成员指针的 `std::tuple`，常量初始化（`[READ:third_party/rtti/include\rtti\reflection.hpp:5449]`）。冷路径（HTTP 绑定、管理面、调试）可以使用 `field_access_base::set_value`/`get_value`（`[READ:third_party/rtti/include\rtti\reflection.hpp:451]`、`:461`、`:463`）。
 
-派生类型被 crpc-binary 以 `static_assert` 拒绝：`RTTI_DEFINE_TYPE_DERIVED` 把基类字段放在 `members` 之外（D12，`[READ:F:\RTTI\include\rtti\reflection.hpp:5490]`）。文本格式仍可通过虚调用路径编码派生类型。
+派生类型被 crpc-binary 以 `static_assert` 拒绝：`RTTI_DEFINE_TYPE_DERIVED` 把基类字段放在 `members` 之外（D12，`[READ:third_party/rtti/include\rtti\reflection.hpp:5490]`）。文本格式仍可通过虚调用路径编码派生类型。
 ### 10.4 文本与 schema 格式
 | 格式 | 解码 | 编码 | 证据 |
 |---|---|---|---|
-| JSON | `json::parse` 后 `rtti::from_value`（保留偏移） | `rtti::to_value` 后 `json::serialize(document)` | `[READ:F:\RTTI\include\rtti\json.hpp:170]`、`:174`、`[READ:F:\RTTI\include\rtti\convert.hpp:1354]`、`:1414` |
-| XML | `xml::parse_as<t>` | `rtti::to_value` 后 `xml::serialize(document)` | `[READ:F:\RTTI\include\rtti\xml.hpp:220]`、`:216` |
-| INI | `ini::parse_as<t>` | `rtti::to_value` 后 `ini::serialize(document)` | `[READ:F:\RTTI\include\rtti\ini.hpp:346]`、`:320` |
-| TOML | `toml::parse_as<t>` | `rtti::to_value` 后 `toml::serialize(document)` | `[READ:F:\RTTI\include\rtti\toml.hpp:297]`、`:271` |
-| protobuf | `rtti::proto::parse_as<t>(bytes, cfg)` | `rtti::proto::serialize<t>(obj, out)` | `[READ:F:\RTTI\include\rtti\proto.hpp:2700]`、`:2679` |
-| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, rtti::flat::schema_of<t>(), out, cfg)` | `[READ:F:\RTTI\include\rtti\flat.hpp:346]`、`:290` |
+| JSON | `json::parse` 后 `rtti::from_value`（保留偏移） | `rtti::to_value` 后 `json::serialize(document)` | `[READ:third_party/rtti/include\rtti\json.hpp:170]`、`:174`、`[READ:third_party/rtti/include\rtti\convert.hpp:1354]`、`:1414` |
+| XML | `xml::parse_as<t>` | `rtti::to_value` 后 `xml::serialize(document)` | `[READ:third_party/rtti/include\rtti\xml.hpp:220]`、`:216` |
+| INI | `ini::parse_as<t>` | `rtti::to_value` 后 `ini::serialize(document)` | `[READ:third_party/rtti/include\rtti\ini.hpp:346]`、`:320` |
+| TOML | `toml::parse_as<t>` | `rtti::to_value` 后 `toml::serialize(document)` | `[READ:third_party/rtti/include\rtti\toml.hpp:297]`、`:271` |
+| protobuf | `rtti::proto::parse_as<t>(bytes, cfg)` | `rtti::proto::serialize<t>(obj, out)` | `[READ:third_party/rtti/include\rtti\proto.hpp:2700]`、`:2679` |
+| FlatBuffers | `rtti::flat::parse_as<t>(bytes, cfg)` | `rtti::flat::tree_to_wire(&doc, rtti::flat::schema_of<t>(), out, cfg)` | `[READ:third_party/rtti/include\rtti\flat.hpp:346]`、`:290` |
 
-文本格式必须两段式编码：便捷函数 `serialize<T>` 在转换失败时返回空串（D9，`[READ:F:\RTTI\include\rtti\json.hpp:222]`）。JSON 必须两段式解码：`parse_as` 丢失字节偏移（D8，`[READ:F:\RTTI\include\rtti\json.hpp:193]`）。
+文本格式必须两段式编码：便捷函数 `serialize<T>` 在转换失败时返回空串（D9，`[READ:third_party/rtti/include\rtti\json.hpp:222]`）。JSON 必须两段式解码：`parse_as` 丢失字节偏移（D8，`[READ:third_party/rtti/include\rtti\json.hpp:193]`）。
 
-protobuf 与 FlatBuffers 要求用户显式特化 `rtti::proto::schema<t>`（`[READ:F:\RTTI\include\rtti\proto.hpp:432]`）或 `rtti::flat::schema<t>`（`[READ:F:\RTTI\include\rtti\flat.hpp:198]`）。主模板为空，未注册类型会静默编码成零字节。因此 CRPC 必须要求 `schema_hash`，并在这些格式上对 schema count 为零的类型拒绝注册（D13）。FlatBuffers 的类型化编码经过 DOM，不宣称零拷贝（D14）。
+protobuf 与 FlatBuffers 要求用户显式特化 `rtti::proto::schema<t>`（`[READ:third_party/rtti/include\rtti\proto.hpp:432]`）或 `rtti::flat::schema<t>`（`[READ:third_party/rtti/include\rtti\flat.hpp:198]`）。主模板为空，未注册类型会静默编码成零字节。因此 CRPC 必须要求 `schema_hash`，并在这些格式上对 schema count 为零的类型拒绝注册（D13）。FlatBuffers 的类型化编码经过 DOM，不宣称零拷贝（D14）。
 ### 10.5 限制、字节序与错误映射
 | 限制 | 默认 | 超限 |
 |---|---|---|
@@ -1095,7 +1099,7 @@ protobuf 与 FlatBuffers 要求用户显式特化 `rtti::proto::schema<t>`（`[R
 
 所有整数与浮点 wire 值显式小端；文本格式为无 BOM 的 UTF-8，且与 locale 无关。二进制布局没有对齐与填充要求：每个字段逐字节编解码，读者不做对齐加载，写者不插入填充。
 
-`rtti::error_code`（`[READ:F:\RTTI\include\rtti\error.hpp:15]`）在输入侧映射为 `rpc_code::decode_error`，输出侧映射为 `encode_error`，原始码写入 `metadata["rtti_code"]`。`strict_schema = true` 时 schema 不匹配为 `failed_precondition`；否则按字段 id 继续解码并计数。
+`rtti::error_code`（`[READ:third_party/rtti/include\rtti\error.hpp:15]`）在输入侧映射为 `rpc_code::decode_error`，输出侧映射为 `encode_error`，原始码写入 `metadata["rtti_code"]`。`strict_schema = true` 时 schema 不匹配为 `failed_precondition`；否则按字段 id 继续解码并计数。
 ## 11. 服务 API 与 stub <a id="s11"></a>
 ### 11.1 声明宏（R8）
 ```cpp
@@ -1133,7 +1137,7 @@ protobuf 与 FlatBuffers 要求用户显式特化 `rtti::proto::schema<t>`（`[R
 #define CRPC_FROM_FORM(name)    RTTI_ATTR("FromForm", name)
 #define CRPC_FROM_FILE(name)    RTTI_ATTR("FromFile", name)
 ```
-它们写在 `RTTI_DEFINE_FIELD_ATTRS` 内，例如 `RTTI_DEFINE_FIELD_ATTRS(get_user_req, RTTI_FIELD_ATTR_ENTRY(id, CRPC_FROM_ROUTE("id")))`。只使用公开 RTTI API（`[READ:F:\RTTI\include\rtti\reflection.hpp:6791]`、`:6766`、`:1142`）。
+它们写在 `RTTI_DEFINE_FIELD_ATTRS` 内，例如 `RTTI_DEFINE_FIELD_ATTRS(get_user_req, RTTI_FIELD_ATTR_ENTRY(id, CRPC_FROM_ROUTE("id")))`。只使用公开 RTTI API（`[READ:third_party/rtti/include\rtti\reflection.hpp:6791]`、`:6766`、`:1142`）。
 ### 11.2 方法 traits 与调用
 ```cpp
 namespace crpc::rpc {
@@ -1360,7 +1364,7 @@ v1 规模下，路由树表示为精确匹配表加预排序参数表；trie 只
 | 动词不符 | 405，带 `Allow` |
 | 未命中 | 404 |
 
-DTO 绑定遍历 `rtti::fields<req>()`（`[READ:F:\RTTI\include\rtti\reflection.hpp:884]`）并读取字段属性。`FromRoute`、`FromQuery`、`FromHeader`、`FromForm` 取对应来源；`FromBody` 或无属性取 body 文档。必填字段缺失为 400 并给出字段名；`std::optional` 缺失留空；未知 body 键默认忽略，`strict_body = true` 时为 400。整数解析使用 `std::from_chars` 且必须消费全部字符；枚举先查 `rtti::enum_table<t>` 标签，再按数值（`[READ:F:\RTTI\include\rtti\reflection.hpp:1837]`）。转换失败为 400，`crpc_code = invalid_argument`。
+DTO 绑定遍历 `rtti::fields<req>()`（`[READ:third_party/rtti/include\rtti\reflection.hpp:884]`）并读取字段属性。`FromRoute`、`FromQuery`、`FromHeader`、`FromForm` 取对应来源；`FromBody` 或无属性取 body 文档。必填字段缺失为 400 并给出字段名；`std::optional` 缺失留空；未知 body 键默认忽略，`strict_body = true` 时为 400。整数解析使用 `std::from_chars` 且必须消费全部字符；枚举先查 `rtti::enum_table<t>` 标签，再按数值（`[READ:third_party/rtti/include\rtti\reflection.hpp:1837]`）。转换失败为 400，`crpc_code = invalid_argument`。
 ### 13.3 响应
 | handler 返回值 | 默认 |
 |---|---|
@@ -1685,7 +1689,7 @@ D1-D15 为 B §8 的 RTTI 集成缺陷；D16-D20 为 A §1.1 D1-D5 的 corocc �
 4. **转绿**：同一测试通过，并永久保留为回归守卫。
 5. **绝不删除或弱化**已钉住的测试；缺陷有更多分支时只扩展。
 
-这遵循项目规则：失败必须先被证明，修复后测试不得删除（`[READ:F:\crpc\.opencode\memory.md:90]`）。
+项目规则是：失败必须先被证明，修复后测试不得删除。
 ### 19.4 sanitizer 矩阵
 | 工具 | 目标 | job |
 |---|---|---|
@@ -1757,7 +1761,7 @@ gossip/Raft 强一致、动态策略下发、io_uring/shm/RDMA、ARM64/大端/An
 | # | 问题 | 影响 | 阻塞点 / 计划 |
 |---|---|---|---|
 | O1 | R6 没有 `permission_denied`、`unauthenticated`、`already_exists`、`out_of_range`、`unimplemented`、`data_loss`、`not_leader` | HTTP 401/403/409/422/501 与注册中心 leader 提示无法用 `rpc_code` 表达 | 桥接：HTTP 层直接设置状态并记录 `metadata["http.status"]`；注册中心返回 `unavailable` 加 `metadata["leader"]`。M3/M5 冻结前需裁决确认。 |
-| O2 | R1 定义 `source::on_data` 返回信用，但未命名恢复入口 | 没有恢复路径时，ET 会永久保留尾部 | 本规格把 `connection::resume_read()` 放在 `source`/`sink` 之外；需裁决确认这不违反两接口约束。 |
+| O2 | R1 定义 `source::on_data` 返回信用，但未命名恢复入口 | 没有恢复路径时，ET 会永久保留尾部 | `connection::resume_read()` 位于 `source`/`sink` 之外，两接口约束因此保持完整。 |
 | O3 | A §30.1 的 flags 与 B §4.2.1 不同 | 复用 B 的常量会破坏 wire | 采用 A；B 的位分配被取代。任何基于 B 的代码必须重写。 |
 | O4 | A §31.1 把压缩算法放在 flags bit5-7；B §21.6 放在 payload 首字节 | 互操作破坏 | 采用 A；B 的布局被取代。 |
 | O5 | 帧类型数值此前没有文档固定 | 独立实现可能不一致 | 数值在 §7.3 固定并提交 golden bytes；修改即 wire 破坏。 |

@@ -117,8 +117,7 @@ OpenSSL 3.0.13 (8 cases / 80 assertions green, `CRPC_WITH_OPENSSL=ON`). On
 Windows only the unguarded build has been exercised: the OpenSSL branch has not
 been linked or run there, and the source records that it was code-reviewed
 rather than compiled in that environment. Treat Windows HTTPS as unverified.
-Evidence: `.opencode/plan.md` P10, `.opencode/process.md:108-110`,
-`src/io/tls_openssl.cpp:9-11`.
+The source records the same limitation at `src/io/tls_openssl.cpp:9-11`.
 
 ### Compiler feature requirements
 

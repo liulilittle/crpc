@@ -1,7 +1,7 @@
 // CRPC -- service catalog (registry).
 //
 // The registry is the single authority for the service catalog. It implements
-// the Consul-shaped data model from the design specification: a service
+// the Consul-shaped data model from the design: a service
 // instance is identified by (service, node_id), every accepted mutation bumps a
 // global monotonic index, and readers observe immutable snapshots.
 //

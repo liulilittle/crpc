@@ -39,7 +39,7 @@ This document specifies the CRPC binary stream carried by TCP and by the in-proc
 
 The CRPC binary protocol is a length-prefixed, multiplexed frame stream. A frame is a 16-byte fixed header, an optional 16-byte ordered extension, and a payload. The frame layer knows nothing about RPC methods; `REQUEST`, `RESPONSE` and `ONE_WAY` payloads carry a call envelope.
 
-Authority: `include/crpc/frame.hpp` for field widths, numeric values, flags, limits and CRC; `src/frame/frame.cpp` for validation order and envelope encoding; `src/rpc/client.cpp` for what the client writes and accepts; `src/rpc/dispatcher.cpp` for response encoding. The design specification §7 is the target contract. One deviation is called out: the envelope uses 64-bit service/method ids and a different extension layout (§8, §9). The deadline is relative as the design requires (§9).
+Authority: `include/crpc/frame.hpp` for field widths, numeric values, flags, limits and CRC; `src/frame/frame.cpp` for validation order and envelope encoding; `src/rpc/client.cpp` for what the client writes and accepts; `src/rpc/dispatcher.cpp` for response encoding. The design §7 is the target contract. One deviation is called out: the envelope uses 64-bit service/method ids and a different extension layout (§8, §9). The deadline is relative as the design requires (§9).
 
 ## 2. Byte-order and alignment <a id="s2"></a>
 

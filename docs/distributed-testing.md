@@ -5,9 +5,8 @@
 Version 1.0 / 2026-10-26
 
 This document records how the multi-node/distributed test suite and the
-performance benchmarks are built, run and read. The numbers are copied from
-`.superpowers/sdd/distbench-report.md`; they were measured in one Debug build on
-the machine named there, with the in-process backend unless stated otherwise.
+performance benchmarks are built, run and read. The numbers were all measured in one Debug build on a single development
+machine, with the in-process backend unless stated otherwise.
 
 ## Contents
 
@@ -397,8 +396,8 @@ recorded explicitly.
    concurrency.** The concurrent issue path and the in-process backend's
    synchronous completion path deadlock (see §7); the harness detects it with a
    child-process watchdog and records the closed-loop fallback. This is a library
-   finding for the parent, not a benchmark artefact; it is reproduced with a
-   stack trace in `.superpowers/sdd/bench-pipeline-report.md`.
+   finding for the parent, not a benchmark artefact; a stack trace was
+   captured with those measurements.
 5. **Debug numbers.** Compression encode throughput in particular is not
    representative; see §7.
 5. **`none` decode is not decompression.** Its "decode throughput" is header

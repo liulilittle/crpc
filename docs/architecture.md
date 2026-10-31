@@ -39,7 +39,7 @@ CRPC is a C++17 framework for large server systems. Its public surface is header
 - **partial** — code exists and is tested, but a documented part is missing.
 - **specified, not implemented** — the design freezes the behaviour, but no code path provides it.
 
-The authoritative target is [the design specification](superpowers/specs/2026-10-19-crpc-design.md). If this document and the specification disagree, the code wins for a factual statement about today and the specification wins for the target contract.
+The authoritative target is [the design](design.md). If this document and the specification disagree, the code wins for a factual statement about today and the specification wins for the target contract.
 
 ## 2. Two first-class capabilities <a id="s2"></a>
 

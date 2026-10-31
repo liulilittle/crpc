@@ -18,9 +18,9 @@
 //
 // The checks are text scans, not a Markdown parser. That keeps them stable when
 // prose is rewrapped while still failing when a fact changes. The historical
-// exemption (docs/superpowers/** and docs/CHANGELOG*) is explicit: those are
-// dated records and plans, not living documents, so a stale phrase there is the
-// point rather than a defect.
+// exemption is explicit: docs/CHANGELOG* (dated release notes) and any restored
+// docs/superpowers/** archive are records of a past moment rather than living
+// documents, so a stale phrase there is the point rather than a defect.
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif

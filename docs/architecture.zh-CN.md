@@ -39,7 +39,7 @@ CRPC 是面向大型服务器系统的 C++17 框架。公开接口以头文件�
 - **partial（部分实现）** —— 代码存在且有测试，但契约中有明确缺失的部分。
 - **specified, not implemented（已设计，未实现）** —— 设计冻结了行为，但没有任何代码路径提供它。
 
-权威目标是[设计规格](superpowers/specs/2026-10-19-crpc-design.zh-CN.md)。如果本文与规格不一致：关于“今天的事实”，以代码为准；关于“目标契约”，以规格为准。
+权威目标是[设计](design.zh-CN.md)。如果本文与规格不一致：关于“今天的事实”，以代码为准；关于“目标契约”，以规格为准。
 
 ## 2. 两项一等能力 <a id="s2"></a>
 
@@ -359,7 +359,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 推送 hub/流 | `push/*` | 已实现；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump，SSE 与长轮询已接入 `http_server` |
 | 追踪/日志/AOP | `observability/*` | 已实现；服务端调用路径已接线（`before_call`/`after_call`，含短路、异常边界与零成本空链）；客户端终态经 diagnostics 默认链观察；serialize/retry/breaker/connect 钩点未接线 |
 | 流控 | `flow/estimator.hpp`、`rpc/flow_control.hpp` | 已实现并接入 `rpc::client`：字节窗口、PING/PONG 探针、估计器、每 lane 配额、连接级 pacer |
-| 分片/协程/MPSC | 设计规格 §4 | 已设计，未实现 |
+| 分片/协程/MPSC | 设计 §4 | 已设计，未实现 |
 
 ## 19. 状态矩阵 <a id="s19"></a>
 

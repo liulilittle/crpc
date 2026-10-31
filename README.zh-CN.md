@@ -12,7 +12,7 @@
 
 | 文档 | 中文 | English |
 |---|---|---|
-| 设计规格 | [docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md](docs/superpowers/specs/2026-10-19-crpc-design.zh-CN.md) | [English](docs/superpowers/specs/2026-10-19-crpc-design.md) |
+| 设计 | [docs/design.zh-CN.md](docs/design.zh-CN.md) | [English](docs/design.md) |
 | ABI 策略 | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) | [docs/abi.md](docs/abi.md) |
 | 架构概览 | [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | [Architecture overview](docs/architecture.md) |
 | 线上协议 | [docs/protocol.zh-CN.md](docs/protocol.zh-CN.md) | [Wire protocol](docs/protocol.md) |

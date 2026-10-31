@@ -294,9 +294,8 @@ Debug build: the concurrent issue path and the in-process backend's synchronous
 completion path deadlock, so the watchdog kills the case and records the
 closed-loop fallback instead of a pipelined number. The ONE_WAY path does not
 deadlock (its issue path does not wait), so its pipelined numbers are complete.
-The deadlock is a library finding, not a benchmark artefact; it is reproduced
-with a stack trace in `.superpowers/sdd/bench-pipeline-report.md` and recorded
-as a limitation in [distributed-testing.md §8](distributed-testing.md#s8).
+The deadlock is a library finding, not a benchmark artefact; a stack trace was captured
+with those measurements and recorded as a limitation in [distributed-testing.md §8](distributed-testing.md#s8).
 The hang is timing-dependent, so the exact set of hanging cases varies between
 runs; the fallback is always recorded explicitly.
 
