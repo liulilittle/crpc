@@ -266,10 +266,16 @@ status connection::streaming_cursor::advance(bool& got_row) {
             if (item.env.type == env_change_type::begin_transaction) {
                 owner_->descriptor_ = item.env.new_descriptor;
                 owner_->has_descriptor_ = true;
+                // Third decode point for the same authority rule: the server's
+                // ENVCHANGE boundary decides, and this stream must report it too --
+                // `query_streaming` is reachable through `db::connection*`, so the
+                // pool's rollback decision depends on it.
+                owner_->in_transaction_ = true;
             } else if (item.env.type == env_change_type::commit_transaction ||
                        item.env.type == env_change_type::rollback_transaction) {
                 owner_->has_descriptor_ = false;
                 owner_->descriptor_.fill(0);
+                owner_->in_transaction_ = false;
             }
             break;
         case token::kind::return_status:

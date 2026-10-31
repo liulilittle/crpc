@@ -1057,4 +1057,50 @@ CRPC_TEST(tds_pool_release_rolls_back_a_transaction_opened_by_sql) {
     CRPC_CHECK(contains_utf16(requests->back(), "ROLLBACK TRANSACTION"));
 }
 
+// `query_streaming` is a third, independent decode point: it is reachable through
+// `db::connection*`, so the pool's rollback decision rests on it as well.
+CRPC_TEST(tds_streaming_begin_transaction_is_visible_to_in_transaction) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::sql_batch) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK_FALSE(session->in_transaction());
+    result_set* rows = nullptr;
+    // `query_streaming` primes the pull decoder: the first `advance()` reads the
+    // ENVCHANGE and then the final DONE, so the boundary is seen before it returns.
+    const crpc::status started = session->query_streaming("BEGIN TRANSACTION", {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    CRPC_CHECK(static_cast<bool>(started));
+    while (rows != nullptr && rows->next()) {
+    }
+    CRPC_CHECK(session->in_transaction());
+}
+
+// A login reply can already report an open transaction (a session bound to one);
+// the handshake decode point must expose that to the caller.
+CRPC_TEST(tds_login_reply_reports_an_open_transaction) {
+    auto respond = login_server();
+    auto session = open_with([respond](packet_type type, crpc::span<const std::byte> payload) {
+        if (type != packet_type::login7) {
+            return respond(type, payload);
+        }
+        bytes reply;
+        put_login_ack(reply);
+        put_packet_size_change(reply, "8192");
+        put_transaction_change(reply, crpc::db::tds::env_change_type::begin_transaction,
+                               transaction_descriptor_fixture);
+        put_done(reply, 0, 0);
+        return reply;
+    });
+    CRPC_CHECK(session->is_open());
+    CRPC_CHECK(session->in_transaction());
+}
+
 CRPC_TEST_MAIN()
