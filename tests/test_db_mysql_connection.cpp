@@ -862,6 +862,37 @@ CRPC_TEST(mysql_truncated_binary_trailing_ok_keeps_the_transaction_state) {
     CRPC_CHECK(no_rows.session->in_transaction());
 }
 
+// The binary twin of `mysql_short_eof_keeps_the_transaction_state`. A one-byte
+// 0xfe closes the binary row stream, and `read_binary_result` must size-check it
+// before decoding: `decode_eof` reports success for a short EOF (it is legal for
+// very old servers) and leaves the flags zeroed, so decoding it anyway would apply
+// status 0, clear the transaction and make the pool skip its ROLLBACK.
+CRPC_TEST(mysql_binary_short_eof_keeps_the_transaction_state) {
+    // DEPRECATE_EOF is withheld (the default greeting), so the binary row stream is
+    // closed by a classic EOF -- and this one is a single 0xfe byte, which carries
+    // no status word.
+    harness h;
+    CRPC_CHECK((h.session->negotiated_capabilities() & mask(capability::deprecate_eof)) == 0);
+    push_ok(h.raw, 0, 0x0001);
+    CRPC_CHECK(h.session->begin().ok());
+    CRPC_CHECK(h.session->in_transaction());
+
+    h.raw->push(packet(prepare_ok_payload(91, 1, 0), 1));
+    h.raw->push(packet(column_payload("id", 8), 2));
+    h.raw->push(packet(eof_payload(2), 3));          // prepare: column-definition EOF
+    h.raw->push(packet({std::byte{1}}, 1));           // execute: column count
+    h.raw->push(packet(column_payload("id", 8), 2));
+    h.raw->push(packet(eof_payload(0x0001), 3));      // execute: column EOF, IN_TRANS set
+    h.raw->push(packet({std::byte{0x00}, std::byte{0x04}}, 4)); // one binary row (NULL)
+    h.raw->push(packet({std::byte{0xfe}}, 5));        // ONE-BYTE terminator: no status word
+
+    crpc::db::result_set* rows = nullptr;
+    CRPC_CHECK(h.session->call("CALL p()", {}, &rows).ok());
+    std::unique_ptr<crpc::db::result_set> owned(rows);
+    // read_binary_result's short-EOF branch must keep the previous status word.
+    CRPC_CHECK(h.session->in_transaction());
+}
+
 // The binary twin of `mysql_truncated_deprecate_eof_keeps_the_transaction_state`.
 // `read_binary_result` decodes the DEPRECATE_EOF terminator with the same
 // two-length-encoded-integer walk, so it needs the same guards: without them the
@@ -958,10 +989,12 @@ CRPC_TEST(mysql_error_packet_keeps_the_transaction_state_of_an_idle_autocommit_s
 // --- R1: session state is restored before a connection is reused -------------
 //
 // `autocommit` is a session variable: ROLLBACK ends the transaction, it does not
-// put the session back to the defaults the connection was opened with. A pooled
-// `autocommit=0` session would make the next borrower's statements join an
-// implicit transaction, and the next release would roll them back -- silent data
-// loss. `reset_session()` closes that gap; these cases pin its shape.
+// put the session back to a clean state. A pooled `autocommit=0` session would
+// make the next borrower's statements join an implicit transaction, and the next
+// release would roll them back -- silent data loss. `reset_session()` closes that
+// gap: it always targets `autocommit=1`, deliberately not the server's global
+// default (a server started with `--autocommit=0` would hand the next borrower the
+// same trap). These cases pin its shape.
 
 CRPC_TEST(mysql_reset_session_restores_autocommit) {
     // The handshake reports status 0x0000 (autocommit off).
