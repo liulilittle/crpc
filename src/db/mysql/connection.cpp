@@ -673,14 +673,6 @@ status connection::ping() {
 
 bool connection::in_transaction() const noexcept { return open_ && in_transaction_; }
 
-status connection::set_autocommit(bool enabled) {
-    // Explicit statements rather than a capability bit: the server's
-    // SERVER_STATUS_IN_TRANS is not set for `START TRANSACTION` until a statement
-    // runs, so tracking it locally is the only exact answer.
-    const char* sql = enabled ? "SET autocommit=1" : "SET autocommit=0";
-    return run_query(sql, nullptr);
-}
-
 status connection::begin() {
     if (!open_) {
         return status{rpc_code::shutting_down, "mysql connection is closed"};

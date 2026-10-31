@@ -241,7 +241,6 @@ private:
     // Reads a result set whose rows are encoded by the binary protocol.
     [[nodiscard]] status read_binary_result(std::uint64_t column_count, result_set** out,
                                            bool allow_more_results = false);
-    [[nodiscard]] status set_autocommit(bool enabled);
     void fail(const status& error) noexcept;
 
     connection_options options_;
