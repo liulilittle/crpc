@@ -472,4 +472,167 @@ CRPC_TEST(odbc_it_lists_drivers) {
     }
 }
 
+// Counts the rows of a table the caller created. Used to tell a real rollback from a
+// transaction flag that merely reports itself closed.
+[[nodiscard]] std::int64_t count_rows(crpc::db::odbc::connection& session, const char* table) {
+    crpc::db::result_set* out = nullptr;
+    const std::string sql = std::string("SELECT COUNT(*) FROM ") + table;
+    const crpc::status selected = session.query(sql, {}, &out);
+    crpc::db::statement_guard guard(out);
+    if (!selected || guard.get() == nullptr || !guard->next()) {
+        return -1;
+    }
+    const auto value = guard->get_int64(0);
+    return value ? value.value() : -1;
+}
+
+void insert_one(crpc::db::odbc::connection& session, std::int64_t id) {
+    crpc::db::parameter params[1] = {crpc::db::parameter::from_int64(id)};
+    crpc::db::result_set* out = nullptr;
+    const crpc::status inserted = session.query(
+        "INSERT INTO crpc_txn (id) VALUES (?)", crpc::span<const crpc::db::parameter>(params, 1),
+        &out);
+    crpc::db::statement_guard guard(out);
+    CRPC_CHECK(static_cast<bool>(inserted));
+    if (!inserted) {
+        report("insert", inserted.error());
+    }
+}
+
+void create_txn_table(crpc::db::odbc::connection& session) {
+    run_quietly(session, "DROP TABLE crpc_txn");
+    crpc::db::result_set* out = nullptr;
+    const crpc::status created =
+        session.query("CREATE TABLE crpc_txn (id INTEGER NOT NULL PRIMARY KEY)", {}, &out);
+    crpc::db::statement_guard guard(out);
+    CRPC_CHECK(static_cast<bool>(created));
+    if (!created) {
+        report("create txn table", created.error());
+    }
+}
+
+// `in_transaction()` used to return a hard false no matter what the connection was doing,
+// so `db::pool` never rolled a dirty session back before handing it to the next caller --
+// the next caller inherited an open transaction and could commit another caller's work.
+// The flag alone is not enough to prove the fix: the driver has to really be in manual
+// commit, or `rollback` below would discard nothing.
+CRPC_TEST(odbc_it_transaction_state_follows_the_connection) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    create_txn_table(*it.session);
+
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+
+    const crpc::status begun = it.session->begin();
+    if (!begun) {
+        report("begin", begun.error());
+    }
+    CRPC_CHECK(static_cast<bool>(begun));
+    CRPC_CHECK(it.session->in_transaction());
+
+    // A second begin must be refused rather than silently reported as a nested transaction
+    // that does not exist. The transaction that is already open stays open.
+    const crpc::status again = it.session->begin();
+    CRPC_CHECK_FALSE(static_cast<bool>(again));
+    if (!again) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                      static_cast<int>(again.error().code));
+    }
+    CRPC_CHECK(it.session->in_transaction());
+
+    const crpc::status committed = it.session->commit();
+    if (!committed) {
+        report("commit", committed.error());
+    }
+    CRPC_CHECK(static_cast<bool>(committed));
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+
+    CRPC_CHECK(static_cast<bool>(it.session->begin()));
+    CRPC_CHECK(it.session->in_transaction());
+    const crpc::status rolled = it.session->rollback();
+    if (!rolled) {
+        report("rollback", rolled.error());
+    }
+    CRPC_CHECK(static_cast<bool>(rolled));
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+
+    run_quietly(*it.session, "DROP TABLE crpc_txn");
+}
+
+CRPC_TEST(odbc_it_commit_persists_the_work) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    create_txn_table(*it.session);
+
+    CRPC_CHECK(static_cast<bool>(it.session->begin()));
+    insert_one(*it.session, 1);
+    // Inside the transaction the row is visible to this session.
+    CRPC_CHECK_EQ(std::int64_t{1}, count_rows(*it.session, "crpc_txn"));
+    const crpc::status committed = it.session->commit();
+    if (!committed) {
+        report("commit", committed.error());
+    }
+    CRPC_CHECK(static_cast<bool>(committed));
+    CRPC_CHECK_EQ(std::int64_t{1}, count_rows(*it.session, "crpc_txn"));
+
+    run_quietly(*it.session, "DROP TABLE crpc_txn");
+}
+
+CRPC_TEST(odbc_it_rollback_discards_the_work) {
+    (void)require_bridge();
+    it_session it;
+    if (!it.ok()) {
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    create_txn_table(*it.session);
+
+    CRPC_CHECK(static_cast<bool>(it.session->begin()));
+    insert_one(*it.session, 1);
+    CRPC_CHECK_EQ(std::int64_t{1}, count_rows(*it.session, "crpc_txn"));
+    const crpc::status rolled = it.session->rollback();
+    if (!rolled) {
+        report("rollback", rolled.error());
+    }
+    CRPC_CHECK(static_cast<bool>(rolled));
+    // Zero, not one: the row was written inside the transaction, so a driver still in
+    // autocommit would leave it behind.
+    CRPC_CHECK_EQ(std::int64_t{0}, count_rows(*it.session, "crpc_txn"));
+
+    run_quietly(*it.session, "DROP TABLE crpc_txn");
+}
+
+// Closing with a transaction open must not leave the work behind. `SQLDisconnect` is
+// specified to roll back, but a pool that drops the `connection` is the case that decides
+// whether an abandoned `begin()` can reach the file.
+CRPC_TEST(odbc_it_close_rolls_back_an_open_transaction) {
+    (void)require_bridge();
+    {
+        it_session it;
+        if (!it.ok()) {
+            CRPC_CHECK(it.ok());
+            return;
+        }
+        create_txn_table(*it.session);
+        CRPC_CHECK(static_cast<bool>(it.session->begin()));
+        insert_one(*it.session, 1);
+        CRPC_CHECK_EQ(std::int64_t{1}, count_rows(*it.session, "crpc_txn"));
+    }
+    it_session reopened;
+    if (!reopened.ok()) {
+        CRPC_CHECK(reopened.ok());
+        return;
+    }
+    CRPC_CHECK_EQ(std::int64_t{0}, count_rows(*reopened.session, "crpc_txn"));
+    run_quietly(*reopened.session, "DROP TABLE crpc_txn");
+}
+
 CRPC_TEST_MAIN()

@@ -71,9 +71,13 @@ struct connection_options {
 // connection fails on a machine that looks correctly configured.
 [[nodiscard]] CRPC_API result<std::vector<std::string>> list_drivers();
 
-// One ODBC session. Access has no transactions worth the name in a single-user file, but
-// the base class requires the three calls, so they are implemented and a driver that
-// refuses them reports its own error.
+// One ODBC session. Transactions use ODBC's own model rather than a driver's SQL dialect:
+// `begin()` puts the connection into manual commit, `commit()` and `rollback()` end the
+// transaction with `SQLEndTran` and restore autocommit, and `in_transaction()` reads the
+// commit mode back from the driver. Sending `BEGIN TRANSACTION` as text instead would be
+// one dialect among many, and the connection's state would be a local guess rather than
+// something the driver reports. A driver that refuses manual commit reports its own error
+// through `last_sqlstate()`.
 class CRPC_API connection final : public db::connection {
 public:
     // Connects with `options`. On failure the driver's SQLSTATE and message are in

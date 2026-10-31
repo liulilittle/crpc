@@ -226,7 +226,12 @@ if (!session->is_open()) {
 * 全程使用宽字符（`W`）入口：否则表名或值中超出本机 ANSI 代码页的字符在到达驱动前就被破坏；
 * 同时报告驱动的 SQLSTATE 与库错误码。`map_sqlstate` 按类别判定：23xxx 完整性约束、42xxx 语法或
   权限错误、08xxx 连接丢失、40xxx 死锁、HYT00/HYT01 超时；
-* 每个结果集按 `max_result_rows` / `max_result_bytes` 物化，所有列按文本读取，只让驱动做它自己的转换。
+* 每个结果集按 `max_result_rows` / `max_result_bytes` 物化，所有列按文本读取，只让驱动做它自己的转换；
+* 事务走 ODBC 自己的模型而不是 SQL 文本：`begin()` 把连接切到手动提交（`SQL_ATTR_AUTOCOMMIT` 关闭），
+  `commit()` 与 `rollback()` 用 `SQLEndTran` 结束事务再恢复自动提交，`in_transaction()` 从驱动读回提交模式。
+  直接发 `BEGIN TRANSACTION` 对某些驱动可用、对另一些不可用，而且连接状态会变成本地猜测——这很重要，
+  因为池在把会话交给下一个借用者之前要问 `in_transaction()`。`close()` 在断开前先回滚未结束的事务：
+  驱动不允许从事务中直接断开，残留的会话会一直持锁到超时。
 
 用真实 32 位 Access 驱动跑出来的两个事实：
 

@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+### ODBC: transactions use the driver's manual-commit mode, and the state is no longer a guess
+
+- `in_transaction()` returned a hard `false` whatever the connection was doing, while `begin()` really started a transaction. `db::pool` consults that answer before reusing a session, so a dirty ODBC connection was handed to the next borrower with its transaction still open -- the next borrower's release could commit or roll back work it never ran.
+- `begin()`/`commit()`/`rollback()` now use ODBC's own transaction model instead of sending `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` as text: `begin()` switches the connection to manual commit with `SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF)`, and `commit()`/`rollback()` end the transaction with `SQLEndTran` before restoring autocommit. That is one mapping for every driver instead of one SQL dialect per driver, and it is what makes the state observable at all: `in_transaction()` reads `SQL_ATTR_AUTOCOMMIT` back from the connection, so the answer comes from the driver rather than from a flag this library keeps.
+- `close()` ends an open transaction before `SQLDisconnect`. A driver is not allowed to disconnect out of an outstanding transaction -- the disconnect fails and the server-side session survives, holding its locks until it times out, which blocks the next caller on the same table. An abandoned `begin()` no longer outlives the object that opened it.
+- `begin()` reports `failed_precondition` when a transaction is already open, and `commit()` when there is none. `rollback()` on a clean connection is still a no-op, because the pool calls it unconditionally on a session it is retiring.
+- If ending the transaction fails, the connection is left in manual commit on purpose: setting autocommit back on while a transaction is active commits it, which after a failed rollback would persist exactly the work that was asked to be discarded. Left that way `in_transaction()` keeps answering true and the pool discards the session instead of reusing it.
+- ABI: no change. No public signature or data member moved; `run_simple` was internal to the translation unit.
+- Not verified: a real Access/Jet driver. The suite was run against SQL Server LocalDB through `ODBC Driver 17`; the pre-existing cases in `tests/test_db_odbc_it.cpp` are written in Jet dialect (`MEMO`, `LONGBINARY`) and three of them fail on SQL Server for that reason, before and after this change.
+
 ### MySQL: reset the session when a pooled connection is returned
 
 - `autocommit=0` no longer leaks across leases. The pool already rolled back an open transaction before returning a connection to the idle set, but `autocommit` is a session variable that `ROLLBACK` does not restore: the next borrower's statements joined an implicit transaction nobody committed, and its release rolled them back -- silent data loss. `db::connection` gained `reset_session()`; the pool now calls it after a successful rollback, and `mysql::connection` sends `SET autocommit=1` when the session is not already at the default.

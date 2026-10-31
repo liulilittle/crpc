@@ -4,6 +4,16 @@
 
 ## 未发布
 
+### ODBC：事务改用驱动的手动提交模式，状态不再是猜测
+
+- `in_transaction()` 无论连接正在做什么都硬返回 `false`，而 `begin()` 确实开启了事务。`db::pool` 在复用会话前要读这个答案，于是脏的 ODBC 连接会带着未结束的事务交给下一个借用者——下一个借用者归还时可能提交或回滚它从没执行过的工作。
+- `begin()`/`commit()`/`rollback()` 改用 ODBC 自身的事务模型，而不再把 `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` 当文本发出去：`begin()` 用 `SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF)` 把连接切到手动提交，`commit()`/`rollback()` 用 `SQLEndTran` 结束事务再恢复自动提交。这是所有驱动共用的一套映射，而不是每个驱动一种 SQL 方言；也正是它让状态可观测：`in_transaction()` 从连接读回 `SQL_ATTR_AUTOCOMMIT`，答案来自驱动，而不是本库自己记的标志。
+- `close()` 在 `SQLDisconnect` 之前先结束未完成的事务。驱动不允许从事务中直接断开——断开失败而服务端会话仍然存活，直到超时前一直持有锁，阻塞同一张表上的下一个调用者。被遗弃的 `begin()` 不再比开启它的对象活得更久。
+- 已有事务时 `begin()` 返回 `failed_precondition`；没有事务时 `commit()` 同样。空连接上的 `rollback()` 仍是空操作，因为池在退役会话时会无条件调用它。
+- 结束事务失败时，连接被有意留在手动提交状态：事务仍活跃时把自动提交打开会**提交**它，这在回滚失败之后就等于把要求丢弃的工作持久化。保持原状则 `in_transaction()` 继续返回 true，池会丢弃该会话而不是复用。
+- ABI：无变更。没有公共签名或数据成员移动；`run_simple` 是编译单元内部的。
+- 未验证：真实的 Access/Jet 驱动。测试套件是在 SQL Server LocalDB 上通过 `ODBC Driver 17` 跑的；`tests/test_db_odbc_it.cpp` 里原有的用例是按 Jet 方言写的（`MEMO`、`LONGBINARY`），其中三个在 SQL Server 上因此失败，改动前后都一样。
+
 ### MySQL：连接池归还连接时复位会话（`autocommit`）
 
 - `autocommit=0` 不再跨租约泄漏。池在把连接放回空闲集之前已经会回滚未结束的事务，但 `autocommit` 是 `ROLLBACK` 不会复位的会话变量：下一个借用者的语句会加入一个无人提交的隐式事务，并在它归还时被回滚——静默丢数据。`db::connection` 新增 `reset_session()`；池在回滚成功后调用它，`mysql::connection` 在会话尚未处于默认值时会发送 `SET autocommit=1`。

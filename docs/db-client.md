@@ -265,7 +265,17 @@ What the bridge does:
   class: 23xxx is an integrity constraint, 42xxx a syntax or access error, 08xxx a lost
   connection, 40xxx a deadlock, HYT00/HYT01 a timeout;
 * materialises each result set under `max_result_rows` / `max_result_bytes`, and reads every
-  column as text so the driver's own conversion is the only one applied.
+  column as text so the driver's own conversion is the only one applied;
+* drives transactions through ODBC's own model rather than through SQL text: `begin()`
+  switches the connection to manual commit (`SQL_ATTR_AUTOCOMMIT` off), `commit()` and
+  `rollback()` end the transaction with `SQLEndTran` and restore autocommit, and
+  `in_transaction()` reads the commit mode back from the driver. Sending
+  `BEGIN TRANSACTION` as a statement would work on some drivers and not others, and it
+  would leave the connection's state a local guess — which matters because the pool asks
+  `in_transaction()` before handing a session to the next borrower. `close()` rolls an open
+  transaction back before disconnecting: a driver refuses to disconnect out of an
+  outstanding transaction, and the session that survives holds its locks until it times
+  out.
 
 Two driver facts found by running against a real 32-bit Access driver:
 

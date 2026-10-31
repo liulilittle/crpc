@@ -148,6 +148,20 @@ struct diagnostic {
     return out;
 }
 
+// True when the connection is in manual commit. ODBC has no server-side "am I in a
+// transaction" query: the connection's commit mode is the authority, and it is the one
+// thing every driver agrees on. In manual commit ODBC itself opens a transaction at the
+// first statement and keeps it open until `SQLEndTran`, so this attribute answers the
+// question directly. Reading it instead of remembering a flag is what keeps the answer
+// from drifting away from the connection the pool is about to hand to someone else. A
+// read failure is reported as "not in a transaction", the direction whose worst case is
+// an unused rollback rather than discarded work.
+[[nodiscard]] bool manual_commit(SQLHDBC dbc) {
+    SQLUINTEGER mode = SQL_AUTOCOMMIT_ON;
+    const SQLRETURN got = SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, 0, nullptr);
+    return SQL_SUCCEEDED(got) && mode == SQL_AUTOCOMMIT_OFF;
+}
+
 // The value ODBC needs for one parameter, kept alive until the statement is executed.
 struct bound_parameter {
     // A copy of the text, because SQLBindParameter only keeps the pointer.
@@ -395,35 +409,49 @@ status connection::ping() {
     return ran;
 }
 
-bool connection::in_transaction() const noexcept { return false; }
+bool connection::in_transaction() const noexcept {
+    return impl_ && impl_->open && manual_commit(impl_->dbc);
+}
 
 namespace {
 
-// Runs one statement with no result set: BEGIN/COMMIT/ROLLBACK and DDL.
-[[nodiscard]] status run_simple(SQLHDBC dbc, const char* sql, std::string& sqlstate) {
-    SQLHSTMT stmt = SQL_NULL_HSTMT;
-    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt))) {
-        return status{rpc_code::resource_exhausted, "an ODBC statement could not be allocated"};
+// Reports a failure from a driver call, keeping the SQLSTATE where the caller can see it.
+[[nodiscard]] status from_diagnostics(SQLSMALLINT type, SQLHANDLE handle, const char* what,
+                                      std::string& sqlstate) {
+    const std::vector<diagnostic> diagnostics = collect_diagnostics(type, handle);
+    std::string message = what;
+    rpc_code code = rpc_code::application;
+    if (!diagnostics.empty()) {
+        message = diagnostics.front().message;
+        sqlstate = diagnostics.front().sqlstate;
+        code = map_sqlstate(sqlstate);
     }
-    const std::vector<SQLWCHAR> wide = to_wide(sql);
-    SQLRETURN ran = SQLExecDirectW(stmt, const_cast<SQLWCHAR*>(wide.data()), SQL_NTS);
-    if (ran == SQL_NO_DATA) {
-        ran = SQL_SUCCESS;
+    return status{code, std::move(message)};
+}
+
+[[nodiscard]] status set_manual_commit(SQLHDBC dbc, bool manual, std::string& sqlstate) {
+    const auto mode = static_cast<SQLULEN>(manual ? SQL_AUTOCOMMIT_OFF : SQL_AUTOCOMMIT_ON);
+    const SQLRETURN set =
+        SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(mode),
+                          SQL_IS_UINTEGER);
+    if (SQL_SUCCEEDED(set)) {
+        return status{};
     }
-    if (!SQL_SUCCEEDED(ran)) {
-        const std::vector<diagnostic> diagnostics = collect_diagnostics(SQL_HANDLE_STMT, stmt);
-        std::string message = "the statement failed";
-        rpc_code code = rpc_code::application;
-        if (!diagnostics.empty()) {
-            message = diagnostics.front().message;
-            sqlstate = diagnostics.front().sqlstate;
-            code = map_sqlstate(sqlstate);
-        }
-        (void)SQLFreeHandle(SQL_HANDLE_STMT, stmt);
-        return status{code, message};
+    return from_diagnostics(SQL_HANDLE_DBC, dbc,
+                            "the transaction mode could not be changed", sqlstate);
+}
+
+// Ends the transaction and puts the connection back into autocommit. On failure the
+// connection is left in manual commit on purpose: setting autocommit back on while a
+// transaction is still active commits it, which after a failed ROLLBACK would persist
+// exactly the work the caller asked to discard. Left as it is, `in_transaction()` keeps
+// answering true and the pool discards the session instead of reusing it.
+[[nodiscard]] status end_transaction(SQLHDBC dbc, SQLSMALLINT completion, std::string& sqlstate) {
+    if (!SQL_SUCCEEDED(SQLEndTran(SQL_HANDLE_DBC, dbc, completion))) {
+        return from_diagnostics(SQL_HANDLE_DBC, dbc, "the transaction could not be ended",
+                                sqlstate);
     }
-    (void)SQLFreeHandle(SQL_HANDLE_STMT, stmt);
-    return status{};
+    return set_manual_commit(dbc, false, sqlstate);
 }
 
 } // namespace
@@ -432,21 +460,34 @@ status connection::begin() {
     if (!impl_->open) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
-    return run_simple(impl_->dbc, "BEGIN TRANSACTION", last_sqlstate_);
+    if (manual_commit(impl_->dbc)) {
+        return status{rpc_code::failed_precondition, "a transaction is already open"};
+    }
+    return set_manual_commit(impl_->dbc, true, last_sqlstate_);
 }
 
 status connection::commit() {
     if (!impl_->open) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
-    return run_simple(impl_->dbc, "COMMIT", last_sqlstate_);
+    if (!manual_commit(impl_->dbc)) {
+        return status{rpc_code::failed_precondition, "no transaction is open"};
+    }
+    return end_transaction(impl_->dbc, SQL_COMMIT, last_sqlstate_);
 }
 
 status connection::rollback() {
     if (!impl_->open) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
-    return run_simple(impl_->dbc, "ROLLBACK", last_sqlstate_);
+    // Rolling back nothing is not an error: the pool calls this unconditionally on a
+    // session it is retiring, and a caller that rolls back defensively should not have to
+    // ask first. `commit` is the stricter one because losing work is the failure mode
+    // there.
+    if (!manual_commit(impl_->dbc)) {
+        return status{};
+    }
+    return end_transaction(impl_->dbc, SQL_ROLLBACK, last_sqlstate_);
 }
 
 status connection::query(std::string_view sql, span<const parameter> params, result_set** out) {
@@ -717,6 +758,22 @@ status connection::query(std::string_view sql, span<const parameter> params, res
 void connection::close() noexcept {
     if (impl_ && impl_->open) {
         impl_->open = false;
+        // An open transaction has to be ended before the connection goes away. ODBC does
+        // not let a driver disconnect out of an outstanding transaction: SQLDisconnect
+        // answers "invalid transaction operation" (25000) and the session stays alive on
+        // the server holding its locks until it times out, which blocks the next caller.
+        // The rollback is issued here rather than left to the driver for the same reason
+        // the pool rolls back before reuse -- an abandoned `begin()` must not outlive the
+        // object that opened it.
+        if (manual_commit(impl_->dbc) &&
+            SQL_SUCCEEDED(SQLEndTran(SQL_HANDLE_DBC, impl_->dbc, SQL_ROLLBACK))) {
+            // Only after the transaction is really gone: setting autocommit back on while
+            // one is still active commits it, the opposite of what a close must do.
+            (void)SQLSetConnectAttr(
+                impl_->dbc, SQL_ATTR_AUTOCOMMIT,
+                reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_AUTOCOMMIT_ON)),
+                SQL_IS_UINTEGER);
+        }
         (void)SQLDisconnect(impl_->dbc);
     }
 }
