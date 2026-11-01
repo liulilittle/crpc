@@ -810,7 +810,12 @@ CRPC_TEST(iocp_destruction_bounded_live_connection) {
             CRPC_CHECK(wait_for([&] { return ss.accepts.load() == 1; }, 5000));
         }
         std::atomic<int> fired{0};
-        (void)backend->arm_timer(seconds(10), &timer_cb, &fired);
+        // arm_timer answers 0 when it refused -- an invalid backend or no free slot --
+        // and the case is about destroying the backend while a timer is live. Without
+        // this check a refused arm would leave no timer at all and the destruction
+        // measurement below would pass while testing nothing.
+        const std::uint64_t timer_id = backend->arm_timer(seconds(10), &timer_cb, &fired);
+        CRPC_CHECK(timer_id != 0);
 
         const auto start = steady_clock::now();
         backend.reset(); // stops pump + timer threads and force-closes
