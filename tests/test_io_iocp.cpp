@@ -411,7 +411,12 @@ CRPC_TEST(iocp_reader_pause_resume) {
     conn->resume_read();
     CRPC_CHECK(wait_for([&] { return cs.size() == payload.size(); }, 5000));
     CRPC_CHECK_EQ(payload.size(), cs.size());
-    (void)calls_before;
+    // The buffered remainder must come back in one hand-over, not dribbled out a byte
+    // at a time. Measured: one additional callback for the whole 200 bytes. The bound
+    // allows a couple of extra callbacks because the payload may arrive split across
+    // segments on a loaded host, and it is a count rather than a clock so it means the
+    // same thing everywhere. A per-byte resume would take 200.
+    CRPC_CHECK(cs.data_calls.load() - calls_before < 32);
     l->stop();
 }
 
