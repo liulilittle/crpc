@@ -1545,6 +1545,16 @@ CRPC_TEST(aoi_stress_ten_thousand_entities_one_thousand_watchers) {
     CRPC_CHECK_EQ(actual_update, stats.update_events);
     CRPC_CHECK(stats.full_scan_visits >
                stats.neighbor_visits + stats.reverse_visits);
+    // The comparison above is guaranteed by construction: `full_scan_visits` is a
+    // counterfactual that adds the live watcher count for every dirty entity, so it is
+    // large no matter what the forwarding path does, and it cannot fail on a correct
+    // run or a broken one. What is worth asserting is that the work actually done
+    // scales with the neighbourhood instead of the world. Measured on this run:
+    // 185991 reconciled (entity, watcher) pairs against 20000000 slots a naive scan
+    // would have touched -- 107x. The bound is 1/16 of the scan, so a regression that
+    // fell back to visiting every watcher (ratio collapsing to ~1) fails it with 6x of
+    // headroom on the correct side, and the numbers are integers.
+    CRPC_CHECK(stats.candidate_checks <= stats.full_scan_visits / 16);
 
     const auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               build_end - build_start)
