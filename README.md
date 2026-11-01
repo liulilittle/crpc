@@ -16,7 +16,7 @@ server push over one connection, one frame format and one coroutine model.
 |---|---|---|
 | Design | [docs/design.md](docs/design.md) | [中文](docs/design.zh-CN.md) |
 | ABI policy | [docs/abi.md](docs/abi.md) | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) |
-| Architecture overview | [docs/architecture.md](docs/architecture.md) | [架构概览](docs/architecture.zh-CN.md) |
+| Architecture | [docs/architecture.md](docs/architecture.md) | [架构](docs/architecture.zh-CN.md) |
 | Wire protocol | [docs/protocol.md](docs/protocol.md) | [线上协议](docs/protocol.zh-CN.md) |
 | Build and test | [docs/building.md](docs/building.md) | [构建与测试](docs/building.zh-CN.md) |
 | Engineering principles | [docs/principles.md](docs/principles.md) | [工程原则](docs/principles.zh-CN.md) |

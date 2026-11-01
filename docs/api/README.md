@@ -135,7 +135,7 @@ in [Redis client](../redis-client.md).
 ## See also
 
 - [Tutorial](../tutorial.md) — a step-by-step build of a call and a push subscription.
-- [Architecture overview](../architecture.md) — the subsystem map and status matrix.
+- [Architecture](../architecture.md) — the subsystem map and status matrix.
 - [Wire protocol](../protocol.md) — the frame format and codecs.
 - [Redis client](../redis-client.md) — the Redis API map and recipes.
 - [Distributed testing and benchmarks](../distributed-testing.md) — multi-node tests and benchmark commands.

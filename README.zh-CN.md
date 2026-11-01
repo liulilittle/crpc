@@ -14,7 +14,7 @@
 |---|---|---|
 | 设计 | [docs/design.zh-CN.md](docs/design.zh-CN.md) | [English](docs/design.md) |
 | ABI 策略 | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) | [docs/abi.md](docs/abi.md) |
-| 架构概览 | [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | [Architecture overview](docs/architecture.md) |
+| 架构 | [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | [Architecture](docs/architecture.md) |
 | 线上协议 | [docs/protocol.zh-CN.md](docs/protocol.zh-CN.md) | [Wire protocol](docs/protocol.md) |
 | 构建与测试 | [docs/building.zh-CN.md](docs/building.zh-CN.md) | [Build and test](docs/building.md) |
 | 工程原则 | [docs/principles.zh-CN.md](docs/principles.zh-CN.md) | [Engineering principles](docs/principles.md) |

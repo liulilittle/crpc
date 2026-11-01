@@ -80,7 +80,12 @@ SHARED_ARG=()
 for san in "${SAN_LIST[@]}"; do
   for cfg in "${CFG_LIST[@]}"; do
     log INFO "=== build $ARCH/$cfg/$san shared=$SHARED ==="
-    if ! "$BUILD_SH" --config "$cfg" --arch "$ARCH" --compiler "$COMPILER" \
+    # Invoke through bash rather than relying on the executable bit. Git stores the
+    # mode per file, and a checkout that lost the bit -- a Windows working tree, an
+    # archive export, a zip download -- would otherwise fail here with
+    # "Permission denied" while the build itself is fine. CI calls this script as
+    # `bash scripts/test.sh`, so the interpreter is already known to exist.
+    if ! bash "$BUILD_SH" --config "$cfg" --arch "$ARCH" --compiler "$COMPILER" \
          --sanitizer "$san" --source "$SOURCE_DIR" --build-root "$BUILD_ROOT" \
          "${SHARED_ARG[@]}"; then
       log ERROR "build failed $ARCH/$cfg/$san"

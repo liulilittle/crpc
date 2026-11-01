@@ -132,7 +132,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 ## 另见
 
 - [教程](../tutorial.zh-CN.md) —— 一步步构建一次调用与一个推送订阅。
-- [架构概览](../architecture.zh-CN.md) —— 子系统地图与状态矩阵。
+- [架构](../architecture.zh-CN.md) —— 子系统地图与状态矩阵。
 - [线上协议](../protocol.zh-CN.md) —— 帧格式与编解码。
 - [Redis 客户端](../redis-client.zh-CN.md) —— Redis API 地图与配方。
 - [分布式测试与基准](../distributed-testing.zh-CN.md) —— 多节点测试与基准命令。
