@@ -784,6 +784,11 @@ CRPC_TEST(push_slow_client_pauses_pump_and_hub_drops) {
             unreliable));
     }
     const auto elapsed = std::chrono::steady_clock::now() - begin;
+    // A hang guard, not a throughput claim: the subscriber above is paused, so the
+    // whole point is that publishing never waits for it. If `publish` blocked, this
+    // loop would not return at all; 2 s against a few microseconds of in-process work
+    // is the margin that turns a hang into a failure instead of a ctest timeout
+    // (plan.md D1, keep).
     CRPC_CHECK(elapsed < 2s);
 
     const server::statistics blocked = fixture.srv->stats();

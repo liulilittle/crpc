@@ -1174,14 +1174,20 @@ CRPC_TEST(geom_performance_point_in_polygon_and_circle_polygon) {
     //
     // Removing them left this case with no assertion at all, which is worse than
     // having no case: a test that cannot fail still shows up as a green line in
-    // the report. The two routines it exercises are pinned here on inputs whose
-    // answers are not in doubt -- the 32-gon is centred on (3, -2) with radius
-    // 100, so its own centre is inside, a point 500 units away is outside, and a
-    // circle that straddles the rim shares points with it.
+    // the report. What is pinned here is chosen for distance from the boundary, not
+    // for convenience. The 32-gon is centred on (3, -2) with radius 100, so its
+    // inradius is about 99.5: a point 90 out is inside with ~9.5 units of margin and
+    // one 110 out is outside with ~10, which is what makes a radius that is halved
+    // or a centre that has drifted show up. A point on a vertex would have passed
+    // whatever the radius was, because the boundary check returns true there.
     const vec2 centre(3.0f, -2.0f);
     CRPC_CHECK(poly.contains(centre));
-    CRPC_CHECK_FALSE(poly.contains(vec2(503.0f, -2.0f)));
-    CRPC_CHECK(geom::intersects(geom::circle{vec2(103.0f, -2.0f), 20.0f}, poly));
+    CRPC_CHECK(poly.contains(vec2(93.0f, -2.0f)));        // 90 from the centre
+    CRPC_CHECK_FALSE(poly.contains(vec2(113.0f, -2.0f))); // 110 from the centre
+    // A circle centred 110 out with radius 20 reaches back to 90, so it must share
+    // points with the polygon; the same circle at radius 5 stays clear.
+    CRPC_CHECK(geom::intersects(geom::circle{vec2(113.0f, -2.0f), 20.0f}, poly));
+    CRPC_CHECK_FALSE(geom::intersects(geom::circle{vec2(113.0f, -2.0f), 5.0f}, poly));
     CRPC_CHECK_FALSE(geom::intersects(geom::circle{vec2(1000.0f, 1000.0f), 5.0f}, poly));
 }
 

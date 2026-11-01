@@ -953,20 +953,19 @@ CRPC_TEST(ado_command_timeout_cancels_a_slow_statement_and_stays_usable) {
     CRPC_CHECK(static_cast<bool>(settled));
     CRPC_CHECK_EQ(std::chrono::milliseconds(300).count(), session.command_timeout().count());
 
-    const auto began = std::chrono::steady_clock::now();
     result_set* rows = nullptr;
     const crpc::status ran = session.query("SLOW", {}, &rows);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - began)
-                             .count();
     statement_guard guard(rows);
     CRPC_CHECK_FALSE(static_cast<bool>(ran));
     if (!ran) {
         CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled),
                       static_cast<int>(ran.error().code));
     }
-    // Cancelled well before the server "would have" answered at 2s.
-    CRPC_CHECK(elapsed < 1900);
+    // No wall-clock bound here. The scripted channel answers SLOW at 2 s, so a
+    // `canceled` error already proves the 300 ms timeout fired first: had the reply
+    // won, `ran` would be a success and the check above would fail. A "< 1900 ms"
+    // bound sat 1.05x below that 2 s outcome, close enough that a loaded host could
+    // red a correct run while telling nothing the error code does not (plan.md D4).
     CRPC_CHECK(session.is_open());
 
     // The session still answers: the acknowledgement was consumed and the delayed
@@ -1004,19 +1003,17 @@ CRPC_TEST(ado_streaming_timeout_cancels_a_slow_first_token) {
     CRPC_CHECK(session.is_open());
     CRPC_CHECK(static_cast<bool>(session.set_command_timeout(std::chrono::milliseconds(300))));
 
-    const auto began = std::chrono::steady_clock::now();
     result_set* rows = nullptr;
     const crpc::status ran = session.query_streaming("SLOW", {}, &rows);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - began)
-                             .count();
     statement_guard guard(rows);
     CRPC_CHECK_FALSE(static_cast<bool>(ran));
     if (!ran) {
         CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::canceled),
                       static_cast<int>(ran.error().code));
     }
-    CRPC_CHECK(elapsed < 1900);
+    // Same reasoning as the non-streaming case above: the scripted reply needs 2 s,
+    // so `canceled` at all means the timeout won, and a 1.05x wall-clock bound added
+    // no discrimination (plan.md D4).
     CRPC_CHECK(session.is_open());
 
     result_set* after = nullptr;

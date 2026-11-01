@@ -979,7 +979,13 @@ CRPC_TEST(request_timeout_is_not_starved_by_the_idle_timer) {
     // fire at its own (earlier) deadline: the session timer is re-armed when the
     // new nearest deadline is earlier than the armed one.
     http::http_server_options options;
-    options.idle_timeout = std::chrono::milliseconds(3000);
+    // The idle deadline is deliberately far outside the wait below. Both timers
+    // answer 408, so a wall-clock check was the only thing telling them apart --
+    // with idle at 3 s and the bound at 1.5 s the two were 2x apart, which a loaded
+    // host can cross. At 30 s the 5 s wait itself is the discriminator: the idle
+    // timer cannot fire inside it, so a 408 inside it can only be the request
+    // deadline (plan.md D4: replace the clock with state, do not widen it).
+    options.idle_timeout = std::chrono::milliseconds(30000);
     options.request_timeout = std::chrono::milliseconds(300);
     fixture fx(options);
 
@@ -988,16 +994,10 @@ CRPC_TEST(request_timeout_is_not_starved_by_the_idle_timer) {
     CRPC_CHECK(client != nullptr);
     client->bind_source(&capture);
 
-    const auto start = std::chrono::steady_clock::now();
     send_raw(*client, "GET /root HTTP/1.1\r\nHost: test\r\n");
     const bool answered = crpc_test::wait_for(
         [&] { return capture.snapshot().find("408") != std::string::npos; }, 5000);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start);
     CRPC_CHECK(answered);
-    // Well before the 3 s idle deadline, and not much after the 300 ms request
-    // deadline.
-    CRPC_CHECK(elapsed < std::chrono::milliseconds(1500));
 }
 
 // --- TLS test ----------------------------------------------------------------

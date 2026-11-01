@@ -461,6 +461,11 @@ CRPC_TEST(flow_lane_rejection_leaves_no_seq_hole) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - begin)
                              .count();
+    // A hang guard for the case where a refusal *did* consume a sequence number: the
+    // lane would then wait for the missing sequence and this call would block instead
+    // of failing. The `seqs` check above is what proves the accounting; this bound is
+    // what turns a hypothetical block into a failure rather than a ctest timeout
+    // (plan.md D1, keep).
     CRPC_CHECK(elapsed < 5000);
 
     cli->close();

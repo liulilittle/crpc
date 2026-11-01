@@ -1829,13 +1829,13 @@ CRPC_TEST(longpoll_waiting_publish_wakes_immediately) {
     send_raw(*client, http1("GET", poll_target(subscriber)));
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
-    const auto begin = std::chrono::steady_clock::now();
     CRPC_CHECK(publish_text(*fx.server, "news", "wake"));
     CRPC_CHECK(wait_polls(parser, capture, 2, 2000));
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - begin)
-                             .count();
-    CRPC_CHECK(elapsed < 1000);
+    // No stricter wall-clock bound: `wait_polls(..., 2000)` is the hang guard, and
+    // the 200 plus the "wake" body below prove the publish released the poll rather
+    // than the long-poll timing out (a timeout answers 204 with an empty body). An
+    // extra "< 1000 ms" sat 2x under the guard's own 2000 ms, so a loaded host
+    // could red a correct wake (plan.md D4).
     CRPC_CHECK_EQ(200, parser.responses[1].status);
     CRPC_CHECK_EQ(std::string("wake"), parser.responses[1].body);
     CRPC_CHECK(parser.responses[1].head.find("X-CRPC-Event-ID: 1:1") !=
@@ -3140,13 +3140,13 @@ CRPC_TEST(longpoll_multishard_waiting_poll_wakes) {
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return fx.server->stats().longpoll_waiters == 1; }, 2000));
 
-    const auto begin = std::chrono::steady_clock::now();
     CRPC_CHECK(publish_text(*fx.server, "news", "wake"));
     CRPC_CHECK(wait_polls(parser, capture, 2, 2000));
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - begin)
-                             .count();
-    CRPC_CHECK(elapsed < 1000);
+    // No stricter wall-clock bound: `wait_polls(..., 2000)` is the hang guard, and
+    // the 200 plus the "wake" body below prove the publish released the poll rather
+    // than the long-poll timing out (a timeout answers 204 with an empty body). An
+    // extra "< 1000 ms" sat 2x under the guard's own 2000 ms, so a loaded host
+    // could red a correct wake (plan.md D4).
     CRPC_CHECK_EQ(200, parser.responses[1].status);
     CRPC_CHECK_EQ(std::string("wake"), parser.responses[1].body);
     client->close();
