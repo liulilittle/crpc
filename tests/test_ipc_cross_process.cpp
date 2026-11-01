@@ -136,6 +136,12 @@ int run_child_process(std::string_view name, int& exit_code) {
 }
 #else
 int run_child_process(std::string_view name, int& exit_code) {
+    // Flush before forking: the harness prints the case name before this runs, and a
+    // buffered write made before the fork is duplicated into the child. The child
+    // then emits the parent's line again, which reads as the test running itself
+    // twice. Terminal output is line-buffered and hides this; a captured run does not.
+    std::fflush(stdout);
+    std::fflush(stderr);
     const pid_t pid = ::fork();
     if (pid < 0) {
         return 0;
