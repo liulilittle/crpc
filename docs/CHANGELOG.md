@@ -4,6 +4,40 @@
 
 ## Unreleased
 
+### IPC: named shared memory, a byte ring, a value queue, and a channel
+
+- `fs::shared_memory` adds a named mapping two local processes use to hand each other a
+  buffer without a socket. Two platform differences are part of the API rather than
+  hidden: a 16-byte header records the creator's requested length, because Windows
+  rounds a mapping to the page size and cannot recover the request afterwards; and
+  `remove_unlinks_the_name()` reports whether `remove()` actually takes the name out of
+  the namespace (POSIX) or only reports that it exists (Windows, where the object lives
+  while any handle is open).
+- `ipc::ring_buffer` is a lock-free single-producer single-consumer byte ring whose
+  control block is integers only, so it can live inside a mapping. There is no sentinel
+  slot: a full ring holds exactly `capacity()` bytes, occupancy is `write - read` over
+  two free-running counters each written by one side, and the producer publishes the
+  index with release ordering after the bytes.
+- `ipc::spsc_queue` is the same ring for values. `T` must be trivially copyable, enforced
+  with `static_assert` because a value owning a pointer is meaningless in memory the
+  peer also sees, and the control block records the element size so a queue of `int`
+  mapped as a queue of `double` is refused.
+- `ipc::channel` composes two rings into a full-duplex channel: the creator produces
+  into one and consumes from the other, the joiner does the reverse. Readiness is
+  published last with release ordering, so a joiner that attaches mid-creation gets
+  `unavailable` instead of a half-initialised view.
+- Async contract: `try_send`/`try_receive` never wait; the timed `send`/`receive` park
+  on a shard thread (never block it, which would deadlock a peer waiting on the same
+  shard) and wait with a bound on a plain thread. A zero timeout means "do not wait".
+- Ring indexing avoids a 64-bit division when the capacity is a power of two: measured
+  3.8-4.5 ns/op versus 5.0-6.4 ns/op, about 30%. SIMD was deliberately not added: a
+  single-element queue operation is a store plus two atomic indices with nothing to
+  widen, and a 1 MiB frame already runs at memory bandwidth through `memcpy`.
+- ABI: no change to existing types; the new headers are additive.
+- Verified: `ctest` 188/188. Not verified: the POSIX branch of `fs::shared_memory` was
+  not compiled on this host, and the memory-ordering argument needs a weakly-ordered
+  CPU to be exercised.
+
 ### ODBC: transactions use the driver's manual-commit mode, and the state is no longer a guess
 
 - `in_transaction()` returned a hard `false` whatever the connection was doing, while `begin()` really started a transaction. `db::pool` consults that answer before reusing a session, so a dirty ODBC connection was handed to the next borrower with its transaction still open -- the next borrower's release could commit or roll back work it never ran.

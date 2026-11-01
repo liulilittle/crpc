@@ -16,6 +16,7 @@
 | ABI 策略 | [docs/abi.zh-CN.md](docs/abi.zh-CN.md) | [docs/abi.md](docs/abi.md) |
 | 架构 | [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md) | [Architecture](docs/architecture.md) |
 | 线上协议 | [docs/protocol.zh-CN.md](docs/protocol.zh-CN.md) | [Wire protocol](docs/protocol.md) |
+| 进程间通信 | [docs/ipc.zh-CN.md](docs/ipc.zh-CN.md) | [IPC](docs/ipc.md) |
 | 构建与测试 | [docs/building.zh-CN.md](docs/building.zh-CN.md) | [Build and test](docs/building.md) |
 | 工程原则 | [docs/principles.zh-CN.md](docs/principles.zh-CN.md) | [Engineering principles](docs/principles.md) |
 | 性能报告 | [docs/performance.zh-CN.md](docs/performance.zh-CN.md) | [Performance report](docs/performance.md) |
