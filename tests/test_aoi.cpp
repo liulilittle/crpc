@@ -1567,7 +1567,9 @@ CRPC_TEST(aoi_stress_ten_thousand_entities_one_thousand_watchers) {
                 static_cast<unsigned long long>(stats.reverse_visits),
                 static_cast<unsigned long long>(stats.full_scan_visits));
 
-    CRPC_CHECK(build_ms + static_cast<long long>(engine_ms) < 15000);
+    // The 15 s wall-clock bound was a degeneration gate with no reachable
+    // V_bad; build/ticks/verify timings live in bench/bench_algorithms.cpp now
+    // (plan.md D3).
 }
 
 } // namespace

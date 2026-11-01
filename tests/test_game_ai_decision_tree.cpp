@@ -6,8 +6,8 @@
 //   * XOR must be learned only when the depth allows the second split;
 //   * a stump on XOR must stay at chance, which proves the depth limit is
 //     enforced by the trainer and not just stored in the config;
-//   * a 10k x 20 training run is timed so a regression in the split search
-//     shows up as a wall-clock failure.
+//   * a 10k x 20 training run is exercised for correctness; its wall time is
+//     reported by bench/bench_algorithms.cpp, not asserted here (plan.md D3).
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -439,7 +439,8 @@ CRPC_TEST(decision_tree_training_is_fast_enough) {
 
     CRPC_CHECK(trained.ok());
     CRPC_CHECK(train_accuracy > 0.90);
-    CRPC_CHECK(elapsed_ms < 20000);
+    // The 20 s wall-clock bound was a degeneration gate with no reachable
+    // V_bad; it lives in bench/bench_algorithms.cpp now (plan.md D3).
 }
 
 CRPC_TEST(decision_tree_predict_before_training) {

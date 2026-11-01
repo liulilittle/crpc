@@ -5,7 +5,6 @@
 // DFS is checked for completeness and path validity (it is deliberately not
 // optimal). Edge cases and the not_found contract are covered explicitly.
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -725,7 +724,6 @@ CRPC_TEST(pathfind_large_open_board_all_algorithms) {
     const std::size_t optimal = k_size - 1;
     const auto config = config_for(connectivity::four);
 
-    const auto begin = std::chrono::steady_clock::now();
     const auto astar =
         crpc::algorithm::astar_grid(g, start, goal, step_unit, h_manhattan, config);
     const auto star =
@@ -733,8 +731,6 @@ CRPC_TEST(pathfind_large_open_board_all_algorithms) {
     const auto bfs = crpc::algorithm::bfs_grid(g, start, goal, config);
     const auto two_way =
         crpc::algorithm::bidirectional_bfs_grid(g, start, goal, config);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - begin);
 
     CRPC_CHECK(astar.ok());
     CRPC_CHECK(star.ok());
@@ -751,8 +747,8 @@ CRPC_TEST(pathfind_large_open_board_all_algorithms) {
         CRPC_CHECK_EQ(optimal, two_way.value().nodes.size() - 1);
         CRPC_CHECK(two_way.value().stats.expanded < bfs.value().stats.expanded);
     }
-    // Four searches over 65k open cells: 5 s only trips on a degenerate build.
-    CRPC_CHECK(elapsed.count() < 5000);
+    // The 5 s wall-clock bound was a degeneration gate with no reachable V_bad;
+    // it lives in bench/bench_algorithms.cpp now (plan.md D3).
 }
 
 CRPC_TEST_MAIN()

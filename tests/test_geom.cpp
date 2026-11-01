@@ -1169,8 +1169,20 @@ CRPC_TEST(geom_performance_point_in_polygon_and_circle_polygon) {
         "10000 circle-polygon = %.3f ms (sink=%d)\n",
         point_ms, circle_ms, static_cast<int>(sink));
     std::fflush(stdout);
-    CRPC_CHECK(point_ms < 2000.0);
-    CRPC_CHECK(circle_ms < 2000.0);
+    // The 2 s wall-clock bounds were degeneration gates with no reachable
+    // V_bad; they live in bench/bench_algorithms.cpp now (plan.md D3).
+    //
+    // Removing them left this case with no assertion at all, which is worse than
+    // having no case: a test that cannot fail still shows up as a green line in
+    // the report. The two routines it exercises are pinned here on inputs whose
+    // answers are not in doubt -- the 32-gon is centred on (3, -2) with radius
+    // 100, so its own centre is inside, a point 500 units away is outside, and a
+    // circle that straddles the rim shares points with it.
+    const vec2 centre(3.0f, -2.0f);
+    CRPC_CHECK(poly.contains(centre));
+    CRPC_CHECK_FALSE(poly.contains(vec2(503.0f, -2.0f)));
+    CRPC_CHECK(geom::intersects(geom::circle{vec2(103.0f, -2.0f), 20.0f}, poly));
+    CRPC_CHECK_FALSE(geom::intersects(geom::circle{vec2(1000.0f, 1000.0f), 5.0f}, poly));
 }
 
 CRPC_TEST_MAIN()

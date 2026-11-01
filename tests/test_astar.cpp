@@ -3,7 +3,6 @@
 // Optimality is proven by exhaustive comparison against a Dijkstra reference on
 // random 20x20 obstacle grids over many seeds, for every supported heuristic.
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -513,7 +512,6 @@ CRPC_TEST(astar_large_open_area_stays_fast) {
     const std::size_t start = w.index(0, 0);
     const std::size_t goal = w.index(k_size - 1, k_size - 1);
 
-    const auto begin = std::chrono::steady_clock::now();
     const auto result = crpc::algorithm::astar_path<std::size_t>(
         start, goal,
         [&](std::size_t n, std::vector<std::size_t>& out) {
@@ -524,16 +522,14 @@ CRPC_TEST(astar_large_open_area_stays_fast) {
             return static_cast<double>(crpc::algorithm::manhattan_distance(
                 w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g)));
         });
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - begin);
     CRPC_CHECK(result.ok());
     if (result.ok()) {
         CRPC_CHECK_EQ(start, result.value().front());
         CRPC_CHECK_EQ(goal, result.value().back());
         CRPC_CHECK_EQ(k_size * 2 - 2, path_cost(w, false, result.value()));
     }
-    // 40k open nodes; 4s only trips if the implementation degenerates.
-    CRPC_CHECK(elapsed.count() < 4000);
+    // The 4 s wall-clock bound was a degeneration gate with no reachable V_bad;
+    // it lives in bench/bench_algorithms.cpp now (plan.md D3).
 }
 
 CRPC_TEST(astar_8_connected_open_area_stays_fast) {
@@ -545,7 +541,6 @@ CRPC_TEST(astar_8_connected_open_area_stays_fast) {
     const std::size_t start = w.index(0, 0);
     const std::size_t goal = w.index(k_size - 1, k_size - 1);
 
-    const auto begin = std::chrono::steady_clock::now();
     const auto result = crpc::algorithm::astar_path<std::size_t>(
         start, goal,
         [&](std::size_t n, std::vector<std::size_t>& out) {
@@ -556,14 +551,13 @@ CRPC_TEST(astar_8_connected_open_area_stays_fast) {
             return crpc::algorithm::octile_distance(
                 w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g));
         });
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - begin);
     CRPC_CHECK(result.ok());
     if (result.ok()) {
         CRPC_CHECK_EQ(start, result.value().front());
         CRPC_CHECK_EQ(goal, result.value().back());
     }
-    CRPC_CHECK(elapsed.count() < 4000);
+    // The 4 s wall-clock bound was a degeneration gate with no reachable V_bad;
+    // it lives in bench/bench_algorithms.cpp now (plan.md D3).
 }
 
 CRPC_TEST_MAIN()
