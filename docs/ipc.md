@@ -168,6 +168,24 @@ otherwise — about 30% on the index alone. A single-element queue operation is 
 plus two atomic indices, so SIMD has nothing to widen there; a 1 MiB frame is already
 at memory bandwidth through `memcpy`, which uses the widest load/store available.
 
+### One optimisation that was measured and rejected
+
+`net::connection::read_exact` drains its inbound buffer one byte at a time
+(`front()`/`pop_front()` in a loop). Replacing that loop with a chunked
+`insert(end, begin, end)` + `clear()` looks obviously cheaper — one call instead of N.
+Measured on a 64 KiB deque, drained into a pre-reserved vector:
+
+| Drain | Cost per 64 KiB |
+|---|---|
+| per-byte `front()`/`pop_front()` loop | 295–315 µs |
+| chunked `insert` + `clear` | 403–405 µs |
+
+The chunked form is about 35% **slower**. `std::deque` stores its elements in segments,
+so a range `insert` has to walk segment headers rather than a flat buffer, while the
+per-byte loop touches one segment header per several bytes and predicts well. The
+number is recorded here because "fewer calls must be faster" is a plausible-sounding
+rule that this container does not obey; the code was left as it was.
+
 ### Where this queue is *not* used, and why
 
 `runtime::submit` and `push::hub` both queue from more than one thread: a server
