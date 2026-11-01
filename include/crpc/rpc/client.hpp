@@ -724,7 +724,14 @@ private:
 
     void on_write_complete(io::io_result result) noexcept;
     void flush_write();
-    void enqueue_raw(span<const std::byte> bytes);
+    // Appends one encoded frame to the write queue. Returns false when the buffer
+    // refused it -- the allocation failed -- leaving the queue unchanged. The
+    // byte-window check the callers already made is a *smaller* bound than the
+    // buffer's own ceiling, so a refusal here means memory ran out, not that the
+    // frame was too big. A dropped frame would desynchronise the stream, so every
+    // caller has to decide what "not sent" means for its frame instead of assuming
+    // success.
+    [[nodiscard]] bool enqueue_raw(span<const std::byte> bytes);
     void send_rst(u32 stream_id, rpc_code code);
     void send_push_ack(u32 stream_id, u64 seq);
     // Stages one PING carrying `token`. Called from inside the write lock (the

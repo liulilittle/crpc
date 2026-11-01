@@ -475,7 +475,12 @@ void client::handle_ping(const frame& value) {
     if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), pong, written).ok()) {
         return;
     }
-    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    // A pong that cannot be queued is dropped: the peer will time the probe out on
+    // its own, and there is no frame to send a report in. Not flushing is the point
+    // -- it keeps the failure from looking like a successful write.
+    if (!enqueue_raw(span<const std::byte>(frame_scratch_.data(), written))) {
+        return;
+    }
     flush_write();
 }
 
@@ -582,8 +587,8 @@ void client::flush_pending() {
     flush_write();
 }
 
-void client::enqueue_raw(span<const std::byte> bytes) {
-    (void)out_.append(bytes);
+bool client::enqueue_raw(span<const std::byte> bytes) {
+    return out_.append(bytes);
 }
 
 bool client::stage_probe(u64 token) {
@@ -619,8 +624,11 @@ bool client::stage_probe(u64 token) {
     if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), ping, written).ok()) {
         return false;
     }
-    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
-    return true;
+    // The queue refusing the bytes is the other way a PING is not staged, and it
+    // has to answer false for the same reason as the branches above: the caller
+    // rolls the probe reservation back, and a probe reported as staged but never
+    // queued would keep the "one probe outstanding" flag set forever.
+    return enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
 }
 
 void client::send_rst(u32 stream_id, rpc_code code) {
@@ -643,7 +651,12 @@ void client::send_rst(u32 stream_id, rpc_code code) {
     if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), rst, written).ok()) {
         return;
     }
-    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    // A reset that cannot be queued is dropped, and the peer keeps waiting for the
+    // stream. That is worse than a slow failure but not worse than a truncated
+    // frame, which is what appending to a full buffer would produce.
+    if (!enqueue_raw(span<const std::byte>(frame_scratch_.data(), written))) {
+        return;
+    }
     flush_write();
 }
 
@@ -712,7 +725,12 @@ void client::send_push_ack(u32 stream_id, u64 seq) {
     if (!encode_frame(span<std::byte>(frame_scratch_.data(), size), ack, written).ok()) {
         return;
     }
-    enqueue_raw(span<const std::byte>(frame_scratch_.data(), written));
+    // An acknowledgement that cannot be queued leaves the server thinking the push
+    // was not received, so it retransmits. Dropping it is the safe direction: a
+    // duplicate delivery is handled by the sequence number, a lost frame is not.
+    if (!enqueue_raw(span<const std::byte>(frame_scratch_.data(), written))) {
+        return;
+    }
     flush_write();
 }
 
