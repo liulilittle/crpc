@@ -749,6 +749,17 @@ CRPC_TEST(pathfind_large_open_board_all_algorithms) {
     }
     // The 5 s wall-clock bound was a degeneration gate with no reachable V_bad;
     // it lives in bench/bench_algorithms.cpp now (plan.md D3).
+    //
+    // What replaces it is a count, which is deterministic on every machine. On this
+    // board the Manhattan heuristic keeps A* to the 255 nodes along the optimal row,
+    // while a search that stopped using the heuristic degenerates to Dijkstra and
+    // expands the explored area instead: BFS here is 32640. The gap is 128x, so the
+    // bound below is 4x above the correct answer and 32x below the degenerate one --
+    // it catches "the heuristic was dropped", which the clock could not catch at all
+    // without a 40x margin. Measured, not guessed (plan.md R1).
+    CRPC_CHECK(astar.value().stats.expanded <= 1024);
+    CRPC_CHECK(bfs.value().stats.expanded <= g.walkable.size());
+    CRPC_CHECK(astar.value().stats.expanded * 10 < bfs.value().stats.expanded);
 }
 
 CRPC_TEST_MAIN()
