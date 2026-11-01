@@ -448,13 +448,26 @@ CRPC_TEST(dedup_capacity_is_bounded) {
     CRPC_CHECK_EQ(6, fx.state.calls.load());
 
     const dedup_statistics stats = fx.dispatch.dedup().stats();
-    CRPC_CHECK(stats.entries <= 3);
-    CRPC_CHECK(stats.evictions >= 3);
+    // Capacity is a promise in both directions. Six inserts into a three-entry table
+    // leave exactly three behind and force exactly three evictions; `<= 3` and `>= 3`
+    // were also satisfied by a table that dropped everything on every insert, which
+    // stays under the bound, evicts at least three times, and never deduplicates
+    // anything at all.
+    CRPC_CHECK_EQ(std::size_t{3}, stats.entries);
+    CRPC_CHECK_EQ(3u, stats.evictions);
 
     // Key #1 was evicted: replaying it re-executes the handler.
     const built_request replay = make_call(1, 1, make_key(1), true);
     const dispatch_result result = run(fx.dispatch, replay);
     CRPC_CHECK(result.dispatched.ok());
+    CRPC_CHECK_EQ(7, fx.state.calls.load());
+
+    // ...and the most recently used key is still remembered: replaying it must be
+    // deduplicated, not executed again. This is what separates "bounded" from
+    // "remembers nothing", which the bounds above could not do on their own.
+    const built_request recent = make_call(1, 1, make_key(6), true);
+    const dispatch_result hit = run(fx.dispatch, recent);
+    CRPC_CHECK(hit.dispatched.ok());
     CRPC_CHECK_EQ(7, fx.state.calls.load());
 }
 
