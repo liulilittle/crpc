@@ -143,21 +143,39 @@ event loop has to poll, and `poll_ready()` exists for exactly that.
 
 ## Measured cost
 
-Release build, 8-byte frames, this machine (x64 Windows, MSVC):
+Release build, 8-byte frames. The Windows and Linux rows differ and both are shown:
+the same code measures differently on the two toolchains, so a single number would be
+a claim about one machine presented as a claim about the library.
 
 | Operation | Cost |
 |---|---|
-| `spsc_queue` push + pop, one thread | 4.4 ns/op |
-| `spsc_queue` push + pop, two threads | 9.5–13 ns/op (scheduler noise) |
-| `ring_buffer`, 64-byte frame | 10.3–10.9 ns/op |
-| `ring_buffer`, 1 MiB frame | 47–56 µs (≈40 GB/s, memory bandwidth) |
-| Ring index, power-of-two capacity | 3.8–4.5 ns/op |
-| Ring index, non-power-of-two capacity | 5.0–6.4 ns/op |
+| `spsc_queue` push + pop, one thread | 4.0 ns/op |
+| `spsc_queue` push + pop, two threads | 9.3–13 ns/op (scheduler noise) |
+| `ring_buffer`, 64-byte frame | 9.0–10.9 ns/op |
+| `ring_buffer`, 1 MiB frame | 42–56 µs (≈40 GB/s, memory bandwidth) |
+| Ring index, power-of-two capacity | 3.0–4.5 ns/op |
+| Ring index, non-power-of-two capacity | 3.5–6.4 ns/op |
+| **`std::mutex` + `std::deque`, same pattern** | **15.6 ns/op** |
+
+The mutex row is the reason the lock-free form exists, but the size of the win is
+toolchain-dependent and worth stating precisely: on Windows the mutex path is 15.6
+ns/op against 4.0 (3.9x), while the same code on Linux measures 9.8 against 4.0
+(2.4x). Both are the *uncontended* case. The direction is the same on both; quoting
+only the Windows ratio would overstate what a Linux build gets.
 
 The index reduction is a mask when the capacity is a power of two and a remainder
 otherwise — about 30% on the index alone. A single-element queue operation is a store
 plus two atomic indices, so SIMD has nothing to widen there; a 1 MiB frame is already
 at memory bandwidth through `memcpy`, which uses the widest load/store available.
+
+### Where this queue is *not* used, and why
+
+`runtime::submit` and `push::hub` both queue from more than one thread: a server
+connection submits from whichever thread owns that connection, and the hub is fed by
+every publisher. Replacing those with an SPSC queue would be a correctness bug, not an
+optimisation — two producers would corrupt the indices that the whole design rests on.
+The measured 3.9x is therefore a reason to *reach for* this queue in a single-producer
+path, not a reason to force it where the producer is not single.
 
 ## Testing
 
@@ -173,6 +191,15 @@ for a wrong value:
 - channel: each direction independently, and a move that must not swap the ends;
 - async: a shard-thread wait that must park rather than block.
 
-Coverage of the platform-specific paths is uneven and stated rather than implied: the
-POSIX branch of `fs::shared_memory` has not been compiled on this host, and the
-memory-ordering argument needs a weakly-ordered CPU to be exercised.
+Two cases cross a boundary rather than a branch:
+
+- shared memory reads back through a **second process**: the test binary re-launches
+  itself as a peer, so a process-private mapping would fail instead of passing;
+- both platforms run the suite. On Linux (Ubuntu 24.04, g++ 13.3, the CI flags) the
+  POSIX `shm_open`/`ftruncate`/`shm_unlink` branch is compiled and exercised, and its
+  case reports 46 checks against 43 on Windows — the extra three are the
+  `remove_unlinks_the_name() == true` path, which only POSIX takes.
+
+Still not covered: the memory-ordering argument needs a weakly-ordered CPU to be
+exercised, and a real reader's event-loop wake through `poll_ready()` has no external
+poller to attach to in a test, so the tests poll `try_receive` instead.

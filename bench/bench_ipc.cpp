@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -205,6 +207,36 @@ void run_all_cases() {
             crpc_bench::record(name, "ns/op", ns / static_cast<double>(kOps));
             (void)seed;
         }
+    }
+
+    // --- The mutex-guarded baseline, for comparison ---------------------------
+    // `runtime::submit` pushes through a std::mutex + std::deque. Whether replacing
+    // that with the SPSC queue is worth anything depends on what the lock actually
+    // costs relative to the work around it, so the cost is measured rather than
+    // assumed. Uncontended and contended are both reported: a shard is submitted to
+    // from its own thread in the simple case and from connection threads when a
+    // server is busy.
+    {
+        constexpr std::uint64_t kOps = 2000000;
+        std::mutex m;
+        std::deque<std::uint64_t> q;
+        crpc_bench::measure(
+            "baseline/mutex-deque/push+pop/1thread", kOps, 5,
+            [&](std::size_t iterations) {
+                for (std::size_t i = 0; i < iterations; ++i) {
+                    {
+                        std::lock_guard<std::mutex> lk(m);
+                        q.push_back(i);
+                    }
+                    std::uint64_t out = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(m);
+                        out = q.front();
+                        q.pop_front();
+                    }
+                    (void)out;
+                }
+            });
     }
 }
 
