@@ -3,6 +3,7 @@ build/
 build-*/
 # Out-of-tree build root used by scripts/build.ps1 -BuildRoot
 .build/
+.build-*/
 out/
 cmake-build-*/
 CMakeCache.txt
