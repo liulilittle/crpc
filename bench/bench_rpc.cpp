@@ -463,12 +463,18 @@ void bench_multishard(crpc::inproc_backend& backend, std::size_t payload_bytes,
 //
 // These cases do not measure RPC. They measure the individual pieces the
 // throughput cases are made of, so the bottleneck can be named with numbers
-// instead of guessed: the per-call shared_ptr allocation, the per-connection
+// instead of guessed: the per-call state allocation, the per-connection
 // recursive mutex, the string codec, the issue-vs-wait split of a pipelined
 // call, and whether extra client threads scale with extra server shards.
 
+// The number below is what a call would cost if it allocated its state with
+// `make_shared`, which it does not: `call_state` objects come from a per-client
+// pool, and `test_client_facade_call_state_pool` asserts that a steady-state call
+// reaches the system allocator zero times. It is kept as the size of the prize the
+// pool is playing for, and the label now says so -- the earlier name read as
+// "this is the per-call cost" and was quoted that way.
 void bench_diag_alloc() {
-    crpc_bench::measure("diag/make_shared_call_state", 2'000'000, 7,
+    crpc_bench::measure("diag/unpooled_state_alloc_hypothetical", 2'000'000, 7,
                         [](std::size_t n) {
         for (std::size_t i = 0; i < n; ++i) {
             auto state =
