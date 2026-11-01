@@ -12,11 +12,9 @@
 - `begin()` reports `failed_precondition` when a transaction is already open, and `commit()` when there is none. `rollback()` on a clean connection is still a no-op: the pool asks `in_transaction()` first, but that answer is deliberately conservative (a failed attribute read counts as open), so a rollback can arrive at a connection with nothing to roll back, and a caller rolling back defensively should not have to ask first.
 - If ending the transaction fails, the connection is left in manual commit on purpose: setting autocommit back on while a transaction is active commits it, which after a failed rollback would persist exactly the work that was asked to be discarded. Left that way `in_transaction()` keeps answering true and the pool discards the session instead of reusing it.
 - A failed `SQLGetConnectAttr` counts as "in a transaction". The two mistakes are not symmetric: a spurious true costs one `SQLEndTran` that ends nothing, while a spurious false tells the pool the session is clean and hands the next borrower uncommitted work. This is the rule `mysql::connection` already follows for a stale status word.
-
 - ABI: no change. No public signature or data member moved; `run_simple` was internal to the translation unit.
 - Two boundaries are worth stating. First, `in_transaction()` observes the transactions this class started: a `BEGIN TRANSACTION` sent through `query()` is invisible, because it does not change the driver's commit mode. Second, when the server aborts a transaction by itself (`XACT_ABORT ON`, a deadlock victim, a batched error), `SQLEndTran` answers success even on a connection with no transaction to end, so `commit()` reports success while the work is gone. A successful `commit()` therefore means the driver ended whatever transaction it had; it does not mean the rows survived. The failing statement is what reports the abort, and a caller that ignores statement errors inside a transaction can silently lose the work done earlier in it.
-
-- Verified on both driver families the bridge can meet. Against SQL Server LocalDB through `ODBC Driver 17` (x64, `-DCRPC_WITH_ODBC=ON`): 12 cases, the four new ones green. Against the real 32-bit Access driver (x86 build, a Jet 4 `.mdb`): 12 cases, 85 checks, 0 failures -- including the three cases that are written in Jet dialect and therefore fail on SQL Server. The Access run is the one that matters most: Jet/ACE is what this bridge exists for, and a transaction model that only worked on SQL Server would have been the wrong fix.
+- Verified on both driver families the bridge can meet. Against SQL Server LocalDB through `ODBC Driver 17` (x64, `-DCRPC_WITH_ODBC=ON`): 13 cases, 76 checks, and the five transaction cases green -- the 13 failures are the three pre-existing cases written in Jet dialect, which cannot pass on SQL Server. Against the real 32-bit Access driver (x86 build, a Jet 4 `.mdb`): 13 cases, 97 checks, 0 failures, so the Jet-dialect cases pass there too. The Access run is the one that matters most: Jet/ACE is what this bridge exists for, and a transaction model that only worked on SQL Server would have been the wrong fix.
 
 ### MySQL: reset the session when a pooled connection is returned
 
@@ -296,7 +294,6 @@
   library symbol changed.
 - Impact: MINOR. New regression `tests/test_poll_recycle.cpp` (2 cases) covers
   both recycle windows; it fails 200/200 checks against the old shape.
-
 
 ### Error diagnostics
 

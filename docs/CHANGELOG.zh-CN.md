@@ -12,11 +12,9 @@
 - 已有事务时 `begin()` 返回 `failed_precondition`；没有事务时 `commit()` 同样。空连接上的 `rollback()` 仍是空操作：池会先问 `in_transaction()`，而这个答案被有意取得偏保守（读属性失败也算"开启"），所以回滚可能落到一个无事可回滚的连接上；防御性回滚的调用者也不该先问一遍。
 - 结束事务失败时，连接被有意留在手动提交状态：事务仍活跃时把自动提交打开会**提交**它，这在回滚失败之后就等于把要求丢弃的工作持久化。保持原状则 `in_transaction()` 继续返回 true，池会丢弃该会话而不是复用。
 - `SQLGetConnectAttr` 读失败按"事务已开启"处理。两个方向的错误不对称：多报一次 true 只多一次结束空事务的 `SQLEndTran`，而错报 false 会让池以为会话干净，把未提交的工作交给下一个借用者。这正是 `mysql::connection` 对陈旧状态字早已采用的法则。
-
 - ABI：无变更。没有公共签名或数据成员移动；`run_simple` 是编译单元内部的。
 - 有两条边界必须写明。其一，`in_transaction()` 只观测本类开启的事务：通过 `query()` 发出的 `BEGIN TRANSACTION` 不可见，因为它不改变驱动的提交模式。其二，当**服务器自行**中止事务（`XACT_ABORT ON`、死锁牺牲者、批量错误回滚）时，`SQLEndTran` 在根本没有事务可结束时同样返回成功，于是 `commit()` 报告成功，而工作已经没了。因此 `commit()` 成功只表示驱动结束了它手上的事务，**不表示数据还在**；中止由那条失败的语句本身报告，在事务里忽略语句错误再指望 `commit()` 兜底的调用方会静默丢掉此前的工作。
-
-- 已在桥接可能遇到的两族驱动上都验证过。SQL Server LocalDB + `ODBC Driver 17`（x64，`-DCRPC_WITH_ODBC=ON`）：12 条用例，新增的 4 条全绿。真实 32 位 Access 驱动（x86 构建 + Jet 4 `.mdb`）：12 条用例、85 项断言、0 失败 —— 包括那三条按 Jet 方言写、因此在 SQL Server 上必然失败的用例。Access 那一轮最关键：Jet/ACE 正是这个桥接存在的理由，只在 SQL Server 上成立的事务模型会是错误的修法。
+- 已在桥接可能遇到的两族驱动上都验证过。SQL Server LocalDB + `ODBC Driver 17`（x64，`-DCRPC_WITH_ODBC=ON`）：13 条用例、76 项断言，5 条事务用例全绿 —— 那 13 个失败全部来自三条按 Jet 方言写的既有用例，它们在 SQL Server 上本来就不可能通过。真实 32 位 Access 驱动（x86 构建 + Jet 4 `.mdb`）：13 条用例、97 项断言、0 失败，Jet 方言那三条在那里也通过。Access 那一轮最关键：Jet/ACE 正是这个桥接存在的理由，只在 SQL Server 上成立的事务模型会是错误的修法。
 
 ### MySQL：连接池归还连接时复位会话（`autocommit`）
 
@@ -188,7 +186,6 @@
 - `poll()` 与 `fail_all()` 不再快照裸 `call_slot*`。`then` 回调在完成锁内运行，且合法地可以销毁**兄弟**句柄——那会把兄弟的槽位还回池；预先收集的快照因此可能去 finish 一个已回收的槽位，把伪造的 `timed_out` 写进去（若该槽位已被重新获取，则写进一个全新的、从未发送的调用）。两者现在每轮只取一个仍存活的 victim 并立刻 finish。
 - `rpc::client::start_call` 新增尾部参数 `bool flush = true`。默认值保持文档化的「start_call 会发送」语义；`client_facade` 传 `false`，改在新 `flush_pending()` 里于连接槽位锁之外 flush，这正是让同步 inproc drain 安全的关键。源码兼容；模板在消费者侧实例化，库符号未变。
 - 影响：MINOR。新增回归 `tests/test_poll_recycle.cpp`（2 个 case）覆盖两个回收窗口；对旧形状 200/200 check 失败。
-
 
 ### 错误诊断
 
