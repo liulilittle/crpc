@@ -13,6 +13,7 @@
 
 #include "test_framework.hpp"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -79,6 +80,41 @@ void run_quietly(crpc::db::connection& session, std::string_view sql) {
     (void)ran;
 }
 
+// True when the connection is talking to Jet/ACE. The bridge exists for Access, but the
+// same suite has to run against whatever DSN the machine offers, and the two dialects
+// disagree on the type names for exactly the columns that carry the interesting cases:
+// a long text and a binary blob. Adapting the DDL by driver name is what lets one file
+// cover both instead of passing on one and failing on the other by construction.
+[[nodiscard]] bool is_jet(const crpc::db::odbc::connection& session) {
+    // SQL_DBMS_NAME for Jet comes back as "ACCESS" in capitals, so a case-sensitive
+    // search for "Access" silently answered "not Jet" and the DDL below used T-SQL type
+    // names on a Jet file -- the failure looked like a driver limitation rather than the
+    // missed comparison it was.
+    std::string name;
+    name.reserve(session.dbms_name().size());
+    for (const char c : session.dbms_name()) {
+        name.push_back(static_cast<char>(
+            std::toupper(static_cast<unsigned char>(c))));
+    }
+    return name.find("ACCESS") != std::string::npos;
+}
+
+// A long text column: Jet spells it MEMO, T-SQL has VARCHAR(MAX).
+[[nodiscard]] const char* long_text_type(const crpc::db::odbc::connection& session) {
+    return is_jet(session) ? "MEMO" : "VARCHAR(MAX)";
+}
+
+// A binary column: Jet spells it LONGBINARY, T-SQL has VARBINARY(MAX).
+[[nodiscard]] const char* long_binary_type(const crpc::db::odbc::connection& session) {
+    return is_jet(session) ? "LONGBINARY" : "VARBINARY(MAX)";
+}
+
+// A floating point column: Jet understands DOUBLE, T-SQL needs FLOAT (bare DOUBLE is a
+// syntax error there).
+[[nodiscard]] const char* double_type(const crpc::db::odbc::connection& session) {
+    return is_jet(session) ? "DOUBLE" : "FLOAT";
+}
+
 } // namespace
 
 CRPC_TEST(odbc_it_connects_and_reports_the_driver) {
@@ -113,7 +149,8 @@ CRPC_TEST(odbc_it_ddl_dml_and_typed_reads) {
             // `note` is a reserved word in Jet ("Syntax error in field definition"), so
               // the column is called `memo`. This is the driver's dialect, not a mistake to
               // paper over: nothing here rewrites SQL.
-            "CREATE TABLE crpc_odbc (id INTEGER, name VARCHAR(50), amount DOUBLE, extra VARCHAR(50))",
+            std::string("CREATE TABLE crpc_odbc (id INTEGER, name VARCHAR(50), amount ") +
+                double_type(*it.session) + ", extra VARCHAR(50))",
             {}, &out);
         crpc::db::statement_guard guard(out);
         if (!created) {
@@ -203,7 +240,9 @@ CRPC_TEST(odbc_it_long_text_is_not_truncated) {
     {
         crpc::db::result_set* out = nullptr;
         const crpc::status created = it.session->query(
-            "CREATE TABLE crpc_memo (id INTEGER, body MEMO)", {}, &out);
+            std::string("CREATE TABLE crpc_memo (id INTEGER, body ") +
+                long_text_type(*it.session) + ")",
+            {}, &out);
         crpc::db::statement_guard guard(out);
         if (!created) {
             report("create memo table", created.error());
@@ -329,7 +368,9 @@ CRPC_TEST(odbc_it_binary_with_embedded_nul_survives) {
     {
         crpc::db::result_set* out = nullptr;
         const crpc::status created = it.session->query(
-            "CREATE TABLE crpc_bin (id INTEGER, body LONGBINARY)", {}, &out);
+            std::string("CREATE TABLE crpc_bin (id INTEGER, body ") +
+                long_binary_type(*it.session) + ")",
+            {}, &out);
         crpc::db::statement_guard guard(out);
         if (!created) {
             report("create binary table", created.error());
