@@ -512,6 +512,16 @@ CRPC_TEST(astar_large_open_area_stays_fast) {
     const std::size_t start = w.index(0, 0);
     const std::size_t goal = w.index(k_size - 1, k_size - 1);
 
+    // A node budget, not a clock. Corner-to-corner on an open board is the case where
+    // every node in the rectangle has the same f, so this search really does expand
+    // about 40000 of the 40000 cells -- measured, and the reason no tighter count is
+    // possible here. What the budget still catches is a search that revisits nodes
+    // instead of closing them, which costs a multiple of the board rather than being
+    // 10% slower. A per-node slowdown remains invisible; that is the gap the bench
+    // covers now (plan.md D3/R1).
+    crpc::algorithm::astar_config config;
+    config.max_expanded = 60000;
+
     const auto result = crpc::algorithm::astar_path<std::size_t>(
         start, goal,
         [&](std::size_t n, std::vector<std::size_t>& out) {
@@ -521,7 +531,8 @@ CRPC_TEST(astar_large_open_area_stays_fast) {
         [&](std::size_t n, std::size_t g) {
             return static_cast<double>(crpc::algorithm::manhattan_distance(
                 w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g)));
-        });
+        },
+        config);
     CRPC_CHECK(result.ok());
     if (result.ok()) {
         CRPC_CHECK_EQ(start, result.value().front());
@@ -541,6 +552,14 @@ CRPC_TEST(astar_8_connected_open_area_stays_fast) {
     const std::size_t start = w.index(0, 0);
     const std::size_t goal = w.index(k_size - 1, k_size - 1);
 
+    // Same node budget as the 4-connected case, for the same reason: it catches a
+    // search that re-expands instead of closing, which costs a multiple of the board.
+    // No tighter bound is claimed -- with an exact heuristic on an open board the
+    // equal-cost ties make the expansion count a property of the tie-break, and the
+    // number was not measured for this shape (unlike the 4-connected case above).
+    crpc::algorithm::astar_config config;
+    config.max_expanded = 60000;
+
     const auto result = crpc::algorithm::astar_path<std::size_t>(
         start, goal,
         [&](std::size_t n, std::vector<std::size_t>& out) {
@@ -550,7 +569,8 @@ CRPC_TEST(astar_8_connected_open_area_stays_fast) {
         [&](std::size_t n, std::size_t g) {
             return crpc::algorithm::octile_distance(
                 w.cell_x(n), w.cell_y(n), w.cell_x(g), w.cell_y(g));
-        });
+        },
+        config);
     CRPC_CHECK(result.ok());
     if (result.ok()) {
         CRPC_CHECK_EQ(start, result.value().front());
