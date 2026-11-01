@@ -11,6 +11,8 @@
 
 #include <crpc/db/memory_result_set.hpp>
 
+#include "transaction_state.hpp"
+
 #if defined(CRPC_HAVE_ODBC)
 #include <windows.h>
 
@@ -155,18 +157,16 @@ struct diagnostic {
 // question directly. Reading it instead of remembering a flag is what keeps the answer
 // from drifting away from the connection the pool is about to hand to someone else.
 //
-// A failed read answers true. The two mistakes are not symmetric: a spurious true costs
-// one `SQLEndTran` that ends nothing, while a spurious false tells the pool the session is
-// clean and hands the next borrower a transaction with uncommitted work in it. This is the
-// same rule the MySQL adapter applies to a stale status word (see
-// `include/crpc/db/mysql/connection.hpp`), and the reason `rollback()` below tolerates a
-// connection with nothing to roll back.
+// The decision for an unreadable attribute lives in `transaction_state_from_attr`, which
+// is a pure function so a test can pin the direction: a failed read answers "open", for
+// the reason given there. This is the same rule the MySQL adapter applies to a stale
+// status word (see `include/crpc/db/mysql/connection.hpp`), and the reason `rollback()`
+// below tolerates a connection with nothing to roll back.
 [[nodiscard]] bool manual_commit(SQLHDBC dbc) noexcept {
     SQLUINTEGER mode = SQL_AUTOCOMMIT_ON;
-    if (!SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, 0, nullptr))) {
-        return true;
-    }
-    return mode == SQL_AUTOCOMMIT_OFF;
+    const bool read_ok =
+        SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, 0, nullptr));
+    return detail::transaction_state_from_attr(read_ok, mode == SQL_AUTOCOMMIT_OFF);
 }
 
 // The value ODBC needs for one parameter, kept alive until the statement is executed.

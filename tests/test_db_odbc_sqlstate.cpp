@@ -9,6 +9,8 @@
 #include <crpc/db/odbc/connection.hpp>
 #include <crpc/error.hpp>
 
+#include "../src/db/odbc/transaction_state.hpp"
+
 namespace {
 
 [[nodiscard]] crpc::rpc_code classify(std::string_view sqlstate) {
@@ -102,6 +104,22 @@ CRPC_TEST(odbc_bridge_reports_whether_it_is_available) {
         CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
                       static_cast<int>(session.connect_error().code));
     }
+}
+
+// `manual_commit()` answering the wrong way on a failed read is not a small mistake: that
+// answer is what `db::pool` consults before reusing a session, so "not in a transaction"
+// for an unreadable connection hands the next borrower uncommitted work. The direction was
+// written backwards once, and no test noticed -- an ODBC driver that refuses to report its
+// commit mode cannot be asked for on demand, so the branch was unreachable from the
+// integration cases. The predicate is kept apart from the driver call for exactly this
+// reason, and all four rows are asserted rather than only the failure one, because a
+// function that always answered true would pass a one-row test.
+CRPC_TEST(sqlstate_unreadable_commit_mode_counts_as_a_transaction) {
+    using crpc::db::odbc::detail::transaction_state_from_attr;
+    CRPC_CHECK(transaction_state_from_attr(false, false)); // read failed: assume open
+    CRPC_CHECK(transaction_state_from_attr(false, true));  // read failed: assume open
+    CRPC_CHECK(transaction_state_from_attr(true, true));   // manual commit: open
+    CRPC_CHECK_FALSE(transaction_state_from_attr(true, false)); // autocommit: clean
 }
 
 CRPC_TEST_MAIN()

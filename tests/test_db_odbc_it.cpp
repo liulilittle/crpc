@@ -663,6 +663,11 @@ CRPC_TEST(odbc_it_pool_rolls_back_a_session_borrowed_dirty) {
     settings.max_idle = 1;
     // The ping round trip proves nothing here; this keeps the case about reuse.
     settings.validate_on_borrow = false;
+    // Both timers would retire the idle connection between the two leases if the machine
+    // stalled, and `opened()+1` would then read +2 for a reason that has nothing to do
+    // with the defect. Zero disables them (pool.cpp: expired()).
+    settings.idle_timeout = std::chrono::nanoseconds{0};
+    settings.max_lifetime = std::chrono::nanoseconds{0};
     crpc::db::pool sessions(settings, factory);
 
     const auto opened_before = sessions.opened();
