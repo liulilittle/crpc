@@ -226,4 +226,61 @@ CRPC_TEST(ring_survives_a_thread_handoff_in_order) {
     CRPC_CHECK(in_order);
 }
 
+// The index reduction has two paths: a mask for power-of-two capacities and a
+// remainder for everything else. Only the mask path can be wrong in a way that a
+// power-of-two test misses -- an off-by-one in the mask (`& capacity` instead of
+// `& (capacity - 1)`) reads slot `capacity`, which is outside the buffer, and with
+// the counters below capacity that index never comes up. So the two paths are
+// driven to the same cursor values and required to agree; that is the property, not
+// "both happened to work on the capacities this file used before".
+CRPC_TEST(ring_mask_and_modulo_paths_agree_at_every_index) {
+    // A write immediately followed by a read keeps both cursors equal, and equal
+    // cursors make `% cap` and `& (cap - 1)` agree for every value -- which is why
+    // the first version of this case could not tell the two paths apart. The ring is
+    // therefore kept partly full: seed it, then write and read one byte at a time, so
+    // the cursors stay offset by the fill level and every low-bit pattern of the
+    // cursor is visited while the slots still have to line up.
+    //
+    // The value that comes out is the oldest queued byte, not the one just written:
+    // the queue is FIFO, so the expectation is a small model of the ring rather than
+    // "the marker must come back".
+    for (const std::size_t cap : {std::size_t{8}, std::size_t{7},
+                                  std::size_t{16}, std::size_t{15}}) {
+        for (std::size_t fill = 1; fill < cap; ++fill) {
+            region r(cap);
+            // Model: the bytes currently queued, oldest first.
+            std::vector<std::byte> model;
+            for (std::size_t i = 0; i < fill; ++i) {
+                const std::byte b{static_cast<unsigned char>(0x40 + (i & 0x3F))};
+                model.push_back(b);
+                CRPC_CHECK(r.producer.try_write(span<const std::byte>(&b, 1)));
+            }
+            const std::size_t rounds = cap * 3 + 5;
+            for (std::size_t i = 0; i < rounds; ++i) {
+                const std::byte marker{static_cast<unsigned char>(i & 0xFF)};
+                CRPC_CHECK(r.producer.try_write(span<const std::byte>(&marker, 1)));
+                model.push_back(marker);
+                std::byte out{};
+                CRPC_CHECK_EQ(static_cast<std::size_t>(1),
+                              r.consumer.try_read(span<std::byte>(&out, 1)));
+                // FIFO: the byte read must be the oldest one still queued.
+                CRPC_CHECK_EQ(static_cast<unsigned char>(model.front()),
+                              static_cast<unsigned char>(out));
+                model.erase(model.begin());
+            }
+            // Drain what is left and keep checking the same model.
+            std::byte out{};
+            while (r.consumer.try_read(span<std::byte>(&out, 1)) == 1) {
+                CRPC_CHECK_FALSE(model.empty());
+                if (!model.empty()) {
+                    CRPC_CHECK_EQ(static_cast<unsigned char>(model.front()),
+                                  static_cast<unsigned char>(out));
+                    model.erase(model.begin());
+                }
+            }
+            CRPC_CHECK(model.empty());
+        }
+    }
+}
+
 CRPC_TEST_MAIN()

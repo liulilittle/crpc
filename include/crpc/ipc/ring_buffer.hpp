@@ -70,6 +70,25 @@ struct ring_control {
 // usual content of a fresh mapping -- does not pass the check.
 inline constexpr std::uint64_t ring_magic = 0x4352504352494E31ull; // "CRPCRIN1"
 
+// Index reduction for the hot paths. `% capacity` compiles to a 64-bit division,
+// which costs tens of cycles; a power-of-two capacity turns it into a mask. The
+// capacity is a runtime value, so both forms are kept and the branch is inside the
+// caller -- the branch predicts perfectly because capacity never changes.
+[[nodiscard]] inline std::size_t ring_index(std::uint64_t cursor,
+                                            std::size_t capacity,
+                                            bool power_of_two) noexcept {
+    if (power_of_two) {
+        return static_cast<std::size_t>(cursor & (capacity - 1));
+    }
+    return static_cast<std::size_t>(cursor % capacity);
+}
+
+// True when `n` is a power of two and not zero. Zero would make the mask above read
+// every slot as index 0.
+[[nodiscard]] constexpr bool is_power_of_two(std::size_t n) noexcept {
+    return n != 0 && (n & (n - 1)) == 0;
+}
+
 // Bytes that a caller must reserve before the payload.
 inline constexpr std::size_t ring_control_size = sizeof(ring_control);
 
@@ -121,6 +140,12 @@ public:
         return control_ != nullptr ? static_cast<std::size_t>(control_->capacity) : 0;
     }
 
+    // Whether `capacity()` is a power of two, computed once per call site below.
+    // Kept as a member rather than recomputed because the hot paths index twice.
+    [[nodiscard]] bool power_of_two_capacity() const noexcept {
+        return is_power_of_two(capacity());
+    }
+
     // Bytes currently queued. Computed from the two counters, so it is a snapshot:
     // a caller that needs it to be exact must be the only party touching that
     // direction.
@@ -161,7 +186,7 @@ public:
         if (static_cast<std::size_t>(write - read) + data.size() > cap) {
             return false;
         }
-        const std::size_t offset = static_cast<std::size_t>(write % cap);
+        const std::size_t offset = ring_index(write, cap, is_power_of_two(cap));
         const std::size_t first = cap - offset;
         if (data.size() <= first) {
             if (!data.empty()) {
@@ -198,7 +223,7 @@ public:
             return 0;
         }
         const std::size_t take = out.size() < available ? out.size() : available;
-        const std::size_t offset = static_cast<std::size_t>(read % cap);
+        const std::size_t offset = ring_index(read, cap, is_power_of_two(cap));
         const std::size_t first = cap - offset;
         if (take <= first) {
             std::memcpy(out.data(), payload_.data() + offset, take);
@@ -224,7 +249,7 @@ public:
         const std::uint64_t write = control_->write.load(std::memory_order_acquire);
         const std::uint64_t read = control_->read.load(std::memory_order_relaxed);
         const std::size_t available = static_cast<std::size_t>(write - read);
-        const std::size_t offset = static_cast<std::size_t>(read % cap);
+        const std::size_t offset = ring_index(read, cap, is_power_of_two(cap));
         const std::size_t run = cap - offset;
         return available < run ? available : run;
     }
