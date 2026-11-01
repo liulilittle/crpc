@@ -139,9 +139,10 @@ auto rows = crpc::db::read_all<order_row>(*result_set);
 这个干净状态刻意**不等于**服务端的全局默认值：以 `--autocommit=0` 启动的服务端
 会把同样的陷阱交给下一个借用者。注意归一化发生在**归还**时而非打开时：一条连接的
 **第一个**租约仍在服务端给出的默认值下运行，只有它归还时才把会话置入干净状态。
-无法复位会话的连接会被关闭，而不是被复用。目前**只有 MySQL** 实现该复位；
-没有会话状态的后端复位零成本。MySQL 仅在会话尚未处于该状态时才发送一次
-`SET autocommit=1`。
+无法复位会话的连接会被关闭，而不是被复用。需要显式复位的是 MySQL：`ROLLBACK` 会留下
+`autocommit=0`，所以它发送一次 `SET autocommit=1`，且仅在会话尚未处于该状态时才发。
+而 `rollback()` 本身就能把整个会话恢复干净的后端保持默认实现、零成本——ODBC 桥在
+`rollback()` 里结束事务并回到自动提交，已经无事可复位。
 
 ## 限制
 
@@ -231,7 +232,16 @@ if (!session->is_open()) {
   `commit()` 与 `rollback()` 用 `SQLEndTran` 结束事务再恢复自动提交，`in_transaction()` 从驱动读回提交模式。
   直接发 `BEGIN TRANSACTION` 对某些驱动可用、对另一些不可用，而且连接状态会变成本地猜测——这很重要，
   因为池在把会话交给下一个借用者之前要问 `in_transaction()`。`close()` 在断开前先回滚未结束的事务：
-  驱动不允许从事务中直接断开，残留的会话会一直持锁到超时。
+  驱动不允许从事务中直接断开，残留的会话会一直持锁到超时。这次回滚是**尽力而为**：
+  若它失败，对象销毁后该会话可能仍持锁，这里没有手段强制驱动放手；
+* 只观测由它自己开启的事务。通过 `query()` 发出的 `BEGIN TRANSACTION` 不改变驱动的
+  提交模式，因此 `in_transaction()` 仍返回 false，池会带着那个未结束的事务把会话交出去。
+  请用 `begin()`。（这不是 Jet 的问题：Jet 直接拒绝文本 `BEGIN TRANSACTION`，旧适配器在
+  Access 上根本无法开启事务。）
+* `commit()` 成功只等于 `SQLEndTran` 成功，不等于“数据还在”。当**服务器自行**中止事务
+  ——死锁牺牲者、`XACT_ABORT ON`、批量错误回滚——该事务此前的工作已经没了，而
+  `SQLEndTran` 因为已无事务可结束仍返回成功。中止由那条失败的语句报告；不要在事务里
+  忽略语句错误、指望 `commit()` 替你发现。
 
 用真实 32 位 Access 驱动跑出来的两个事实：
 
@@ -242,6 +252,20 @@ if (!session->is_open()) {
 
 `list_drivers()` 报告本机有哪些驱动 —— “Access 驱动没装”比任何错误消息都更能解释连接失败。
 注意 Access 驱动只有 32 位：64 位进程用不了它，所以集成用例必须用 32 位构建运行。
+
+实际做法（构建脚本没有 ODBC 开关）：
+
+```
+call vcvars32.bat
+cmake -S . -B .build-x86odbc/build/x86-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug ^
+      -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON -DCRPC_WITH_ODBC=ON ^
+      -DCRPC_RTTI_DIR=<rtti> -DCRPC_COROCC_DIR=<corocc> -DCRPC_BUILD_SHARED=OFF
+ninja -C .build-x86odbc/build/x86-Debug crpc_test_db_odbc_it
+set CRPC_ODBC_IT=1
+set CRPC_ODBC_CONNECTION=Driver={Microsoft Access Driver (*.mdb)};Dbq=C:\path\app.mdb;
+```
+
+一个空的 `.mdb` 就够：套件自己建表、自己删表；没装 Access 也能用 32 位 PowerShell 的 `ADOX.Catalog` 创建。不要把套件指向 `127.0.0.1:1433` 以为那是 SQL Server：装了 WSL 的机器上该端口常常是 WSL 中继，驱动会回 `Cannot generate SSPI context` 而不是任何有用信息。
 
 ## MongoDB
 

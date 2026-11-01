@@ -78,6 +78,20 @@ struct connection_options {
 // one dialect among many, and the connection's state would be a local guess rather than
 // something the driver reports. A driver that refuses manual commit reports its own error
 // through `last_sqlstate()`.
+//
+// The scope of that state is the one this class controls: a transaction started with
+// `begin()`. A `BEGIN TRANSACTION` sent through `query()` is invisible here, because the
+// driver's commit mode does not change, so `in_transaction()` will keep answering false
+// and the pool will treat the session as clean. Start transactions with `begin()`.
+//
+// One consequence of the manual-commit model is worth stating: when the *server* aborts a
+// transaction on its own (a deadlock victim, `XACT_ABORT ON`, a batched error that rolls
+// back), the work done earlier in that transaction is gone, and `SQLEndTran` answers
+// success anyway -- it succeeds on a connection with no transaction to end. So `commit()`
+// reports success, while the rows are not there. A successful `commit()` means the driver
+// ended whatever transaction it had; it does not mean the data survived. The statement
+// that caused the abort is what reports it, so treat a failed statement inside a
+// transaction as possibly ending it rather than trusting the final `commit()`.
 class CRPC_API connection final : public db::connection {
 public:
     // Connects with `options`. On failure the driver's SQLSTATE and message are in

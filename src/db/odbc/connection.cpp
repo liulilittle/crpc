@@ -153,13 +153,20 @@ struct diagnostic {
 // thing every driver agrees on. In manual commit ODBC itself opens a transaction at the
 // first statement and keeps it open until `SQLEndTran`, so this attribute answers the
 // question directly. Reading it instead of remembering a flag is what keeps the answer
-// from drifting away from the connection the pool is about to hand to someone else. A
-// read failure is reported as "not in a transaction", the direction whose worst case is
-// an unused rollback rather than discarded work.
-[[nodiscard]] bool manual_commit(SQLHDBC dbc) {
+// from drifting away from the connection the pool is about to hand to someone else.
+//
+// A failed read answers true. The two mistakes are not symmetric: a spurious true costs
+// one `SQLEndTran` that ends nothing, while a spurious false tells the pool the session is
+// clean and hands the next borrower a transaction with uncommitted work in it. This is the
+// same rule the MySQL adapter applies to a stale status word (see
+// `include/crpc/db/mysql/connection.hpp`), and the reason `rollback()` below tolerates a
+// connection with nothing to roll back.
+[[nodiscard]] bool manual_commit(SQLHDBC dbc) noexcept {
     SQLUINTEGER mode = SQL_AUTOCOMMIT_ON;
-    const SQLRETURN got = SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, 0, nullptr);
-    return SQL_SUCCEEDED(got) && mode == SQL_AUTOCOMMIT_OFF;
+    if (!SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, 0, nullptr))) {
+        return true;
+    }
+    return mode == SQL_AUTOCOMMIT_OFF;
 }
 
 // The value ODBC needs for one parameter, kept alive until the statement is executed.
@@ -480,10 +487,11 @@ status connection::rollback() {
     if (!impl_->open) {
         return status{rpc_code::shutting_down, "the connection is closed"};
     }
-    // Rolling back nothing is not an error: the pool calls this unconditionally on a
-    // session it is retiring, and a caller that rolls back defensively should not have to
-    // ask first. `commit` is the stricter one because losing work is the failure mode
-    // there.
+    // Rolling back nothing is not an error. The pool asks `in_transaction()` first, but
+    // that answer is deliberately conservative -- a failed attribute read counts as "open"
+    // -- so this can be called on a connection that has nothing to roll back, and a caller
+    // rolling back defensively should not have to ask first. `commit` is the stricter one
+    // because losing work is the failure mode there.
     if (!manual_commit(impl_->dbc)) {
         return status{};
     }

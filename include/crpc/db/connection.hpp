@@ -152,8 +152,14 @@ public:
     // out, so it must be a round trip the server answers cheaply (`SELECT 1`).
     [[nodiscard]] virtual status ping() = 0;
 
-    // True while a transaction is open on this connection. The pool consults it
-    // before returning the connection to the idle set (P3).
+    // True while a transaction this connection started is still open. The pool consults
+    // it before returning the connection to the idle set (P3).
+    //
+    // A backend that can only observe transactions it opened itself reports nothing for
+    // one started with raw SQL; the contract is scoped to `begin()`. Where the answer has
+    // to be a guess it must guess "open": a spurious true costs one rollback that ends
+    // nothing, while a spurious false hands the next borrower a transaction full of
+    // uncommitted work.
     [[nodiscard]] virtual bool in_transaction() const noexcept = 0;
 
     [[nodiscard]] virtual status begin() = 0;

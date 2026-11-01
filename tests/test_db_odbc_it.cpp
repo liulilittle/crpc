@@ -72,7 +72,7 @@ struct it_session {
 
 // Runs a statement whose result does not matter, freeing whatever came back. `DROP TABLE`
 // on a missing table is the reason this exists: the failure is expected.
-void run_quietly(crpc::db::odbc::connection& session, std::string_view sql) {
+void run_quietly(crpc::db::connection& session, std::string_view sql) {
     crpc::db::result_set* out = nullptr;
     const crpc::status ran = session.query(sql, {}, &out);
     crpc::db::statement_guard guard(out);
@@ -474,7 +474,7 @@ CRPC_TEST(odbc_it_lists_drivers) {
 
 // Counts the rows of a table the caller created. Used to tell a real rollback from a
 // transaction flag that merely reports itself closed.
-[[nodiscard]] std::int64_t count_rows(crpc::db::odbc::connection& session, const char* table) {
+[[nodiscard]] std::int64_t count_rows(crpc::db::connection& session, const char* table) {
     crpc::db::result_set* out = nullptr;
     const std::string sql = std::string("SELECT COUNT(*) FROM ") + table;
     const crpc::status selected = session.query(sql, {}, &out);
@@ -486,7 +486,7 @@ CRPC_TEST(odbc_it_lists_drivers) {
     return value ? value.value() : -1;
 }
 
-void insert_one(crpc::db::odbc::connection& session, std::int64_t id) {
+void insert_one(crpc::db::connection& session, std::int64_t id) {
     crpc::db::parameter params[1] = {crpc::db::parameter::from_int64(id)};
     crpc::db::result_set* out = nullptr;
     const crpc::status inserted = session.query(
@@ -499,7 +499,7 @@ void insert_one(crpc::db::odbc::connection& session, std::int64_t id) {
     }
 }
 
-void create_txn_table(crpc::db::odbc::connection& session) {
+void create_txn_table(crpc::db::connection& session) {
     run_quietly(session, "DROP TABLE crpc_txn");
     crpc::db::result_set* out = nullptr;
     const crpc::status created =
@@ -633,6 +633,82 @@ CRPC_TEST(odbc_it_close_rolls_back_an_open_transaction) {
     }
     CRPC_CHECK_EQ(std::int64_t{0}, count_rows(*reopened.session, "crpc_txn"));
     run_quietly(*reopened.session, "DROP TABLE crpc_txn");
+}
+
+// The defect this exists for was in the pool, not in the connection: `prepare_for_reuse`
+// asks `in_transaction()` and relies on the answer. Testing only the connection leaves the
+// consumer -- the line that actually decides whether a dirty session is handed on --
+// untested, and a change that returns the right flag while the pool ignores it would stay
+// green. So this drives the whole loop: borrow, leave a transaction open, release, borrow
+// again, and read what the second borrower can see.
+CRPC_TEST(odbc_it_pool_rolls_back_a_session_borrowed_dirty) {
+    (void)require_bridge();
+    {
+        it_session setup;
+        if (!setup.ok()) {
+            CRPC_CHECK(setup.ok());
+            return;
+        }
+        create_txn_table(*setup.session);
+    }
+
+    crpc::db::odbc::connection_options options;
+    options.connection_string = env_or("CRPC_ODBC_CONNECTION", "");
+    options.login_timeout_seconds = 15;
+    crpc::db::odbc::connection_factory factory(std::move(options));
+
+    crpc::db::pool_options settings;
+    settings.min_size = 0;
+    settings.max_size = 1;
+    settings.max_idle = 1;
+    // The ping round trip proves nothing here; this keeps the case about reuse.
+    settings.validate_on_borrow = false;
+    crpc::db::pool sessions(settings, factory);
+
+    const auto opened_before = sessions.opened();
+    {
+        auto lease = sessions.acquire();
+        if (!lease) {
+            report("acquire", lease.error());
+        }
+        CRPC_CHECK(static_cast<bool>(lease));
+        if (!lease) {
+            return;
+        }
+        crpc::db::connection* session = lease.value().get();
+        CRPC_CHECK(session != nullptr);
+        if (session == nullptr) {
+            return;
+        }
+        CRPC_CHECK(static_cast<bool>(session->begin()));
+        insert_one(*session, 1);
+        CRPC_CHECK_EQ(std::int64_t{1}, count_rows(*session, "crpc_txn"));
+        CRPC_CHECK(session->in_transaction());
+        // Dropped with the transaction still open and nothing committed.
+    }
+    {
+        auto lease = sessions.acquire();
+        if (!lease) {
+            report("acquire after release", lease.error());
+        }
+        CRPC_CHECK(static_cast<bool>(lease));
+        if (!lease) {
+            return;
+        }
+        crpc::db::connection* session = lease.value().get();
+        CRPC_CHECK(session != nullptr);
+        if (session == nullptr) {
+            return;
+        }
+        // Zero, not one: the release rolled the abandoned transaction back before the
+        // connection went back to the idle set.
+        CRPC_CHECK_EQ(std::int64_t{0}, count_rows(*session, "crpc_txn"));
+        CRPC_CHECK_FALSE(session->in_transaction());
+        // And it was the same connection, so this really did exercise the reuse path
+        // rather than a fresh open that would have looked clean either way.
+        CRPC_CHECK_EQ(opened_before + 1, sessions.opened());
+        run_quietly(*session, "DROP TABLE crpc_txn");
+    }
 }
 
 CRPC_TEST_MAIN()

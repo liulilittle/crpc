@@ -160,9 +160,11 @@ started with `--autocommit=0` would hand the next borrower the same trap. Note t
 normalisation happens on return, not on open: the very first lease of a connection
 still runs under whatever default the server gave it, and only its release puts the
 session into the clean state. A connection whose session cannot be reset is closed
-rather than reused. Only MySQL implements the reset today; a backend with no session
-state resets for free. MySQL sends one `SET autocommit=1` only when the session is
-not already at that state.
+rather than reused. MySQL is the backend that needs an explicit reset -- `ROLLBACK`
+leaves `autocommit=0` behind, so it sends one `SET autocommit=1`, and only when the
+session is not already there. A backend whose `rollback()` restores the whole session
+keeps the default and costs nothing: the ODBC bridge ends the transaction and returns
+the connection to autocommit, so there is nothing left to reset.
 
 ## Limits
 
@@ -275,7 +277,19 @@ What the bridge does:
   `in_transaction()` before handing a session to the next borrower. `close()` rolls an open
   transaction back before disconnecting: a driver refuses to disconnect out of an
   outstanding transaction, and the session that survives holds its locks until it times
-  out.
+  out. That rollback is best effort: if it fails, the session may still be holding its
+  locks after the object is gone, and nothing here can force the driver to let go.
+* observes the transactions it started. A `BEGIN TRANSACTION` sent through `query()`
+  does not change the driver's commit mode, so `in_transaction()` keeps answering false
+  and the pool will hand the session on with that transaction still open. Use `begin()`.
+  (This is not a Jet concern: Jet rejects a text `BEGIN TRANSACTION` outright, so the
+  old adapter could not start a transaction on Access at all.)
+* reports `commit()` success as `SQLEndTran` success, not as "the rows are there". When
+  the server aborts a transaction by itself -- a deadlock victim, `XACT_ABORT ON`, a
+  batched error that rolls back -- the earlier work in that transaction is gone, and
+  `SQLEndTran` still answers success because there is no transaction left to end. The
+  statement that failed is what reports the abort; do not ignore statement errors
+  inside a transaction and wait for `commit()` to catch them.
 
 Two driver facts found by running against a real 32-bit Access driver:
 
@@ -291,6 +305,24 @@ Two driver facts found by running against a real 32-bit Access driver:
 installed" explains a connection failure better than any error message. Note that the
 Access driver is 32-bit only: a 64-bit process cannot use it, which is why the integration
 case must run against a 32-bit build.
+
+The way that was actually done, since the build script has no ODBC switch:
+
+```
+call vcvars32.bat
+cmake -S . -B .build-x86odbc/build/x86-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug ^
+      -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON -DCRPC_WITH_ODBC=ON ^
+      -DCRPC_RTTI_DIR=<rtti> -DCRPC_COROCC_DIR=<corocc> -DCRPC_BUILD_SHARED=OFF
+ninja -C .build-x86odbc/build/x86-Debug crpc_test_db_odbc_it
+set CRPC_ODBC_IT=1
+set CRPC_ODBC_CONNECTION=Driver={Microsoft Access Driver (*.mdb)};Dbq=C:\path\app.mdb;
+```
+
+An empty `.mdb` is enough for the suite to create and drop its own tables; `ADOX.Catalog`
+creates one from 32-bit PowerShell without Access installed. Do not point the suite at
+`127.0.0.1:1433` expecting SQL Server: on a machine with WSL that port is often the WSL
+relay, and the driver answers `Cannot generate SSPI context` rather than anything
+informative.
 
 ## MongoDB
 
