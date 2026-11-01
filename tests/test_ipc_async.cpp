@@ -48,12 +48,6 @@ void put(channel& c, std::string_view text) {
     CRPC_CHECK(c.try_send(span<const std::byte>(bytes, text.size())));
 }
 
-std::string take(channel& c, std::size_t n) {
-    std::vector<std::byte> out(n);
-    const std::size_t got = c.try_receive(span<std::byte>(out.data(), out.size()));
-    return std::string(reinterpret_cast<const char*>(out.data()), got);
-}
-
 } // namespace
 
 CRPC_TEST(ipc_async_try_forms_never_wait) {
