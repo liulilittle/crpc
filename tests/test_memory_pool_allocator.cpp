@@ -110,11 +110,14 @@ CRPC_TEST(pa_allocator_equality_follows_the_arena) {
     CRPC_CHECK_FALSE(a1 != a2);
 
     pa<int> a4;
-    pa<int> a5;
-    CRPC_CHECK(a4 == a4);               // a copy shares its own arena
+    // A copy must share its own arena. This compared `a4` with itself and left `a5`
+    // unused, so the property named in the comment was never exercised: `a4 == a4` is
+    // reflexive for any equality operator that is not outright broken, and it cannot
+    // fail if the copy constructor hands out a fresh arena.
+    pa<int> a5(a4);
+    CRPC_CHECK(a4 == a5);
     CRPC_CHECK_FALSE(a1 == a4);         // borrowed != default-owned
     CRPC_CHECK(a1 != a4);
-    (void)a5;
 }
 
 CRPC_TEST(pa_vector_reuse_after_arena_reset) {
