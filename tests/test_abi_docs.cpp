@@ -1348,7 +1348,7 @@ CRPC_TEST(abi_rpc_client_size_probe_matches_consumer) {
 // caller, not to resist forgery, and closing it would mean resolving the receiver's
 // type here -- a compiler's job, done worse. What makes the limit acceptable is that
 // the forgery does not produce a green result: the behavioural assertion in
-// redis_lock_watchdog_renews_past_one_ttl (`count_of(executor.executed, "EVAL") >= 2`)
+// redis_lock_watchdog_renews_past_one_ttl (`executor.executed_count("EVAL") >= 2`)
 // fails the moment the real call disappears, and no amount of naming can fake a
 // renewal command. A guard is acceptable when being fooled still leaves the suite
 // red, not when it is unbreakable.
