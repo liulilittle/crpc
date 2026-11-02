@@ -293,7 +293,10 @@ CRPC_TEST(shared_link_public_surface) {
     serialized_response.reason = "No Content";
     wire.clear();
     CRPC_CHECK(crpc::http::serialize(serialized_response, wire).ok());
-    CRPC_CHECK(wire.find("204") != std::string::npos);
+    // The status line, not the digits anywhere in the message: a 204 carries no
+    // body, but the serializer could still print "1204" somewhere and satisfy a
+    // bare substring test.
+    CRPC_CHECK(wire.find("HTTP/1.1 204") != std::string::npos);
 
     std::string out;
     crpc::http::chunked_encoder encoder;

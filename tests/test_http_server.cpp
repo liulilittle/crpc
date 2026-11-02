@@ -183,6 +183,51 @@ std::string http1(std::string_view method, std::string_view path,
     return out;
 }
 
+// True when `wire` contains the HTTP/1.1 status line for `code`, i.e. the
+// digits appear where a status code belongs (`HTTP/1.1 400 Bad Request`,
+// `HTTP/1.1 404`), not merely somewhere in the bytes.
+//
+// The status assertions used to be `find("400") != npos`, which matches any
+// occurrence: a body, a header value (`Content-Length: 1400`), a Date, or the
+// tail of a longer code. Two consequences, both real: a response that did not
+// carry the expected status could still pass, and a genuine timeout produced a
+// failure that said only "the substring never appeared" -- which cannot
+// distinguish "the server answered something else" from "the server answered
+// nothing yet".
+[[nodiscard]] bool has_status(std::string_view wire, int code) {
+    const std::string status = "HTTP/1.1 " + std::to_string(code);
+    std::size_t pos = 0;
+    while ((pos = wire.find(status, pos)) != std::string_view::npos) {
+        const std::size_t after = pos + status.size();
+        // The code must end here: `HTTP/1.1 40` must not match `HTTP/1.1 400`.
+        // A status line is followed by a space and a reason phrase (which may be
+        // empty) or by CRLF, so anything other than a digit is acceptable.
+        if (after >= wire.size()) {
+            return true;
+        }
+        const char next = wire[after];
+        if (next != '0' && next != '1' && next != '2' && next != '3' &&
+            next != '4' && next != '5' && next != '6' && next != '7' &&
+            next != '8' && next != '9') {
+            return true;
+        }
+        pos = after;
+    }
+    return false;
+}
+
+// Fails the case with the bytes actually received, so a red run says whether
+// the server answered something else or nothing at all.
+void expect_status(std::string_view wire, int code) {
+    if (has_status(wire, code)) {
+        return;
+    }
+    std::printf("  expected HTTP/1.1 %d, received %zu byte(s):\n", code,
+                wire.size());
+    const std::string_view shown =
+        wire.size() > 512 ? wire.substr(0, 512) : wire;
+    std::printf("    %.*s\n", static_cast<int>(shown.size()), shown.data());
+}
 std::size_t count_substring(std::string_view haystack, std::string_view needle) {
     std::size_t count = 0;
     std::size_t pos = 0;
@@ -410,8 +455,14 @@ CRPC_TEST(http1_header_and_request_line_limits) {
         extra += std::string(200, 'a');
         extra += "\r\n";
         send_raw(*client, http1("GET", "/root", extra));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("431") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 431); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 431);
+            }
+        }
     }
     // Request line over the limit -> 400.
     {
@@ -421,8 +472,14 @@ CRPC_TEST(http1_header_and_request_line_limits) {
         std::string path = "/";
         path += std::string(80, 'p');
         send_raw(*client, http1("GET", path, ""));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("400") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 400); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 400);
+            }
+        }
     }
 }
 
@@ -535,11 +592,14 @@ CRPC_TEST(http1_pipelining_preserves_order) {
             const std::string data = capture.snapshot();
             return count_substring(data, "HTTP/1.1") >= 2 &&
                    data.find("200 OK") != std::string::npos &&
-                   data.find("404") != std::string::npos;
+                   has_status(data, 404);
         },
         5000);
     CRPC_CHECK(ok);
     const std::string data = capture.snapshot();
+    if (!ok) {
+        expect_status(data, 404);
+    }
     CRPC_CHECK(data.find("200 OK") < data.find("404 Not Found"));
 }
 
@@ -551,8 +611,14 @@ CRPC_TEST(http1_status_paths) {
         auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("GET", "/nope", ""));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("404") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 404); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 404);
+            }
+        }
     }
     // 405 (POST to a GET-only route)
     {
@@ -560,8 +626,14 @@ CRPC_TEST(http1_status_paths) {
         auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("POST", "/root", "Content-Length: 0\r\n"));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("405") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 405); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 405);
+            }
+        }
     }
     // 411 (PUT with no framing)
     {
@@ -569,8 +641,14 @@ CRPC_TEST(http1_status_paths) {
         auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("PUT", "/echo", ""));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("411") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 411); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 411);
+            }
+        }
     }
     // 500 (handler throws)
     {
@@ -578,8 +656,14 @@ CRPC_TEST(http1_status_paths) {
         auto client = fx.connect();
         client->bind_source(&capture);
         send_raw(*client, http1("GET", "/boom", ""));
-        CRPC_CHECK(crpc_test::wait_for(
-            [&] { return capture.snapshot().find("500") != std::string::npos; }, 5000));
+        {
+            const bool answered = crpc_test::wait_for(
+                [&] { return has_status(capture.snapshot(), 500); }, 5000);
+            CRPC_CHECK(answered);
+            if (!answered) {
+                expect_status(capture.snapshot(), 500);
+            }
+        }
     }
 }
 
@@ -595,8 +679,14 @@ CRPC_TEST(http1_body_limit_is_413) {
     request += std::string(4096, 'a');
     send_raw(*client, request);
 
-    CRPC_CHECK(crpc_test::wait_for(
-        [&] { return capture.snapshot().find("413") != std::string::npos; }, 5000));
+    {
+        const bool answered = crpc_test::wait_for(
+            [&] { return has_status(capture.snapshot(), 413); }, 5000);
+        CRPC_CHECK(answered);
+        if (!answered) {
+            expect_status(capture.snapshot(), 413);
+        }
+    }
 }
 
 CRPC_TEST(http1_missing_host_is_400) {
@@ -606,8 +696,14 @@ CRPC_TEST(http1_missing_host_is_400) {
     client->bind_source(&capture);
 
     send_raw(*client, "GET /root HTTP/1.1\r\n\r\n");
-    CRPC_CHECK(crpc_test::wait_for(
-        [&] { return capture.snapshot().find("400") != std::string::npos; }, 5000));
+    {
+        const bool answered = crpc_test::wait_for(
+            [&] { return has_status(capture.snapshot(), 400); }, 5000);
+        CRPC_CHECK(answered);
+        if (!answered) {
+            expect_status(capture.snapshot(), 400);
+        }
+    }
 }
 
 CRPC_TEST(http1_request_smuggling_is_400) {
@@ -621,8 +717,14 @@ CRPC_TEST(http1_request_smuggling_is_400) {
         "POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n"
         "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     send_raw(*client, request);
-    CRPC_CHECK(crpc_test::wait_for(
-        [&] { return capture.snapshot().find("400") != std::string::npos; }, 5000));
+    {
+        const bool answered = crpc_test::wait_for(
+            [&] { return has_status(capture.snapshot(), 400); }, 5000);
+        CRPC_CHECK(answered);
+        if (!answered) {
+            expect_status(capture.snapshot(), 400);
+        }
+    }
 }
 
 // --- HTTP/2 tests ------------------------------------------------------------
@@ -871,8 +973,11 @@ CRPC_TEST(request_timeout_answers_408_for_a_partial_request) {
     // A request that never completes: headers only, no terminating blank line.
     send_raw(*client, "GET /root HTTP/1.1\r\nHost: test\r\n");
     const bool answered = crpc_test::wait_for(
-        [&] { return capture.snapshot().find("408") != std::string::npos; }, 5000);
+        [&] { return has_status(capture.snapshot(), 408); }, 5000);
     CRPC_CHECK(answered);
+    if (!answered) {
+        expect_status(capture.snapshot(), 408);
+    }
     CRPC_CHECK(fx.server->stats().timed_out_connections >= 1);
 }
 
@@ -996,8 +1101,11 @@ CRPC_TEST(request_timeout_is_not_starved_by_the_idle_timer) {
 
     send_raw(*client, "GET /root HTTP/1.1\r\nHost: test\r\n");
     const bool answered = crpc_test::wait_for(
-        [&] { return capture.snapshot().find("408") != std::string::npos; }, 5000);
+        [&] { return has_status(capture.snapshot(), 408); }, 5000);
     CRPC_CHECK(answered);
+    if (!answered) {
+        expect_status(capture.snapshot(), 408);
+    }
 }
 
 // --- TLS test ----------------------------------------------------------------
