@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   linux:
-    name: linux/${{ matrix.compiler }}/${{ matrix.config }}
+    name: linux/${{ matrix.compiler }}/${{ matrix.config }}${{ matrix.shared && ' /shared' || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -45,6 +45,12 @@ jobs:
           - { compiler: gcc, config: Debug }
           - { compiler: gcc, config: Release }
           - { compiler: clang, config: Debug }
+          # A shared build is a different configuration of the same sources and
+          # it is the only one that exercises the ELF export table. Without this
+          # row, `scripts/export_gate.py` never reads libcrpc.so: test.sh runs it
+          # only under --shared (see the export-gate block in test.sh).
+          - { compiler: gcc, config: Debug, shared: true }
+          - { compiler: clang, config: Debug, shared: true }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,18 +70,20 @@ jobs:
           --config ${{ matrix.config }}
           --compiler ${{ matrix.compiler }}
           --jobs "$(nproc)"
+          ${{ matrix.shared && '--shared' || '' }}
 
       - name: Test
         run: >-
           bash scripts/test.sh
           --config ${{ matrix.config }}
           --compiler ${{ matrix.compiler }}
+          ${{ matrix.shared && '--shared' || '' }}
 
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-linux-${{ matrix.compiler }}-${{ matrix.config }}
+          name: logs-linux-${{ matrix.compiler }}-${{ matrix.config }}${{ matrix.shared && '-shared' || '' }}
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 
@@ -144,6 +152,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-windows-${{ matrix.config }}
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
+  # The static jobs link the object files directly, so they cannot see whether a
+  # public symbol is actually exported. In this configuration `CRPC_API` becomes
+  # __declspec(dllexport), and `crpc_test_shared_link` links as a consumer against the
+  # import library: a public type or function that the headers declare but the library
+  # does not export fails to link here, instead of in a user's program. The job runs
+  # Debug only -- the export set does not depend on optimisation -- and keeps the whole
+  # test suite, because some cases behave differently when the library is a DLL.
+  shared:
+    name: windows/shared
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+
+      # test.ps1 -Shared also runs crpc_test_shared_link directly: it is the
+      # consumer link gate, and a filtered ctest would skip it.
+      - name: Build and test (shared)
+        shell: pwsh
+        run: ./scripts/test.ps1 -Config Debug -Arch x64 -Shared
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-shared
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 

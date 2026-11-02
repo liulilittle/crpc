@@ -100,7 +100,7 @@ _TRAILING_QUALIFIERS = re.compile(
     r'&&|&|=\s*0|=\s*default|=\s*delete)\s*\Z')
 _SKIP_KEYWORDS = ('using ', 'typedef ', 'friend ', 'static_assert', 'template',
                   'return ', 'enum ', 'class ', 'struct ', 'union ', 'namespace',
-                  'static ', 'extern ')
+                  'static ', 'extern ', 'constexpr ')
 
 
 def strip_comments_and_literals(text):
@@ -153,10 +153,38 @@ def function_name(statement):
     `crpc::status`, `crpc::metadata_list` and every abstract interface as a
     class with out-of-line members, which is wrong: nothing is defined for them
     anywhere, so there is nothing to export.
+
+    Also returns None for a member with a brace-or-equal initialiser, such as
+    `db::mysql::connection_options::capabilities`. That initialiser spans several
+    `mask(...)` calls, so the statement the scanner sees is
+    `std::uint32_t capabilities = mask(...) | mask(...)`, and the identifier
+    before the last parenthesis is `mask` -- a call, not a declaration. The first
+    version reported it as an out-of-line member and demanded CRPC_API on a plain
+    options struct. The `=` is matched only at the top level of the statement, so
+    `std::size_t f(std::size_t x = 1);` (a default argument) still counts.
     """
     stmt = statement.strip()
     if not stmt or stmt.lstrip().startswith(_SKIP_KEYWORDS):
         return None
+    # A top-level `=` marks a variable definition with an initialiser (including
+    # `constexpr double x = limits::infinity();`) or a pure-virtual / defaulted
+    # member, never a declaration whose name is the identifier before the last
+    # parenthesis. Matched outside parentheses so a default argument still counts.
+    _depth = 0
+    for _i, _ch in enumerate(stmt):
+        if _ch in '({[':
+            _depth += 1
+        elif _ch in ')}]':
+            _depth -= 1
+        elif _ch == '=' and _depth == 0:
+            _prev = stmt[_i - 1:_i]
+            _next = stmt[_i + 1:_i + 2]
+            if _next == '=' or _prev in ('=', '<', '>', '!', '+', '-',
+                                         '*', '/', '%', '&', '|', '^'):
+                continue  # comparison or compound operator, not an initialiser
+            if stmt[:_i].rstrip().endswith('operator'):
+                continue  # `operator=`: the `=` is part of the name
+            return None
     if re.search(r'=\s*(?:default|delete|0)\s*\Z', stmt):
         return None
     while True:
@@ -217,6 +245,16 @@ class HeaderIndex(object):
         # one shadow the other and silently exempt the template from rule D.
         self.classes = {}
         self.free_decls = {}
+        # (scope chain, name) of namespace-scope functions *defined* inline in a
+        # header. A forward declaration followed by such a definition needs no
+        # CRPC_API: the consumer compiles the body from the header, so there is
+        # no DLL copy to import. Rule C used to demand the macro anyway, because
+        # a `;` records a free declaration and the later `{ ... }` body never
+        # cleared it -- `client_detail::live_owner`, `live_owner_release` and
+        # `async::detail::current_executor` were reported in error, and the
+        # wrong fix (decorating them) would have exported an inline function
+        # that every consumer also defines.
+        self.free_defs = set()
         # Count of `{` blocks the scanner could not attribute to a class,
         # namespace or enum. Most are function bodies and initialisers, so the
         # absolute value is not meaningful -- but every historical scanner bug
@@ -323,6 +361,12 @@ def _scan(text, path, index):
                     frame = Frame('ns', m.group(1), stmt_start=i + 1)
             if frame.kind == 'other':
                 index.other_frames += 1
+                # A `{` reached at namespace scope after a parameter list is a
+                # function body; remember the name so rule C does not treat the
+                # earlier declaration as body-less.
+                head_name = function_name(head)
+                if head_name:
+                    index.free_defs.add((index.scope_chain(stack), head_name))
             stack.append(frame)
         elif ch == '}':
             if len(stack) > 1:
@@ -863,6 +907,21 @@ def main(argv=None):
         for key, info in sorted(index.classes.items()):
             if not info['api'] or info['template']:
                 continue
+            # A class whose members are all defined in the header has no
+            # entity that needs to cross the module boundary, so there is
+            # nothing for rule B to require. The two toolchains disagree
+            # about what they emit for such a class -- MSVC exports every
+            # inline member of a dllexport class (`?value@publish_result@
+            # crpc@@QEBA?AW4code@12@XZ`), GCC emits no dynamic symbol at all
+            # because the members are never odr-used inside the library and
+            # `visibility("default")` only affects entities that are
+            # emitted -- and neither difference is visible to a consumer,
+            # which compiles the same inline definitions from the header.
+            # Without this, rule B demanded exports that ELF deliberately
+            # does not produce for 20 value types (`publish_result`,
+            # `directory_entry`, `node_health`, ...).
+            if not info['out_of_line_member']:
+                continue
             # A class inside `#if defined(CRPC_OS_LINUX)` cannot be exported by
             # a Windows build; the platform tag makes that explicit instead of
             # forcing a permanent allowlist entry.
@@ -941,6 +1000,8 @@ def main(argv=None):
 
     # Rule C: a namespace-scope declaration without a body must be decorated.
     for key, info in sorted(index.free_decls.items()):
+        if key in index.free_defs:
+            continue
         if not info['api']:
             violations.append(
                 ('C', '%s:%d' % (info['file'], info['line']),

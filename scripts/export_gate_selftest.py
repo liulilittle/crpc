@@ -345,6 +345,123 @@ def test_nm_parser_keeps_spaces():
           'crpc::http2::plain_free(int)' in names, sorted(names))
 
 
+
+# ---------------------------------------------------------------------------
+# Header scanner: declaration classification
+#
+# These pin the two rules a plain `python scripts/export_gate.py` run only
+# exercises through the tree's current contents. Without them, dropping the
+# initialiser guard or the inline-definition exemption from `function_name` /
+# `_scan` would keep printing OK on this tree until the offending headers
+# changed, and the gate would quietly go back to false positives.
+# ---------------------------------------------------------------------------
+def _scan(src):
+    index = export_gate.HeaderIndex()
+    text = export_gate.strip_directives(
+        export_gate.strip_comments_and_literals(src))
+    export_gate._scan(text, 'test.hpp', index)
+    return index
+
+
+def test_declaration_shapes():
+    print('synthetic: declaration classification')
+    fn = export_gate.function_name
+
+    check('member with an initialiser is not a declaration',
+          fn('std::uint32_t capabilities = mask(1) | mask(2)') is None)
+    check('constexpr variable ending in () is not a function',
+          fn('constexpr double grid_inf = std::numeric_limits<double>::infinity()')
+          is None)
+    check('constexpr variable with a cast is not a function',
+          fn('constexpr std::size_t grid_none = static_cast<std::size_t>(-1)')
+          is None)
+    check('a default argument is still a declaration',
+          fn('std::size_t f(std::size_t x = 1)') == 'f')
+    check('pure virtual is skipped', fn('virtual void read() = 0') is None)
+    check('deleted is skipped', fn('connection(const connection&) = delete') is None)
+    check('the defaulted ctor is skipped', fn('socket() = default') is None)
+    check('operator= keeps its name',
+          fn('options& operator=(const options& other)') == 'operator=')
+    check('real member is a declaration', fn('void close() noexcept') == 'close')
+    # A `const` return type must not be mistaken for a `constexpr` variable; a
+    # blanket `const ` prefix in _SKIP_KEYWORDS hid every const-qualified
+    # member function and made rule A miss real out-of-line members.
+    check('const member function is a declaration',
+          fn('const std::string& name() const') == 'name')
+    check('const-qualified getter is a declaration',
+          fn('const char* data() const noexcept') == 'data')
+
+
+def test_inline_definition_exemption():
+    print('synthetic: inline definition exemption')
+    idx = _scan('''
+namespace crpc { namespace detail {
+[[nodiscard]] client* live_owner(const call_core& core) noexcept;
+inline client* live_owner(const call_core& core) noexcept { return nullptr; }
+} }
+''')
+    check('declaration recorded',
+          any(n == 'live_owner' for (_chain, n) in idx.free_decls))
+    check('header definition recorded',
+          any(n == 'live_owner' for (_chain, n) in idx.free_defs))
+
+    idx2 = _scan('''
+namespace crpc { namespace detail {
+client* never_defined(const call_core& core) noexcept;
+} }
+''')
+    check('body-less declaration recorded',
+          any(n == 'never_defined' for (_chain, n) in idx2.free_decls))
+    check('body-less declaration is not a definition',
+          not any(n == 'never_defined' for (_chain, n) in idx2.free_defs))
+
+
+def test_initialiser_member_is_not_out_of_line():
+    print('synthetic: initialiser member is not out-of-line')
+    idx = _scan('''
+namespace crpc {
+struct options {
+    std::uint32_t capabilities = mask(1) | mask(2);
+    std::size_t rows = 100;
+};
+class socket {
+public:
+    void close() noexcept;
+};
+}
+''')
+    opt = [v for k, v in idx.classes.items() if k[1] == 'options']
+    check('options indexed', len(opt) == 1, opt)
+    check('options has no out-of-line member',
+          bool(opt) and not opt[0]['out_of_line_member'])
+    sock = [v for k, v in idx.classes.items() if k[1] == 'socket']
+    check('a real member is still detected',
+          bool(sock) and sock[0]['out_of_line_member'])
+
+
+def test_exported_classes_shapes():
+    print('synthetic: exported_classes name extraction')
+    scopes = export_gate.exported_classes([
+        'crpc::io::real_sink::~real_sink()',
+        'crpc::obs::span<int>::size() const',
+        '??0completion@io@crpc@@QEAAXXZ',
+        'crpc::io::real_sink::~real_sink(int, char*)',
+    ])
+    check('Itanium member scope', 'real_sink' in scopes)
+    check('template arguments stripped', 'span' in scopes)
+    check('MSVC ctor prefix stripped', 'completion' in scopes)
+    check('a name is not welded to its punctuation',
+          not any(',' in s or '(' in s or ')' in s for s in scopes if s),
+          sorted(scopes))
+
+    # A class that only ever appears as a parameter type is not "exported": the
+    # rule B check must not treat it as such, which is why the scan stops at the
+    # argument list.
+    scopes2 = export_gate.exported_classes(['crpc::take(crpc::widget)'])
+    check('parameter type alone is not an export', 'widget' not in scopes2,
+          sorted(scopes2))
+
+
 def main():
     test_real_dll()
     test_suffixes()
@@ -359,6 +476,10 @@ def main():
     test_readelf_parser_filters()
     test_objdump_parser_filters()
     test_nm_parser_keeps_spaces()
+    test_exported_classes_shapes()
+    test_declaration_shapes()
+    test_inline_definition_exemption()
+    test_initialiser_member_is_not_out_of_line()
     print('')
     if _failures:
         print('export_gate_selftest: FAIL -- %d check(s): %s'

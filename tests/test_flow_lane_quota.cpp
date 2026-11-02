@@ -132,6 +132,11 @@ private:
     bool open_ = true;
 };
 
+// Only the allocation-failure case below uses these, and that case is compiled
+// out of a shared build (the library then allocates inside the DLL, so the
+// injected operator new cannot observe it). Without the guard the helpers are
+// defined but never called, which `-Wunused-function` turns into an error.
+#if !defined(CRPC_SHARED)
 flow_control_options lane_flow(u64 quota) {
     flow_control_options flow;
     flow.lane_quota_bytes = quota;
@@ -145,6 +150,7 @@ std::unique_ptr<rpc::client> silent_client() {
     options.slot_capacity = 64;
     return std::make_unique<rpc::client>(std::move(conn), options);
 }
+#endif // !CRPC_SHARED
 
 } // namespace
 

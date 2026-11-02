@@ -103,8 +103,13 @@ void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer)
 
 namespace {
 
-constexpr crpc::u64 kService = 100;
-constexpr crpc::u64 kMethod = 1;
+// Read only by the allocation-failure cases, which a shared build compiles out.
+// Clang diagnoses a namespace-scope constexpr that ends up unreferenced
+// (`-Wunused-const-variable`) and the tree builds with -Werror; GCC does not
+// warn here in either configuration. `[[maybe_unused]]` says the two states are
+// both intended, instead of moving the constants into six separate #if blocks.
+[[maybe_unused]] constexpr crpc::u64 kService = 100;
+[[maybe_unused]] constexpr crpc::u64 kMethod = 1;
 
 // A connection that accepts writes and never completes a read: calls stay in
 // flight so the deadline/close paths have live state to walk.
@@ -147,10 +152,16 @@ struct stalled_backend final : crpc::backend_factory {
     }
 };
 
+// Only the allocation-failure cases below use this handler, and they are
+// compiled out of a shared build (the library allocates inside the DLL, so the
+// injected operator new never sees those allocations). Without the guard it is
+// defined and never referenced, which `-Wunused-function` makes an error.
+#if !defined(CRPC_SHARED)
 crpc::status noop_handler(void*, const crpc::call_envelope&, crpc::span<const std::byte>,
                           crpc::buffer&, crpc::rpc::call_context&) {
     return crpc::status{};
 }
+#endif // !CRPC_SHARED
 
 // A server with one in-flight call per pooled connection, used by the GOAWAY and
 // dispatch cases.
@@ -371,12 +382,16 @@ CRPC_TEST(noexcept_deadline_tick_survives_allocation_failure) {
 
 namespace {
 
+// Used only by the deadline case below, which a shared build compiles out for
+// the same reason as the other allocation-failure cases.
+#if !defined(CRPC_SHARED)
 std::atomic<std::int64_t> g_clock_ns{0};
 
 std::chrono::steady_clock::time_point test_clock(void*) noexcept {
     return std::chrono::steady_clock::time_point{} +
            std::chrono::nanoseconds{g_clock_ns.load(std::memory_order_acquire)};
 }
+#endif // !CRPC_SHARED
 
 } // namespace
 

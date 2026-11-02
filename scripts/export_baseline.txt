@@ -12,3 +12,7 @@
 #
 # Regenerate with:
 #   python scripts/export_gate.py --build-dir <dir> --update-baseline
+
+class:crpc::net::detail::stream_factory	Internal bridge between net::connect/listener and tcp_stream. adopt() is called only from src/net/{connector,listener}.cpp, which are inside the DLL; every caller is library code, and the private tcp_stream constructor keeps consumers from inventing a handle. Exporting it would widen the ABI for a symbol no consumer can use.
+class:crpc::net::detail::listener_factory	Internal bridge between the accept loop and listener. adopt() is called only from src/net/listener.cpp. Consumers reach a listener through net::listener::bind(); the native handle this takes is never public, so the factory cannot be invoked across the boundary.
+class:crpc::net::detail::udp_factory	Internal bridge between the UDP receive path and udp_socket. adopt() is called only from src/net/udp.cpp. Consumers reach a socket through udp_socket::bind(); exposing the factory would expose the native handle type the header deliberately hides.
