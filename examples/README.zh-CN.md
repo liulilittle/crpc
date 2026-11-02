@@ -157,6 +157,39 @@ game OK
 网关在转发调用返回后发出事件。逻辑层回调网关会在同步进程内传输上死锁，因为网关
 分片线程正阻塞在转发调用里；在 TCP（独立进程/线程）下这种回调形状可行。
 
+## 共享内存（IPC）
+
+`quickstart_ipc.cpp` 是唯一一个不经过 socket、真正跨进程的示例。两个独立进程通过命名共享内存
+通道各发一条消息：
+
+- 父进程创建通道（`crpc::ipc::channel::create`）、先排入一条请求，然后用 `peer <name>`
+  参数启动**它自己**；
+- 子进程按名字加入（`crpc::ipc::channel::open`）并回复；
+- 两端结束时都删除名字；父进程还会校验回复内容必须**恰好**等于由请求推导出的答案，
+  所以"送到了但字节不对"不会通过。
+
+它故意自启：同一个进程里放两个 `channel` 对象，即使映射其实是私有的也照样"成功"，
+所以必须用 `CreateProcessA`（Windows）/ `fork`（POSIX）才让共享内存有意义。
+
+运行（`quickstart*.cpp` 的 glob 已经把它构建出来了）：
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_quickstart_ipc.exe
+```
+
+期望输出（`peer:` 行可能出现在 `parent: created` 之前或之后——子进程在映射建立后立即启动，
+两个进程在 stdout 上没有同步）：
+
+```text
+peer: got "render frame 42", answering
+parent: created channel "crpc_example_ipc" (4096 bytes each way)
+parent: got "worker: handled 15 bytes"
+ok: two processes exchanged a message over shared memory
+```
+
+退出码 0 表示两个方向都送出了期望的字节。通道、环形缓冲与 SPSC 队列的契约见
+[ipc.zh-CN.md](../docs/ipc.zh-CN.md)。
+
 ## 为什么在一个进程里
 
 快速开始使用 `crpc::inproc_backend`：它在同一个进程内连接两个端点，没有套接字、

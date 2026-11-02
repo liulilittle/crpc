@@ -165,6 +165,43 @@ callback would deadlock on the synchronous in-process transport, because the
 gateway shard thread is blocked in the forward call; over TCP (separate
 processes/threads) that callback shape is possible.
 
+## Shared memory (IPC)
+
+`quickstart_ipc.cpp` is the only example that crosses a real process boundary
+without a socket. Two independent processes exchange one message each way over a
+named shared-memory channel:
+
+- the parent creates the channel (`crpc::ipc::channel::create`), queues a request
+  and then spawns the same binary with `peer <name>`;
+- the child joins by name (`crpc::ipc::channel::open`) and answers;
+- both sides remove the name at the end, and the parent fails if the answer is
+  not exactly the one derived from the request, so a channel that delivered the
+  wrong bytes cannot pass on "something arrived".
+
+It spawns itself on purpose. Two `channel` objects in one process would pass even
+if the mapping were quietly private, so `CreateProcessA` (Windows) / `fork`
+(POSIX) is what makes the shared memory meaningful.
+
+Run (the existing `quickstart*.cpp` glob already built it):
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_quickstart_ipc.exe
+```
+
+Expected output (the peer line can be printed before or after the parent's
+`created` line: the child starts as soon as the mapping exists and the two
+processes are not synchronised on stdout):
+
+```text
+peer: got "render frame 42", answering
+parent: created channel "crpc_example_ipc" (4096 bytes each way)
+parent: got "worker: handled 15 bytes"
+ok: two processes exchanged a message over shared memory
+```
+
+Exit code 0 means both directions delivered the expected bytes. See
+[ipc.md](../docs/ipc.md) for the channel, ring buffer and SPSC queue contracts.
+
 ## Why one process
 
 The quickstart uses `crpc::inproc_backend`, which connects two endpoints inside

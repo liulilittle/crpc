@@ -718,4 +718,61 @@ CRPC_TEST(docs_lint_index_lists_every_document) {
     CRPC_CHECK_FALSE(bad);
 }
 
+// --- 7. The examples index must mention every example ------------------------
+//
+// Same gap, third place: docs/api/README.md was missing 115 headers,
+// docs/README.md was missing ipc.md, and examples/README.md was missing
+// quickstart_ipc.cpp. The examples index is the page the root README sends a
+// reader to, so an example absent from it is an example nobody discovers.
+//
+// "Mentioned" is the right bar here rather than a link: the page is prose about
+// what each example demonstrates, not a table of links, so the file name in the
+// text is what a reader searches for.
+
+CRPC_TEST(docs_lint_examples_index_lists_every_example) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path dir = root / "examples";
+    CRPC_CHECK(fs::exists(dir));
+    if (!fs::exists(dir)) {
+        return;
+    }
+
+    std::vector<std::string> examples;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != ".cpp") {
+            continue;
+        }
+        examples.push_back(entry.path().filename().generic_string());
+    }
+    std::sort(examples.begin(), examples.end());
+    CRPC_CHECK(examples.size() >= 4);
+
+    const char* const indexes[] = {"examples/README.md",
+                                   "examples/README.zh-CN.md"};
+    bool bad = false;
+    for (const char* rel : indexes) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        const std::string text = read_text(path);
+        for (const std::string& example : examples) {
+            if (text.find(example) != std::string::npos) {
+                continue;
+            }
+            std::printf("  %s does not mention %s\n", rel, example.c_str());
+            bad = true;
+        }
+    }
+    CRPC_CHECK_FALSE(bad);
+}
+
 CRPC_TEST_MAIN()

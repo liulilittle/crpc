@@ -4,7 +4,8 @@
 # Usage:
 #   .\scripts\test.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
 #                      [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-#                      [-Repeat N] [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
+#                      [-Repeat N] [-Shared] [-Examples] [-SourceDir <path>]
+#                      [-BuildRoot <path>]
 #
 # -Shared builds and tests CRPC_BUILD_SHARED=ON. In that mode the run also
 # executes crpc_test_shared_link directly: it is the consumer link gate, and
@@ -14,6 +15,12 @@
 # Behavior:
 #   * runs CTest per build dir, then every test executable directly for per-case output
 #   * -Sanitizer all builds+runs asan, ubsan, tsan in separate build dirs
+#   * -Examples also builds CRPC_BUILD_EXAMPLES=ON and runs the example
+#     binaries through CTest. It exists because examples/ is off by default,
+#     so without a job that turns it on nothing would notice an example that
+#     stopped compiling or started exiting non-zero. The examples index in
+#     examples/README.md also claims a build proves they run; this switch is
+#     what makes that claim checkable.
 #   * detects ASan/LSan/UBSan/TSan reports in output -> failure
 #   * UTF-8 logs, non-zero exit on any failure
 
@@ -25,6 +32,7 @@ param(
     [string]$Filter = '',
     [int]$Repeat = 1,
     [switch]$Shared,
+    [switch]$Examples,
     # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
     # parameter defaults before $PSScriptRoot is populated, so a default of
     # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
@@ -80,7 +88,7 @@ $logDir = Join-Path $BuildRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "test-$Arch-$Config-$Sanitizer-$stamp.log"
-Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat shared=$([bool]$Shared)"
+Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat shared=$([bool]$Shared) examples=$([bool]$Examples)"
 
 # --- Unattended-run guards ---------------------------------------------------
 #
@@ -128,6 +136,7 @@ foreach ($san in $sanList) {
         $buildArgs = @{ Config = $cfg; Arch = $Arch; Sanitizer = $san
                         SourceDir = $SourceDir; BuildRoot = $BuildRoot }
         if ($Shared) { $buildArgs['Shared'] = $true }
+        if ($Examples) { $buildArgs['Examples'] = $true }
         & $buildScript @buildArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Log "build failed for $Arch/$cfg/$san" 'ERROR'
@@ -187,6 +196,32 @@ foreach ($san in $sanList) {
                     Write-Log "killing leftover test process $($_.ProcessName) (pid $($_.Id))" 'WARN'
                     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
                 }
+
+            # An examples run is a separate gate from the unit suite: the
+            # examples are consumers of the public API and are off by
+            # default, so nothing else would notice one that stopped building
+            # or started exiting non-zero. Filtered by target-name prefix;
+            # --no-tests=error keeps an empty filter from passing silently.
+            if ($Examples) {
+                Write-Log "--- examples $Arch/$cfg/$san run $r/$Repeat ---"
+                $exArgs = @('--test-dir', $buildDir, '--output-on-failure',
+                            '--timeout', "$testTimeoutSeconds", '--no-tests=error',
+                            '-R', '^crpc_example_')
+                $savedPreferenceEx = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    $exOut = & $ctest @exArgs 2>&1
+                    $exExit = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $savedPreferenceEx
+                }
+                $exOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
+                $exOut | Where-Object { $_ -match 'Test\s+#|tests passed|tests failed' } | ForEach-Object { Write-Host $_ }
+                if ($exExit -ne 0) {
+                    Write-Log "examples FAILED $Arch/$cfg/$san run $r (exit $exExit)" 'ERROR'
+                    $script:Failures++
+                }
+            }
 
             # The shared-build consumer gate is part of the ctest set, but a
             # -Filter run can exclude it. Execute it unconditionally in shared

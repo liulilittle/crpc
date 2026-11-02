@@ -363,16 +363,23 @@ endif()
 # Tests
 # ---------------------------------------------------------------------------
 
-if(CRPC_BUILD_TESTS)
+# enable_testing() has to run for the examples too: examples/CMakeLists.txt
+# registers one CTest entry per example and its header comment promises "a
+# build proves it actually runs". That was only true when CRPC_BUILD_TESTS
+# was also ON, so the configure line examples/README.md documents
+# (BUILD_EXAMPLES=ON, BUILD_TESTS=OFF) produced a tree where `ctest -N`
+# listed 0 tests and nothing ran.
+if(CRPC_BUILD_TESTS OR CRPC_BUILD_EXAMPLES)
     enable_testing()
-    add_subdirectory(tests)
 
     # RTTI's own CMakeLists calls enable_testing() and registers its test
     # binaries unconditionally. We add it with EXCLUDE_FROM_ALL (we only need
     # the library), so those entries exist in CTest but are never built, which
-    # makes `ctest` report three "Not Run" failures. They belong to the
-    # dependency's own CI, not to ours: exclude them by name rather than
-    # patching the dependency.
+    # makes `ctest` report three "Not Run" failures -- and they appear in the
+    # examples-only tree as soon as enable_testing() is called there too. They
+    # belong to the dependency's own CI, not to ours: exclude them by name
+    # rather than patching the dependency. The ignore list therefore has to be
+    # written whenever enable_testing() is, not only for the test build.
     set(CRPC_EXTERNAL_TESTS
         rtti_tests
         rtti_proto_extension_tests
@@ -380,6 +387,10 @@ if(CRPC_BUILD_TESTS)
         rtti_bench)
     file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
          "set(CTEST_CUSTOM_TESTS_IGNORE \${CTEST_CUSTOM_TESTS_IGNORE} ${CRPC_EXTERNAL_TESTS})\n")
+endif()
+
+if(CRPC_BUILD_TESTS)
+    add_subdirectory(tests)
 endif()
 
 if(CRPC_BUILD_BENCH)
