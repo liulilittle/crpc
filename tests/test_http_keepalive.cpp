@@ -747,6 +747,12 @@ CRPC_TEST(closed_connection_is_not_reused) {
 
     // The scripted handler closes once its script is exhausted; give the
     // backend thread a moment to observe the FIN before the next borrow.
+    //
+    // Tried replacing this with a wait on an observed-close counter: the
+    // scripted handler finishes its loop *before* the socket is closed, so that
+    // counter fired early and the case then reused the still-open connection
+    // (it went red at :794/:802/:803). The fixture has no cheap way to observe
+    // the close itself, so the fixed wait stays.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     result<http::response> second{rpc_error{rpc_code::canceled, "not run"}};
