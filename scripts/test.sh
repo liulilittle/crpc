@@ -24,6 +24,8 @@ SANITIZER="none"
 FILTER=""
 REPEAT=1
 SHARED=0
+EXAMPLES=0
+TESTS=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_ROOT=""
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do
     --filter) FILTER="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
     --shared) SHARED=1; shift ;;
+    --examples) EXAMPLES=1; shift ;;
+    --no-tests) TESTS=0; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
@@ -76,6 +80,12 @@ esac
 
 SHARED_ARG=()
 [[ $SHARED -eq 1 ]] && SHARED_ARG=(--shared)
+# build.ps1 gained -Examples/-NoTests for the CI jobs that guard examples/ and
+# bench/ from rotting; this script forwards the same two so the Linux path can
+# reproduce those jobs. See build.sh for why TESTS=OFF exists at all.
+EXTRA_ARGS=()
+[[ $EXAMPLES -eq 1 ]] && EXTRA_ARGS+=(--examples)
+[[ $TESTS -eq 0 ]] && EXTRA_ARGS+=(--no-tests)
 
 for san in "${SAN_LIST[@]}"; do
   for cfg in "${CFG_LIST[@]}"; do
@@ -87,7 +97,7 @@ for san in "${SAN_LIST[@]}"; do
     # `bash scripts/test.sh`, so the interpreter is already known to exist.
     if ! bash "$BUILD_SH" --config "$cfg" --arch "$ARCH" --compiler "$COMPILER" \
          --sanitizer "$san" --source "$SOURCE_DIR" --build-root "$BUILD_ROOT" \
-         "${SHARED_ARG[@]}"; then
+         "${SHARED_ARG[@]}" "${EXTRA_ARGS[@]}"; then
       log ERROR "build failed $ARCH/$cfg/$san"
       FAILURES=$((FAILURES + 1))
       continue

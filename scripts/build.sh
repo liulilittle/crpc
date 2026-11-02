@@ -6,6 +6,7 @@
 #   scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
 #                    [--jobs N] [--clean] [--shared]
+#                    [--examples] [--no-tests] [--bench]
 #                    [--source DIR] [--build-root DIR]
 #
 # --shared selects CRPC_BUILD_SHARED=ON (a crpc.so/dll plus the
@@ -25,6 +26,8 @@ JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 CLEAN=0
 SHARED=0
 BENCH=0
+EXAMPLES=0
+TESTS=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_ROOT=""
@@ -39,6 +42,8 @@ while [[ $# -gt 0 ]]; do
     --clean) CLEAN=1; shift ;;
     --shared) SHARED=1; shift ;;
     --bench) BENCH=1; shift ;;
+    --examples) EXAMPLES=1; shift ;;
+    --no-tests) TESTS=0; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -97,6 +102,17 @@ SHARED_ARGS=(-DCRPC_BUILD_SHARED=OFF)
 [[ $SHARED -eq 1 ]] && SHARED_ARGS=(-DCRPC_BUILD_SHARED=ON)
 BENCH_ARGS=(-DCRPC_BUILD_BENCH=OFF)
 [[ $BENCH -eq 1 ]] && BENCH_ARGS=(-DCRPC_BUILD_BENCH=ON)
+EXAMPLES_ARGS=(-DCRPC_BUILD_EXAMPLES=OFF)
+[[ $EXAMPLES -eq 1 ]] && EXAMPLES_ARGS=(-DCRPC_BUILD_EXAMPLES=ON)
+# The two scripts must accept the same inputs: build.ps1 gained -Examples and
+# -NoTests when CI needed the examples-only shape, and this file had neither, so
+# a Linux contributor could not reproduce the job that guards examples/ or
+# bench/ from rotting. -NoTests exists for the same reason it does there:
+# enable_testing() used to be called only under CRPC_BUILD_TESTS, so
+# EXAMPLES=ON with TESTS=OFF registered zero tests and no TESTS=ON job could
+# have noticed.
+TESTS_ARGS=(-DCRPC_BUILD_TESTS=ON)
+[[ $TESTS -eq 0 ]] && TESTS_ARGS=(-DCRPC_BUILD_TESTS=OFF)
 
 # Dependency checkouts are CMake cache variables (CRPC_RTTI_DIR,
 # CRPC_COROCC_DIR). The top-level CMakeLists.txt also falls back to the
@@ -151,7 +167,8 @@ for cfg in "${CONFIGS[@]}"; do
   if ! "$CMAKE" -S "$SOURCE_DIR" -B "$BUILD_DIR" "${GENERATOR_ARGS[@]}" \
       -DCMAKE_BUILD_TYPE="$cfg" \
       -DCMAKE_C_COMPILER="$CC_COMPILER" -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
-      -DCRPC_WARNINGS_AS_ERRORS=ON -DCRPC_BUILD_TESTS=ON \
+      -DCRPC_WARNINGS_AS_ERRORS=ON "${TESTS_ARGS[@]}" \
+         "${EXAMPLES_ARGS[@]}" \
       "${SHARED_ARGS[@]}" "${BENCH_ARGS[@]}" \
       "${DEP_ARGS[@]}" \
       "${ARCH_ARGS[@]}" "${SAN_ARGS[@]}" >>"$LOG" 2>&1; then

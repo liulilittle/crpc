@@ -26,6 +26,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -906,6 +907,140 @@ CRPC_TEST(docs_lint_design_build_facts_match_the_tree) {
             }
         }
     }
+    CRPC_CHECK_FALSE(bad);
+}
+// --- 9. The one-click scripts must accept the same switches ----------------
+//
+// "One-click build" is a per-platform promise: a contributor on Linux must be
+// able to run the same job CI runs on Windows. That promise had already been
+// broken once for the dependency paths (`build.sh` required CRPC_RTTI_DIR in
+// the environment while `build.ps1` fell back to the submodule), and it broke
+// again when `-Examples` and `-NoTests` were added to build.ps1 for the
+// examples/bench CI jobs: build.sh and test.sh had neither, so the exact
+// configuration those jobs test could not be reproduced on Linux at all.
+//
+// The check is deliberately one-directional: every switch the PowerShell
+// script exposes must exist in its POSIX counterpart. The POSIX scripts also
+// take value options (--config, --arch, ...) that the PowerShell ones expose
+// as parameters of the same name, so comparing the full sets would produce
+// noise without catching anything.
+
+namespace {
+
+// `[switch]$Name` in PowerShell; `--name)` in the POSIX case statement.
+std::vector<std::string> ps_switches(const std::string& text) {
+    std::vector<std::string> out;
+    const std::string needle = "[switch]$";
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        pos += needle.size();
+        std::size_t end = pos;
+        while (end < text.size()) {
+            const char c = text[end];
+            const bool ident = (c >= 'A' && c <= 'Z') ||
+                               (c >= 'a' && c <= 'z') ||
+                               (c >= '0' && c <= '9') || c == '_';
+            if (!ident) {
+                break;
+            }
+            ++end;
+        }
+        std::string name = text.substr(pos, end - pos);
+        for (char& ch : name) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        out.push_back(name);
+        pos = end;
+    }
+    return out;
+}
+
+std::vector<std::string> sh_switches(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::size_t pos = line.find_first_not_of(" \t");
+        if (pos == std::string::npos || line[pos] != '-') {
+            continue;
+        }
+        const std::size_t close = line.find(')', pos);
+        if (close == std::string::npos) {
+            continue;
+        }
+        std::string name = line.substr(pos, close - pos);
+        // `-h|--help)`: take the long form.
+        const std::size_t bars = name.rfind('|');
+        if (bars != std::string::npos) {
+            name = name.substr(bars + 1);
+        }
+        while (!name.empty() && name.front() == '-') {
+            name.erase(name.begin());
+        }
+        if (name.empty() || name.find(' ') != std::string::npos) {
+            continue;
+        }
+        // `-NoTests` has no separator while `--no-tests` does, so drop both
+        // separators rather than mapping one to the other: mapping '-' to '_'
+        // produced `no_tests` vs `notests` and failed on an equivalent pair.
+        std::string compact;
+        for (char ch : name) {
+            if (ch != '-' && ch != '_') {
+                compact.push_back(ch);
+            }
+        }
+        out.push_back(compact);
+    }
+    return out;
+}
+
+} // namespace
+
+CRPC_TEST(docs_lint_one_click_scripts_accept_the_same_switches) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    struct Pair {
+        const char* ps;
+        const char* sh;
+    };
+    const Pair pairs[] = {{"scripts/build.ps1", "scripts/build.sh"},
+                          {"scripts/test.ps1", "scripts/test.sh"}};
+    std::size_t compared = 0;
+    bool bad = false;
+    for (const Pair& pair : pairs) {
+        const fs::path ps_path = root / pair.ps;
+        const fs::path sh_path = root / pair.sh;
+        CRPC_CHECK(fs::exists(ps_path));
+        CRPC_CHECK(fs::exists(sh_path));
+        if (!fs::exists(ps_path) || !fs::exists(sh_path)) {
+            continue;
+        }
+        const std::vector<std::string> ps = ps_switches(read_text(ps_path));
+        const std::vector<std::string> sh = sh_switches(read_text(sh_path));
+        // Both sides must contribute, or the parser is broken and every
+        // comparison below is vacuous.
+        CRPC_CHECK(!ps.empty());
+        CRPC_CHECK(!sh.empty());
+        for (const std::string& name : ps) {
+            ++compared;
+            bool found = false;
+            for (const std::string& candidate : sh) {
+                if (candidate == name) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::printf("  %s accepts --%s, %s does not\n", pair.ps,
+                            name.c_str(), pair.sh);
+                bad = true;
+            }
+        }
+    }
+    CRPC_CHECK(compared >= 6);
     CRPC_CHECK_FALSE(bad);
 }
 CRPC_TEST_MAIN()
