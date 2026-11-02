@@ -29,6 +29,7 @@ never mixes the two languages.
 | 17 | [Proxy headers](proxy-headers.md) |
 | 18 | [Oracle TTC evidence](oracle-ttc-evidence.md) |
 | 19 | [TDS TLS evidence](tds-tls-evidence.md) |
+| 20 | [IPC: shared memory, ring buffer, SPSC queue, channel](ipc.md) |
 
 ## Reading order
 

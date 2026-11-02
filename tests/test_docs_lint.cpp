@@ -653,4 +653,69 @@ CRPC_TEST(docs_api_index_lists_every_public_header) {
     }
 }
 
+
+// --- 6. The docs index must link every document -------------------------------
+//
+// docs/README.md calls itself "the entry point for the English documentation",
+// and README.zh-CN.md is the same for Chinese. Neither is checked against the
+// directory, so a document can exist, be linked from the top-level README and
+// from its own language pair, and still be missing from the index a reader
+// actually starts at. That is what happened to docs/ipc.md: written, reviewed,
+// linked from ../../README.md, absent from the index for two rounds.
+//
+// The requirement is one-directional and precise: every English document is
+// linked from the English index, every Chinese document from the Chinese index.
+// The index deliberately links one language per file (each page links its own
+// pair at the top), so requiring both languages everywhere would be wrong.
+
+CRPC_TEST(docs_lint_index_lists_every_document) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const std::vector<DocFile> docs = collect_docs(root);
+    CRPC_CHECK(!docs.empty());
+
+    struct IndexCase {
+        const char* index;
+        bool chinese;
+    };
+    const IndexCase cases[] = {{"docs/README.md", false},
+                               {"docs/README.zh-CN.md", true}};
+
+    std::size_t checked = 0;
+    bool bad = false;
+    for (const IndexCase& c : cases) {
+        const fs::path index_path = root / c.index;
+        CRPC_CHECK(fs::exists(index_path));
+        if (!fs::exists(index_path)) {
+            continue;
+        }
+        const std::string index_text = read_text(index_path);
+        for (const DocFile& doc : docs) {
+            if (is_historical(doc.rel)) {
+                continue;
+            }
+            if (is_chinese(doc.rel) != c.chinese) {
+                continue;
+            }
+            // The index itself and its language sibling are not entries in it.
+            if (doc.rel == "README.md" || doc.rel == "README.zh-CN.md") {
+                continue;
+            }
+            ++checked;
+            const std::string needle = "](" + doc.rel + ")";
+            if (index_text.find(needle) != std::string::npos) {
+                continue;
+            }
+            std::printf("  %s does not link %s\n", c.index, doc.rel.c_str());
+            bad = true;
+        }
+    }
+    // Both indexes together hold ~36 entries; a collapsed scan must not pass.
+    CRPC_CHECK(checked > 20);
+    CRPC_CHECK_FALSE(bad);
+}
+
 CRPC_TEST_MAIN()

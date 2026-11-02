@@ -28,6 +28,7 @@
 | 17 | [代理头](proxy-headers.zh-CN.md) |
 | 18 | [Oracle TTC 证据](oracle-ttc-evidence.zh-CN.md) |
 | 19 | [TDS TLS 证据](tds-tls-evidence.zh-CN.md) |
+| 20 | [IPC：共享内存、环形缓冲、SPSC 队列、通道](ipc.zh-CN.md) |
 
 ## 阅读顺序
 
