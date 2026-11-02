@@ -194,6 +194,15 @@ foreach ($san in $sanList) {
 
             if ($ctestExit -ne 0) {
                 Write-Log "ctest FAILED $Arch/$cfg/$san run $r (exit $ctestExit)" 'ERROR'
+                # --output-on-failure makes ctest print the failing test's own
+                # output, but the filter above drops it, so a red CI run showed
+                # only "85 - crpc_test_http_keepalive (Failed)" -- no case name,
+                # no expression, no actual value, which is not enough to tell a
+                # real defect from a timing flake. Surface everything the failed
+                # run printed; it is already in the log file.
+                Write-Log "--- full ctest output for this failed run ---" 'ERROR'
+                $out | ForEach-Object { Write-Host $_ }
+                Write-Log "--- end of failed run output ---" 'ERROR'
                 $script:Failures++
             }
 
