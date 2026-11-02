@@ -199,10 +199,12 @@ Windows:
 ```powershell
 .\scripts\build.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
                     [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean] [-Shared]
+                    [-Examples] [-NoTests] [-Bench]
                     [-SourceDir <path>] [-BuildRoot <path>]
 .\scripts\test.ps1  [-Config Debug|Release|Both] [-Arch x86|x64]
                     [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-                    [-Repeat N] [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
+                    [-Repeat N] [-Shared] [-Examples] [-NoTests]
+                    [-SourceDir <path>] [-BuildRoot <path>]
 ```
 
 Linux/macOS:
@@ -211,10 +213,12 @@ Linux/macOS:
 ./scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
                    [--jobs N] [--clean] [--shared]
+                   [--examples] [--no-tests] [--bench]
                    [--source DIR] [--build-root DIR]
 ./scripts/test.sh  [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
                    [--filter REGEX] [--repeat N] [--shared]
+                   [--examples] [--no-tests]
                    [--source DIR] [--build-root DIR]
 ```
 

@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -1151,6 +1152,179 @@ CRPC_TEST(docs_lint_shell_usage_lists_every_flag) {
     }
     // Two scripts x (clean, shared, bench, examples, no-tests) at least.
     CRPC_CHECK(compared >= 10);
+    CRPC_CHECK_FALSE(bad);
+}
+// --- 11. The usage block in the docs must match the scripts -----------------
+//
+// "One-click scripts" lists the full command line for both script families, in
+// both languages. That copy lagged the scripts twice: `-Examples`/`-NoTests`
+// were added to the scripts and never appeared here, and `-Bench` was never
+// listed at all. A reader following section 5 would not learn that the
+// examples-only configuration -- the one CI uses -- exists.
+//
+// The check is scoped to the fenced block that contains `<script> [`, i.e. the
+// usage line itself. Matching anywhere in the document would pass on a prose
+// mention elsewhere, which is the failure mode the last two rounds were about.
+
+namespace {
+
+// Every fenced ``` block in `text`, in order.
+std::vector<std::string> fenced_blocks(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream(text);
+    std::string line;
+    std::string current;
+    bool inside = false;
+    while (std::getline(stream, line)) {
+        if (line.rfind("```", 0) == 0) {
+            if (inside) {
+                out.push_back(current);
+                current.clear();
+            }
+            inside = !inside;
+            continue;
+        }
+        if (inside) {
+            current += line;
+            current += '\n';
+        }
+    }
+    return out;
+}
+
+// The usage *lines* for `script`, joined. A bare mention is not enough: the
+// document also contains example invocations in earlier blocks, so the needle is
+// a line where the script name is followed by a '[' bracket.
+//
+// The result is the script's own lines only, not the whole block. Both scripts
+// of one family share a block, so a block-wide search would let `test.sh`'s
+// `[--examples]` satisfy the check for `build.sh` -- exactly the false green the
+// mutation test produced on the first version of this check.
+std::string usage_lines_for(const std::string& doc, const std::string& script) {
+    std::string out;
+    for (const std::string& block : fenced_blocks(doc)) {
+        std::istringstream stream(block);
+        std::string line;
+        bool collecting = false;
+        while (std::getline(stream, line)) {
+            const std::size_t at = line.find(script);
+            bool is_start = false;
+            if (at != std::string::npos) {
+                std::size_t pos = at + script.size();
+                while (pos < line.size() &&
+                       (line[pos] == ' ' || line[pos] == '\t')) {
+                    ++pos;
+                }
+                is_start = pos < line.size() && line[pos] == '[';
+            }
+            if (is_start) {
+                collecting = true;
+            } else if (collecting) {
+                // A continuation line is indented and starts with a bracket; the
+                // next script name or the closing fence ends this entry.
+                std::size_t pos = line.find_first_not_of(" \t");
+                if (pos == std::string::npos) {
+                    break;
+                }
+                if (line[pos] != '[' && line.find("./scripts/") == std::string::npos) {
+                    break;
+                }
+                if (line.find("./scripts/") != std::string::npos) {
+                    break;
+                }
+            }
+            if (collecting) {
+                out += line;
+                out += '\n';
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+CRPC_TEST(docs_lint_documented_usage_matches_the_scripts) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    struct Case {
+        const char* doc;
+        const char* script;
+        bool posix;
+    };
+    const Case cases[] = {
+        {"docs/building.md", "build.ps1", false},
+        {"docs/building.md", "test.ps1", false},
+        {"docs/building.md", "build.sh", true},
+        {"docs/building.md", "test.sh", true},
+        {"docs/building.zh-CN.md", "build.ps1", false},
+        {"docs/building.zh-CN.md", "test.ps1", false},
+        {"docs/building.zh-CN.md", "build.sh", true},
+        {"docs/building.zh-CN.md", "test.sh", true},
+    };
+    std::size_t compared = 0;
+    bool bad = false;
+    for (const Case& c : cases) {
+        const fs::path doc_path = root / c.doc;
+        const fs::path script_path = root / "scripts" / c.script;
+        CRPC_CHECK(fs::exists(doc_path));
+        CRPC_CHECK(fs::exists(script_path));
+        if (!fs::exists(doc_path) || !fs::exists(script_path)) {
+            continue;
+        }
+        const std::string block = usage_lines_for(read_text(doc_path), c.script);
+        if (block.empty()) {
+            std::printf("  %s has no usage block for %s\n", c.doc, c.script);
+            bad = true;
+            continue;
+        }
+        const std::string script_text = read_text(script_path);
+        const std::vector<std::string> names =
+            c.posix ? sh_switches(script_text) : ps_switches(script_text);
+        CRPC_CHECK(!names.empty());
+        for (const std::string& name : names) {
+            // The names are compared compacted (no '-' or '_'), so the documented
+            // spelling has to be recovered from the script text: `--build-root`
+            // compacts to `buildroot` and cannot be re-spelled from it.
+            if (name == "help" || name == "h") {
+                continue;  // documents itself; no usage block names it
+            }
+            const std::string documented =
+                c.posix ? ("--" + name) : ("-" + name);
+            std::string haystack = block;
+            for (char& ch : haystack) {
+                if (ch == '-' || ch == '_') {
+                    ch = ' ';
+                }
+            }
+            std::string needle = documented;
+            for (char& ch : needle) {
+                if (ch == '-' || ch == '_') {
+                    ch = ' ';
+                }
+            }
+            // Compare on the compacted forms on both sides.
+            std::string compact_block;
+            for (char ch : block) {
+                if (ch != '-' && ch != '_' && ch != ' ') {
+                    compact_block.push_back(
+                        static_cast<char>(std::tolower(
+                            static_cast<unsigned char>(ch))));
+                }
+            }
+            ++compared;
+            if (compact_block.find(name) == std::string::npos) {
+                std::printf("  %s: %s usage block does not list %s\n", c.doc,
+                            c.script, documented.c_str());
+                bad = true;
+            }
+        }
+    }
+    // 8 case pairs x at least 4 switches each.
+    CRPC_CHECK(compared >= 30);
     CRPC_CHECK_FALSE(bad);
 }
 CRPC_TEST_MAIN()
