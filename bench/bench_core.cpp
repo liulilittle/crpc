@@ -59,12 +59,16 @@ void* operator new(std::size_t size) {
     if (g_trace_on.load(std::memory_order_relaxed) != 0) {
         const int idx = g_trace_n.fetch_add(1, std::memory_order_relaxed);
         if (idx < kTraceMax) {
+            // `unsigned short`, not `USHORT`: the latter is a Windows typedef, and
+            // this file is compiled on Linux too (the bench target is built by
+            // bench-compile on Windows and by build.sh --bench elsewhere). Using
+            // the platform spelling in shared locals made the non-Windows branch
+            // fail to compile even though it only assigned 0.
+            unsigned short n = 0;
 #if defined(_WIN32)
-            USHORT n = CaptureStackBackTrace(1, 8, g_trace[idx], nullptr);
-#else
-            USHORT n = 0;
+            n = CaptureStackBackTrace(1, 8, g_trace[idx], nullptr);
 #endif
-            for (USHORT i = n; i < 8; ++i) {
+            for (unsigned short i = n; i < 8; ++i) {
                 g_trace[idx][i] = nullptr;
             }
         }
@@ -1162,8 +1166,14 @@ void bench_low_level_call_alloc() {
     g_trace_on.store(0, std::memory_order_relaxed);
     {
         const int n = g_trace_n.load(std::memory_order_relaxed);
-        std::printf("trace: %d allocations, module base=%p\n", n,
-                    reinterpret_cast<void*>(GetModuleHandle(nullptr)));
+        // The module base makes a raw frame address readable in a debugger
+        // (subtract it to get an RVA). Only Windows can ask for it, so the other
+        // platforms print a null base rather than not compiling.
+        void* module_base = nullptr;
+#if defined(_WIN32)
+        module_base = reinterpret_cast<void*>(GetModuleHandle(nullptr));
+#endif
+        std::printf("trace: %d allocations, module base=%p\n", n, module_base);
         for (int i = 0; i < n && i < 40; ++i) {
             std::printf("  #%d:", i);
             for (int j = 0; j < 8; ++j) {

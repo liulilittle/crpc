@@ -190,6 +190,55 @@ jobs:
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 
+  # The Windows bench job below compiled bench/ on one platform only, and that
+  # was enough to miss three Linux-only build failures in it: a `USHORT` local in
+  # the non-Windows branch of the allocation tracer, an unguarded
+  # `GetModuleHandle` in the same file, and two helpers that are only reachable
+  # from the Windows child-spawn path (so on Linux they were "defined but not
+  # used" and -Werror rejected them). `scripts/build.sh --bench` failed with
+  # those, and CI never ran it.
+  #
+  # Compile only, like its Windows counterpart: a shared runner cannot produce
+  # comparable numbers, and the point is that bench/ cannot rot.
+  linux-bench-compile:
+    name: linux/bench-compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build libssl-dev
+          gcc --version | head -1
+
+      - name: Build benchmarks (gcc)
+        run: >-
+          bash scripts/build.sh
+          --config Debug
+          --compiler gcc
+          --bench
+          --jobs "$(nproc)"
+
+      - name: Build benchmarks (clang)
+        run: >-
+          bash scripts/build.sh
+          --config Debug
+          --compiler clang
+          --bench
+          --jobs "$(nproc)"
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-bench-compile
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
   # examples/ is off by default, and until this job existed no CI job ever set
   # CRPC_BUILD_EXAMPLES=ON: the quickstarts are consumers of the public API, so
   # one could stop compiling, or start exiting non-zero, and every job would

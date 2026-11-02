@@ -816,19 +816,11 @@ struct oneway_pipeline_stats {
 // the closed-loop measurement, which is recorded with a fallback name rather
 // than a pipelined number.
 
-std::string self_path() {
-#if defined(_WIN32)
-    char path[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) {
-        return std::string();
-    }
-    return std::string(path, n);
-#else
-    return std::string();
-#endif
-}
-
+// Both child-process helpers below exist only for Windows: `run_case_in_child`
+// has no portable spawn path yet, so on Linux they would be "defined but not
+// used", which -Werror turns into a build failure (`build.sh --bench` failed for
+// exactly that reason). Rather than inventing a stub that nothing calls, the
+// region is marked as what it is.
 std::string child_result_path() {
     static std::atomic<unsigned> counter{0};
     return "crpc-bench-pipeline-child-" +
@@ -836,9 +828,18 @@ std::string child_result_path() {
            ".tmp";
 }
 
+#if defined(_WIN32)
+std::string self_path() {
+    char path[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return std::string();
+    }
+    return std::string(path, n);
+}
+
 bool spawn_and_wait(const std::string& exe, const std::string& args,
                     int timeout_ms, int* exit_code) {
-#if defined(_WIN32)
     const std::string cmd = "\"" + exe + "\" " + args;
     std::vector<char> buffer(cmd.begin(), cmd.end());
     buffer.push_back('\0');
@@ -864,16 +865,8 @@ bool spawn_and_wait(const std::string& exe, const std::string& args,
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return completed;
-#else
-    (void)exe;
-    (void)args;
-    (void)timeout_ms;
-    if (exit_code != nullptr) {
-        *exit_code = -1;
-    }
-    return false;
-#endif
 }
+#endif // _WIN32
 
 // Runs one pipelined case in a child process with a timeout. Returns true and
 // fills the result when the child completed; returns false when the child hung
@@ -882,7 +875,7 @@ bool spawn_and_wait(const std::string& exe, const std::string& args,
 bool run_case_in_child(const std::string& case_id, const std::string& out_path,
                        pipeline_stats* reliable, oneway_pipeline_stats* oneway) {
 #if defined(_WIN32)
-    const std::string exe = self_path();
+    const std::string exe = self_path();  // defined in the _WIN32 region above
     if (exe.empty()) {
         return false;
     }
@@ -1211,7 +1204,6 @@ double run_oneway_closed_loop_fallback(std::size_t payload,
     for (std::thread& worker : workers) {
         worker.join();
     }
-    const auto issue_stop = std::chrono::steady_clock::now();
     const std::size_t sent = issued.load(std::memory_order_acquire);
     const std::uint64_t target = baseline + sent;
     (void)wait_until(
