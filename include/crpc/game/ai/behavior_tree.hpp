@@ -125,6 +125,11 @@ private:
 // --- Composites --------------------------------------------------------------
 
 class CRPC_API sequence_node final : public behavior_node {
+    // Owns its children; a copy would have to clone the subtree, which this type
+    // does not do. Stated explicitly so an exported build does not instantiate the
+    // implicitly-deleted copy operations -- the static build never looked at them.
+    sequence_node(const sequence_node&) = delete;
+    sequence_node& operator=(const sequence_node&) = delete;
 public:
     sequence_node() = default;
     explicit sequence_node(std::vector<std::unique_ptr<behavior_node>> children,
@@ -142,6 +147,11 @@ private:
 };
 
 class CRPC_API selector_node final : public behavior_node {
+    // Owns its children; a copy would have to clone the subtree, which this type
+    // does not do. Stated explicitly so an exported build does not instantiate the
+    // implicitly-deleted copy operations -- the static build never looked at them.
+    selector_node(const selector_node&) = delete;
+    selector_node& operator=(const selector_node&) = delete;
 public:
     selector_node() = default;
     explicit selector_node(std::vector<std::unique_ptr<behavior_node>> children,
@@ -159,6 +169,11 @@ private:
 };
 
 class CRPC_API parallel_node final : public behavior_node {
+    // Owns its children; a copy would have to clone the subtree, which this type
+    // does not do. Stated explicitly so an exported build does not instantiate the
+    // implicitly-deleted copy operations -- the static build never looked at them.
+    parallel_node(const parallel_node&) = delete;
+    parallel_node& operator=(const parallel_node&) = delete;
 public:
     parallel_node() = default;
     explicit parallel_node(std::vector<std::unique_ptr<behavior_node>> children,

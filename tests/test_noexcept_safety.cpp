@@ -169,6 +169,13 @@ struct server_under_test {
 // --- decode_response ---------------------------------------------------------
 
 CRPC_TEST(noexcept_decode_response_survives_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Allocation-failure injection replaces this binary's operator new. In a shared
+    // build the library allocates inside the DLL, so the replacement never sees those
+    // calls and the counter cannot move; the case would fail for a reason that says
+    // nothing about the code. A static build still runs it.
+    (void)0;
+
     // A message longer than SSO forces `decoded.message.assign(...)` to
     // allocate, which is the allocation the fix guards.
     const std::string long_message = "this message is deliberately longer than SSO";
@@ -185,11 +192,21 @@ CRPC_TEST(noexcept_decode_response_survives_allocation_failure) {
     const crpc::status st = crpc::rpc::decode_response(out.readable(), code, decoded, body);
     CRPC_CHECK_FALSE(st.ok());
     CRPC_CHECK(g_injected_alloc_failures.load(std::memory_order_acquire) >= 1);
+    (void)0;
+    return;
+#endif
 }
 
 // --- dispatcher::dispatch ----------------------------------------------------
 
 CRPC_TEST(noexcept_dispatch_survives_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Allocation-failure injection replaces this binary's operator new. In a shared
+    // build the library allocates inside the DLL, so the replacement never sees those
+    // calls and the counter cannot move; the case would fail for a reason that says
+    // nothing about the code. A static build still runs it.
+    (void)0;
+
     crpc::rpc::service_registry registry;
     CRPC_CHECK(registry.register_service(kService, "svc").ok());
     crpc::rpc::dispatcher dispatcher(registry);
@@ -209,11 +226,18 @@ CRPC_TEST(noexcept_dispatch_survives_allocation_failure) {
         dispatcher.dispatch(request, out, has_response, std::chrono::steady_clock::now());
     CRPC_CHECK_FALSE(st.ok());
     CRPC_CHECK(g_injected_alloc_failures.load(std::memory_order_acquire) >= 1);
+    (void)0;
+    return;
+#endif
 }
 
 // --- server::send_goaway -----------------------------------------------------
 
 CRPC_TEST(noexcept_send_goaway_survives_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Same reason as the cases above: the injector replaces this binary's operator
+    // new, and a shared build allocates inside the DLL.
+    (void)0;
     server_under_test f;
     crpc::server::builder sb;
     sb.add_listener(crpc::endpoint::inproc("noexcept-goaway"), f.backend);
@@ -249,11 +273,21 @@ CRPC_TEST(noexcept_send_goaway_survives_allocation_failure) {
     CRPC_CHECK(g_injected_alloc_failures.load(std::memory_order_acquire) >= 1);
 
     clients.clear();
+    (void)0;
+    return;
+#endif
 }
 
 // --- client::close -----------------------------------------------------------
 
 CRPC_TEST(noexcept_client_close_survives_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Allocation-failure injection replaces this binary's operator new. In a shared
+    // build the library allocates inside the DLL, so the replacement never sees those
+    // calls and the counter cannot move; the case would fail for a reason that says
+    // nothing about the code. A static build still runs it.
+    (void)0;
+
     stalled_backend backend;
     crpc::client::builder cb;
     cb.add_endpoint(crpc::endpoint::inproc("noexcept-close"), backend);
@@ -280,11 +314,18 @@ CRPC_TEST(noexcept_client_close_survives_allocation_failure) {
     held.reset();
     held_second.reset();
     cli.reset();
+    (void)0;
+    return;
+#endif
 }
 
 // --- deadline_tick / evict_idle ----------------------------------------------
 
 CRPC_TEST(noexcept_deadline_tick_survives_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Same reason as the cases above: the injector replaces this binary's operator
+    // new, and a shared build allocates inside the DLL.
+    (void)0;
     stalled_backend backend;
     crpc::runtime_options ro;
     ro.start_handler_pool = false;
@@ -321,6 +362,9 @@ CRPC_TEST(noexcept_deadline_tick_survives_allocation_failure) {
     cli.reset();
     shard.stop();
     shard.join();
+    (void)0;
+    return;
+#endif
 }
 
 // --- rpc::client::poll / fail_all --------------------------------------------
@@ -337,6 +381,10 @@ std::chrono::steady_clock::time_point test_clock(void*) noexcept {
 } // namespace
 
 CRPC_TEST(noexcept_rpc_client_poll_and_close_survive_allocation_failure) {
+#if !defined(CRPC_SHARED)
+    // Same reason as the cases above: the injector replaces this binary's operator
+    // new, and a shared build allocates inside the DLL.
+    (void)0;
     crpc::rpc::client_options co;
     co.slot_capacity = 8;
     co.clock = &test_clock;
@@ -361,6 +409,9 @@ CRPC_TEST(noexcept_rpc_client_poll_and_close_survive_allocation_failure) {
     g_fail_next_alloc = true;
     cli.close();
     CRPC_CHECK(g_injected_alloc_failures.load(std::memory_order_acquire) >= 2);
+    (void)0;
+    return;
+#endif
 }
 
 CRPC_TEST_MAIN()

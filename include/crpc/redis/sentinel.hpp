@@ -60,11 +60,11 @@ struct CRPC_API sentinel_address {
                            const sentinel_address& b) noexcept {
         return a.port == b.port && a.host == b.host;
     }
-    friend bool operator!=(const sentinel_address& a,
+    friend CRPC_API bool operator!=(const sentinel_address& a,
                            const sentinel_address& b) noexcept {
         return !(a == b);
     }
-    friend bool operator<(const sentinel_address& a,
+    friend CRPC_API bool operator<(const sentinel_address& a,
                            const sentinel_address& b) noexcept {
         return a.host < b.host || (a.host == b.host && a.port < b.port);
     }

@@ -62,7 +62,11 @@ enum class bson_type : std::uint8_t {
 class bson_document;
 
 // One value. `type` says which members are meaningful.
-struct bson_value {
+// Exported: the constructors, the copy/move operations and the `make_*` factories are
+// all defined out of line in bson.cpp, so a consumer linking against the shared build
+// needs them in the import library. The static build hid this by linking the object
+// files directly; `test_db_mongo_bson` is the consumer that reported it.
+struct CRPC_API bson_value {
     bson_type type = bson_type::null;
 
     // real

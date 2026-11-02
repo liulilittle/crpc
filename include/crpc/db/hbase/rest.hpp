@@ -86,7 +86,13 @@ enum class compare_operator {
 // key, a prefix on the qualifier, and a comparison against one column's value. A filter
 // document is sent as a *string* inside the scanner request (see `encode_scan_filter`), and
 // its row keys, column names and values are base64.
-struct scan_filter {
+// Exported because the three static factories below are defined out of line in
+// rest.cpp: without this marker a consumer linking against the shared build gets an
+// unresolved external for `row_prefix`/`column_prefix`/`column_value`. The static
+// build hides it, because it links the object files directly. The plain data
+// aggregates in this header (`cell`, `row`, `scan_options`) stay unexported -- they
+// have no out-of-line symbols.
+struct CRPC_API scan_filter {
     enum class kind {
         none,
         row_prefix,

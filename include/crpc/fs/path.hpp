@@ -100,9 +100,9 @@ public:
 
     // Equality compares logical path spelling: separator-insensitive and, on
     // Windows, case-insensitive. No normalisation is performed.
-    friend bool operator==(const path& a, const path& b) noexcept;
-    friend bool operator!=(const path& a, const path& b) noexcept;
-    friend bool operator<(const path& a, const path& b) noexcept;
+    friend CRPC_API bool operator==(const path& a, const path& b) noexcept;
+    friend CRPC_API bool operator!=(const path& a, const path& b) noexcept;
+    friend CRPC_API bool operator<(const path& a, const path& b) noexcept;
 
 private:
     std::string text_;

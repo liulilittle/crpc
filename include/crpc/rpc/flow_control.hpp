@@ -132,11 +132,12 @@ struct flow_state {
     u32 lanes_in_use = 0;
 };
 
-// The connection-level controller. Not exported: only `rpc::client` owns one,
-// and a caller observes it through `client::can_admit()` and
-// `client::flow_snapshot()`. Keeping the type out of the export table keeps the
-// ABI surface at "one added pointer member plus three methods".
-class flow_controller {
+// The connection-level controller. Exported because this is a public header:
+// `rpc::client` includes it and its declaration is visible to every consumer, so a
+// consumer may construct one and call it (the flow tests do exactly that). Leaving
+// it out of the export table made its out-of-line members unavailable in the shared
+// build -- every consumer got an unresolved external, the opposite of the intent.
+class CRPC_API flow_controller {
 public:
     explicit flow_controller(const flow_control_options& options);
 

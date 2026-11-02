@@ -109,7 +109,7 @@ public:
     // Assigns text bytes, replacing the contents.
     status assign(std::string_view text);
 
-    friend bool operator==(const byte_buffer& a, const byte_buffer& b) noexcept;
+    friend CRPC_API bool operator==(const byte_buffer& a, const byte_buffer& b) noexcept;
     friend bool operator!=(const byte_buffer& a, const byte_buffer& b) noexcept {
         return !(a == b);
     }
