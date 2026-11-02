@@ -580,4 +580,77 @@ CRPC_TEST(docs_lint_api_names_exist_in_public_headers) {
     CRPC_CHECK_FALSE(bad);
 }
 
+
+// --- 5. The API index must not silently fall behind ---------------------------
+//
+// docs/api/README.md calls itself "a map of the public headers under
+// include/crpc". For a long time it was a map of *some* of them: 115 of the 183
+// headers were absent, including whole subsystems added later (db/, orm/,
+// mq/, game/, ipc/, fs/, ws/). Nothing noticed, because every other docs check
+// asks "is what is written true", never "is anything missing".
+//
+// This is the symmetric check: every public header has to be pointed at from
+// both language versions. Listing a header is cheap (a link), so the bar is
+// set at the complete set rather than a curated subset -- an index that omits
+// two thirds of the surface is worse than no index, because a reader concludes
+// the missing modules do not exist.
+
+CRPC_TEST(docs_api_index_lists_every_public_header) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path headers_dir = root / "include" / "crpc";
+    CRPC_CHECK(fs::exists(headers_dir));
+    if (!fs::exists(headers_dir)) {
+        return;
+    }
+
+    std::set<std::string> headers;
+    for (const auto& entry : fs::recursive_directory_iterator(headers_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != ".hpp") {
+            continue;
+        }
+        headers.insert(
+            fs::relative(entry.path(), headers_dir).generic_string());
+    }
+    // A scan that found nothing would make every assertion below vacuous.
+    CRPC_CHECK(headers.size() > 100);
+
+    const char* const indexes[] = {"docs/api/README.md",
+                                   "docs/api/README.zh-CN.md"};
+    for (const char* rel : indexes) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        const std::string text = read_text(path);
+        std::size_t missing = 0;
+        std::vector<std::string> reported;
+        for (const std::string& header : headers) {
+            if (text.find("include/crpc/" + header) != std::string::npos) {
+                continue;
+            }
+            ++missing;
+            if (reported.size() < 10) {
+                reported.push_back(header);
+            }
+        }
+        for (const std::string& header : reported) {
+            std::printf("  %s does not list include/crpc/%s\n", rel,
+                        header.c_str());
+        }
+        if (missing > reported.size()) {
+            std::printf("  ... and %zu more in %s\n",
+                        missing - reported.size(), rel);
+        }
+        CRPC_CHECK_EQ(std::size_t{0}, missing);
+    }
+}
+
 CRPC_TEST_MAIN()

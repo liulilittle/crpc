@@ -132,6 +132,284 @@ in [Redis client](../redis-client.md).
 |---|---|---|
 | [`c_api.h`](../../include/crpc/c_api.h) | `crpc_*` functions | The stable C entry points. See [abi.md](../abi.md). |
 
+## Complete header index
+
+The sections above pick out key types by purpose. This one lists **every**
+public header under `include/crpc` by directory, for lookup by name. The
+entries are links only; the authoritative declaration is the header.
+
+`tests/test_docs_lint.cpp` guards this list
+(`docs_api_index_lists_every_public_header`): adding a public header
+without registering it here fails the suite.
+
+### `crpc`
+
+- [`buffer.hpp`](../../include/crpc/buffer.hpp)
+- [`client_facade.hpp`](../../include/crpc/client_facade.hpp)
+- [`codec.hpp`](../../include/crpc/codec.hpp)
+- [`codec_id.hpp`](../../include/crpc/codec_id.hpp)
+- [`config.hpp`](../../include/crpc/config.hpp)
+- [`delivery_mode.hpp`](../../include/crpc/delivery_mode.hpp)
+- [`diagnostics.hpp`](../../include/crpc/diagnostics.hpp)
+- [`endian.hpp`](../../include/crpc/endian.hpp)
+- [`error.hpp`](../../include/crpc/error.hpp)
+- [`frame.hpp`](../../include/crpc/frame.hpp)
+- [`frame_compression.hpp`](../../include/crpc/frame_compression.hpp)
+- [`id.hpp`](../../include/crpc/id.hpp)
+- [`io.hpp`](../../include/crpc/io.hpp)
+- [`runtime.hpp`](../../include/crpc/runtime.hpp)
+- [`server.hpp`](../../include/crpc/server.hpp)
+- [`span.hpp`](../../include/crpc/span.hpp)
+- [`wire.hpp`](../../include/crpc/wire.hpp)
+
+### `crpc/algorithm`
+
+- [`algorithm/astar.hpp`](../../include/crpc/algorithm/astar.hpp)
+- [`algorithm/heuristic.hpp`](../../include/crpc/algorithm/heuristic.hpp)
+- [`algorithm/pathfind.hpp`](../../include/crpc/algorithm/pathfind.hpp)
+
+### `crpc/async`
+
+- [`async/executor.hpp`](../../include/crpc/async/executor.hpp)
+
+### `crpc/crypto`
+
+- [`crypto/base64.hpp`](../../include/crpc/crypto/base64.hpp)
+- [`crypto/hash.hpp`](../../include/crpc/crypto/hash.hpp)
+- [`crypto/rsa.hpp`](../../include/crpc/crypto/rsa.hpp)
+
+### `crpc/db`
+
+- [`db/bulk.hpp`](../../include/crpc/db/bulk.hpp)
+- [`db/channel.hpp`](../../include/crpc/db/channel.hpp)
+- [`db/client.hpp`](../../include/crpc/db/client.hpp)
+- [`db/cluster.hpp`](../../include/crpc/db/cluster.hpp)
+- [`db/connection.hpp`](../../include/crpc/db/connection.hpp)
+- [`db/hbase/rest.hpp`](../../include/crpc/db/hbase/rest.hpp)
+- [`db/mapping.hpp`](../../include/crpc/db/mapping.hpp)
+- [`db/memory_result_set.hpp`](../../include/crpc/db/memory_result_set.hpp)
+- [`db/mongo/auth.hpp`](../../include/crpc/db/mongo/auth.hpp)
+- [`db/mongo/bson.hpp`](../../include/crpc/db/mongo/bson.hpp)
+- [`db/mongo/connection.hpp`](../../include/crpc/db/mongo/connection.hpp)
+- [`db/mongo/protocol.hpp`](../../include/crpc/db/mongo/protocol.hpp)
+- [`db/mysql/auth.hpp`](../../include/crpc/db/mysql/auth.hpp)
+- [`db/mysql/channel.hpp`](../../include/crpc/db/mysql/channel.hpp)
+- [`db/mysql/cluster.hpp`](../../include/crpc/db/mysql/cluster.hpp)
+- [`db/mysql/connection.hpp`](../../include/crpc/db/mysql/connection.hpp)
+- [`db/mysql/protocol.hpp`](../../include/crpc/db/mysql/protocol.hpp)
+- [`db/odbc/connection.hpp`](../../include/crpc/db/odbc/connection.hpp)
+- [`db/oracle/tns.hpp`](../../include/crpc/db/oracle/tns.hpp)
+- [`db/oracle/ttc.hpp`](../../include/crpc/db/oracle/ttc.hpp)
+- [`db/result_set_list.hpp`](../../include/crpc/db/result_set_list.hpp)
+- [`db/rtti_mapping.hpp`](../../include/crpc/db/rtti_mapping.hpp)
+- [`db/stream_channel.hpp`](../../include/crpc/db/stream_channel.hpp)
+- [`db/tds/cluster.hpp`](../../include/crpc/db/tds/cluster.hpp)
+- [`db/tds/connection.hpp`](../../include/crpc/db/tds/connection.hpp)
+- [`db/tds/protocol.hpp`](../../include/crpc/db/tds/protocol.hpp)
+- [`db/tidb/connection.hpp`](../../include/crpc/db/tidb/connection.hpp)
+- [`db/tidb/retry.hpp`](../../include/crpc/db/tidb/retry.hpp)
+- [`db/types.hpp`](../../include/crpc/db/types.hpp)
+
+### `crpc/fs`
+
+- [`fs/directory.hpp`](../../include/crpc/fs/directory.hpp)
+- [`fs/file.hpp`](../../include/crpc/fs/file.hpp)
+- [`fs/fs.hpp`](../../include/crpc/fs/fs.hpp)
+- [`fs/memory.hpp`](../../include/crpc/fs/memory.hpp)
+- [`fs/mmap.hpp`](../../include/crpc/fs/mmap.hpp)
+- [`fs/path.hpp`](../../include/crpc/fs/path.hpp)
+- [`fs/shared_memory.hpp`](../../include/crpc/fs/shared_memory.hpp)
+- [`fs/temp.hpp`](../../include/crpc/fs/temp.hpp)
+
+### `crpc/game`
+
+- [`game/ai/adaboost.hpp`](../../include/crpc/game/ai/adaboost.hpp)
+- [`game/ai/behavior_tree.hpp`](../../include/crpc/game/ai/behavior_tree.hpp)
+- [`game/ai/decision_tree.hpp`](../../include/crpc/game/ai/decision_tree.hpp)
+- [`game/aoi/aoi.hpp`](../../include/crpc/game/aoi/aoi.hpp)
+- [`game/aoi/grid.hpp`](../../include/crpc/game/aoi/grid.hpp)
+- [`game/aoi/world.hpp`](../../include/crpc/game/aoi/world.hpp)
+- [`game/geom/attack.hpp`](../../include/crpc/game/geom/attack.hpp)
+- [`game/geom/collide2d.hpp`](../../include/crpc/game/geom/collide2d.hpp)
+- [`game/geom/collide3d.hpp`](../../include/crpc/game/geom/collide3d.hpp)
+- [`game/geom/hitbox.hpp`](../../include/crpc/game/geom/hitbox.hpp)
+- [`game/geom/shapes2d.hpp`](../../include/crpc/game/geom/shapes2d.hpp)
+- [`game/geom/shapes3d.hpp`](../../include/crpc/game/geom/shapes3d.hpp)
+- [`game/geom/transform.hpp`](../../include/crpc/game/geom/transform.hpp)
+- [`game/geom/vec.hpp`](../../include/crpc/game/geom/vec.hpp)
+
+### `crpc/http`
+
+- [`http/client.hpp`](../../include/crpc/http/client.hpp)
+- [`http/content_coding.hpp`](../../include/crpc/http/content_coding.hpp)
+- [`http/file_transfer.hpp`](../../include/crpc/http/file_transfer.hpp)
+- [`http/forwarded.hpp`](../../include/crpc/http/forwarded.hpp)
+- [`http/h2_client.hpp`](../../include/crpc/http/h2_client.hpp)
+- [`http/message.hpp`](../../include/crpc/http/message.hpp)
+- [`http/multipart.hpp`](../../include/crpc/http/multipart.hpp)
+- [`http/server.hpp`](../../include/crpc/http/server.hpp)
+- [`http/sse.hpp`](../../include/crpc/http/sse.hpp)
+
+### `crpc/http2`
+
+- [`http2/connection.hpp`](../../include/crpc/http2/connection.hpp)
+- [`http2/frame.hpp`](../../include/crpc/http2/frame.hpp)
+- [`http2/hpack.hpp`](../../include/crpc/http2/hpack.hpp)
+
+### `crpc/io`
+
+- [`io/epoll_backend.hpp`](../../include/crpc/io/epoll_backend.hpp)
+- [`io/iocp_backend.hpp`](../../include/crpc/io/iocp_backend.hpp)
+- [`io/tls.hpp`](../../include/crpc/io/tls.hpp)
+
+### `crpc/ipc`
+
+- [`ipc/channel.hpp`](../../include/crpc/ipc/channel.hpp)
+- [`ipc/ring_buffer.hpp`](../../include/crpc/ipc/ring_buffer.hpp)
+- [`ipc/spsc_queue.hpp`](../../include/crpc/ipc/spsc_queue.hpp)
+
+### `crpc/lock`
+
+- [`lock/local_lock.hpp`](../../include/crpc/lock/local_lock.hpp)
+
+### `crpc/memcached`
+
+- [`memcached/client.hpp`](../../include/crpc/memcached/client.hpp)
+- [`memcached/hash.hpp`](../../include/crpc/memcached/hash.hpp)
+- [`memcached/protocol.hpp`](../../include/crpc/memcached/protocol.hpp)
+- [`memcached/router.hpp`](../../include/crpc/memcached/router.hpp)
+
+### `crpc/memory`
+
+- [`memory/arena.hpp`](../../include/crpc/memory/arena.hpp)
+- [`memory/object_pool.hpp`](../../include/crpc/memory/object_pool.hpp)
+- [`memory/pool_allocator.hpp`](../../include/crpc/memory/pool_allocator.hpp)
+
+### `crpc/mq`
+
+- [`mq/amqp/connection.hpp`](../../include/crpc/mq/amqp/connection.hpp)
+- [`mq/amqp/protocol.hpp`](../../include/crpc/mq/amqp/protocol.hpp)
+- [`mq/amqp/types.hpp`](../../include/crpc/mq/amqp/types.hpp)
+- [`mq/msmq/queue.hpp`](../../include/crpc/mq/msmq/queue.hpp)
+- [`mq/msmq/transaction.hpp`](../../include/crpc/mq/msmq/transaction.hpp)
+- [`mq/msmq/types.hpp`](../../include/crpc/mq/msmq/types.hpp)
+
+### `crpc/mvc`
+
+- [`mvc/attributes.hpp`](../../include/crpc/mvc/attributes.hpp)
+- [`mvc/binding.hpp`](../../include/crpc/mvc/binding.hpp)
+- [`mvc/router.hpp`](../../include/crpc/mvc/router.hpp)
+
+### `crpc/net`
+
+- [`net/address.hpp`](../../include/crpc/net/address.hpp)
+- [`net/backoff.hpp`](../../include/crpc/net/backoff.hpp)
+- [`net/channel.hpp`](../../include/crpc/net/channel.hpp)
+- [`net/connection.hpp`](../../include/crpc/net/connection.hpp)
+- [`net/connector.hpp`](../../include/crpc/net/connector.hpp)
+- [`net/icmp.hpp`](../../include/crpc/net/icmp.hpp)
+- [`net/ip.hpp`](../../include/crpc/net/ip.hpp)
+- [`net/listener.hpp`](../../include/crpc/net/listener.hpp)
+- [`net/udp.hpp`](../../include/crpc/net/udp.hpp)
+
+### `crpc/observability`
+
+- [`observability/context.hpp`](../../include/crpc/observability/context.hpp)
+- [`observability/interceptor.hpp`](../../include/crpc/observability/interceptor.hpp)
+- [`observability/log.hpp`](../../include/crpc/observability/log.hpp)
+- [`observability/tracer.hpp`](../../include/crpc/observability/tracer.hpp)
+
+### `crpc/orm`
+
+- [`orm/annotate.hpp`](../../include/crpc/orm/annotate.hpp)
+- [`orm/fwd.hpp`](../../include/crpc/orm/fwd.hpp)
+- [`orm/metadata.hpp`](../../include/crpc/orm/metadata.hpp)
+- [`orm/orm.hpp`](../../include/crpc/orm/orm.hpp)
+- [`orm/session.hpp`](../../include/crpc/orm/session.hpp)
+- [`orm/sql.hpp`](../../include/crpc/orm/sql.hpp)
+- [`orm/value.hpp`](../../include/crpc/orm/value.hpp)
+
+### `crpc/pattern`
+
+- [`pattern/constraint.hpp`](../../include/crpc/pattern/constraint.hpp)
+- [`pattern/memento.hpp`](../../include/crpc/pattern/memento.hpp)
+- [`pattern/version.hpp`](../../include/crpc/pattern/version.hpp)
+
+### `crpc/push`
+
+- [`push/bridge.hpp`](../../include/crpc/push/bridge.hpp)
+- [`push/hub.hpp`](../../include/crpc/push/hub.hpp)
+- [`push/stream.hpp`](../../include/crpc/push/stream.hpp)
+- [`push/wire.hpp`](../../include/crpc/push/wire.hpp)
+
+### `crpc/redis`
+
+- [`redis/client.hpp`](../../include/crpc/redis/client.hpp)
+- [`redis/cluster.hpp`](../../include/crpc/redis/cluster.hpp)
+- [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp)
+- [`redis/distributed_lock.hpp`](../../include/crpc/redis/distributed_lock.hpp)
+- [`redis/keyspace.hpp`](../../include/crpc/redis/keyspace.hpp)
+- [`redis/pipeline.hpp`](../../include/crpc/redis/pipeline.hpp)
+- [`redis/pubsub.hpp`](../../include/crpc/redis/pubsub.hpp)
+- [`redis/resp.hpp`](../../include/crpc/redis/resp.hpp)
+- [`redis/rtti.hpp`](../../include/crpc/redis/rtti.hpp)
+- [`redis/scan.hpp`](../../include/crpc/redis/scan.hpp)
+- [`redis/scripting.hpp`](../../include/crpc/redis/scripting.hpp)
+- [`redis/sentinel.hpp`](../../include/crpc/redis/sentinel.hpp)
+- [`redis/stream.hpp`](../../include/crpc/redis/stream.hpp)
+- [`redis/transaction.hpp`](../../include/crpc/redis/transaction.hpp)
+- [`redis/types.hpp`](../../include/crpc/redis/types.hpp)
+
+### `crpc/resilience`
+
+- [`resilience/admission.hpp`](../../include/crpc/resilience/admission.hpp)
+- [`resilience/bulkhead.hpp`](../../include/crpc/resilience/bulkhead.hpp)
+- [`resilience/circuit_breaker.hpp`](../../include/crpc/resilience/circuit_breaker.hpp)
+- [`resilience/fallback.hpp`](../../include/crpc/resilience/fallback.hpp)
+- [`resilience/load_balancer.hpp`](../../include/crpc/resilience/load_balancer.hpp)
+- [`resilience/rate_limiter.hpp`](../../include/crpc/resilience/rate_limiter.hpp)
+- [`resilience/retry.hpp`](../../include/crpc/resilience/retry.hpp)
+- [`resilience/smart_policy.hpp`](../../include/crpc/resilience/smart_policy.hpp)
+
+### `crpc/rpc`
+
+- [`rpc/call.hpp`](../../include/crpc/rpc/call.hpp)
+- [`rpc/client.hpp`](../../include/crpc/rpc/client.hpp)
+- [`rpc/dedup.hpp`](../../include/crpc/rpc/dedup.hpp)
+- [`rpc/dispatcher.hpp`](../../include/crpc/rpc/dispatcher.hpp)
+- [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp)
+- [`rpc/lane_queue.hpp`](../../include/crpc/rpc/lane_queue.hpp)
+- [`rpc/method_macro.hpp`](../../include/crpc/rpc/method_macro.hpp)
+- [`rpc/method_meta.hpp`](../../include/crpc/rpc/method_meta.hpp)
+
+### `crpc/text`
+
+- [`text/case.hpp`](../../include/crpc/text/case.hpp)
+- [`text/number.hpp`](../../include/crpc/text/number.hpp)
+- [`text/string_ops.hpp`](../../include/crpc/text/string_ops.hpp)
+- [`text/utf.hpp`](../../include/crpc/text/utf.hpp)
+
+### `crpc/ws`
+
+- [`ws/client.hpp`](../../include/crpc/ws/client.hpp)
+- [`ws/frame.hpp`](../../include/crpc/ws/frame.hpp)
+- [`ws/handshake.hpp`](../../include/crpc/ws/handshake.hpp)
+- [`ws/server.hpp`](../../include/crpc/ws/server.hpp)
+- [`ws/stream.hpp`](../../include/crpc/ws/stream.hpp)
+
+### `crpc/cluster`
+
+- [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp)
+- [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp)
+- [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
+- [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
+- [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)
+
+### `crpc/flow`
+
+- [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp)
+
+
 ## See also
 
 - [Tutorial](../tutorial.md) — a step-by-step build of a call and a push subscription.
