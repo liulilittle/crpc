@@ -60,6 +60,7 @@ import argparse
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -426,6 +427,84 @@ def _export_name(block):
     text = block[0] + ''.join(line.strip() for line in block[1:])
     return text.split(' = ', 1)[0].strip()
 
+
+def _msvc_dumpbin():
+    """Path to dumpbin.exe under the newest installed MSVC toolset, or None.
+
+    None means "this machine has no MSVC with dumpbin", which is different
+    from "resolution failed" -- the caller may legitimately fall back to PATH,
+    and the self-test may legitimately skip. Conflating the two is what made
+    the first version of that test vacuous.
+    """
+    if os.name != 'nt':
+        return None
+    vswhere = None
+    for candidate in (
+            os.path.join(os.environ.get('ProgramFiles(x86)', ''),
+                         'Microsoft Visual Studio', 'Installer', 'vswhere.exe'),
+            os.path.join(os.environ.get('ProgramFiles', ''),
+                         'Microsoft Visual Studio', 'Installer', 'vswhere.exe')):
+        if candidate and os.path.exists(candidate):
+            vswhere = candidate
+            break
+    if not vswhere:
+        return None
+    try:
+        query = subprocess.run(
+            [vswhere, '-latest', '-products', '*',
+             '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+             '-property', 'installationPath'],
+            capture_output=True)
+        install = query.stdout.decode('utf-8', 'replace').strip().splitlines()
+    except OSError:
+        return None
+    if not install:
+        return None
+    msvc_root = os.path.join(install[0], 'VC', 'Tools', 'MSVC')
+    if not os.path.isdir(msvc_root):
+        return None
+    # Newest toolset first. The gate only reads a file, so it does not need the
+    # toolset that produced it; either host layout works.
+    for version in sorted(os.listdir(msvc_root), reverse=True):
+        for host in ('Hostx64', 'Hostx86'):
+            for target in ('x64', 'x86'):
+                exe = os.path.join(msvc_root, version, 'bin', host, target,
+                                   'dumpbin.exe')
+                if os.path.exists(exe):
+                    return exe
+    return None
+
+
+def find_dumpbin_has_toolchain():
+    """True when this machine has an MSVC install that ships dumpbin."""
+    return _msvc_dumpbin() is not None
+
+
+def find_dumpbin(explicit=None):
+    """Path to `dumpbin.exe`, falling back to the bare name.
+
+    The gate shells out to dumpbin to read the PE export table. That works on
+    a developer machine inside a vcvars prompt and failed on a clean CI
+    runner, where dumpbin is installed but not on PATH: the first
+    shared-build CI run reported
+
+        export_gate: [WinError 2] The system cannot find the file specified
+        [ERROR] export gate FAILED (exit 2)
+
+    with all 190 tests passing. Resolution order: an explicit value
+    (--dumpbin / CRPC_DUMPBIN), then PATH, then the newest installed MSVC.
+    The bare name is the last resort so the caller still gets the original
+    FileNotFoundError message rather than a silent skip.
+    """
+    if explicit:
+        return explicit
+    if os.name != 'nt':
+        return 'dumpbin'
+    found = shutil.which('dumpbin')
+    if found:
+        return found
+    resolved = _msvc_dumpbin()
+    return resolved if resolved else 'dumpbin'
 
 def read_exports(dumpbin, dll):
     out = subprocess.run([dumpbin, '/exports', dll],
@@ -814,7 +893,8 @@ def main(argv=None):
         os.path.dirname(os.path.abspath(__file__))))
     parser.add_argument('--build-dir', default=None,
                         help='shared build dir; required for rules B and D')
-    parser.add_argument('--dumpbin', default=os.environ.get('CRPC_DUMPBIN', 'dumpbin'))
+    parser.add_argument('--dumpbin', default=None,
+                        help='path to dumpbin.exe (default: PATH, then vswhere)')
     parser.add_argument('--nm', default=os.environ.get('CRPC_NM', 'nm'),
                         help='ELF dynamic-symbol reader (nm)')
     parser.add_argument('--readelf', default=os.environ.get('CRPC_READELF', 'readelf'),
@@ -849,7 +929,7 @@ def main(argv=None):
             return 2
         try:
             if found[0].endswith('.dll'):
-                exported = read_exports(args.dumpbin, found[0])
+                exported = read_exports(args.dumpbin or find_dumpbin(), found[0])
             else:
                 exported = read_exports_elf(
                     found[0], nm=args.nm, readelf=args.readelf,

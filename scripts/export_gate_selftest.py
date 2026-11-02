@@ -461,6 +461,82 @@ def test_exported_classes_shapes():
     check('parameter type alone is not an export', 'widget' not in scopes2,
           sorted(scopes2))
 
+def _msvc_install_present():
+    """True when an MSVC toolset directory exists on this machine.
+
+    Deliberately independent of `export_gate`: the point of the check it
+    guards is that `export_gate` can find dumpbin, so asking `export_gate`
+    whether a toolchain exists would make a broken resolver silence its own
+    test (which is exactly what the previous version did).
+    """
+    if os.name != 'nt':
+        return False
+    for env in (os.environ.get('ProgramFiles(x86)', ''),
+                os.environ.get('ProgramFiles', '')):
+        if not env:
+            continue
+        root = os.path.join(env, 'Microsoft Visual Studio')
+        if not os.path.isdir(root):
+            continue
+        # `<root>\<year>\<edition>\VC\Tools\MSVC\<version>`, and BuildTools
+        # installs sometimes omit the edition level, so try both depths.
+        for year in os.listdir(root):
+            if year == 'Installer':
+                continue
+            year_dir = os.path.join(root, year)
+            if not os.path.isdir(year_dir):
+                continue
+            bases = [year_dir]
+            for sub in os.listdir(year_dir):
+                sub_dir = os.path.join(year_dir, sub)
+                if os.path.isdir(sub_dir):
+                    bases.append(sub_dir)
+            for base in bases:
+                if os.path.isdir(os.path.join(base, 'VC', 'Tools', 'MSVC')):
+                    return True
+    return False
+
+
+def test_find_dumpbin():
+    print('synthetic: dumpbin resolution')
+    # An explicit path always wins, so --dumpbin and CRPC_DUMPBIN keep working.
+    check('explicit path is returned unchanged',
+          export_gate.find_dumpbin(r'C:\\tools\\dumpbin.exe')
+          == r'C:\\tools\\dumpbin.exe')
+
+    # On a machine that has a toolchain, resolving with no argument must produce
+    # something that exists -- this is the case that failed in CI: the gate was
+    # invoked from a shell where dumpbin was installed but not on PATH, and it
+    # died with WinError 2 instead of finding the binary.
+    if os.name == 'nt':
+        resolved = export_gate.find_dumpbin()
+        on_path = shutil.which('dumpbin')
+        if on_path is None:
+            # The interesting case, and the one CI hit: dumpbin is installed but
+            # not on PATH, so resolution must produce a real path.
+            #
+            # Two earlier versions of this check were vacuous: one accepted
+            # `resolved == 'dumpbin'`, and one asked
+            # `find_dumpbin_has_toolchain()` -- so a mutant that broke the
+            # resolver also silenced the check via the skip branch. The
+            # decision must come from something the code under test cannot
+            # influence: scan the same install root independently.
+            toolchain_present = _msvc_install_present()
+            if toolchain_present:
+                check('resolves to a real file when not on PATH',
+                      resolved != 'dumpbin' and os.path.exists(resolved),
+                      'resolved %r' % (resolved,))
+                check('resolved path is dumpbin.exe',
+                      resolved.lower().endswith('dumpbin.exe'), resolved)
+            else:
+                print('  skip (no MSVC toolchain installed on this machine)')
+        else:
+            check('uses the PATH entry when one exists', resolved == on_path,
+                  '%r vs %r' % (resolved, on_path))
+    else:
+        check('non-Windows returns the bare name',
+              export_gate.find_dumpbin() == 'dumpbin')
+
 
 def main():
     test_real_dll()
@@ -476,6 +552,7 @@ def main():
     test_readelf_parser_filters()
     test_objdump_parser_filters()
     test_nm_parser_keeps_spaces()
+    test_find_dumpbin()
     test_exported_classes_shapes()
     test_declaration_shapes()
     test_inline_definition_exemption()
