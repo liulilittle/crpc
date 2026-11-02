@@ -4,7 +4,8 @@
 # Usage:
 #   .\scripts\build.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
 #                       [-Sanitizer none|asan|ubsan|tsan] [-Jobs N] [-Clean]
-#                       [-Shared] [-SourceDir <path>] [-BuildRoot <path>]
+#                       [-Shared] [-Examples] [-NoTests] [-Bench]
+#                       [-SourceDir <path>] [-BuildRoot <path>]
 #
 # -Shared selects CRPC_BUILD_SHARED=ON (a crpc.dll/crpc.so plus the
 # crpc_test_shared_link consumer gate). Without it the library is a static
@@ -35,9 +36,17 @@ param(
     [switch]$Shared,
 
     # Also build the examples. They are OFF in CMake by default, so without this
-    # switch the four quickstarts are never compiled and can silently rot -- a
+    # switch the quickstarts are never compiled and can silently rot -- a
     # documentation example that no longer builds is worse than none.
     [switch]$Examples,
+
+    # Configure with CRPC_BUILD_TESTS=OFF. The unit suite is ON by default because
+    # that is what the normal gate wants; an examples-only configure line needs it
+    # off, and not for build time: enable_testing() used to be called only inside
+    # the CRPC_BUILD_TESTS branch, so EXAMPLES=ON with TESTS=OFF produced a tree
+    # where `ctest -N` listed zero tests. Testing only the TESTS=ON combination
+    # would never have caught that, so CI needs a way to ask for this shape.
+    [switch]$NoTests,
 
     # Also build the microbenchmarks. They are OFF in CMake by default and are
     # never run by the test gate, so without this switch bench/ is never compiled
@@ -198,7 +207,7 @@ foreach ($cfg in $configs) {
         '-G', $generator,
         "-DCMAKE_BUILD_TYPE=$cfg",
         '-DCRPC_WARNINGS_AS_ERRORS=ON',
-        '-DCRPC_BUILD_TESTS=ON'
+        $(if ($NoTests) { '-DCRPC_BUILD_TESTS=OFF' } else { '-DCRPC_BUILD_TESTS=ON' })
     )
     $configureArgs += $sanFlags[$Sanitizer]
     $configureArgs += $depArgs

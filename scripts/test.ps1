@@ -4,7 +4,8 @@
 # Usage:
 #   .\scripts\test.ps1 [-Config Debug|Release|Both] [-Arch x86|x64]
 #                      [-Sanitizer none|asan|ubsan|tsan|all] [-Filter <regex>]
-#                      [-Repeat N] [-Shared] [-Examples] [-SourceDir <path>]
+#                      [-Repeat N] [-Shared] [-Examples] [-NoTests]
+#                      [-SourceDir <path>]
 #                      [-BuildRoot <path>]
 #
 # -Shared builds and tests CRPC_BUILD_SHARED=ON. In that mode the run also
@@ -15,6 +16,12 @@
 # Behavior:
 #   * runs CTest per build dir, then every test executable directly for per-case output
 #   * -Sanitizer all builds+runs asan, ubsan, tsan in separate build dirs
+#   * -NoTests configures with CRPC_BUILD_TESTS=OFF, for the examples-only
+#     shape examples/README.md documents. It is separate from -Examples on
+#     purpose: enable_testing() used to be called only inside the
+#     CRPC_BUILD_TESTS branch, so EXAMPLES=ON with TESTS=OFF registered zero
+#     tests while every TESTS=ON job stayed green. A CI job that only ever ran
+#     the TESTS=ON shape could not have caught that.
 #   * -Examples also builds CRPC_BUILD_EXAMPLES=ON and runs the example
 #     binaries through CTest. It exists because examples/ is off by default,
 #     so without a job that turns it on nothing would notice an example that
@@ -33,6 +40,7 @@ param(
     [int]$Repeat = 1,
     [switch]$Shared,
     [switch]$Examples,
+    [switch]$NoTests,
     # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
     # parameter defaults before $PSScriptRoot is populated, so a default of
     # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
@@ -88,7 +96,7 @@ $logDir = Join-Path $BuildRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "test-$Arch-$Config-$Sanitizer-$stamp.log"
-Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat shared=$([bool]$Shared) examples=$([bool]$Examples)"
+Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer repeat=$Repeat shared=$([bool]$Shared) examples=$([bool]$Examples) noTests=$([bool]$NoTests)"
 
 # --- Unattended-run guards ---------------------------------------------------
 #
@@ -137,6 +145,7 @@ foreach ($san in $sanList) {
                         SourceDir = $SourceDir; BuildRoot = $BuildRoot }
         if ($Shared) { $buildArgs['Shared'] = $true }
         if ($Examples) { $buildArgs['Examples'] = $true }
+        if ($NoTests) { $buildArgs['NoTests'] = $true }
         & $buildScript @buildArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Log "build failed for $Arch/$cfg/$san" 'ERROR'

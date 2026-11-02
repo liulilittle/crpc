@@ -190,6 +190,48 @@ jobs:
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 
+  # examples/ is off by default, and until this job existed no CI job ever set
+  # CRPC_BUILD_EXAMPLES=ON: the quickstarts are consumers of the public API, so
+  # one could stop compiling, or start exiting non-zero, and every job would
+  # stay green. examples/CMakeLists.txt registers each one in CTest and claims
+  # "a build proves it actually runs", so this job builds and runs them.
+  #
+  # It configures with CRPC_BUILD_TESTS=OFF on purpose (build.ps1 -NoTests).
+  # enable_testing() used to be called only inside the CRPC_BUILD_TESTS branch,
+  # so that exact combination registered zero tests while the unit-test jobs --
+  # which all pass TESTS=ON -- stayed green. Testing only the TESTS=ON shape
+  # would reproduce the blind spot, and --no-tests=error is what makes the
+  # regression loud if it comes back.
+  examples:
+    name: windows/examples
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+
+      # One call does both halves: test.ps1 resolves vcvars/cmake/ctest itself
+      # (cmake is not guaranteed to be on PATH), configures with
+      # CRPC_BUILD_TESTS=OFF, builds, then runs CTest with --no-tests=error and
+      # a per-test timeout, plus the filtered crpc_example_ pass.
+      - name: Build and run the examples
+        shell: pwsh
+        run: ./scripts/test.ps1 -Config Release -Arch x64 -Examples -NoTests
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-examples
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
   # bench/ is off by default and is never part of the pass/fail gate, so nothing
   # compiled it and its code could rot into something that does not build at all --
   # while bench/CMakeLists.txt claims it is built "so that benchmark code cannot
