@@ -284,6 +284,14 @@ CRPC_TEST_MAIN()
 
 #else
 
+// Off Windows this binary is a no-op: IOCP does not exist here. It is still
+// built (and registered with CTest) so the test list stays identical across
+// platforms, but it executes nothing. A sanitizer job therefore provides
+// *zero* coverage for the Windows IOCP paths in this file -- do not cite a
+// green asan/tsan run of this binary as evidence about them. (Recorded after
+// making exactly that mistake: an asan run "passed" 30/30 because main()
+// returned immediately.)
+
 int main() { return 0; }
 
 #endif // _WIN32
