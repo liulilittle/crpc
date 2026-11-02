@@ -373,11 +373,18 @@ IOCP loopback on Windows. The wider matrix is being filled in:
   and pipeline batch throughput (§2.5).
 - `bench/bench_rpc.cpp` — still to extend to 1 KiB, 1/8/64/512 connections,
   epoll loopback, and separate reliable/unreliable/ordered-lane runs.
-- `bench/bench_http.cpp` — HTTP/1.1 and HTTP/2 request/response, keep-alive,
-  header sizes, upload/download streaming.
-- `bench/bench_codec.cpp` — crpc-binary, JSON, XML, INI, TOML and the schema
-  formats at 64 B, 256 B and 1 KiB, with a warm cache and no allocation on the
-  measured path.
+Two planned benchmarks are **not implemented**, and no file of that
+name exists in `bench/`; they are listed so the gap is visible rather
+than implied to be covered:
+
+- HTTP/1.1 and HTTP/2 request/response, keep-alive, header sizes,
+  upload/download streaming.
+- Codec throughput for crpc-binary, JSON, XML, INI, TOML and the schema
+  formats at 64 B, 256 B and 1 KiB with a warm cache.
+
+The codec numbers quoted above come from `bench/bench_core.cpp`
+(`codec/binary_encode_small` and the `crc32c` cases), not from a
+dedicated codec benchmark.
 
 The run commands, substring filters and scenario interpretation for the three
 implemented benchmarks are in

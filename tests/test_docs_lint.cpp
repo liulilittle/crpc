@@ -1327,4 +1327,84 @@ CRPC_TEST(docs_lint_documented_usage_matches_the_scripts) {
     CRPC_CHECK(compared >= 30);
     CRPC_CHECK_FALSE(bad);
 }
+// --- 12. A documented benchmark file must exist ----------------------------
+//
+// docs/performance.md sections 2 and 4 describe the benchmark plan file by
+// file (`bench/bench_redis.cpp`, `bench/bench_rpc_matrix.cpp`, ...). Two of
+// those entries, `bench/bench_http.cpp` and `bench/bench_codec.cpp`, were
+// never written, so the document promised coverage that did not exist -- and
+// the codec numbers quoted elsewhere in the same document come from
+// `bench/bench_core.cpp`, not from either of them.
+//
+// A planned-but-absent benchmark may legitimately be discussed, so the rule is
+// narrow: naming a `bench/*.cpp` file is only allowed if the file exists,
+// unless the sentence also says it is not implemented. That keeps the gap
+// visible (which is the point) while forbidding the "listed as if it exists"
+// form the document had.
+
+CRPC_TEST(docs_lint_bench_claims_match_the_bench_directory) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path bench_dir = root / "bench";
+    CRPC_CHECK(fs::exists(bench_dir));
+    if (!fs::exists(bench_dir)) {
+        return;
+    }
+
+    std::set<std::string> present;
+    for (const auto& entry : fs::directory_iterator(bench_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        present.insert(entry.path().filename().generic_string());
+    }
+    CRPC_CHECK(present.size() >= 5);
+
+    const char* const docs[] = {"docs/performance.md",
+                                "docs/performance.zh-CN.md"};
+    std::size_t checked = 0;
+    bool bad = false;
+    for (const char* rel : docs) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        const std::string text = read_text(path);
+        std::istringstream stream(text);
+        std::string line;
+        while (std::getline(stream, line)) {
+            std::size_t pos = 0;
+            while ((pos = line.find("bench/", pos)) != std::string::npos) {
+                const std::size_t end = line.find(".cpp", pos);
+                if (end == std::string::npos) {
+                    break;
+                }
+                const std::string file =
+                    line.substr(pos + 6, end - pos - 6) + ".cpp";
+                pos = end + 4;
+                if (present.count(file) != 0) {
+                    ++checked;
+                    continue;
+                }
+                // Absent: only acceptable when the line admits it.
+                const bool admitted =
+                    line.find("not implemented") != std::string::npos ||
+                    line.find("尚未实现") != std::string::npos ||
+                    line.find("未实现") != std::string::npos;
+                if (!admitted) {
+                    std::printf("  %s names bench/%s, which does not exist, "
+                                "without saying so\n", rel, file.c_str());
+                    bad = true;
+                }
+            }
+        }
+    }
+    // The two documents name well over a dozen real files between them.
+    CRPC_CHECK(checked >= 8);
+    CRPC_CHECK_FALSE(bad);
+}
 CRPC_TEST_MAIN()

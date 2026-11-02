@@ -324,10 +324,15 @@ executor（RESP 编码 + 解析），两者都不含真实服务器或网络。
   pipeline 批量吞吐（§2.5）。
 - `bench/bench_rpc.cpp` —— 仍待扩展到 1 KiB、1/8/64/512 连接、
   epoll loopback，以及可靠/不可靠/有序 lane 分开运行。
-- `bench/bench_http.cpp` —— HTTP/1.1 与 HTTP/2 请求/响应、
-  keep-alive、头部大小、上传/下载流。
-- `bench/bench_codec.cpp` —— crpc-binary、JSON、XML、INI、
-  TOML 与模式格式，在 64 B、256 B、1 KiB 下，热缓存且测量路径无分配。
+以下两项基准**尚未实现**，`bench/` 下没有同名文件；列出它们是为了让缺口可见，
+而不是暗示已经覆盖：
+
+- HTTP/1.1 与 HTTP/2 请求/响应、keep-alive、头部尺寸、上传/下载流式传输。
+- crpc-binary、JSON、XML、INI、TOML 及 schema 格式在 64 B、256 B、1 KiB 下的吐吐量
+  （热缓存、测量路径零分配）。
+
+上面引用的编解码数字来自 `bench/bench_core.cpp`（`codec/binary_encode_small` 与
+`crc32c` 用例），不是来自独立的编解码基准。
 
 三个已实现基准的运行命令、子串过滤与场景解读见
 [distributed-testing.zh-CN.md §5](distributed-testing.zh-CN.md#s5)。
