@@ -46,7 +46,9 @@ while [[ $# -gt 0 ]]; do
     --no-tests) TESTS=0; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    # Print the leading comment block instead of a hardcoded line range; '2,20p'
+    # silently cut the usage text when the header grew.
+    -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

@@ -6,11 +6,17 @@
 #   scripts/test.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                   [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
 #                   [--filter REGEX] [--repeat N] [--shared]
+#                   [--examples] [--no-tests]
 #                   [--source DIR] [--build-root DIR]
 #
 # --shared builds and tests CRPC_BUILD_SHARED=ON. In that mode the run also
 # executes crpc_test_shared_link directly: it is the consumer link gate, and
 # running it explicitly keeps a filtered ctest invocation from skipping it.
+#
+# --examples builds CRPC_BUILD_EXAMPLES=ON and additionally runs the
+# `crpc_example_` tests; --no-tests configures with CRPC_BUILD_TESTS=OFF (the
+# examples-only shape, where enable_testing() must still run or zero tests are
+# registered). Both mirror build.ps1/test.ps1.
 #
 # Runs CTest per build dir, then each test binary for per-case output.
 # Detects sanitizer reports. Non-zero exit on any failure.
@@ -43,7 +49,10 @@ while [[ $# -gt 0 ]]; do
     --no-tests) TESTS=0; shift ;;
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --build-root) BUILD_ROOT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    # Print the leading comment block instead of a hardcoded line range: the
+    # range used to be '2,22p' and silently cut the block in half once the
+    # header grew. Stopping at the first non-comment line cannot drift.
+    -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

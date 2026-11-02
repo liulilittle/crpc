@@ -1043,4 +1043,114 @@ CRPC_TEST(docs_lint_one_click_scripts_accept_the_same_switches) {
     CRPC_CHECK(compared >= 6);
     CRPC_CHECK_FALSE(bad);
 }
+// --- 10. A shell script's --help must list every flag it accepts -----------
+//
+// The usage block is the only documentation these scripts have (there is no
+// man page), and it drifted twice: `--examples` and `--no-tests` were added to
+// the case statement while the usage text still listed seven flags, so
+// `--help` was actively misleading about the two shapes CI depends on.
+//
+// The check is textual on purpose. It compares the flags parsed out of the case
+// statement against those named in the leading comment block; both come from the
+// same file, so it cannot pass by inspecting a different copy.
+
+namespace {
+
+// Flags in the `while [[ $# ... case "$1" in` table, e.g. `--examples)`.
+std::vector<std::string> sh_flag_table(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::size_t pos = line.find_first_not_of(" \t");
+        if (pos == std::string::npos || line[pos] != '-') {
+            continue;
+        }
+        const std::size_t close = line.find(')', pos);
+        // A case arm, not a stray dash in prose: `--flag) ... ;;`.
+        if (close == std::string::npos ||
+            line.find(";;", close) == std::string::npos) {
+            continue;
+        }
+        std::string name = line.substr(pos, close - pos);
+        const std::size_t bars = name.rfind('|');
+        if (bars != std::string::npos) {
+            name = name.substr(bars + 1);
+        }
+        while (!name.empty() && name.front() == '-') {
+            name.erase(name.begin());
+        }
+        // Flags whose value is a whole word ("--arch) ARCH=$2") are skipped:
+        // only the documentation of boolean switches is being checked here,
+        // because those are the ones that were missing.
+        if (name.empty() || name.find(' ') != std::string::npos ||
+            name.find('{') != std::string::npos) {
+            continue;
+        }
+        // `--help` documents itself; every usage block would have to name it
+        // and none do, which says nothing about whether a real flag is missing.
+        if (name == "help" || name == "h") {
+            continue;
+        }
+        out.push_back(name);
+    }
+    return out;
+}
+
+// The leading block of `#` lines, i.e. what --help prints.
+std::string leading_comment_block(const std::string& text) {
+    std::istringstream stream(text);
+    std::string line;
+    std::string block;
+    bool started = false;
+    while (std::getline(stream, line)) {
+        std::size_t pos = line.find_first_not_of(" \t");
+        if (pos != std::string::npos && line[pos] == '#') {
+            started = true;
+            block += line;
+            block += '\n';
+            continue;
+        }
+        if (started) {
+            break;
+        }
+    }
+    return block;
+}
+
+} // namespace
+
+CRPC_TEST(docs_lint_shell_usage_lists_every_flag) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const char* const scripts[] = {"scripts/build.sh", "scripts/test.sh"};
+    std::size_t compared = 0;
+    bool bad = false;
+    for (const char* rel : scripts) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        const std::string text = read_text(path);
+        const std::vector<std::string> flags = sh_flag_table(text);
+        const std::string usage = leading_comment_block(text);
+        CRPC_CHECK(!flags.empty());
+        CRPC_CHECK(!usage.empty());
+        for (const std::string& flag : flags) {
+            ++compared;
+            if (usage.find("--" + flag) == std::string::npos) {
+                std::printf("  %s accepts --%s but its usage block does not "
+                            "list it\n", rel, flag.c_str());
+                bad = true;
+            }
+        }
+    }
+    // Two scripts x (clean, shared, bench, examples, no-tests) at least.
+    CRPC_CHECK(compared >= 10);
+    CRPC_CHECK_FALSE(bad);
+}
 CRPC_TEST_MAIN()
