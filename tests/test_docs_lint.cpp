@@ -775,4 +775,137 @@ CRPC_TEST(docs_lint_examples_index_lists_every_example) {
     CRPC_CHECK_FALSE(bad);
 }
 
+// --- 8. design.md's build/CI section must match the tree ---------------------
+//
+// Section 20 is the normative description of how this project is built. It had
+// drifted into fiction: it named seven library targets (crpc_core,
+// crpc_transport, crpc_rpc, crpc_http, crpc_cluster, crpc_tests, crpc_fuzz,
+// crpc_bench) when the tree builds one library plus an INTERFACE shim, it
+// listed CRPC_BUILD_FUZZ / CRPC_WITH_LZ4 / CRPC_WITH_ZSTD /
+// CRPC_32BIT_FRAME_CAP which never existed, and it advertised CI jobs for x86,
+// fuzz smoke, golden bytes and a benchmark report when ci.yml had none of them
+// (x86 is now real; the rest were removed from the document).
+//
+// Both language versions are checked, because only one of them being right is
+// the same defect in a different language.
+
+CRPC_TEST(docs_lint_design_build_facts_match_the_tree) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path cmake_path = root / "CMakeLists.txt";
+    const fs::path ci_path = root / ".github" / "workflows" / "ci.yml";
+    CRPC_CHECK(fs::exists(cmake_path));
+    CRPC_CHECK(fs::exists(ci_path));
+    if (!fs::exists(cmake_path) || !fs::exists(ci_path)) {
+        return;
+    }
+    const std::string cmake = read_text(cmake_path);
+    const std::string ci = read_text(ci_path);
+
+    // Every option the document says exists must be a real CMake variable.
+    const char* const claimed_options[] = {
+        "CRPC_BUILD_TESTS", "CRPC_BUILD_BENCH", "CRPC_BUILD_EXAMPLES",
+        "CRPC_BUILD_SHARED", "CRPC_WITH_OPENSSL", "CRPC_WITH_ODBC",
+        "CRPC_WARNINGS_AS_ERRORS", "CRPC_ENABLE_LTO", "CRPC_SANITIZER",
+        "CRPC_RTTI_DIR", "CRPC_COROCC_DIR"};
+    // Options that were removed from the document; naming them again is the
+    // regression this half guards.
+    const char* const phantom_options[] = {
+        "CRPC_BUILD_FUZZ", "CRPC_WITH_LZ4", "CRPC_WITH_ZSTD",
+        "CRPC_32BIT_FRAME_CAP"};
+    // Targets the tree actually creates. The needle includes the table cell
+    // separator: the claim is "this row of the target table is true", so a row
+    // renamed to `crpc_all` must fail even though "`crpc`" still appears in the
+    // surrounding prose.
+    const char* const real_targets[] = {"| `crpc` |", "| `crpc_mpmc` |"};
+    const char* const phantom_targets[] = {
+        "`crpc_transport`", "`crpc_rpc`", "`crpc_http`", "`crpc_cluster`",
+        "`crpc_tests`", "`crpc_fuzz`", "`crpc_bench`"};
+
+    const char* const docs[] = {"docs/design.md", "docs/design.zh-CN.md"};
+    bool bad = false;
+    for (const char* rel : docs) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        const std::string text = read_text(path);
+
+        for (const char* option : claimed_options) {
+            if (cmake.find(option) == std::string::npos) {
+                std::printf("  %s claims option %s, absent from CMakeLists\n",
+                            rel, option);
+                bad = true;
+            }
+        }
+        for (const char* option : phantom_options) {
+            if (text.find(option) != std::string::npos) {
+                std::printf("  %s still names non-existent option %s\n", rel,
+                            option);
+                bad = true;
+            }
+        }
+        for (const char* target : real_targets) {
+            if (text.find(target) == std::string::npos) {
+                std::printf("  %s no longer names real target %s\n", rel,
+                            target);
+                bad = true;
+            }
+        }
+        for (const char* target : phantom_targets) {
+            if (text.find(target) != std::string::npos) {
+                std::printf("  %s still names non-existent target %s\n", rel,
+                            target);
+                bad = true;
+            }
+        }
+
+        // CI facts: what the document may claim must appear in the workflow.
+        struct CiClaim {
+            const char* phrase_in_doc;
+            const char* must_appear_in_ci;
+        };
+        const CiClaim claims[] = {
+            {"linux-sanitizers", "linux-sanitizers"},
+            {"linux-bench-compile", "linux-bench-compile"},
+            {"bench-compile", "bench-compile"},
+            {"examples", "examples"}
+        };
+        for (const CiClaim& claim : claims) {
+            if (text.find(claim.phrase_in_doc) == std::string::npos) {
+                continue;
+            }
+            if (ci.find(claim.must_appear_in_ci) == std::string::npos) {
+                std::printf("  %s claims CI job %s, absent from ci.yml\n", rel,
+                            claim.must_appear_in_ci);
+                bad = true;
+            }
+        }
+        // The x86 claim is the one this round made true: if the document lists
+        // 32-bit Windows jobs, the workflow must actually pass the matrix arch to
+        // BOTH the build and the test step. Counting occurrences is deliberate:
+        // pinning only one of the two still means half the job builds x64, which
+        // is not coverage. (Mutation M1 did exactly that and the first version of
+        // this check passed it.)
+        if (text.find("x86") != std::string::npos) {
+            std::size_t uses = 0;
+            const std::string needle = "-Arch ${{ matrix.arch }}";
+            for (std::size_t pos = ci.find(needle); pos != std::string::npos;
+                 pos = ci.find(needle, pos + needle.size())) {
+                ++uses;
+            }
+            if (uses < 2) {
+                std::printf("  %s claims x86 CI coverage, ci.yml passes the "
+                            "matrix arch %zu time(s), need >= 2\n",
+                            rel, uses);
+                bad = true;
+            }
+        }
+    }
+    CRPC_CHECK_FALSE(bad);
+}
 CRPC_TEST_MAIN()

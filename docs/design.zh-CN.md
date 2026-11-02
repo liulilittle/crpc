@@ -1701,19 +1701,25 @@ D1-D15 为 B §8 的 RTTI 集成缺陷；D16-D20 为 A §1.1 D1-D5 的 corocc �
 corocc 已提供 fiber hook：`COROCC_ASAN` 与 `COROCC_TSAN` 构建选项、ASan 上下文切换、TSan fiber 注解。CRPC 用这些选项构建依赖，不自建 fiber 注解。
 ## 20. 构建与 CI <a id="s20"></a>
 ### 20.1 CMake 目标
+只构建一个库目标，源文件来自整个 `src/`：
+
 | 目标 | 内容 |
 |---|---|
-| `crpc_core` | `core`、`io`、`wire` |
-| `crpc_transport` | epoll、IOCP、inproc、定时器、MPSC |
-| `crpc_rpc` | rpc、codec |
-| `crpc_http` | HTTP/1.1、HTTP/2、HPACK、TLS、MVC |
-| `crpc_cluster` | 节点、注册中心、发现、负载均衡 |
-| `crpc` | 汇总静态库 |
-| `crpc_tests` | 单元、集成、conformance、golden |
-| `crpc_fuzz` | fuzz 目标 |
-| `crpc_bench` | 基准 |
+| `crpc` | 库本体：core、io、wire、rpc、http、http2、cluster、mvc、codec、files、push、db、mq、redis、ws、ipc、fs、orm、game、algorithm、crypto、text |
+| `crpc::crpc`、`crpc_core` | `crpc` 的别名，供 `target_link_libraries` 与测试使用 |
+| `crpc_mpmc` | INTERFACE 目标，只负责传递 vendored mpmc 的头文件目录 |
 
-选项：`CRPC_BUILD_TESTS`、`CRPC_BUILD_BENCH`、`CRPC_BUILD_FUZZ`、`CRPC_WITH_OPENSSL`、`CRPC_WITH_LZ4`、`CRPC_WITH_ZSTD`、`CRPC_SANITIZER=none|asan|ubsan|tsan`、`CRPC_RTTI_DIR`、`CRPC_COROCC_DIR`、`CRPC_32BIT_FRAME_CAP`。
+其余都是"源文件一个可执行文件"，全部输出到构建根目录：`crpc_test_<file>`
+（嵌套测试目录为 `crpc_test_<dir>_<file>`）、`crpc_example_<stem>`、
+`crpc_bench_<file>`。按子系统拆分库曾被考虑但不采用：它不改变依赖图
+（汇总库本来就连全部），只会增加每个目标的链接行维护成本。
+
+选项：`CRPC_BUILD_TESTS`、`CRPC_BUILD_BENCH`、`CRPC_BUILD_EXAMPLES`、
+`CRPC_BUILD_SHARED`、`CRPC_WITH_OPENSSL`、`CRPC_WITH_ODBC`、
+`CRPC_WARNINGS_AS_ERRORS`、`CRPC_ENABLE_LTO`、
+`CRPC_SANITIZER=none|asan|ubsan|tsan`、`CRPC_RTTI_DIR`、`CRPC_COROCC_DIR`。
+不在这个列表里的选项都不存在。压缩器是内置的、不是可选项；32 位帧上限是编译期
+常量；也没有 fuzz 目标——没有可以打开这些能力的开关。
 
 零警告策略：MSVC `/W4 /WX`；GCC/Clang `-Wall -Wextra -Wpedantic -Werror`；可行处再加 `-Wconversion -Wsign-conversion`。CRPC 代码不得关闭警告；第三方抑制必须写明库名与理由。
 ### 20.2 脚本与 CI
@@ -1723,7 +1729,12 @@ scripts/build.sh  --config debug|release|both --arch x64 --sanitizer none|asan|u
 scripts/test.ps1  -Config Debug|Release -Arch x86|x64 -Sanitizer none|all -Filter <substring> -Repeat N
 scripts/test.sh   --config debug|release --sanitizer none|all --filter <substring> --repeat N
 ```
-CI job：MSVC x64 Debug/Release、MSVC x86 Debug/Release、GCC x64、Clang x64、ASan、UBSan、TSan、fuzz 冒烟、golden bytes、基准报告。CI 调用开发者同一套脚本，不重复构建逻辑。日志 UTF-8；失败非零退出；构建幂等。
+CI job：`linux`（GCC Debug/Release、Clang Debug，以及 GCC/Clang 的 shared）、
+`linux-sanitizers`（ASan + UBSan + TSan）、`windows`（MSVC x64 与 x86，Debug/Release）、
+`shared`（MSVC shared，含消费方链接门与导出表门）、`linux-bench-compile` 与
+`bench-compile`（两个平台都编译 `bench/`，但都不运行）、`examples`。
+没有 fuzz job，也没有 golden-bytes job：逐字节期望写在单元测试里
+（`test_frame.cpp`、`test_protocol*`、`test_redis_resp.cpp` 等），不是独立的比对步骤。CI 调用开发者同一套脚本，不重复构建逻辑。日志 UTF-8；失败非零退出；构建幂等。
 ## 21. v1 范围、v1.1、里程碑 <a id="s21"></a>
 ### 21.1 v1（R5，权威）
 | 领域 | v1 内容 |

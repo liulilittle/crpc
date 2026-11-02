@@ -117,15 +117,22 @@ jobs:
           if-no-files-found: ignore
 
   windows:
-    name: windows/${{ matrix.config }}
+    name: windows/${{ matrix.arch }}/${{ matrix.config }}
     runs-on: windows-2022
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { config: Debug }
-          - { config: Release }
+          - { config: Debug,   arch: x64 }
+          - { config: Release, arch: x64 }
+          # 32-bit is a supported target (both scripts take -Arch x86) and
+          # tests/test_abi_docs.cpp names x86-specific tail padding, so the
+          # 32-bit layout rules were documented and checked by hand but never
+          # by CI. Both configurations pass locally (189/189 each, zero
+          # warnings); these rows are what keeps them passing.
+          - { config: Debug,   arch: x86 }
+          - { config: Release, arch: x86 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -141,17 +148,17 @@ jobs:
       # developer prompt.
       - name: Build
         shell: pwsh
-        run: ./scripts/build.ps1 -Config ${{ matrix.config }} -Arch x64 -Jobs $env:NUMBER_OF_PROCESSORS
+        run: ./scripts/build.ps1 -Config ${{ matrix.config }} -Arch ${{ matrix.arch }} -Jobs $env:NUMBER_OF_PROCESSORS
 
       - name: Test
         shell: pwsh
-        run: ./scripts/test.ps1 -Config ${{ matrix.config }} -Arch x64
+        run: ./scripts/test.ps1 -Config ${{ matrix.config }} -Arch ${{ matrix.arch }}
 
       - name: Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-windows-${{ matrix.config }}
+          name: logs-windows-${{ matrix.arch }}-${{ matrix.config }}
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 

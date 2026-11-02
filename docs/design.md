@@ -1699,19 +1699,28 @@ The project rule is that a failure must be proven before the fix, and that the t
 corocc already provides fiber hooks: `COROCC_ASAN` and `COROCC_TSAN` build options, ASan context switching, and TSan fiber annotations. CRPC builds the dependency with those options; it does not add its own fiber annotations.
 ## 20. Build and CI <a id="s20"></a>
 ### 20.1 CMake targets
+One library target is built, from the whole of `src/`:
+
 | Target | Content |
 |---|---|
-| `crpc_core` | `core`, `io`, `wire` |
-| `crpc_transport` | epoll, IOCP, inproc, timer, MPSC |
-| `crpc_rpc` | rpc, codec |
-| `crpc_http` | HTTP/1.1, HTTP/2, HPACK, TLS, MVC |
-| `crpc_cluster` | node, registry, discovery, balance |
-| `crpc` | Umbrella static library |
-| `crpc_tests` | Unit, integration, conformance, golden |
-| `crpc_fuzz` | Fuzz targets |
-| `crpc_bench` | Benchmarks |
+| `crpc` | the library: core, io, wire, rpc, http, http2, cluster, mvc, codecs, files, push, db, mq, redis, ws, ipc, fs, orm, game, algorithm, crypto, text |
+| `crpc::crpc`, `crpc_core` | aliases of `crpc`, for `target_link_libraries` and for tests |
+| `crpc_mpmc` | INTERFACE target carrying the vendored mpmc include directories |
 
-Options: `CRPC_BUILD_TESTS`, `CRPC_BUILD_BENCH`, `CRPC_BUILD_FUZZ`, `CRPC_WITH_OPENSSL`, `CRPC_WITH_LZ4`, `CRPC_WITH_ZSTD`, `CRPC_SANITIZER=none|asan|ubsan|tsan`, `CRPC_RTTI_DIR`, `CRPC_COROCC_DIR`, `CRPC_32BIT_FRAME_CAP`.
+Everything else is one executable per source file, all written to the build
+root: `crpc_test_<file>` (and `crpc_test_<dir>_<file>` for nested test
+directories), `crpc_example_<stem>`, and `crpc_bench_<file>`. Subsystem
+libraries were considered and are not used: they would not change the
+dependency graph (the umbrella links all of it anyway) and would only add
+per-target link lines to maintain.
+
+Options: `CRPC_BUILD_TESTS`, `CRPC_BUILD_BENCH`, `CRPC_BUILD_EXAMPLES`,
+`CRPC_BUILD_SHARED`, `CRPC_WITH_OPENSSL`, `CRPC_WITH_ODBC`,
+`CRPC_WARNINGS_AS_ERRORS`, `CRPC_ENABLE_LTO`,
+`CRPC_SANITIZER=none|asan|ubsan|tsan`, `CRPC_RTTI_DIR`, `CRPC_COROCC_DIR`.
+Anything not in that list does not exist. In particular the compressors are
+built in rather than optional, the 32-bit frame cap is a compile-time constant,
+and there are no fuzz targets -- so there is nothing to switch on for them.
 
 Zero-warning policy: MSVC `/W4 /WX`; GCC/Clang `-Wall -Wextra -Wpedantic -Werror`; additionally `-Wconversion -Wsign-conversion` where practical. Warnings are never disabled for CRPC code; third-party suppressions must name the library and the reason.
 ### 20.2 Scripts and CI
@@ -1721,7 +1730,14 @@ scripts/build.sh  --config debug|release|both --arch x64 --sanitizer none|asan|u
 scripts/test.ps1  -Config Debug|Release -Arch x86|x64 -Sanitizer none|all -Filter <substring> -Repeat N
 scripts/test.sh   --config debug|release --sanitizer none|all --filter <substring> --repeat N
 ```
-CI jobs: MSVC x64 Debug/Release, MSVC x86 Debug/Release, GCC x64, Clang x64, ASan, UBSan, TSan, fuzz smoke, golden bytes, benchmark report. CI calls the same scripts developers use; it does not duplicate build logic. Logs are UTF-8; failures exit non-zero; builds are idempotent.
+CI jobs: `linux` (GCC Debug/Release, Clang Debug, and GCC/Clang shared),
+`linux-sanitizers` (ASan + UBSan + TSan), `windows` (MSVC x64 and x86,
+Debug/Release), `shared` (MSVC shared with the consumer link gate and the
+export gate), `linux-bench-compile` and `bench-compile` (compile `bench/` on
+both platforms, never run it), and `examples`. There is no fuzz job and no
+golden-bytes job: byte-exact expectations live in the unit tests
+(`test_frame.cpp`, `test_protocol*`, `test_redis_resp.cpp`, ...) rather than in
+a separate comparison step. CI calls the same scripts developers use; it does not duplicate build logic. Logs are UTF-8; failures exit non-zero; builds are idempotent.
 ## 21. v1 scope, v1.1, milestones <a id="s21"></a>
 ### 21.1 v1 (R5, authoritative)
 | Area | v1 content |
