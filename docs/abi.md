@@ -517,7 +517,8 @@ private data members, and its width is not a fixed number: it is
 `sizeof(server::options)` plus its three `std::vector` members and the borrowed
 `obs::interceptor_chain*` observability-chain pointer, rounded to its
 alignment, and the vector width changes with the standard library's debug
-configuration (MSVC x64: 392 bytes in Release, 416 in Debug; x86: 304 / 312).
+configuration (MSVC 19.44: x64 is 400 bytes in Release and 424 in Debug;
+x86 is 304 and 320).
 `src/abi_check.cpp` therefore pins the structural relation rather than an
 absolute size, and requires the builder to keep the options alignment; that
 catches an added, removed or re-typed builder member on every target and
@@ -649,8 +650,9 @@ field. Every existing member keeps its offset (`send_goaway_on_stop` stays 249
 on x64 and 225 on x86, `push_subscribe` stays 264 / 232), so a consumer that
 only reads those members keeps working **within one header set**, but
 `sizeof(server::options)` grows from 304 to **320** on x64 and from 256 to
-**264** on x86, and `sizeof(server::builder)` grows with it (376 → 392 on x64,
-296 → 304 on x86) because the builder holds the options by value. Passing an
+**264** on x86, and `sizeof(server::builder)` grows with it (376 → **400** on
+x64, 296 → **304** on x86 in Release) because the builder holds the options
+by value. Passing an
 options struct by value into the library constructor is an exported signature,
 so this is a **MAJOR** change under §1, not a MINOR extension: a consumer must
 be rebuilt from the same headers. The same field is the one injection point for

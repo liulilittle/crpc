@@ -372,7 +372,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 护栏无法作用于其私有数据成员，其宽度也不是固定数字：它等于 `sizeof(server::options)`
 加上三个 `std::vector` 成员与借用的 `obs::interceptor_chain*` 可观测性链指针，
 并按 builder 的对齐向上取整，而 `std::vector` 的宽度会随
-标准库调试配置变化（MSVC x64：Release 392 字节，Debug 416 字节；x86：304 / 312）。
+标准库调试配置变化（MSVC 19.44：x64 Release 400 字节、Debug 424 字节；
+x86 分别 304 与 320 字节）。
 因此 `src/abi_check.cpp` 锁定的是这一结构关系而非绝对尺寸，并要求 builder 保持
 options 的对齐；它能在所有目标与配置上捕获 builder 成员的增删或类型变更。三个等宽
 vector 的重排与其它护栏看不见的变更一样，仍按第 7 节属 MAJOR。
@@ -469,7 +470,7 @@ MAJOR 处理（见第 8 节）。
 偏移全部不变（`send_goaway_on_stop` 仍是 x64 249 / x86 225，`push_subscribe` 仍是
 264 / 232），因此只读这些成员的消费方在**同一套头文件内**仍可工作；但
 `sizeof(server::options)` 从 304 增长到 **320**（x64）、从 256 增长到 **264**（x86），
-`sizeof(server::builder)` 也随之增长（x64 376 → 392，x86 296 → 304），因为 builder 按值
+`sizeof(server::builder)` 也随之增长（Release：x64 376 → **400**，x86 296 → **304**），因为 builder 按值
 持有 options。options 结构体按值进入导出构造函数，因此按第 1 节这属于 **MAJOR** 变更，
 不是 MINOR 扩展：消费方必须用同一份头文件重建。该字段同时是服务端时钟的唯一注入点：
 每连接 rate 桶、每服务 rate 桶、每服务熔断器与 dispatcher 的 deadline 判定都读它，

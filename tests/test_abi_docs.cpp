@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <crpc/rpc/client.hpp>
+#include <crpc/server.hpp>
 
 #include "test_framework.hpp"
 
@@ -1147,6 +1148,67 @@ CRPC_TEST(abi_docs_counts_match_abi_check_source) {
         "就 " + std::to_string(standard_layouts) + "\r\n  个有成员数量护栏的记录而言";
     CRPC_CHECK(has_phrase(zh, zh_member_sentence.c_str()));
     CRPC_CHECK_FALSE(has_phrase(zh, zh_stale_sentence.c_str()));
+}
+
+
+// The documents state absolute sizes for `server::builder`, and the comment in
+// `src/abi_check.cpp` used to state more of them. Three of those four numbers
+// were wrong (392/416 and 312 against a measured 400/424 and 320) and nothing
+// failed: `abi_check.cpp`'s static_assert only checks the structural relation
+// between options, the vectors and the pointer, never the total. That is the
+// right call for a portable ABI guard -- pinning a standard-library width breaks
+// on another MSVC STL -- but it left the documented numbers unverified.
+//
+// This compares the documented Release sizes with the values this translation
+// unit actually compiles to, in both languages. Debug widths are deliberately
+// not pinned: they depend on the STL's iterator-debug level, so the document
+// names them as "in Debug" without the test asserting a specific figure.
+CRPC_TEST(abi_docs_builder_size_matches_the_compiled_value) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+
+    // The Release widths the documents quote. Only meaningful when this build is
+    // a Release build: an iterator-debug STL widens the vectors, and the ABI
+    // tests are run in both configurations. The measurements live inside the
+    // #else branch because a Debug build would otherwise leave them unused,
+    // which /WX turns into an error.
+#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
+    std::printf("  (iterator debug level %d: documented Release widths are not "
+                "comparable in this build)\n", _ITERATOR_DEBUG_LEVEL);
+#else
+    constexpr std::size_t options_size = sizeof(crpc::server::options);
+    constexpr std::size_t builder_size = sizeof(crpc::server::builder);
+    const char* expected_options = nullptr;
+    const char* expected_builder = nullptr;
+#if defined(_M_X64) || defined(__x86_64__)
+    expected_options = "320";
+    expected_builder = "400";
+#elif defined(_M_IX86) || defined(__i386__)
+    expected_options = "264";
+    expected_builder = "304";
+#endif
+    if (expected_options != nullptr) {
+        CRPC_CHECK_EQ(std::string(expected_options), std::to_string(options_size));
+        CRPC_CHECK_EQ(std::string(expected_builder), std::to_string(builder_size));
+
+        const std::string en = read_text(root / "docs" / "abi.md");
+        const std::string zh = read_text(root / "docs" / "abi.zh-CN.md");
+        // The builder sentence quotes the post-change width, and the English one
+        // writes it in bold.
+        const std::string en_builder =
+            std::string("\u2192 **") + expected_builder + "** on";
+        const std::string zh_builder =
+            std::string("\u2192 **") + expected_builder + "**";
+        CRPC_CHECK(has_phrase(en, en_builder.c_str()));
+        CRPC_CHECK(has_phrase(zh, zh_builder.c_str()));
+        // The stale widths must not come back.
+        CRPC_CHECK_FALSE(has_phrase(en, "\u2192 392 on x64"));
+        CRPC_CHECK_FALSE(has_phrase(zh, "376 \u2192 392"));
+    }
+#endif
 }
 
 CRPC_TEST(abi_docs_chinese_states_the_guard_facts) {

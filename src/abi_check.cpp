@@ -505,13 +505,19 @@ CRPC_ABS_OFF(server::options, clock_source, 304);
 // borrowed observability-chain pointer (`aop_chain_`, added with the AOP call
 // path wiring; docs/abi.md section 4 records the change), rounded to the
 // builder's alignment, and `std::vector` widens with the standard library's
-// debug configuration (MSVC x64: 392 bytes in Release, 416 in Debug;
-// x86: 304 / 312). The structural relation below catches an added, removed or
-// re-typed builder member on every target and configuration without pinning a
-// standard-library width, and the alignment assertion catches a member that
+// debug configuration. The structural relation below catches an added, removed
+// or re-typed builder member on every target and configuration without pinning
+// a standard-library width, and the alignment assertion catches a member that
 // would shift the vector offsets without changing the total width. A reorder
 // of the three same-width vectors is still covered only by policy, like the
 // other unguarded cases in docs/abi.md.
+//
+// The absolute sizes used to be written into this comment as 392/416 (x64) and
+// 304/312 (x86), and three of those four were wrong: measured with MSVC 19.44
+// they are 400/424 and 304/320. Nothing failed, because the static_assert only
+// checks the relation. The numbers now live in tests/test_abi_docs.cpp, which
+// compares them with both language versions of docs/abi.md, so a document that
+// states them and a test that reads them cannot drift apart silently.
 static_assert(
     sizeof(server::builder) ==
         (sizeof(server::options) +
