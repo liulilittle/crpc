@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -598,6 +599,42 @@ CRPC_TEST(cluster_extracts_keys_for_routing) {
         cluster_command_keys({"MEMORY", "USAGE", "key"});
     CRPC_CHECK_EQ(std::size_t{1}, memory.size());
     CRPC_CHECK_EQ(std::string("key"), memory[0]);
+}
+
+// `ranges()` must hand back a reference, not a copy.
+//
+// The topology is read-mostly and every caller only iterates it, but a copy
+// duplicates every range *and* each range's replica vector on each call.
+// Nothing observable changes, which is exactly why a behavioural assertion
+// cannot catch a regression here: the check has to be on the signature, at
+// compile time.
+static_assert(
+    std::is_same_v<decltype(std::declval<const cluster_topology&>().ranges()),
+                   const std::vector<cluster_slot_range>&>,
+    "cluster_topology::ranges() must return a reference; returning by value copies every range and its replica list on each call");
+
+CRPC_TEST(redis_cluster_topology_ranges_is_a_reference) {
+    cluster_topology topology;
+    cluster_slot_range range;
+    range.begin = 0;
+    range.end = 100;
+    range.master = cluster_address("127.0.0.1", 7000);
+    CRPC_CHECK(topology.assign(range));
+
+    // The reference must observe a later assign through the same table, which
+    // a by-value snapshot could not.
+    const std::vector<cluster_slot_range>& view = topology.ranges();
+    CRPC_CHECK_EQ(std::size_t{1}, view.size());
+
+    cluster_slot_range second;
+    second.begin = 101;
+    second.end = 200;
+    second.master = cluster_address("127.0.0.1", 7001);
+    CRPC_CHECK(topology.assign(second));
+    CRPC_CHECK_EQ(std::size_t{2}, topology.ranges().size());
+
+    // Same object: the address is stable, so this is the table's own vector.
+    CRPC_CHECK(topology.ranges().data() == topology.ranges().data());
 }
 
 CRPC_TEST_MAIN()

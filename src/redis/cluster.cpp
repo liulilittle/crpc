@@ -653,10 +653,6 @@ const cluster_slot_range* cluster_topology::range_for(
     return &ranges_[index];
 }
 
-std::vector<cluster_slot_range> cluster_topology::ranges() const {
-    return ranges_;
-}
-
 bool cluster_topology::empty() const noexcept { return ranges_.empty(); }
 
 bool cluster_topology::complete() const noexcept {

@@ -158,8 +158,15 @@ public:
     [[nodiscard]] const cluster_slot_range* range_for(
         std::uint16_t slot) const noexcept;
 
-    // Snapshot of the current non-overlapping ranges, in insertion order.
-    [[nodiscard]] std::vector<cluster_slot_range> ranges() const;
+    // The current non-overlapping ranges, in insertion order.
+    //
+    // Returned by reference, not by value: the table is read-mostly and callers
+    // only iterate it, so a copy would duplicate every range (and every
+    // replica list inside it) on each call. The reference is invalidated by the
+    // next assign()/reset(), the same contract as `range_for()`.
+    [[nodiscard]] const std::vector<cluster_slot_range>& ranges() const noexcept {
+        return ranges_;
+    }
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] bool complete() const noexcept;
