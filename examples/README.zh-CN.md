@@ -244,8 +244,8 @@ curl -sS http://127.0.0.1:19555/echo/curl-real
 ```
 
 ```text
-soak: handle counter verified (87 -> 102 for 16 deliberate leaks)
-soak: requests=2000 failures=0 handles 86 -> 87 per-request-ms p50=0.71 p99=15.96 max=25.17 [connect-avg=5.25 transfer-avg=0.32] [connect-ms p50=0.43 p90=14.71 p99=15.58 max=24.67]
+soak: handle counter verified (96 -> 110 for 16 deliberate leaks)
+soak: requests=2000 failures=0 connect_failures=0 worst_connect_ms=0 handles 93 -> 93 per-request-ms p50=0.42 p99=0.73 max=0.75 [connect-avg=0.21 transfer-avg=0.22] [connect-ms p50=0.20 p90=0.29 p99=0.44 max=0.46]
 ```
 
 两个细节比数字本身更重要：
@@ -254,8 +254,13 @@ soak: requests=2000 failures=0 handles 86 -> 87 per-request-ms p50=0.71 p99=15.9
   一个恒返回常量的计数器会让所有泄漏检查"天然通过"——那是最糟的绿——所以它会直接
   中止，而不是报一个没有意义的通过。
 * **报分布而不是均值**。整体请求与单独 connect 各自给 `p50/p99/max`，因为尾部问题
-  在均值里看不见。本机上 connect 尾部是约十分之一连接吃到一个 Windows 时钟片
-  （~15.6 ms），而**已建立连接**的传输是 ~0.3 ms。两者分开报，避免混为一谈。
+  在均值里看不见。两者分开报，避免混为一谈。上面的数字来自 connect 路径正确的机器；
+  本文件早先的版本写的是 `connect p90 = 14.71 ms`，因为 `select` 之后一次多余的
+  `getsockopt(SO_ERROR)` 让约三分之一的回环连接要等一个完整 Windows 时钟片。该调用
+  已删除，同一分布现在报 ~0.3 ms。
+* **失败的连接会说明原因**。`connect_failures` 与 `worst_connect_ms` 独立于
+  `failures` 报出，因为"被拒绝"和"很慢"含义不同：拒绝是立即的，而耗满整个
+  `connect_timeout` 意味着 accept 侧停止取用。前 5 次失败还会打印各自的毫秒耗时。
 
 门禁判据是句柄**增长**，不是绝对值：绝对值随平台与系统版本不同，而泄漏总是随工作量增长。
 

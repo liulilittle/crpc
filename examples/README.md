@@ -264,8 +264,8 @@ count before and after.
 ```
 
 ```text
-soak: handle counter verified (87 -> 102 for 16 deliberate leaks)
-soak: requests=2000 failures=0 handles 86 -> 87 per-request-ms p50=0.71 p99=15.96 max=25.17 [connect-avg=5.25 transfer-avg=0.32] [connect-ms p50=0.43 p90=14.71 p99=15.58 max=24.67]
+soak: handle counter verified (96 -> 110 for 16 deliberate leaks)
+soak: requests=2000 failures=0 connect_failures=0 worst_connect_ms=0 handles 93 -> 93 per-request-ms p50=0.42 p99=0.73 max=0.75 [connect-avg=0.21 transfer-avg=0.22] [connect-ms p50=0.20 p90=0.29 p99=0.44 max=0.46]
 ```
 
 Two details matter more than the numbers:
@@ -276,9 +276,16 @@ Two details matter more than the numbers:
   worst kind of green -- so it aborts rather than reporting a meaningless pass.
 * **it reports a distribution, not an average.** `p50/p99/max` for the whole
   request and for the connect alone, because a tail problem is invisible in a
-  mean. On this host the connect tail is one Windows timer tick (~15.6 ms) for
-  roughly one connection in ten; the established-connection transfer is
-  ~0.3 ms. That split is reported so the two are never confused.
+  mean. The split is reported so the two are never confused. The numbers above
+  are from a host where the connect path is correct; an earlier revision of this
+  file showed `connect p90 = 14.71 ms` because a redundant `getsockopt(SO_ERROR)`
+  after `select` cost a full Windows timer tick on roughly a third of loopback
+  connects. That call was removed, and the same split now reports ~0.3 ms.
+* **a failed connect says why.** `connect_failures` and `worst_connect_ms` are
+  reported separately from `failures`, because a refused connect and a slow one
+  mean different things: a refusal is immediate, while one that burns the whole
+  `connect_timeout` means the accept side stopped consuming. The first five
+  failures also print their elapsed milliseconds.
 
 The gate is `handles` growth, not an absolute count: absolute handle counts
 differ per platform and per OS build, but a leak always grows with the work.

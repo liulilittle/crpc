@@ -1408,6 +1408,68 @@ CRPC_TEST(docs_lint_bench_claims_match_the_bench_directory) {
     CRPC_CHECK_FALSE(bad);
 }
 
+// --- 13. Sample output in examples/README must match what the program prints
+//
+// Both READMEs quote a `soak:` transcript. It went stale twice without anyone
+// noticing: the sample kept `connect p90 = 14.71 ms` after that defect was
+// fixed (a6d92fd), and it kept the pre-fix `connect-avg=` after the summary
+// gained `connect_failures=` / `worst_connect_ms=` (0f80ace) and the STATS line
+// gained `active=` (c98ec20). A sample nobody can reproduce is worse than no
+// sample: it teaches the reader that a 15 ms connect tail is normal.
+//
+// The check is deliberately narrow -- it looks only at lines that start with
+// `soak: requests=` -- so prose may still discuss the old numbers, which it
+// does on purpose to explain why they changed.
+//
+// It cannot compare values (machine dependent), only that the fields the
+// program actually prints are present, and that the one value known to be a
+// fixed defect is not presented as current.
+CRPC_TEST(docs_lint_example_output_matches_the_program) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const char* const docs[] = {"examples/README.md",
+                                "examples/README.zh-CN.md"};
+    std::size_t checked = 0;
+    bool bad = false;
+    for (const char* rel : docs) {
+        const fs::path path = root / rel;
+        CRPC_CHECK(fs::exists(path));
+        if (!fs::exists(path)) {
+            continue;
+        }
+        std::istringstream stream(read_text(path));
+        std::string line;
+        while (std::getline(stream, line)) {
+            if (line.rfind("soak: requests=", 0) != 0) {
+                continue;
+            }
+            ++checked;
+            // Fields the program prints today (examples/deploy_check.cpp).
+            for (const char* field : {"failures=", "connect_failures=",
+                                      "worst_connect_ms=", "handles ",
+                                      "connect-ms p50=", "p99="}) {
+                if (line.find(field) == std::string::npos) {
+                    std::printf("  %s: soak sample is missing %s\n", rel,
+                                field);
+                    bad = true;
+                }
+            }
+            // A value that only existed while a fixed defect was present.
+            // It is fine in prose, not in the line presented as output.
+            if (line.find("14.71") != std::string::npos) {
+                std::printf("  %s: soak sample still shows the fixed "
+                            "connect tail (14.71 ms)\n", rel);
+                bad = true;
+            }
+        }
+    }
+    CRPC_CHECK(checked >= 2);
+    CRPC_CHECK_FALSE(bad);
+}
+
 namespace {
 
 // The text of the section that starts at `heading`, up to the next "## ".
