@@ -98,6 +98,17 @@ set_tests_properties(crpc_test_server_client PROPERTIES TIMEOUT 300)
 # the suite gets the same headroom as the server/client suite.
 set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 300)
 
+# --- Connect-latency gate: must not share the machine ---------------------
+#
+# `crpc_test_io_connect_latency` asserts a p90 on connection establishment, so
+# it is only meaningful when the box is not saturated. A wall-clock form of
+# the same check was tried inside test_io_iocp and went red on a correct
+# build under `ctest -j24` (8 of 200 connects over 8 ms), which is a defect in
+# the check, not in the library. RUN_SERIAL is the stated scope limit: the
+# case still runs in the same suite, just not concurrently with 20+ siblings.
+set_tests_properties(crpc_test_io_connect_latency PROPERTIES
+    TIMEOUT 120 RUN_SERIAL TRUE)
+
 # --- C ABI smoke test --------------------------------------------------------
 # Compiled as C and linked against the (C++) library. LINKER_LANGUAGE CXX is
 # required because the library needs the C++ runtime at link time.
