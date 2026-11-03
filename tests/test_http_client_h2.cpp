@@ -51,6 +51,7 @@
 #endif
 
 #include "test_framework.hpp"
+#include "test_ports.hpp"
 
 #if defined(CRPC_HAVE_OPENSSL)
 #include <crpc/io/tls.hpp>
@@ -1550,18 +1551,18 @@ CRPC_TEST(h2_client_send_and_send_text_round_trip) {
 // Only the OpenSSL-gated fixtures below call this.
 #if defined(CRPC_HAVE_OPENSSL)
 [[nodiscard]] crpc::u16 next_port() {
-    // Stay below 49152 (the Windows dynamic port range starts there on this
-    // host), so a listen port cannot be taken by one of this binary's own
-    // outgoing connections between bind attempts. The previous form could reach
-    // 49313. Same rule as test_http_keepalive's helper.
+    // Same tested allocator as the rest of the suite: below the OS dynamic
+    // range, so a listen port cannot be taken by this binary's own outgoing
+    // connections between bind attempts. The previous form could reach 49313.
 #if defined(_WIN32)
-    static const unsigned base = 26200u + (::GetCurrentProcessId() % 10000u);
+    static const unsigned pid = ::GetCurrentProcessId();
 #else
-    static const unsigned base = 26200u + (static_cast<unsigned>(::getpid()) % 10000u);
+    static const unsigned pid = static_cast<unsigned>(::getpid());
 #endif
     static std::atomic<unsigned> counter{0};
-    const unsigned value = base + counter.fetch_add(7, std::memory_order_relaxed);
-    return static_cast<crpc::u16>(value % 36000u + 1024u);
+    return static_cast<crpc::u16>(
+        crpc_test::test_port_for(pid, 26200u,
+                                 counter.fetch_add(7, std::memory_order_relaxed)));
 }
 #endif
 

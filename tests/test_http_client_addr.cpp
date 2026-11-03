@@ -19,6 +19,7 @@
 // Every peer assertion runs over a real 127.0.0.1 (and one ::1) socket, so the
 // value a handler sees is the kernel's, not a mocked transport's.
 #include "test_framework.hpp"
+#include "test_ports.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -62,20 +63,20 @@ namespace h2 = crpc::http2;
 constexpr std::string_view k_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 crpc::u16 next_port() {
-    // Kept entirely below 49152 (the start of the Windows dynamic port range
-    // measured here) so a listen port can never be stolen by one of this
-    // binary's own outgoing connections between bind attempts. Same rule and
-    // reasoning as test_http_keepalive's helper; the previous form wrapped into
-    // a 1024..59023 window and could reach 50309.
+    // Allocated through the tested helper so the port is guaranteed to stay
+    // below the OS dynamic range -- a listen port inside it can be lost to one
+    // of this binary's own outgoing connections between bind attempts (the
+    // recorded cause of a crpc_test_io_epoll failure). The previous form here
+    // wrapped into 1024..59023 and could reach 50309.
 #if defined(_WIN32)
-    static const unsigned base = 28000u + (::GetCurrentProcessId() % 10000u);
+    static const unsigned pid = ::GetCurrentProcessId();
 #else
-    static const unsigned base =
-        28000u + (static_cast<unsigned>(::getpid()) % 10000u);
+    static const unsigned pid = static_cast<unsigned>(::getpid());
 #endif
     static std::atomic<unsigned> counter{0};
-    const unsigned value = base + counter.fetch_add(11, std::memory_order_relaxed);
-    return static_cast<crpc::u16>(value % 36000u + 1024u);
+    return static_cast<crpc::u16>(
+        crpc_test::test_port_for(pid, 28000u,
+                                 counter.fetch_add(11, std::memory_order_relaxed)));
 }
 
 // --- Raw client plumbing -----------------------------------------------------
