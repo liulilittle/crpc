@@ -251,6 +251,38 @@ curl -sS http://127.0.0.1:19555/echo/curl-real
 A `curl` that gets `HTTP/1.1 200` and the expected body is evidence no
 in-process test can give: the bytes on the wire are correct HTTP, not something
 only this library can parse.
+### Sustained load
+
+A single round trip proves the wire works. It says nothing about whether the
+process survives ten thousand of them. `soak <port> <count>` runs that:
+one client backend, `count` connect/send/receive/close cycles, and a handle
+count before and after.
+
+```powershell
+.\crpc_example_deploy_check.exe serve 19555 600   # in one terminal
+.\crpc_example_deploy_check.exe soak  19555 2000  # in another
+```
+
+```text
+soak: handle counter verified (87 -> 102 for 16 deliberate leaks)
+soak: requests=2000 failures=0 handles 86 -> 87 per-request-ms p50=0.71 p99=15.96 max=25.17 [connect-avg=5.25 transfer-avg=0.32] [connect-ms p50=0.43 p90=14.71 p99=15.58 max=24.67]
+```
+
+Two details matter more than the numbers:
+
+* **the counter proves itself first.** Before measuring, the soak leaks sixteen
+  sockets on purpose and requires the handle count to see them. A counter stuck
+  at a constant value would make every leak check pass by construction -- the
+  worst kind of green -- so it aborts rather than reporting a meaningless pass.
+* **it reports a distribution, not an average.** `p50/p99/max` for the whole
+  request and for the connect alone, because a tail problem is invisible in a
+  mean. On this host the connect tail is one Windows timer tick (~15.6 ms) for
+  roughly one connection in ten; the established-connection transfer is
+  ~0.3 ms. That split is reported so the two are never confused.
+
+The gate is `handles` growth, not an absolute count: absolute handle counts
+differ per platform and per OS build, but a leak always grows with the work.
+
 ## Why one process
 
 The quickstart uses `crpc::inproc_backend`, which connects two endpoints inside

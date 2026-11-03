@@ -28,6 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+#include <fcntl.h>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -35,6 +40,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include <crpc/config.hpp>
 #include <crpc/http/message.hpp>
@@ -43,6 +49,12 @@
 #include <crpc/mvc/router.hpp>
 
 #if defined(_WIN32)
+// winsock2.h must precede windows.h, so the socket types and the handle
+// accounting header are pulled in together here rather than after it.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
 #include <crpc/io/iocp_backend.hpp>
 #elif defined(CRPC_OS_LINUX)
 #include <crpc/io/epoll_backend.hpp>
@@ -131,7 +143,35 @@ struct backend_holder {
     }
 };
 
-int serve(unsigned long port) {
+// --- resource accounting -----------------------------------------------------
+//
+// A soak run is only meaningful if it can see the resource it is supposed to
+// leak. Handle count is the crispest signal available without a profiler: an
+// fd/socket leak after N connections shows up as a handle count that tracks the
+// request count. RSS is noisy (allocators cache), and a leak of a few hundred
+// bytes per request disappears into it.
+//
+// Windows exposes GetProcessHandleCount; Linux exposes the same fact as the
+// number of entries in /proc/self/fd.
+std::size_t process_handle_count() {
+#if defined(_WIN32)
+    DWORD count = 0;
+    if (::GetProcessHandleCount(::GetCurrentProcess(), &count) == 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(count);
+#else
+    std::error_code ec;
+    std::size_t count = 0;
+    for (auto it = std::filesystem::directory_iterator("/proc/self/fd", ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        ++count;
+    }
+    return ec ? 0 : count;
+#endif
+}
+
+int serve(unsigned long port, int idle_seconds) {
     backend_holder backend;
     if (!backend.ok()) {
         std::cerr << "deploy: network backend did not start\n";
@@ -176,7 +216,7 @@ int serve(unsigned long port) {
             continue;
         }
         if (std::chrono::steady_clock::now() - idle_since >
-            std::chrono::seconds(kServeIdleSeconds)) {
+            std::chrono::seconds(idle_seconds)) {
             break;
         }
     }
@@ -185,7 +225,8 @@ int serve(unsigned long port) {
     std::cout << "STATS accepted=" << stats.accepted_connections
               << " requests=" << stats.requests_handled
               << " responses=" << stats.responses_written
-              << " bad=" << stats.bad_requests << std::endl;
+              << " bad=" << stats.bad_requests
+              << " handles=" << process_handle_count() << std::endl;
     server->stop();
     return 0;
 }
@@ -348,6 +389,9 @@ int call(unsigned long port) {
 
 // Spawn this executable as `serve <port>` in a child process and talk to it.
 // This is the mode CTest runs: it needs no shell script and no helper.
+// Defined below; self_check runs a short soak against its own child server.
+int soak(unsigned long port, int requests);
+
 int self_check(const char* self, unsigned long port) {
     std::string command = "\"";
     command += self;
@@ -384,7 +428,15 @@ int self_check(const char* self, unsigned long port) {
     }
     std::cout << "server: " << ready.substr(0, ready.find('\n')) << std::endl;
 
-    const int result = call(port);
+    int result = call(port);
+
+    // A short soak against the same child, so the sustained-load path (handle
+    // accounting, connection churn) is exercised by CTest and not only by a
+    // manual run. 100 connections is enough to catch a per-connection leak and
+    // still finishes in about a second.
+    if (result == 0) {
+        result = soak(port, 100) == 0 ? 0 : 1;
+    }
 
     // Let the child drain and report its counters; it exits on its own idle
     // timer, so this blocks for at most kServeIdleSeconds.
@@ -395,8 +447,229 @@ int self_check(const char* self, unsigned long port) {
     return result;
 }
 
-} // namespace
+// --- soak --------------------------------------------------------------------
+//
+// Sustained connection churn against a real listener, with handle accounting.
+//
+// The deployment question this answers is not "does one request work" -- the
+// deployment check already covers that -- but "does the process survive ten
+// thousand of them without accumulating handles". A socket or fd leak is
+// invisible in a five-request smoke test and fatal in production, so this runs
+// the same connect / send / receive / close cycle `requests` times from ONE
+// client backend (the shape a real client has) and compares the handle count
+// before and after.
+//
+// The assertion is deliberately about growth rather than an absolute number:
+// absolute handle counts differ per platform and per OS build, but a leak is
+// always "grew with the work".
+int soak(unsigned long port, int requests) {
+    backend_holder client_backend;
+    if (!client_backend.ok()) {
+        std::cerr << "deploy: network backend did not start\n";
+        return 1;
+    }
+    auto& backend = client_backend.factory();
 
+    // Warm up: the first few connections legitimately allocate one-time state
+    // (thread pools, socket tables), and counting those as a leak would make
+    // this check fail on every correct build.
+    for (int i = 0; i < 25; ++i) {
+        auto conn = backend.connect(
+            crpc::endpoint::tcp("127.0.0.1", static_cast<crpc::u16>(port)),
+            crpc::connect_options{});
+        if (!conn) {
+            std::cerr << "deploy: soak could not connect on warm-up\n";
+            return 1;
+        }
+        conn->bind_source(nullptr);
+        conn->close();
+    }
+    // Prove the instrument works before trusting it. A handle counter that
+    // silently returns a constant makes every leak check below pass by
+    // construction, which is the worst kind of green. Open a known number of
+    // sockets without closing them and require the counter to see them.
+    {
+        const std::size_t probe_before = process_handle_count();
+#if defined(_WIN32)
+        std::vector<SOCKET> probe;
+        for (int i = 0; i < 16; ++i) {
+            SOCKET s = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr,
+                                    0, WSA_FLAG_OVERLAPPED);
+            if (s != INVALID_SOCKET) {
+                probe.push_back(s);
+            }
+        }
+        const std::size_t probe_during = process_handle_count();
+        for (SOCKET s : probe) {
+            ::closesocket(s);
+        }
+        if (probe_before == 0 || probe.size() < 16 ||
+            probe_during < probe_before + probe.size() / 2) {
+            std::cerr << "deploy: the handle counter cannot see a deliberate leak ("
+                      << probe_before << " -> " << probe_during << " for "
+                      << probe.size() << " leaked sockets), so the leak check "
+                      << "below would be meaningless\n";
+            return 1;
+        }
+#else
+        std::vector<int> probe;
+        for (int i = 0; i < 16; ++i) {
+            const int fd = ::open("/dev/null", O_RDONLY);
+            if (fd >= 0) {
+                probe.push_back(fd);
+            }
+        }
+        const std::size_t probe_during = process_handle_count();
+        for (int fd : probe) {
+            ::close(fd);
+        }
+        if (probe_before == 0 || probe.size() < 16 ||
+            probe_during < probe_before + probe.size() / 2) {
+            std::cerr << "deploy: the fd counter cannot see a deliberate leak ("
+                      << probe_before << " -> " << probe_during << " for "
+                      << probe.size() << " leaked fds), so the leak check "
+                      << "below would be meaningless\n";
+            return 1;
+        }
+#endif
+        std::cout << "soak: handle counter verified (" << probe_before << " -> "
+                  << probe_during << " for " << probe.size()
+                  << " deliberate leaks)" << std::endl;
+    }
+
+    const std::size_t baseline = process_handle_count();
+    if (baseline == 0) {
+        std::cerr << "deploy: cannot read this process's handle count\n";
+        return 1;
+    }
+
+    int failures = 0;
+    std::vector<double> latencies_ms;
+    latencies_ms.reserve(static_cast<std::size_t>(requests));
+    double connect_ms_total = 0.0;
+    double transfer_ms_total = 0.0;
+    std::vector<double> connect_ms;
+    for (int i = 0; i < requests; ++i) {
+        const auto began = std::chrono::steady_clock::now();
+        auto conn = backend.connect(
+            crpc::endpoint::tcp("127.0.0.1", static_cast<crpc::u16>(port)),
+            crpc::connect_options{});
+        if (!conn) {
+            std::cerr << "deploy: soak connect failed at request " << i << "\n";
+            ++failures;
+            continue;
+        }
+        const auto connected = std::chrono::steady_clock::now();
+        {
+            const double cms =
+                std::chrono::duration<double, std::milli>(connected - began)
+                    .count();
+            connect_ms_total += cms;
+            connect_ms.push_back(cms);
+        }
+        collector sink;
+        conn->bind_source(&sink);
+
+        const std::string request =
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        noop_completion op;
+        conn->sink().push(
+            crpc::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(request.data()),
+                request.size()),
+            &op);
+
+        // Spin with yield() before falling back to sleeping. On Windows the
+        // default timer resolution is ~15.6 ms, so `sleep_for(1ms)` actually
+        // sleeps ~15.6 ms -- the first version of this loop did exactly that and
+        // reported a p50 of 15.5 ms per request, which was the measurement, not
+        // the server. Same trap test_framework.hpp documents for the unit
+        // framework.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        unsigned spins = 0;
+        while (std::chrono::steady_clock::now() < deadline && !sink.closed.load()) {
+            if (spins < 20000) {
+                ++spins;
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
+        conn->bind_source(nullptr);
+        conn->close();
+
+        const auto finished = std::chrono::steady_clock::now();
+        transfer_ms_total +=
+            std::chrono::duration<double, std::milli>(finished - connected).count();
+        latencies_ms.push_back(
+            std::chrono::duration<double, std::milli>(finished - began).count());
+
+        const http_reply reply = parse_reply(sink.snapshot());
+        if (!reply.parsed || reply.status != 200 || reply.body != "ok") {
+            if (failures < 5) {
+                std::cerr << "deploy: soak request " << i << " answered "
+                          << reply.status << " \"" << reply.body << "\"\n";
+            }
+            ++failures;
+        }
+    }
+
+    // Give the backend's teardown a moment to run before measuring; a close
+    // that has not finished yet is not a leak, but a close that never finishes
+    // is, and it will still show up after this.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const std::size_t after = process_handle_count();
+
+    std::cout << "soak: requests=" << requests << " failures=" << failures
+              << " handles " << baseline << " -> " << after;
+    if (!latencies_ms.empty()) {
+        std::vector<double> sorted = latencies_ms;
+        std::sort(sorted.begin(), sorted.end());
+        const std::size_t n = sorted.size();
+        const auto at = [&](double q) {
+            const std::size_t idx = static_cast<std::size_t>(
+                q * static_cast<double>(n - 1));
+            return sorted[idx];
+        };
+        std::cout << " per-request-ms p50=" << at(0.50) << " p99=" << at(0.99)
+                  << " max=" << sorted.back();
+        if (requests > 0) {
+            std::cout << " [connect-avg="
+                      << (connect_ms_total / static_cast<double>(requests))
+                      << " transfer-avg="
+                      << (transfer_ms_total / static_cast<double>(requests))
+                      << "]";
+        }
+        if (!connect_ms.empty()) {
+            std::vector<double> cs = connect_ms;
+            std::sort(cs.begin(), cs.end());
+            const std::size_t m = cs.size();
+            const auto cat = [&](double q) {
+                return cs[static_cast<std::size_t>(q * static_cast<double>(m - 1))];
+            };
+            std::cout << " [connect-ms p50=" << cat(0.50)
+                      << " p90=" << cat(0.90) << " p99=" << cat(0.99)
+                      << " max=" << cs.back() << "]";
+        }
+    }
+    std::cout << std::endl;
+
+    // A leak here is one handle per connection, so `requests` handles would be
+    // the signature. 32 is slack for allocator and OS bookkeeping that is
+    // bounded rather than proportional.
+    constexpr std::size_t kHandleSlack = 32;
+    const bool leaked = after > baseline && (after - baseline) > kHandleSlack;
+    if (leaked) {
+        std::cerr << "deploy: handle count grew by " << (after - baseline)
+                  << " over " << requests
+                  << " connections, which tracks the work rather than "
+                     "amortising; that is a leak\n";
+    }
+    return (failures == 0 && !leaked) ? 0 : 1;
+}
+
+} // namespace
 int main(int argc, char** argv) {
     const unsigned long fallback = kPortFallback;
 
@@ -413,11 +686,19 @@ int main(int argc, char** argv) {
     const unsigned long port = parsed != 0 ? parsed : fallback;
 
     if (mode == "serve") {
-        return serve(port);
+        const int idle =
+            argc >= 4 ? std::atoi(argv[3]) : kServeIdleSeconds;
+        return serve(port, idle > 0 ? idle : kServeIdleSeconds);
     }
     if (mode == "call") {
         return call(port);
     }
-    std::cerr << "usage: crpc_example_deploy [serve|call <port>]\n";
+    if (mode == "soak") {
+        // `soak <port> <requests>`: the server must already be running, so a
+        // driver can measure both processes independently.
+        const int requests = argc >= 4 ? std::atoi(argv[3]) : 2000;
+        return soak(port, requests > 0 ? requests : 2000);
+    }
+    std::cerr << "usage: crpc_example_deploy [serve|call|soak] <port> [n]\n";
     return 2;
 }

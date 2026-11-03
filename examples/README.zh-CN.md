@@ -233,6 +233,32 @@ curl -sS http://127.0.0.1:19555/echo/curl-real
 `curl` 拿到 `HTTP/1.1 200` 和预期 body，是任何进程内测试都给不出的证据：
 线上的字节是合法的 HTTP，而不是只有本库能解析的东西。
 
+### 持续负载
+
+一次往返只证明线上能通，不证明进程扛得住一万次。`soak <port> <次数>` 做的就是这件事：
+一个客户端后端、`count` 次"连接/发送/接收/关闭"，并比较前后的句柄数。
+
+```powershell
+.\crpc_example_deploy_check.exe serve 19555 600   # 一个终端
+.\crpc_example_deploy_check.exe soak  19555 2000  # 另一个终端
+```
+
+```text
+soak: handle counter verified (87 -> 102 for 16 deliberate leaks)
+soak: requests=2000 failures=0 handles 86 -> 87 per-request-ms p50=0.71 p99=15.96 max=25.17 [connect-avg=5.25 transfer-avg=0.32] [connect-ms p50=0.43 p90=14.71 p99=15.58 max=24.67]
+```
+
+两个细节比数字本身更重要：
+
+* **计数器先自证**。测量之前，soak 故意泄漏 16 个 socket，并要求句柄数看见它们。
+  一个恒返回常量的计数器会让所有泄漏检查"天然通过"——那是最糟的绿——所以它会直接
+  中止，而不是报一个没有意义的通过。
+* **报分布而不是均值**。整体请求与单独 connect 各自给 `p50/p99/max`，因为尾部问题
+  在均值里看不见。本机上 connect 尾部是约十分之一连接吃到一个 Windows 时钟片
+  （~15.6 ms），而**已建立连接**的传输是 ~0.3 ms。两者分开报，避免混为一谈。
+
+门禁判据是句柄**增长**，不是绝对值：绝对值随平台与系统版本不同，而泄漏总是随工作量增长。
+
 ## 为什么在一个进程里
 
 快速开始使用 `crpc::inproc_backend`：它在同一个进程内连接两个端点，没有套接字、
