@@ -62,15 +62,20 @@ namespace h2 = crpc::http2;
 constexpr std::string_view k_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 crpc::u16 next_port() {
+    // Kept entirely below 49152 (the start of the Windows dynamic port range
+    // measured here) so a listen port can never be stolen by one of this
+    // binary's own outgoing connections between bind attempts. Same rule and
+    // reasoning as test_http_keepalive's helper; the previous form wrapped into
+    // a 1024..59023 window and could reach 50309.
 #if defined(_WIN32)
-    static const unsigned base = 28000u + (::GetCurrentProcessId() % 18000u);
+    static const unsigned base = 28000u + (::GetCurrentProcessId() % 10000u);
 #else
     static const unsigned base =
-        28000u + (static_cast<unsigned>(::getpid()) % 18000u);
+        28000u + (static_cast<unsigned>(::getpid()) % 10000u);
 #endif
     static std::atomic<unsigned> counter{0};
     const unsigned value = base + counter.fetch_add(11, std::memory_order_relaxed);
-    return static_cast<crpc::u16>(value % 58000u + 1024u);
+    return static_cast<crpc::u16>(value % 36000u + 1024u);
 }
 
 // --- Raw client plumbing -----------------------------------------------------
