@@ -75,6 +75,13 @@ foreach(source ${CRPC_TEST_SOURCES})
 
     add_executable(${target} ${sources})
     target_link_libraries(${target} PRIVATE crpc_core)
+    if(WIN32)
+        # `tests/ephemeral_ports.hpp` reads the system TCP table so a
+        # connection-churning case can tell "this machine ran out of
+        # ephemeral ports" from "the iteration failed for a reason that
+        # matters". iphlpapi is a Windows system library.
+        target_link_libraries(${target} PRIVATE iphlpapi)
+    endif()
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
@@ -106,12 +113,6 @@ set_tests_properties(crpc_test_rpc_lanes PROPERTIES TIMEOUT 300)
 # build under `ctest -j24` (8 of 200 connects over 8 ms), which is a defect in
 # the check, not in the library. RUN_SERIAL is the stated scope limit: the
 # case still runs in the same suite, just not concurrently with 20+ siblings.
-if(WIN32)
-    # The case reads the system TCP table to tell "this machine ran out of
-    # ephemeral ports" apart from "connect got slower"; see the comment block in
-    # the source. iphlpapi is a Windows system library, so it is only linked here.
-    target_link_libraries(crpc_test_io_connect_latency PRIVATE iphlpapi)
-endif()
 set_tests_properties(crpc_test_io_connect_latency PROPERTIES
     TIMEOUT 120 RUN_SERIAL TRUE)
 

@@ -50,6 +50,7 @@
 #include <thread>
 #include <vector>
 
+#include "ephemeral_ports.hpp"
 #include "test_framework.hpp"
 
 namespace {
@@ -247,17 +248,59 @@ CRPC_TEST(iocp_close_racing_inflight_send) {
         lp.start(load);
     }
 
+    // This case exists to run many close-vs-completion races, so the loop has
+    // to be honest about how many it actually ran. Two defects made it
+    // dishonest:
+    //
+    //   * `us.accepts` is a monotonic counter and was never reset, so from the
+    //     second iteration on `accepts >= 1` was already true and the wait was
+    //     a no-op -- the test never actually waited for the server to accept the
+    //     connection it was about to race against.
+    //   * a failed connect did `continue`, and the only assertion at the end was
+    //     `clean >= 1`. Under ephemeral-port exhaustion the loop performed a
+    //     small fraction of `iters` iterations and still passed: measured, a
+    //     drained machine turned 3000 iterations into 18-32 and the binary
+    //     exited 0 with 38-66 checks instead of 6012.
+    //
+    // Now the wait targets this iteration's accept, a connect failure is
+    // counted and reported, and the case requires the whole loop to run --
+    // unless the local port range is drained, which is an OS limit rather than
+    // a result, so that case skips with a stated reason.
+    const crpc_test::ephemeral_port_state ports_before =
+        crpc_test::probe_ephemeral_ports();
     int clean = 0;
+    int connect_failures = 0;
+    int accept_timeouts = 0;
     for (int i = 0; i < iters; ++i) {
         connect_options co;
         co.send_buffer_bytes = 4096;
         co.recv_buffer_bytes = 4096;
+        // Snapshot the accept counter BEFORE connecting. Taken afterwards, the
+        // server may already have accepted this connection, and `accepts >
+        // before` could then never become true: the loop would wait out the
+        // whole timeout for an accept that had already happened. Measured with
+        // the snapshot in the wrong place: connect takes 0.5-0.8 ms and the
+        // accept often completes inside that window, so the "stall" appeared at
+        // random iterations (3, 8, 17, 70, 121, 164) with the accept wait
+        // burning its whole timeout while every connect succeeded and the very
+        // next connect was accepted. With the snapshot moved before the
+        // connect, the accept completes in 0.2 ms.
+        const int accepted_before = us.accepts.load();
         auto conn = client.connect(endpoint::tcp("127.0.0.1", port), co);
         if (!conn) {
+            ++connect_failures;
             continue;
         }
-        if (!crpc_test::wait_for([&] { return us.accepts.load() >= 1; }, 5000)) {
-            break;
+        if (!crpc_test::wait_for(
+                [&] { return us.accepts.load() > accepted_before; }, 5000)) {
+            ++accept_timeouts;
+            std::printf(
+                "  STALL i=%d port=%u accepts=%d before=%d is_open=%d "
+                "remote=%s\n",
+                i, unsigned(port), us.accepts.load(), accepted_before,
+                int(conn->is_open()), conn->remote().to_string().c_str());
+            std::fflush(stdout);
+            continue;
         }
 
         uaf_completion* comp = new (std::nothrow) uaf_completion();
@@ -283,7 +326,28 @@ CRPC_TEST(iocp_close_racing_inflight_send) {
         conn.reset();
     }
 
-    CRPC_CHECK(clean >= 1);
+    if (connect_failures != 0) {
+        const crpc_test::ephemeral_port_state now =
+            crpc_test::probe_ephemeral_ports();
+        std::printf(
+            "  %d of %d connects failed (%d of %d ephemeral ports free, "
+            "%d in TIME_WAIT); completed %d race(s)\n",
+            connect_failures, iters, now.free_ports, now.range, now.time_wait,
+            clean);
+        if (crpc_test::ephemeral_ports_scarce(ports_before) ||
+            crpc_test::ephemeral_ports_scarce(now)) {
+            l->stop();
+            crpc_test::skip("ephemeral ports exhausted");
+        }
+    }
+    if (accept_timeouts != 0) {
+        std::printf("  %d of %d connections were not accepted within 5 s\n",
+                    accept_timeouts, iters);
+    }
+    // The point of the case is the iteration count, so it must actually reach
+    // it: `clean >= 1` would pass on a run that raced once.
+    CRPC_CHECK_EQ(0, accept_timeouts);
+    CRPC_CHECK_EQ(iters, clean);
     l->stop();
 }
 
