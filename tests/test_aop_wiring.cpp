@@ -424,6 +424,14 @@ CRPC_TEST(legacy_server_interceptor_still_fires) {
     });
     CRPC_CHECK(ran);
     CRPC_CHECK_EQ(1, probe.requests.load());
+    // `on_response` runs *after* the response frame is written, so the client
+    // call returning does not mean the observer has run yet -- the comment on
+    // `last_code` above says exactly that. Reading the counter once right here
+    // was a race that CI caught (linux/gcc/Debug/shared, run 41675306928:
+    // requests==1 passed, responses==1 failed, 145 checks with one failure).
+    // Wait for the observer instead of assuming it already ran.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&probe] { return probe.responses.load() == 1; }, 5000));
     CRPC_CHECK_EQ(1, probe.responses.load());
     CRPC_CHECK(probe.last_code.load(std::memory_order_acquire) == crpc::rpc_code::ok);
 }
@@ -454,6 +462,12 @@ CRPC_TEST(hook_order_is_pinned_flat_registration_order) {
         CRPC_CHECK(result.ok());
     });
     CRPC_CHECK(ran);
+    // The final entry is appended by `on_response`, which runs after the
+    // response is written; the call returning does not imply it is there yet.
+    // Same race as the legacy case above, so wait for the entry rather than
+    // snapshotting the log immediately.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&log] { return log->snapshot().size() >= 6; }, 5000));
     const std::vector<std::string> expected = {
         "legacy:request", "a:before", "b:before",
         "a:after",        "b:after",  "legacy:response:ok"};
