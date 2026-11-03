@@ -86,8 +86,17 @@ struct uaf_drain_source final : io::source {
 
 struct uaf_server final : accept_sink {
     std::mutex m;
-    std::vector<std::unique_ptr<connection>> conns;
+    // `sources` must be declared BEFORE `conns`: members destruct in reverse
+    // declaration order, so this makes the connections destruct first and the
+    // sources last. A connection's destructor waits for an in-flight delivery
+    // to finish before returning, and that delivery runs into the bound source
+    // -- if the source were already freed the wait would end in a virtual call
+    // on freed memory. This is the same defect the nested-push fixture had; it
+    // produced a real 0xC0000005 here at roughly 1 in 30 runs, faulting in the
+    // pump's `s->on_data(...)` with the vtable pointer overwritten by the MSVC
+    // debug heap's freed-block fill (0xDDDDDDDD).
     std::vector<std::unique_ptr<uaf_drain_source>> sources;
+    std::vector<std::unique_ptr<connection>> conns;
     std::atomic<int> accepts{0};
 
     void on_accept(std::unique_ptr<connection> c) noexcept override {

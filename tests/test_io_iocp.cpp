@@ -212,14 +212,21 @@ struct echo_source final : io::source {
     }
 };
 
+// `src` is declared BEFORE `conn` on purpose. Members destruct in reverse
+// declaration order, so the connection is destroyed first and the source last:
+// a connection's destructor waits for an in-flight delivery, and that delivery
+// runs into the bound source. Declaring `conn` first (as this used to) frees
+// the source while the connection can still deliver into it -- a virtual call
+// on freed memory. The nested-push fixture hit exactly that as a real
+// 0xC0000005; see the comment there.
 struct conn_bundle {
-    std::unique_ptr<connection> conn;
     echo_source src;
+    std::unique_ptr<connection> conn;
 };
 
 struct conn_bundle_plain {
-    std::unique_ptr<connection> conn;
     recording_source src;
+    std::unique_ptr<connection> conn;
 };
 
 struct echo_server final : accept_sink {

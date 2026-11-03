@@ -366,21 +366,35 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 区域 | 状态 | 证据 / 缺口 |
 |---|---|---|
 | 基础、wire、frame | 已实现 | `test_endian.cpp`、`test_wire.cpp`、`test_frame.cpp` |
-| inproc / epoll / IOCP | 已实现 | `test_io_inproc.cpp`、`test_io_epoll.cpp`、`test_io_iocp.cpp` |
+| inproc / epoll / IOCP（`io`）| 已实现 | `test_io_inproc.cpp`、`test_io_epoll.cpp`、`test_io_iocp.cpp` |
 | RPC 核心 | 已实现 | `test_rpc_core.cpp`、`test_server_client.cpp`、`test_push_e2e.cpp`；低层客户端为回调/轮询式；PUSH/PUSH_ACK 帧集成已接线 |
 | 编解码 | 已实现 | `test_codec.cpp`；文本格式依赖 RTTI |
 | HTTP/1.1、multipart、文件 | 已实现 | `test_http_message.cpp`、`test_http_server.cpp`、`test_multipart.cpp`、`test_file_transfer.cpp`；multipart 解析、上传/下载与 Range/206 |
-| HTTP/2 + HPACK | 已实现 | `test_http2.cpp`；`test_http_server.cpp` 覆盖 inproc 上的 h2c |
-| MVC | 已实现 | `test_mvc.cpp`；`test_http_server.cpp` 经 inproc 走路由器分派 |
+| HTTP/2 + HPACK（`http2`）| 已实现 | `test_http2.cpp`；`test_http_server.cpp` 覆盖 inproc 上的 h2c |
+| MVC（`mvc`）| 已实现 | `test_mvc.cpp`；`test_http_server.cpp` 经 inproc 走路由器分派 |
 | 集群原语 | 已实现 | `test_cluster.cpp`；无网络 registry 服务 |
 | 韧性原语 | 已实现 | `test_resilience.cpp`、`test_server_client.cpp`；服务端准入流水线与每端点客户端流水线均已接线；fallback 原语已实现并接入客户端门面；服务端在四个执行前拒绝点声明 `crpc-degradable`，`fallback_execute` 仍从未被服务端调用 |
 | 可观测性 | 部分 | `test_observability.cpp`、`test_aop_wiring.cpp`；服务端调用路径已接线（`before_call`/`after_call`、短路、异常边界、零成本空链；metadata 注入 handler 上下文），客户端终态经 diagnostics 默认链观察，无指标 |
 | 推送 | 已实现 | `test_push.cpp`、`test_push_e2e.cpp`、`test_http_sse.cpp`；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump；SSE 与长轮询已接入 `http_server` |
 | 流控 | 已实现 | `test_flow.cpp`、`test_flow_wiring.cpp`、`test_flow_clock_base.cpp`、`test_flow_lane_quota.cpp`；已接入 `rpc::client`（字节窗口、PING/PONG 探针、每 lane 配额、连接级 pacer） |
-| 分片/协程 | 已设计 | 无 `shard` 类型或 `coro_rt_*` 调用 |
+| 分片/协程 | 已实现 | `test_server_client.cpp`；`src/runtime/runtime.cpp` 调用 `coro_rt_*`（`coro_rt_driver.h`、`coro_rt_t`、`coro_rt_sem_t`）；对外是 `runtime` 类型的每核一实例，没有名为 `shard` 的公开类型 |
 | 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：none/lz4/gzip/deflate/lz77/zip 已实现并测试（`test_frame_compression.cpp`，61 个用例），zstd 保留且 fail-closed；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
 | Redis 客户端 | 已实现（shared 构建已覆盖 Redis 头导出，`CRPC_BUILD_SHARED=ON` 下 `ctest -R 'redis\|abi_docs\|shared_link'` 通过） | `test_redis_*.cpp` 覆盖 RESP2/3、连接池、pipeline、事务、Pub/Sub、Streams、cluster、Sentinel、类型化辅助与 RTTI 绑定；`test_redis_header_conflict.cpp` 钉住 `stream_entry` 与 `redis_stream_entry` 的区分。已测配置为静态构建；shared 构建受支持，API 相同，且其 Redis 头导出已覆盖。 |
 | SSE / 长轮询 | 已实现 | `test_http_sse.cpp`；SSE writer 与长轮询路由已接入 `src/http/server.cpp` |
+| `db` 适配层（MySQL/MariaDB、SQL Server/TDS、MongoDB、HBase、TiDB、Oracle、ODBC） | 已实现；需真实服务端的套件在无服务端时跳过 | `test_db_mysql_*.cpp`、`test_db_tds_*.cpp`、`test_db_mongo_*.cpp`、`test_db_hbase_*.cpp`、`test_db_tidb_it.cpp`、`test_db_odbc_*.cpp`、`test_db_oracle_*.cpp`；线协议与连接层套件离线可跑，`_it` 套件需要 `CRPC_MYSQL_*` / `CRPC_TDS_*` / `CRPC_ODBC_*`，否则跳过。Oracle TNS/TTC 仅对抓包帧做解码验证：无服务端、无端到端证明 |
+| `orm` | 已实现 | `test_orm_metadata.cpp`、`test_orm_session.cpp`、`test_orm_sql.cpp`、`test_orm_value.cpp`；`test_orm_mysql_it.cpp` 需服务端 |
+| `fs` | 已实现 | `test_fs_file.cpp`、`test_fs_directory.cpp`、`test_fs_path.cpp`、`test_fs_mmap.cpp`、`test_fs_temp.cpp`、`test_fs_shared_memory.cpp`、`test_fs_buffer.cpp` |
+| `ipc` | 已实现 | `test_ipc_ring_buffer.cpp`、`test_ipc_spsc_queue.cpp`、`test_ipc_channel.cpp`、`test_ipc_async.cpp`、`test_ipc_cross_process.cpp`（真实第二进程，非第二线程）|
+| `mq`（AMQP 0-9-1、MSMQ）| 已实现；需 broker 的套件在无 broker 时跳过 | `test_mq_amqp_protocol.cpp`、`test_mq_msmq.cpp`；`test_mq_amqp_it.cpp` 需运行中的 broker，`test_mq_msmq_it.cpp` 需 Windows MSMQ |
+| `memcached` | 已实现 | `test_memcached_protocol.cpp`、`test_memcached_client.cpp`、`test_memcached_transport.cpp`、`test_memcached_router.cpp`、`test_memcached_hash.cpp`；`test_memcached_failover_it.cpp` 需服务端 |
+| `crypto` | 已实现 | `test_crypto_hash.cpp`、`test_crypto_hmac.cpp`、`test_crypto_rsa.cpp` |
+| `algorithm` | 已实现 | `test_astar.cpp`、`test_pathfind.cpp` |
+| `game`（AI、AOI、几何）| 已实现 | `test_aoi.cpp`、`test_geom.cpp`、`test_geom3d.cpp`、`test_game_ai_adaboost.cpp`、`test_game_ai_behavior_tree.cpp`、`test_game_ai_decision_tree.cpp` |
+| `memory` | 已实现 | `test_memory_arena.cpp`、`test_memory_object_pool.cpp`、`test_memory_pool_allocator.cpp`、`test_memory_concurrency.cpp` |
+| `pattern` | 已实现 | `test_pattern_memento.cpp`、`test_pattern_constraint.cpp`、`test_pattern_version.cpp` |
+| `net` | 已实现 | `test_net_address.cpp`、`test_net_ip.cpp`、`test_net_transport.cpp`、`test_net_transport_edge.cpp`、`test_net_pool.cpp`、`test_net_bigread.cpp`、`test_net_backoff.cpp`、`test_net_icmp.cpp` |
+| `ws` | 已实现 | `test_ws_frame.cpp`、`test_ws_handshake.cpp`、`test_ws_stream.cpp`、`test_ws_e2e.cpp` |
+| `async`、`lock`、`text` | 已实现 | `test_async_executor.cpp`、`test_lock_local.cpp`、`test_text.cpp` |
 
 ## 20. 验证映射 <a id="s20"></a>
 

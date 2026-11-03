@@ -370,12 +370,12 @@ Per-lane byte quotas are kept in the same controller and released with the idemp
 | Area | Status | Evidence / gap |
 |---|---|---|
 | base, wire, frame | implemented | `test_endian.cpp`, `test_wire.cpp`, `test_frame.cpp` |
-| inproc / epoll / IOCP | implemented | `test_io_inproc.cpp`, `test_io_epoll.cpp`, `test_io_iocp.cpp` |
+| inproc / epoll / IOCP (`io`) | implemented | `test_io_inproc.cpp`, `test_io_epoll.cpp`, `test_io_iocp.cpp` |
 | RPC core | implemented | `test_rpc_core.cpp`, `test_server_client.cpp`, `test_push_e2e.cpp`; low-level client is callback/poll based; PUSH/PUSH_ACK frame integration is wired |
 | codec | implemented | `test_codec.cpp`; text formats depend on RTTI being present |
 | HTTP/1.1, multipart, files | implemented | `test_http_message.cpp`, `test_http_server.cpp`, `test_multipart.cpp`, `test_file_transfer.cpp`; multipart parsing plus upload/download with Range/206 |
-| HTTP/2 + HPACK | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
-| MVC | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
+| HTTP/2 + HPACK (`http2`) | implemented | `test_http2.cpp`; `test_http_server.cpp` covers h2c over inproc |
+| MVC (`mvc`) | implemented | `test_mvc.cpp`; `test_http_server.cpp` dispatches through the router over inproc |
 | cluster primitives | implemented | `test_cluster.cpp`; no network registry service |
 | resilience primitives | implemented | `test_resilience.cpp`, `test_server_client.cpp`; server admission pipeline and per-endpoint client pipeline wired; fallback primitives implemented and wired into the client facade; the server advertises `crpc-degradable` at four pre-execution rejection points, `fallback_execute` still never called from the server |
 | observability | partial | `test_observability.cpp`, `test_aop_wiring.cpp`; server call path wired (`before_call`/`after_call`, short-circuit, exception boundary, zero-cost empty chain; metadata injected into the handler context), client terminal outcome observed via the diagnostics default chain, no metrics |
@@ -385,6 +385,20 @@ Per-lane byte quotas are kept in the same controller and released with the idemp
 | compression | implemented | HTTP gzip/deflate streaming codec implemented, tested (`test_content_coding.cpp`) and wired into `http_server` (`test_http_coding.cpp`); CRPC frame compression: none/lz4/gzip/deflate/lz77/zip implemented and tested (`test_frame_compression.cpp`, 61 cases), zstd reserved and fail-closed; a `COMPRESSED` frame is decompressed or rejected, never delivered as plaintext (it used to be delivered verbatim) |
 | Redis client | implemented (shared build covers the Redis header exports; under `CRPC_BUILD_SHARED=ON`, `ctest -R 'redis\|abi_docs\|shared_link'` passes) | `test_redis_*.cpp` covers RESP2/3, connection pool, pipeline, transaction, Pub/Sub, Streams, cluster, Sentinel, typed helpers and RTTI binding; `test_redis_header_conflict.cpp` pins `stream_entry` vs `redis_stream_entry`. Static build is the default tested configuration; the shared build is supported with the same API and its Redis header exports are covered. |
 | SSE / long polling | implemented | `test_http_sse.cpp`; SSE writer and long-poll routes wired in `src/http/server.cpp` |
+| `db` adapters (MySQL/MariaDB, SQL Server/TDS, MongoDB, HBase, TiDB, Oracle, ODBC) | implemented; live-server suites skip without a server | `test_db_mysql_*.cpp`, `test_db_tds_*.cpp`, `test_db_mongo_*.cpp`, `test_db_hbase_*.cpp`, `test_db_tidb_it.cpp`, `test_db_odbc_*.cpp`, `test_db_oracle_*.cpp`; wire/connection suites run offline, the `_it` suites need `CRPC_MYSQL_*` / `CRPC_TDS_*` / `CRPC_ODBC_*` and skip otherwise. Oracle TNS/TTC is decode-verified against captured frames only: no server, no end-to-end proof |
+| `orm` | implemented | `test_orm_metadata.cpp`, `test_orm_session.cpp`, `test_orm_sql.cpp`, `test_orm_value.cpp`; `test_orm_mysql_it.cpp` needs a server |
+| `fs` | implemented | `test_fs_file.cpp`, `test_fs_directory.cpp`, `test_fs_path.cpp`, `test_fs_mmap.cpp`, `test_fs_temp.cpp`, `test_fs_shared_memory.cpp`, `test_fs_buffer.cpp` |
+| `ipc` | implemented | `test_ipc_ring_buffer.cpp`, `test_ipc_spsc_queue.cpp`, `test_ipc_channel.cpp`, `test_ipc_async.cpp`, `test_ipc_cross_process.cpp` (a real second process, not a second thread) |
+| `mq` (AMQP 0-9-1, MSMQ) | implemented; broker suites skip without one | `test_mq_amqp_protocol.cpp`, `test_mq_msmq.cpp`; `test_mq_amqp_it.cpp` needs a running broker, `test_mq_msmq_it.cpp` needs Windows MSMQ |
+| `memcached` | implemented | `test_memcached_protocol.cpp`, `test_memcached_client.cpp`, `test_memcached_transport.cpp`, `test_memcached_router.cpp`, `test_memcached_hash.cpp`; `test_memcached_failover_it.cpp` needs a server |
+| `crypto` | implemented | `test_crypto_hash.cpp`, `test_crypto_hmac.cpp`, `test_crypto_rsa.cpp` |
+| `algorithm` | implemented | `test_astar.cpp`, `test_pathfind.cpp` |
+| `game` (AI, AOI, geometry) | implemented | `test_aoi.cpp`, `test_geom.cpp`, `test_geom3d.cpp`, `test_game_ai_adaboost.cpp`, `test_game_ai_behavior_tree.cpp`, `test_game_ai_decision_tree.cpp` |
+| `memory` | implemented | `test_memory_arena.cpp`, `test_memory_object_pool.cpp`, `test_memory_pool_allocator.cpp`, `test_memory_concurrency.cpp` |
+| `pattern` | implemented | `test_pattern_memento.cpp`, `test_pattern_constraint.cpp`, `test_pattern_version.cpp` |
+| `net` | implemented | `test_net_address.cpp`, `test_net_ip.cpp`, `test_net_transport.cpp`, `test_net_transport_edge.cpp`, `test_net_pool.cpp`, `test_net_bigread.cpp`, `test_net_backoff.cpp`, `test_net_icmp.cpp` |
+| `ws` | implemented | `test_ws_frame.cpp`, `test_ws_handshake.cpp`, `test_ws_stream.cpp`, `test_ws_e2e.cpp` |
+| `async`, `lock`, `text` | implemented | `test_async_executor.cpp`, `test_lock_local.cpp`, `test_text.cpp` |
 
 ## 20. Verification map <a id="s20"></a>
 

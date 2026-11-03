@@ -1407,4 +1407,270 @@ CRPC_TEST(docs_lint_bench_claims_match_the_bench_directory) {
     CRPC_CHECK(checked >= 8);
     CRPC_CHECK_FALSE(bad);
 }
+
+namespace {
+
+// The text of the section that starts at `heading`, up to the next "## ".
+std::string matrix_section(const std::string& text, const std::string& heading) {
+    const std::size_t start = text.find(heading);
+    if (start == std::string::npos) {
+        return std::string();
+    }
+    const std::size_t end = text.find("\n## ", start + 1);
+    return text.substr(start, end == std::string::npos ? std::string::npos
+                                                       : end - start);
+}
+
+// Whole-word search: `lock` must not match inside "blocking", nor `net` inside
+// "network". Backticks are not required, so the existing rows keep working.
+bool contains_word(const std::string& haystack, const std::string& word) {
+    const auto is_word_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    };
+    for (std::size_t pos = haystack.find(word); pos != std::string::npos;
+         pos = haystack.find(word, pos + 1)) {
+        const bool left_ok = pos == 0 || !is_word_char(haystack[pos - 1]);
+        const std::size_t after = pos + word.size();
+        const bool right_ok =
+            after >= haystack.size() || !is_word_char(haystack[after]);
+        if (left_ok && right_ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+// --- 13. The architecture status matrix must cover every module --------------
+//
+// docs/README.md says: "The status matrix in document 2 (architecture) is the
+// single authoritative per-module status record." It was not. Section 19 listed
+// 16 areas -- all of the framework core -- and omitted every adapter subsystem:
+// db (MySQL, MongoDB, TDS, ODBC, HBase, TiDB, Oracle), fs, ipc, mq (AMQP, MSMQ),
+// memcached, crypto, algorithm, game, memory, pattern, async and ws. The Chinese
+// version was shorter still.
+//
+// The check is scoped to section 19 rather than the whole file: a module named
+// once in passing prose is not "in the status record", and the point of the
+// claim is that a reader can look up any module and find its status plus the
+// test that backs it.
+CRPC_TEST(docs_lint_architecture_matrix_covers_every_module) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path include_dir = root / "include" / "crpc";
+    CRPC_CHECK(fs::exists(include_dir));
+    if (!fs::exists(include_dir)) {
+        return;
+    }
+
+    std::vector<std::string> modules;
+    for (const auto& entry : fs::directory_iterator(include_dir)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        modules.push_back(entry.path().filename().generic_string());
+    }
+    std::sort(modules.begin(), modules.end());
+    // A scan that found nothing would make every assertion below vacuous.
+    CRPC_CHECK(modules.size() >= 20);
+
+    std::size_t compared = 0;
+    bool bad = false;
+
+    // English: every module directory must be named in the status matrix. The
+    // English rows are labelled with the module names, so this is exact.
+    {
+        const fs::path path = root / "docs" / "architecture.md";
+        CRPC_CHECK(fs::exists(path));
+        if (fs::exists(path)) {
+            const std::string text = read_text(path);
+            const std::string section = matrix_section(text, "## 19. Status matrix");
+            CRPC_CHECK(!section.empty());
+            for (const std::string& module : modules) {
+                ++compared;
+                if (!contains_word(section, module)) {
+                    std::printf("  architecture.md section 19 does not cover "
+                                "module %s\n", module.c_str());
+                    bad = true;
+                }
+            }
+            // Evidence parity: every suite the English matrix cites must be cited
+            // by the Chinese one too. The Chinese matrix labels areas in Chinese
+            // ("可观测性", "韧性原语"), so requiring the English module names there
+            // would need a translation table; requiring the same *evidence* is
+            // both checkable and the thing that actually matters. It is also what
+            // the previous drift broke: the Chinese matrix was a strict subset.
+            const fs::path zh_path = root / "docs" / "architecture.zh-CN.md";
+            CRPC_CHECK(fs::exists(zh_path));
+            if (fs::exists(zh_path)) {
+                const std::string zh_text = read_text(zh_path);
+                const std::string zh_section =
+                    matrix_section(zh_text, "## 19. ");
+                CRPC_CHECK(!zh_section.empty());
+                const std::string needle = "`test_";
+                for (std::size_t pos = section.find(needle);
+                     pos != std::string::npos; pos = section.find(needle, pos + 1)) {
+                    const std::size_t close = section.find('`', pos + 1);
+                    if (close == std::string::npos) {
+                        break;
+                    }
+                    const std::string evidence = section.substr(pos, close - pos + 1);
+                    ++compared;
+                    if (zh_section.find(evidence) == std::string::npos) {
+                        std::printf("  architecture.zh-CN.md section 19 does not "
+                                    "cite %s (present in the English matrix)\n",
+                                    evidence.c_str());
+                        bad = true;
+                    }
+                }
+            }
+        }
+    }
+    // Two documents x >= 20 modules.
+    CRPC_CHECK(compared >= 40);
+    CRPC_CHECK_FALSE(bad);
+}
+
+// --- 14. A fixture must destroy its connections before their sources --------
+//
+// This is a source-level gate, and it exists because the defect it catches is
+// invisible to every other check: a test fixture that owns both a
+// `unique_ptr<connection>` and the `io::source` bound to it must declare the
+// SOURCE first, because members destruct in reverse declaration order and a
+// connection's destructor waits for an in-flight delivery that runs into the
+// source. Declaring the connection first frees the source while the pump can
+// still call into it.
+//
+// That is not theoretical: `crpc_test_io_iocp_uaf` crashed with 0xC0000005 at
+// roughly 1 in 30 x86 Debug runs, faulting inside the pump's `s->on_data(...)`
+// with the vtable pointer replaced by the MSVC debug heap's freed-block fill
+// (0xDDDDDDDD), while the main thread sat in `~uaf_server` destroying the
+// connection vector. A cdb stack from the minidump pinned it in one look --
+// but only after the fixture had been crashing intermittently for a day.
+//
+// `test_io_iocp_uaf_nested_push.cpp` already carried a comment describing this
+// exact trap; a comment does not stop the next fixture from repeating it.
+CRPC_TEST(tests_owning_connections_destroy_before_their_sources) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path tests_dir = root / "tests";
+    CRPC_CHECK(fs::exists(tests_dir));
+    if (!fs::exists(tests_dir)) {
+        return;
+    }
+
+    // Leading whitespace of a line, so nesting can be judged without a parser.
+    const auto indent_of = [](const std::string& line) {
+        std::size_t n = 0;
+        while (n < line.size() && (line[n] == ' ' || line[n] == '\t')) {
+            ++n;
+        }
+        return n;
+    };
+    const auto trimmed = [](const std::string& line) {
+        const std::size_t b = line.find_first_not_of(" \t\r");
+        if (b == std::string::npos) {
+            return std::string();
+        }
+        const std::size_t e = line.find_last_not_of(" \t\r");
+        return line.substr(b, e - b + 1);
+    };
+
+    std::size_t checked = 0;
+    bool bad = false;
+    for (const auto& entry : fs::directory_iterator(tests_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const std::string name = entry.path().filename().generic_string();
+        if (name.rfind("test_", 0) != 0 || entry.path().extension() != ".cpp") {
+            continue;
+        }
+        const std::string rel = "tests/" + name;
+        const std::string text = read_text(entry.path());
+        std::vector<std::string> lines;
+        {
+            std::size_t start = 0;
+            while (start <= text.size()) {
+                const std::size_t end = text.find('\n', start);
+                if (end == std::string::npos) {
+                    lines.push_back(text.substr(start));
+                    break;
+                }
+                lines.push_back(text.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            const std::string head = trimmed(lines[i]);
+            if (head.rfind("struct ", 0) != 0 && head.rfind("class ", 0) != 0) {
+                continue;
+            }
+            if (head.find('{') == std::string::npos) {
+                continue;
+            }
+            const std::size_t struct_indent = indent_of(lines[i]);
+            // Body ends at the first line whose leading '}' sits at or left of
+            // the struct's own indentation.
+            std::size_t conn_at = std::string::npos;
+            std::size_t source_at = std::string::npos;
+            for (std::size_t j = i + 1; j < lines.size(); ++j) {
+                const std::string t = trimmed(lines[j]);
+                if (t.empty() || t.rfind("//", 0) == 0) {
+                    continue;
+                }
+                if (t[0] == '}' && indent_of(lines[j]) <= struct_indent) {
+                    break;
+                }
+                // Only direct members: same indentation as the struct's braces.
+                if (indent_of(lines[j]) != struct_indent + 4) {
+                    continue;
+                }
+                if (t.back() != ';' || t.find('(') != std::string::npos) {
+                    continue;
+                }
+                const bool owns_connection =
+                    t.find("unique_ptr<connection") != std::string::npos ||
+                    t.find("unique_ptr<io::connection") != std::string::npos;
+                // A source member is either a `unique_ptr<...source>` or the
+                // source object itself (`echo_source src;`). Both are destroyed
+                // by this fixture, so both must outlive the connection.
+                const bool owns_source =
+                    t.find("source") != std::string::npos;
+                if (owns_connection && conn_at == std::string::npos) {
+                    conn_at = j;
+                }
+                if (owns_source && source_at == std::string::npos) {
+                    source_at = j;
+                }
+            }
+            if (conn_at == std::string::npos || source_at == std::string::npos) {
+                continue;
+            }
+            ++checked;
+            if (source_at > conn_at) {
+                std::printf("  %s:%zu declares the connection before the source "
+                            "it is bound to; the source must be declared first "
+                            "(members destruct in reverse order)\n",
+                            rel.c_str(), i + 1);
+                bad = true;
+            }
+        }
+    }
+    // Four fixtures own both right now (this file's set includes the two IOCP
+    // bundles, the UAF server and the nested-push server). Fewer means the scan
+    // stopped matching and the assertions above became vacuous.
+    CRPC_CHECK(checked >= 4);
+    CRPC_CHECK_FALSE(bad);
+}
+
 CRPC_TEST_MAIN()
