@@ -202,16 +202,32 @@ int serve(unsigned long port, int idle_seconds) {
     // no client ever races the listener's bind.
     std::cout << "READY " << port << std::endl;
 
-    // Stay up while requests keep arriving; exit once the wire has been quiet
-    // for kServeIdleSeconds. The parent cannot close our stdin through a
-    // one-way pipe, so we bound our own lifetime.
+    // Stay up while work is happening; exit once the wire has been quiet for
+    // kServeIdleSeconds. The parent cannot close our stdin through a one-way
+    // pipe, so we bound our own lifetime.
+    //
+    // "Work" is not only *completed* requests. Counting only
+    // `requests_handled` made the child exit while a connection was open but its
+    // request had not been dispatched yet: an accepted socket with a partial
+    // request bumps `active_connections`, not `requests_handled`, so the counter
+    // looked idle and the child shut down under the client. Measured: one
+    // connection that sent headers without the terminating blank line kept the
+    // server alive only ~4 s (idle timer 5 s, minus the probe delay), then the
+    // process exited and closed the socket -- `STATS accepted=1 requests=0` and
+    // the peer saw the close.
+    //
+    // That is the shape CI hit: one slow request let the child disappear, and
+    // every later connect then failed at the closed-port latency (measured
+    // 2048 ms), which is what turned 24 connect failures into the full 60 s
+    // CTest window. So an open session counts as activity too, and the idle
+    // timer only runs when there is no session at all.
     auto last_requests = server->stats().requests_handled;
     auto idle_since = std::chrono::steady_clock::now();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        const auto now_requests = server->stats().requests_handled;
-        if (now_requests != last_requests) {
-            last_requests = now_requests;
+        const crpc::http::http_statistics now = server->stats();
+        if (now.requests_handled != last_requests || now.active_connections != 0) {
+            last_requests = now.requests_handled;
             idle_since = std::chrono::steady_clock::now();
             continue;
         }
@@ -226,6 +242,7 @@ int serve(unsigned long port, int idle_seconds) {
               << " requests=" << stats.requests_handled
               << " responses=" << stats.responses_written
               << " bad=" << stats.bad_requests
+              << " active=" << stats.active_connections
               << " handles=" << process_handle_count() << std::endl;
     server->stop();
     return 0;
