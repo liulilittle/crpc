@@ -190,6 +190,49 @@ ok: two processes exchanged a message over shared memory
 退出码 0 表示两个方向都送出了期望的字节。通道、环形缓冲与 SPSC 队列的契约见
 [ipc.zh-CN.md](../docs/ipc.zh-CN.md)。
 
+## 跨进程部署检查
+
+上面的 quickstart 全部走 `crpc::inproc_backend`——同一个进程内连两个端点，没有 socket。
+这是有意的（让示例确定可复现），但也意味着它们从不证明网络路径可用。
+
+`deploy_check.cpp` 是例外，也是"这个构建能不能上生产"之前该跑的那一个。它把**自己**
+作为子进程拉起，于是服务端与客户端是两个操作系统进程，中间只有 loopback TCP：
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_deploy_check.exe
+```
+
+预期输出：
+
+```text
+server: READY 19562
+call: /health -> 200 ok
+call: /echo/deploy -> 200 deploy
+server: STATS accepted=2 requests=2 responses=2 bad=0
+```
+
+它验证三件进程内示例验证不了的事：
+
+1. 真实的 `iocp_backend`（Windows）或 `epoll_backend`（Linux）监听器能接住来自另一个
+   进程的连接；
+2. 响应被**精确**校验——状态行加 body，逐字节比较。这个文件的第一版用的是子串匹配，
+   在服务端把 `/health` 改成回 `not-ok` 时它依然通过，因为 `"ok"` 就在 `"not-ok"` 里面。
+   会接受错误 body 的门禁只证明了端口是开的；
+3. 服务端自己的计数自洽（`accepted == requests == responses`、`bad == 0`），且进程干净退出。
+
+两个模式也能单独用，这正是让第三方客户端有意义的方式：
+
+```powershell
+# 终端 1
+.\crpc_example_deploy_check.exe serve 19555
+# 终端 2 —— 无关的 HTTP 客户端，证明线上是普通 HTTP/1.1
+curl -sS -D - http://127.0.0.1:19555/health
+curl -sS http://127.0.0.1:19555/echo/curl-real
+```
+
+`curl` 拿到 `HTTP/1.1 200` 和预期 body，是任何进程内测试都给不出的证据：
+线上的字节是合法的 HTTP，而不是只有本库能解析的东西。
+
 ## 为什么在一个进程里
 
 快速开始使用 `crpc::inproc_backend`：它在同一个进程内连接两个端点，没有套接字、
@@ -197,7 +240,7 @@ ok: two processes exchanged a message over shared memory
 都是 `main()` 里的对象。
 
 若要把两个角色放到不同进程，保留服务器代码与客户端代码，替换后端与端点即可：
-Windows 上用 `crpc::io::iocp_backend`，Linux 上用 `crpc::io::epoll_backend`，
+Windows 上用 `crpc::iocp_backend`，Linux 上用 `crpc::io::epoll_backend`，
 两端都用 `crpc::endpoint::tcp("127.0.0.1", port)`。线上格式与调用/推送 API 不变。
 
 ## 下一步

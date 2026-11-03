@@ -38,7 +38,7 @@ Windows 的 IOCP 和 Linux 的 epoll 上。
 #include <crpc/redis/client.hpp>
 
 int main() {
-    crpc::io::iocp_backend backend;
+    crpc::iocp_backend backend;
 
     crpc::redis::client::options options;
     options.pool.connection.ep = crpc::endpoint::tcp("127.0.0.1", 6379);

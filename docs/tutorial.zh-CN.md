@@ -238,7 +238,7 @@ cmake --build build
 
 - **错误即值。** 上面的代码在调用中不抛出异常；`status`、`result<T>` 与 `rpc_error`
   承载失败。见 [`error.hpp`](../include/crpc/error.hpp)。
-- **两个进程。** 把 `crpc::inproc_backend` 换成 `crpc::io::iocp_backend`（Windows）或
+- **两个进程。** 把 `crpc::inproc_backend` 换成 `crpc::iocp_backend`（Windows）或
   `crpc::io::epoll_backend`（Linux），端点换成
   `crpc::endpoint::tcp("127.0.0.1", port)`；调用与推送 API 不变。见
   [examples/README.zh-CN.md](../examples/README.zh-CN.md)。

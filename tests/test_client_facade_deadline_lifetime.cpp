@@ -325,8 +325,17 @@ CRPC_TEST(facade_live_owner_concurrent_close_is_safe) {
         }
     });
 
-    // Let the reader spin up before destroying the client.
-    std::this_thread::sleep_for(2ms);
+    // Wait until the reader has actually taken a lease, rather than sleeping
+    // for a minute amount and hoping. This used to be `sleep_for(2ms)`, which
+    // asserts nothing about the reader being scheduled: under `ctest -j24` the
+    // whole machine is oversubscribed, the reader thread could still be waiting
+    // for its first timeslice when `cli.reset()` ran, and the case then failed on
+    // "nonnull > 0" -- not because the liveness gate was broken but because the
+    // reader never got to observe a live owner. Waiting on the value the
+    // assertion is about makes the fixture deterministic and leaves the
+    // assertion testing what it claims to test.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return nonnull.load(std::memory_order_relaxed) > 0; }, 5000));
     cli.reset();
     stop.store(true, std::memory_order_release);
     reader.join();

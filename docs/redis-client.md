@@ -41,7 +41,7 @@ is the shortest path to a working client.
 #include <crpc/redis/client.hpp>
 
 int main() {
-    crpc::io::iocp_backend backend;
+    crpc::iocp_backend backend;
 
     crpc::redis::client::options options;
     options.pool.connection.ep = crpc::endpoint::tcp("127.0.0.1", 6379);

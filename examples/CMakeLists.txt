@@ -12,8 +12,15 @@
 # so staging them into <build>/examples/ would need a copy of the DLL that an
 # incremental library rebuild would leave stale.
 
+# `quickstart*` are API tours. `deploy_check` is not a tour: it is the
+# cross-process deployment gate, and it is here because it has to link as a
+# consumer of the public API exactly like a real program would. Everything in
+# this directory must follow the same registration rules (built at the build
+# root, registered with CTest, exiting non-zero on failure), so it is picked up
+# by the same glob rather than by its own target.
 file(GLOB CRPC_EXAMPLE_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/quickstart*.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/quickstart*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/deploy_*.cpp")
 
 foreach(source ${CRPC_EXAMPLE_SOURCES})
     get_filename_component(file_name "${source}" NAME_WE)

@@ -256,7 +256,7 @@ cmake --build build
   `result<T>` and `rpc_error` carry the failure. See
   [`error.hpp`](../include/crpc/error.hpp).
 - **Two processes.** Replace `crpc::inproc_backend` with
-  `crpc::io::iocp_backend` (Windows) or `crpc::io::epoll_backend` (Linux) and the
+  `crpc::iocp_backend` (Windows) or `crpc::io::epoll_backend` (Linux) and the
   endpoint with `crpc::endpoint::tcp("127.0.0.1", port)`; the call and push API
   are unchanged. See [examples/README.md](../examples/README.md).
 - **The full API map** is [docs/api/README.md](api/README.md).

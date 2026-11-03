@@ -202,6 +202,55 @@ ok: two processes exchanged a message over shared memory
 Exit code 0 means both directions delivered the expected bytes. See
 [ipc.md](../docs/ipc.md) for the channel, ring buffer and SPSC queue contracts.
 
+
+## Cross-process deployment check
+
+Every quickstart above uses `crpc::inproc_backend`, which connects two endpoints
+inside one process with no sockets. That is deliberate -- it makes the examples
+deterministic -- but it also means they never prove the network paths work.
+
+`deploy_check.cpp` is the exception, and it is the one to run before trusting a
+build in production. It spawns *itself* as a child process, so the server and
+the client are two operating-system processes talking over loopback TCP:
+
+```powershell
+.\.opencode\tmp\p20b\crpc_example_deploy_check.exe
+```
+
+Expected output:
+
+```text
+server: READY 19562
+call: /health -> 200 ok
+call: /echo/deploy -> 200 deploy
+server: STATS accepted=2 requests=2 responses=2 bad=0
+```
+
+It checks three things the in-process examples cannot:
+
+1. a real `iocp_backend` (Windows) or `epoll_backend` (Linux) listener accepts a
+   connection from a different process;
+2. the reply is parsed and compared **exactly** -- status line plus body, byte
+   for byte. A substring check was the first version of this file, and it passed
+   while the server answered `not-ok` for `/health` because `"ok"` is inside
+   `"not-ok"`. A gate that accepts the wrong body only proves a port was open;
+3. the server's own counters agree (`accepted == requests == responses`,
+   `bad == 0`) and the process shuts down cleanly.
+
+The two modes are usable on their own, which is what makes a third-party client
+meaningful:
+
+```powershell
+# terminal 1
+.\crpc_example_deploy_check.exe serve 19555
+# terminal 2 -- an unrelated HTTP client, proving the wire is ordinary HTTP/1.1
+curl -sS -D - http://127.0.0.1:19555/health
+curl -sS http://127.0.0.1:19555/echo/curl-real
+```
+
+A `curl` that gets `HTTP/1.1 200` and the expected body is evidence no
+in-process test can give: the bytes on the wire are correct HTTP, not something
+only this library can parse.
 ## Why one process
 
 The quickstart uses `crpc::inproc_backend`, which connects two endpoints inside
@@ -210,7 +259,7 @@ test suite uses, and it makes the whole API deterministic and portable: the
 server and the client are objects in `main()`.
 
 To run the two roles in separate processes, keep the server code and the client
-code and replace the backend and the endpoint: `crpc::io::iocp_backend` on
+code and replace the backend and the endpoint: `crpc::iocp_backend` on
 Windows, `crpc::io::epoll_backend` on Linux, and
 `crpc::endpoint::tcp("127.0.0.1", port)` on both sides. The wire format and the
 call/push API are unchanged.
