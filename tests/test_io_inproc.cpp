@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -512,6 +513,97 @@ CRPC_TEST(inproc_backend_listen_connect) {
                nullptr);
 }
 
+// A resume_read() issued while on_data is running must not be lost.
+//
+// `drain` hands a chunk to `on_data` with the state lock released, and only
+// afterwards executes `if (consumed < offered) ch.reader_paused = true;`. A
+// `resume_read()` that lands in that window clears a pause that has not been
+// written yet, so the pause the loop is about to record silently discards the
+// wake: the channel stays paused with bytes still queued and nothing left to
+// schedule it again. The epoll backend solved this with `pending_wakes_`; the
+// in-process backend had no equivalent.
+//
+// How it shows up in production: `crpc_test_net_bigread` failed about once in
+// 120 runs with `read_exact` returning deadline_exceeded after the whole 5 s
+// operation timeout -- a lost wake, not corrupt data.
+//
+// This case does not race for the timing. The consumer blocks inside on_data
+// until the test says the resume has been issued, so the resume is guaranteed
+// to arrive during delivery; on_data then returns short, which is the pause.
+struct rendezvous_source final : io::source {
+    std::atomic<bool> in_callback{false};
+    std::atomic<bool> release{false};
+    std::mutex m;
+    std::vector<std::byte> received;
+
+    std::size_t on_data(span<const std::byte> data) noexcept override {
+        in_callback.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        if (data.empty()) {
+            return 0;
+        }
+        // One byte per call: a short consumption, hence a pause.
+        std::lock_guard<std::mutex> lk(m);
+        received.push_back(data[0]);
+        return 1;
+    }
+
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+
+    std::size_t received_size() {
+        std::lock_guard<std::mutex> lk(m);
+        return received.size();
+    }
+};
+
+struct live_completion final : io::completion {
+    std::atomic<int> calls{0};
+    void complete(io::io_result) noexcept override { calls.fetch_add(1); }
+};
+
+CRPC_TEST(inproc_resume_during_delivery_is_not_lost) {
+    inproc_options opt;
+    opt.max_queued_bytes = 64;
+    auto pair = inproc_pair::make_typed(opt);
+
+    rendezvous_source right;
+    pair.second->bind_source(&right);
+
+    // The push has to run on another thread: the drain loop executes on_data
+    // on the pushing thread, and on_data here blocks until the resume below has
+    // been issued. Doing the push on this thread would deadlock the case.
+    const std::string payload = "abcdefgh";
+    live_completion done;
+    std::thread producer([&] {
+        pair.first->sink().push(bytes_of(payload), &done);
+    });
+
+    // Wait for the delivery to actually reach on_data (no sleep, no guess).
+    constexpr int kMaxSpins = 20000000;
+    int spins = 0;
+    while (!right.in_callback.load(std::memory_order_acquire) &&
+           spins < kMaxSpins) {
+        std::this_thread::yield();
+        ++spins;
+    }
+    CRPC_CHECK(right.in_callback.load(std::memory_order_acquire));
+
+    // Issue the wake while the callback is still running, then let it return
+    // short. This is the window the old code dropped.
+    pair.second->resume_read();
+    right.release.store(true, std::memory_order_release);
+
+    // Wait for the producer to finish before touching `done` or the pair.
+    producer.join();
+
+    // Without the fix exactly one byte is delivered: the pause recorded after
+    // on_data returns swallows the resume, and nothing schedules another pass.
+    // With it, the remembered demand buys one more delivery.
+    CRPC_CHECK_EQ(std::size_t{2}, right.received_size());
+}
 } // namespace
 
 CRPC_TEST_MAIN()

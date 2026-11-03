@@ -84,6 +84,21 @@ struct channel {
     io::source* reader = nullptr;
 
     bool reader_paused = false;   // on_data returned short; wait for resume
+    // Number of resumptions the writer of this channel must still honour.
+    //
+    // A `resume_read()` cannot simply clear `reader_paused`: the drain loop
+    // calls `on_data` with the state lock released and only records the pause
+    // after that call returns, so a resume arriving in that window clears a
+    // pause that has not been written yet and the pause the loop goes on to
+    // record silently discards the wake. The channel then stays paused with
+    // bytes queued and nothing to schedule it again.
+    //
+    // Every resume therefore increments this counter, and the drain loop, in
+    // the same critical section in which it records the pause, consumes one
+    // demand and skips that pause instead. The counter is the only place a
+    // demand can be remembered, because `reader_paused` alone cannot represent
+    // "paused now, but a resume was already asked for".
+    std::uint64_t pending_wakes = 0;
     bool reader_closed = false;   // the reading endpoint called close()
     bool dead = false;            // terminal state; no further callbacks
     bool eof_pending = false;     // writer closed; deliver on_eof
@@ -395,8 +410,22 @@ void drain(inproc_state& st) noexcept {
                                 ch.tail = node;
                             }
                         }
+                        // A short consumption normally pauses the channel, but a
+                        // resume_read() issued while on_data was running already
+                        // asked for the next slice: consume that demand here, in
+                        // the same critical section that would record the pause,
+                        // so the wake cannot be swallowed either way.
                         if (consumed < offered) {
-                            ch.reader_paused = true;
+                            if (ch.pending_wakes != 0) {
+                                --ch.pending_wakes;
+                            } else {
+                                ch.reader_paused = true;
+                            }
+                        } else if (ch.pending_wakes != 0) {
+                            // A full consumption leaves the channel runnable, so a
+                            // demand queued against the delivery attempt it just
+                            // finished is spent by staying runnable.
+                            --ch.pending_wakes;
                         }
                         done = promote_locked(ch, done_result);
                     }
@@ -576,6 +605,22 @@ void resume_read_impl(inproc_state& st, int index) noexcept {
         if (in.dead || in.reader_closed) {
             return;
         }
+        // Queue the demand rather than clearing the pause outright. The drain
+        // loop may be inside this channel's on_data right now, holding no lock,
+        // and about to record a pause from the short consumption it has already
+        // made; a snapshot taken before that point would be overwritten and the
+        // wake lost. With a demand queued, the loop consumes it under this same
+        // mutex when it would otherwise pause (see `drain`).
+        //
+        // Queued only when it can be fulfilled -- a pause to clear, bytes still
+        // retained, or a delivery attempt in flight (`delivering != 0`), which is
+        // the case neither of the other two can see. Incrementing with none of
+        // them present would leave a demand that never gets consumed and would
+        // later cancel an unrelated, legitimate pause.
+        if (in.reader_paused || in.head != nullptr || in.held != nullptr ||
+            in.delivering != 0) {
+            ++in.pending_wakes;
+        }
         in.reader_paused = false;
     }
     drain(st);
@@ -695,6 +740,13 @@ void inproc_connection::bind_source(io::source* source) noexcept {
         }
         channel& in = state_->dir[1 - index_];
         if (!in.dead && !in.reader_closed) {
+            // Same reasoning as resume_read_impl: a binding installed while the
+            // drain loop is inside a delivery attempt must leave a demand, not
+            // just clear a flag that the loop is about to set again.
+            if (in.reader_paused || in.head != nullptr || in.held != nullptr ||
+                in.delivering != 0) {
+                ++in.pending_wakes;
+            }
             in.reader_paused = false;
         }
     }
