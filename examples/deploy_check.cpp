@@ -549,13 +549,38 @@ int soak(unsigned long port, int requests) {
     double connect_ms_total = 0.0;
     double transfer_ms_total = 0.0;
     std::vector<double> connect_ms;
+    // A failed connect has two very different meanings and the bare "failed at
+    // request N" could not tell them apart. A refusal is immediate (the listener
+    // answered RST); a connect that burns the full connect_timeout means the SYN
+    // was never answered, i.e. the accept side stopped consuming. CI once failed
+    // here with 24 consecutive connect failures that together used the whole
+    // 60 s CTest timeout -- about 2.4 s each, which is far too slow for a
+    // refusal and is what identified it as an accept-side stall rather than a
+    // closed port. Printing the elapsed time is what makes that distinction
+    // visible in the failure itself instead of having to infer it from a
+    // timeout.
+    double worst_connect_ms = 0.0;
+    int connect_failures = 0;
     for (int i = 0; i < requests; ++i) {
         const auto began = std::chrono::steady_clock::now();
         auto conn = backend.connect(
             crpc::endpoint::tcp("127.0.0.1", static_cast<crpc::u16>(port)),
             crpc::connect_options{});
         if (!conn) {
-            std::cerr << "deploy: soak connect failed at request " << i << "\n";
+            const double failed_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - began)
+                    .count();
+            if (failed_ms > worst_connect_ms) {
+                worst_connect_ms = failed_ms;
+            }
+            ++connect_failures;
+            // First few only: a sustained stall would otherwise bury every other
+            // line of output under hundreds of identical messages.
+            if (connect_failures <= 5) {
+                std::cerr << "deploy: soak connect failed at request " << i
+                          << " after " << failed_ms << " ms\n";
+            }
             ++failures;
             continue;
         }
@@ -622,6 +647,8 @@ int soak(unsigned long port, int requests) {
     const std::size_t after = process_handle_count();
 
     std::cout << "soak: requests=" << requests << " failures=" << failures
+              << " connect_failures=" << connect_failures
+              << " worst_connect_ms=" << worst_connect_ms
               << " handles " << baseline << " -> " << after;
     if (!latencies_ms.empty()) {
         std::vector<double> sorted = latencies_ms;
