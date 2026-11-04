@@ -5,6 +5,7 @@
 # Usage:
 #   scripts/test.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                   [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
+#                   [--cxx-standard 17|20]
 #                   [--filter REGEX] [--repeat N] [--shared]
 #                   [--examples] [--no-tests]
 #                   [--source DIR] [--build-root DIR]
@@ -27,6 +28,7 @@ CONFIG="Debug"
 ARCH="x64"
 COMPILER="gcc"
 SANITIZER="none"
+CXX_STANDARD="17"
 FILTER=""
 REPEAT=1
 SHARED=0
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --arch) ARCH="$2"; shift 2 ;;
     --compiler) COMPILER="$2"; shift 2 ;;
     --sanitizer) SANITIZER="$2"; shift 2 ;;
+    --cxx-standard) CXX_STANDARD="$2"; shift 2 ;;
     --filter) FILTER="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
     --shared) SHARED=1; shift ;;
@@ -105,7 +108,8 @@ for san in "${SAN_LIST[@]}"; do
     # "Permission denied" while the build itself is fine. CI calls this script as
     # `bash scripts/test.sh`, so the interpreter is already known to exist.
     if ! bash "$BUILD_SH" --config "$cfg" --arch "$ARCH" --compiler "$COMPILER" \
-         --sanitizer "$san" --source "$SOURCE_DIR" --build-root "$BUILD_ROOT" \
+         --sanitizer "$san" --cxx-standard "$CXX_STANDARD" \
+         --source "$SOURCE_DIR" --build-root "$BUILD_ROOT" \
          "${SHARED_ARG[@]}" "${EXTRA_ARGS[@]}"; then
       log ERROR "build failed $ARCH/$cfg/$san"
       FAILURES=$((FAILURES + 1))
@@ -115,6 +119,7 @@ for san in "${SAN_LIST[@]}"; do
     suffix=""
     [[ "$san" != "none" ]] && suffix="-$san"
     [[ $SHARED -eq 1 ]] && suffix="$suffix-shared"
+    [[ "$CXX_STANDARD" != "17" ]] && suffix="$suffix-cxx$CXX_STANDARD"
     BUILD_DIR="$BUILD_ROOT/build/$ARCH-$cfg$suffix"
 
     for ((r = 1; r <= REPEAT; ++r)); do

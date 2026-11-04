@@ -370,6 +370,7 @@ Per-lane byte quotas are kept in the same controller and released with the idemp
 | Area | Status | Evidence / gap |
 |---|---|---|
 | base, wire, frame | implemented | `test_endian.cpp`, `test_wire.cpp`, `test_frame.cpp` |
+| `detail` (shared helpers) | implemented | `test_detail_atomic_shared_ptr.cpp`; one atomically swappable `shared_ptr` used by `cluster::registry` and `resilience::load_balancer`, written as a plain `std::shared_ptr` plus the free-function atomic API so the library builds under both C++17 and C++20 with identical layouts (the C++20 `std::atomic<std::shared_ptr<T>>` is 16-aligned on MSVC x64 and would change exported layouts) |
 | inproc / epoll / IOCP (`io`) | implemented | `test_io_inproc.cpp`, `test_io_epoll.cpp`, `test_io_iocp.cpp` |
 | RPC core | implemented | `test_rpc_core.cpp`, `test_server_client.cpp`, `test_push_e2e.cpp`; low-level client is callback/poll based; PUSH/PUSH_ACK frame integration is wired |
 | codec | implemented | `test_codec.cpp`; text formats depend on RTTI being present |

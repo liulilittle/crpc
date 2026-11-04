@@ -116,6 +116,42 @@ jobs:
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 
+  # The library must compile under C++20 as well as C++17: the co_await
+  # support in response<Resp> only exists in C++20 mode, and
+  # tests/test_rpc_response_cpp20.cpp is a no-op in a C++17 build. Until this
+  # job existed no build script or workflow passed -DCMAKE_CXX_STANDARD=20, so
+  # those cases had never run anywhere -- and the library in fact did not
+  # compile in C++20 (std::atomic_load(&shared_ptr) is deprecated there and
+  # /W4 /WX makes the deprecation an error).
+  #
+  # Linux/gcc keeps this job cheap and independent of the MSVC matrix; the
+  # deprecation that blocked it was standard-level, not compiler-specific.
+  cxx20:
+    name: linux/gcc/cxx20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build
+          gcc --version | head -1
+
+      - name: Build and test (C++20)
+        run: bash scripts/test.sh --config Debug --cxx-standard 20
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-cxx20
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
   windows:
     name: windows/${{ matrix.arch }}/${{ matrix.config }}
     runs-on: windows-2022

@@ -1470,6 +1470,145 @@ CRPC_TEST(docs_lint_example_output_matches_the_program) {
     CRPC_CHECK_FALSE(bad);
 }
 
+// --- 17. A test that executes nothing must say so ---------------------------
+//
+// A translation unit whose only main is `int main() { return 0; }` still
+// registers with CTest and reports "Passed 0.00 sec". Nothing distinguishes
+// that from a real pass, so a sanitizer job or a platform matrix looks like it
+// covers code it never executed. This repository has already recorded that
+// mistake once, and it was live again: `test_rpc_response_cpp20` was a no-op
+// in *every* configuration that existed, because no build script or CI job
+// passed `-DCMAKE_CXX_STANDARD=20`, and its four cases had never run.
+//
+// The rule: the no-op path must print something. It stays green (the test list
+// is meant to be identical across platforms and standards), but a reader -- or
+// a log -- can tell that zero work happened.
+namespace {
+
+// True when `pos` sits inside a comment or a string/char literal.
+//
+// The first version of this guard matched raw text, so it counted *its own
+// explanatory comment* -- which quotes `int main() { return 0; }` -- as a
+// seventh no-op. That inflated `noops` and, worse, showed the announcement
+// check was file-wide: any file that merely mentioned another test's SKIP line
+// would have been accepted even if its own main printed nothing. Both are the
+// same mistake, so both are fixed here: skip matches that are not code, and
+// require the announcement inside the no-op body itself.
+bool in_comment_or_literal(const std::string& text, std::size_t pos) {
+    bool line_comment = false;
+    bool block_comment = false;
+    bool in_string = false;
+    bool in_char = false;
+    for (std::size_t i = 0; i < pos && i < text.size(); ++i) {
+        const char c = text[i];
+        const char next = i + 1 < text.size() ? text[i + 1] : '\0';
+        if (line_comment) {
+            if (c == '\n') {
+                line_comment = false;
+            }
+        } else if (block_comment) {
+            if (c == '*' && next == '/') {
+                block_comment = false;
+                ++i;
+            }
+        } else if (in_string) {
+            if (c == '\\') {
+                ++i;
+            } else if (c == '"') {
+                in_string = false;
+            }
+        } else if (in_char) {
+            if (c == '\\') {
+                ++i;
+            } else if (c == '\'') {
+                in_char = false;
+            }
+        } else if (c == '/' && next == '/') {
+            line_comment = true;
+            ++i;
+        } else if (c == '/' && next == '*') {
+            block_comment = true;
+            ++i;
+        } else if (c == '"') {
+            in_string = true;
+        } else if (c == '\'') {
+            in_char = true;
+        }
+    }
+    return line_comment || block_comment || in_string || in_char;
+}
+
+} // namespace
+
+CRPC_TEST(docs_lint_noop_tests_announce_themselves) {
+    const fs::path root = repo_root();
+    CRPC_CHECK(!root.empty());
+    if (root.empty()) {
+        return;
+    }
+    const fs::path tests_dir = root / "tests";
+    CRPC_CHECK(fs::exists(tests_dir));
+    if (!fs::exists(tests_dir)) {
+        return;
+    }
+
+    std::size_t noops = 0;
+    bool bad = false;
+    for (const auto& entry : fs::directory_iterator(tests_dir)) {
+        if (!entry.is_regular_file() ||
+            entry.path().extension() != ".cpp") {
+            continue;
+        }
+        const std::string text = read_text(entry.path());
+        // The trivial main, allowing for any amount of whitespace.
+        std::size_t pos = 0;
+        while ((pos = text.find("int main()", pos)) != std::string::npos) {
+            // This file documents the mistake by quoting the shape it forbids;
+            // a match inside a comment is prose, not a main.
+            if (in_comment_or_literal(text, pos)) {
+                pos += 1;
+                continue;
+            }
+            const std::size_t open = text.find('{', pos);
+            if (open == std::string::npos) {
+                break;
+            }
+            const std::size_t close = text.find('}', open);
+            if (close == std::string::npos) {
+                break;
+            }
+            std::string body = text.substr(open + 1, close - open - 1);
+            body.erase(std::remove_if(body.begin(), body.end(),
+                                     [](unsigned char c) {
+                                         return std::isspace(c) != 0;
+                                     }),
+                       body.end());
+            pos = close + 1;
+            // A main that runs no test case: it never calls the harness
+            // (`CRPC_`) and just returns success. Announcing itself with a
+            // printf is allowed and expected; running cases is not.
+            if (body.find("CRPC_") != std::string::npos ||
+                body.find("return0") == std::string::npos) {
+                continue;
+            }
+            ++noops;
+            // The explanation must be this main's own output, not any
+            // "SKIP crpc_test_" somewhere else in the file: a file-wide search
+            // would accept a silent main as long as a sibling printed.
+            if (body.find("SKIPcrpc_test_") == std::string::npos) {
+                std::printf(
+                    "  %s has a no-op main that prints no reason\n",
+                    entry.path().filename().generic_string().c_str());
+                bad = true;
+            }
+        }
+    }
+    // The suite does have platform/standard-gated binaries; if this drops to
+    // zero the scan stopped working and the check below would be vacuous.
+    CRPC_CHECK(noops >= 4);
+    CRPC_CHECK_FALSE(bad);
+}
+
 namespace {
 
 // The text of the section that starts at `heading`, up to the next "## ".

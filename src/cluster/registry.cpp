@@ -183,14 +183,17 @@ std::shared_ptr<registry_snapshot>
 registry::snapshot_with(const service_instance& instance) const {
     auto next = std::make_shared<registry_snapshot>();
     next->index = index_ + 1;
-    next->instances.reserve(snapshot_->instances.size() + 1);
+    const std::shared_ptr<const registry_snapshot> current =
+        snapshot_.load(std::memory_order_acquire);
+    next->instances.reserve(current->instances.size() + 1);
     bool replaced = false;
-    for (const auto& current : snapshot_->instances) {
-        if (current.service == instance.service && current.node_id == instance.node_id) {
+    for (const auto& entry : current->instances) {
+        if (entry.service == instance.service &&
+            entry.node_id == instance.node_id) {
             next->instances.push_back(instance);
             replaced = true;
         } else {
-            next->instances.push_back(current);
+            next->instances.push_back(entry);
         }
     }
     if (!replaced) {
@@ -297,7 +300,7 @@ result<write_result> registry::register_instance(service_instance instance,
         last_fence_[id] = next_fence;
         index_ = next_index;
         std::shared_ptr<const registry_snapshot> published(std::move(next));
-        std::atomic_store_explicit(&snapshot_, published, std::memory_order_release);
+        snapshot_.store(published, std::memory_order_release);
 
         event.index = next_index;
         event.kind = catalog_event_kind::put;
@@ -380,7 +383,7 @@ result<write_result> registry::deregister(const std::string& service,
         last_fence_[id] = next_fence;
         index_ = next_index;
         std::shared_ptr<const registry_snapshot> published(std::move(next));
-        std::atomic_store_explicit(&snapshot_, published, std::memory_order_release);
+        snapshot_.store(published, std::memory_order_release);
 
         event.index = next_index;
         event.kind = catalog_event_kind::put;
@@ -455,7 +458,7 @@ result<write_result> registry::set_state(const std::string& service,
         last_fence_[id] = next_fence;
         index_ = next_index;
         std::shared_ptr<const registry_snapshot> published(std::move(next));
-        std::atomic_store_explicit(&snapshot_, published, std::memory_order_release);
+        snapshot_.store(published, std::memory_order_release);
 
         event.index = next_index;
         event.kind = catalog_event_kind::put;
@@ -504,7 +507,7 @@ result<catalog_result> registry::query(const query_options& options) const {
 }
 
 std::shared_ptr<const registry_snapshot> registry::snapshot() const noexcept {
-    return std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
+    return snapshot_.load(std::memory_order_acquire);
 }
 
 u64 registry::index() const noexcept {
@@ -583,7 +586,7 @@ std::size_t registry::purge_expired_tombstones() {
             last_fence_.erase(id);
         }
         std::shared_ptr<const registry_snapshot> published(std::move(next));
-        std::atomic_store_explicit(&snapshot_, published, std::memory_order_release);
+        snapshot_.store(published, std::memory_order_release);
     }
     return expired.size();
 }

@@ -41,6 +41,9 @@ param(
     [switch]$Shared,
     [switch]$Examples,
     [switch]$NoTests,
+    # Language standard; forwarded to build.ps1 and used to locate the build
+    # directory (the standard is part of its name).
+    [ValidateSet('17', '20')] [string]$CxxStandard = '17',
     # Resolved below, not here: with [CmdletBinding()] PowerShell evaluates
     # parameter defaults before $PSScriptRoot is populated, so a default of
     # `(Resolve-Path (Join-Path $PSScriptRoot '..'))` throws "Cannot bind
@@ -146,6 +149,7 @@ foreach ($san in $sanList) {
         if ($Shared) { $buildArgs['Shared'] = $true }
         if ($Examples) { $buildArgs['Examples'] = $true }
         if ($NoTests) { $buildArgs['NoTests'] = $true }
+        $buildArgs['CxxStandard'] = $CxxStandard
         & $buildScript @buildArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Log "build failed for $Arch/$cfg/$san" 'ERROR'
@@ -154,6 +158,7 @@ foreach ($san in $sanList) {
         }
 
         $dirName = if ($san -eq 'none') { "build/$Arch-$cfg" } else { "build/$Arch-$cfg-$san" }
+        if ($CxxStandard -ne '17') { $dirName = "$dirName-cxx$CxxStandard" }
         if ($Shared) { $dirName = "$dirName-shared" }
         $buildDir = Join-Path $BuildRoot $dirName
         if (-not (Test-Path -LiteralPath $buildDir)) {

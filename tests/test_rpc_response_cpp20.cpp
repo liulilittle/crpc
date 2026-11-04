@@ -12,6 +12,7 @@
 // a language feature, so the real cases are guarded out and the translation unit
 // reduces to a trivial pass-through main; the operator itself is likewise
 // absent from the header in that mode.
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -303,6 +304,9 @@ CRPC_TEST_MAIN()
 
 // C++17 build: `co_await` is not a language feature, so the operator and these
 // cases are not compiled. The test binary still links and passes trivially.
-int main() { return 0; }
+int main() {
+    std::printf("SKIP crpc_test_rpc_response_cpp20: built as C++17, so co_await and the cases in this file are not compiled; this binary executes nothing\n");
+    return 0;
+}
 
 #endif

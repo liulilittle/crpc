@@ -366,6 +366,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 区域 | 状态 | 证据 / 缺口 |
 |---|---|---|
 | 基础、wire、frame | 已实现 | `test_endian.cpp`、`test_wire.cpp`、`test_frame.cpp` |
+| `detail`（共享小工具） | 已实现 | `test_detail_atomic_shared_ptr.cpp`；一个原子换入换出的 `shared_ptr`，供 `cluster::registry` 与 `resilience::load_balancer` 使用；实现为普通 `std::shared_ptr` 加自由函数原子 API，使库在 C++17 与 C++20 下都能构建且布局完全一致（MSVC x64 上 C++20 的 `std::atomic<std::shared_ptr<T>>` 是 16 字节对齐，会改变导出类的布局，故不使用） |
 | inproc / epoll / IOCP（`io`）| 已实现 | `test_io_inproc.cpp`、`test_io_epoll.cpp`、`test_io_iocp.cpp` |
 | RPC 核心 | 已实现 | `test_rpc_core.cpp`、`test_server_client.cpp`、`test_push_e2e.cpp`；低层客户端为回调/轮询式；PUSH/PUSH_ACK 帧集成已接线 |
 | 编解码 | 已实现 | `test_codec.cpp`；文本格式依赖 RTTI |

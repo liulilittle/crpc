@@ -237,6 +237,9 @@ CRPC_TEST_MAIN()
 // built and registered with CTest so the test list stays identical across
 // platforms, but it executes nothing.
 
-int main() { return 0; }
+int main() {
+    std::printf("SKIP crpc_test_io_connect_latency: IOCP does not exist on this platform; this binary executes nothing\n");
+    return 0;
+}
 
 #endif // _WIN32

@@ -58,6 +58,7 @@
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/detail/atomic_shared_ptr.hpp>
 
 namespace crpc {
 namespace cluster {
@@ -300,7 +301,11 @@ private:
     mutable std::mutex mutex_;
     std::map<key, service_instance, key_less> instances_;
     std::map<key, u64, key_less> last_fence_;
-    std::shared_ptr<const registry_snapshot> snapshot_;
+    // Swapped atomically on every publish; readers keep the snapshot they
+    // loaded. Holds a plain shared_ptr and uses the free-function atomic API;
+    // see detail/atomic_shared_ptr.hpp for why (layout must not depend on the
+    // language standard, and the C++20 atomic<shared_ptr> is 16-aligned).
+    ::crpc::detail::atomic_shared_ptr<const registry_snapshot> snapshot_;
     u64 index_ = 0;
     u64 last_global_fence_ = 0;
 

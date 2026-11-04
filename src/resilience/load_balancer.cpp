@@ -207,7 +207,7 @@ result<instance> load_balancer::select_hash(const instance_set& set, u64 key) {
     ensure_ring(set);
 
     const std::shared_ptr<const ring_data> ring =
-        std::atomic_load_explicit(&ring_, std::memory_order_acquire);
+        ring_.load(std::memory_order_acquire);
     if (!ring || ring->nodes.empty()) {
         return no_healthy_instance();
     }
@@ -253,13 +253,13 @@ u64 load_balancer::next_random() noexcept {
 void load_balancer::ensure_ring(const instance_set& set) {
     const u64 version = set.version();
     std::shared_ptr<const ring_data> current =
-        std::atomic_load_explicit(&ring_, std::memory_order_acquire);
+        ring_.load(std::memory_order_acquire);
     if (current && current->version == version) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(ring_mutex_);
-    current = std::atomic_load_explicit(&ring_, std::memory_order_acquire);
+    current = ring_.load(std::memory_order_acquire);
     if (current && current->version == version) {
         return;
     }
@@ -292,7 +292,7 @@ void load_balancer::ensure_ring(const instance_set& set) {
               });
 
     const std::shared_ptr<const ring_data> immutable = fresh;
-    std::atomic_store_explicit(&ring_, immutable, std::memory_order_release);
+    ring_.store(immutable, std::memory_order_release);
 }
 
 void load_balancer::ensure_weighted(const instance_set& set) {

@@ -212,17 +212,27 @@ Linux/macOS:
 ```sh
 ./scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
+                   [--cxx-standard 17|20]
                    [--jobs N] [--clean] [--shared]
                    [--examples] [--no-tests] [--bench]
                    [--source DIR] [--build-root DIR]
 ./scripts/test.sh  [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
+                   [--cxx-standard 17|20]
                    [--filter REGEX] [--repeat N] [--shared]
                    [--examples] [--no-tests]
                    [--source DIR] [--build-root DIR]
 ```
 
 Build behavior: `Config Both` builds Debug and Release in separate directories.
+`-CxxStandard`/`--cxx-standard` selects the language standard. `17` is the
+default and what every other job builds. `20` exists because the library must
+also compile under C++20 -- `response<Resp>::operator co_await` needs it -- and
+without a build that asks for it, `tests/test_rpc_response_cpp20.cpp` is a no-op
+in every configuration (its cases had never run anywhere until this switch was
+added). The standard is part of the build directory name (`...-cxx20`), so a
+C++20 configure cannot silently reconfigure the C++17 tree.
+
 `-Jobs`/`--jobs` defaults to the processor count. `-Clean`/`--clean` removes
 only the selected build directory, never the source or the whole artifact root.
 The Windows script runs CMake inside the detected `vcvars` environment when one
@@ -313,9 +323,14 @@ truth (requirement 25).
 
 | Job | Matrix |
 | --- | --- |
-| `linux` | gcc x64 and clang x64, each Debug and Release |
+| `linux` | gcc x64 and clang x64, each Debug and Release, static and shared |
 | `linux-sanitizers` | `test.sh --sanitizer all` (asan + ubsan + tsan) |
-| `windows` | MSVC x64, Debug and Release |
+| `linux/gcc/cxx20` | `test.sh --cxx-standard 20`, so the C++20-only code is compiled and its cases actually run |
+| `windows` | MSVC x64 and x86, each Debug and Release |
+| `windows/shared` | MSVC x64 shared build plus the export gate |
+| `windows/examples` | builds and runs `examples/` with `CRPC_BUILD_TESTS=OFF` |
+| `windows/bench-compile` | compiles every benchmark, runs none |
+| `linux/bench-compile` | same for the POSIX compiler |
 
 Both optimiser settings appear on both platforms because a Release-only defect has
 shipped twice, and both Linux compilers appear because clang's `-Werror` diagnostics

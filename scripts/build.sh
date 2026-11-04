@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
 #                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
-#                    [--jobs N] [--clean] [--shared]
+#                    [--cxx-standard 17|20] [--jobs N] [--clean] [--shared]
 #                    [--examples] [--no-tests] [--bench]
 #                    [--source DIR] [--build-root DIR]
 #
@@ -22,6 +22,7 @@ CONFIG="Debug"
 ARCH="x64"
 COMPILER="gcc"
 SANITIZER="none"
+CXX_STANDARD="17"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 CLEAN=0
 SHARED=0
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --arch) ARCH="$2"; shift 2 ;;
     --compiler) COMPILER="$2"; shift 2 ;;
     --sanitizer) SANITIZER="$2"; shift 2 ;;
+    --cxx-standard) CXX_STANDARD="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     --clean) CLEAN=1; shift ;;
     --shared) SHARED=1; shift ;;
@@ -145,7 +147,7 @@ if [[ -z "${CRPC_RTTI_DIR:-}" && ! -f "$SOURCE_DIR/third_party/rtti/CMakeLists.t
   exit 3
 fi
 
-log INFO "source=$SOURCE_DIR arch=$ARCH config=$CONFIG sanitizer=$SANITIZER compiler=$COMPILER shared=$SHARED"
+log INFO "source=$SOURCE_DIR arch=$ARCH config=$CONFIG sanitizer=$SANITIZER compiler=$COMPILER shared=$SHARED cxx=$CXX_STANDARD"
 log INFO "cmake=$CMAKE cxx=$CXX_COMPILER log=$LOG"
 
 FAILURES=0
@@ -158,6 +160,9 @@ for cfg in "${CONFIGS[@]}"; do
   # gets its own directory: reusing the static one would leave a stale archive
   # in place and silently link the wrong library type.
   [[ $SHARED -eq 1 ]] && suffix="$suffix-shared"
+  # The language standard changes what compiles, so it gets its own tree for
+  # the same reason shared does.
+  [[ "$CXX_STANDARD" != "17" ]] && suffix="$suffix-cxx$CXX_STANDARD"
   BUILD_DIR="$BUILD_ROOT/build/$ARCH-$cfg$suffix"
   if [[ $CLEAN -eq 1 && -d "$BUILD_DIR" ]]; then
     log INFO "clean: $BUILD_DIR"
@@ -169,7 +174,8 @@ for cfg in "${CONFIGS[@]}"; do
   if ! "$CMAKE" -S "$SOURCE_DIR" -B "$BUILD_DIR" "${GENERATOR_ARGS[@]}" \
       -DCMAKE_BUILD_TYPE="$cfg" \
       -DCMAKE_C_COMPILER="$CC_COMPILER" -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
-      -DCRPC_WARNINGS_AS_ERRORS=ON "${TESTS_ARGS[@]}" \
+      -DCRPC_WARNINGS_AS_ERRORS=ON "-DCMAKE_CXX_STANDARD=$CXX_STANDARD" \
+      "${TESTS_ARGS[@]}" \
          "${EXAMPLES_ARGS[@]}" \
       "${SHARED_ARGS[@]}" "${BENCH_ARGS[@]}" \
       "${DEP_ARGS[@]}" \

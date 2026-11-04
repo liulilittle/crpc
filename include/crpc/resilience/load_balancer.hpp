@@ -38,6 +38,7 @@
 
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/detail/atomic_shared_ptr.hpp>
 
 namespace crpc::resilience {
 
@@ -130,7 +131,10 @@ private:
     std::atomic<u64> random_state_;
 
     std::mutex ring_mutex_;
-    std::shared_ptr<const ring_data> ring_;
+    // Swapped atomically when the ring is rebuilt; readers keep the ring they
+    // loaded. Plain shared_ptr + free-function atomic API to keep this class's
+    // layout identical in C++17 and C++20 (see detail/atomic_shared_ptr.hpp).
+    ::crpc::detail::atomic_shared_ptr<const ring_data> ring_;
 
     bool weighted_ready_ = false;
     u64 weighted_version_ = 0;

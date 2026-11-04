@@ -835,7 +835,7 @@ CRPC_TEST_MAIN()
 #include <cstdio>
 
 int main() {
-    std::printf("SKIP test_io_epoll: linux only\n");
+    std::printf("SKIP crpc_test_io_epoll: linux only; this binary executes nothing\n");
     return 0;
 }
 

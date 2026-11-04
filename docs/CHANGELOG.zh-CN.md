@@ -4,6 +4,36 @@
 
 ## 未发布
 
+### C++20 构建：库在 C++20 下可编译可运行，并有 CI 任务实际执行
+
+- 库现在与 C++17 一样能在 C++20 下构建并跑过全量测试。阻塞点是
+  `std::atomic_load`/`std::atomic_store` 对 `shared_ptr` 的在 C++20 中被弃用
+  （MSVC STL4029），而 `/W4 /WX` 把弃用变成硬错误；GCC 与 clang 不做此诊断。
+  新增 `crpc/detail/atomic_shared_ptr.hpp` 封装 `cluster::registry` 与
+  `resilience::load_balancer` 使用的换入换出操作，并在会报弃用警告的编译器上
+  局部抑制该警告。
+- 该封装刻意保留普通 `std::shared_ptr` 成员与自由函数 API，而不是改用
+  `std::atomic<std::shared_ptr<T>>`：该特化在 MSVC x64 上是 16 字节对齐，而
+  `shared_ptr` 是 8 字节，嵌入它会**仅在 C++20 构建**下改变两个导出且消费者可
+  构造的类的布局——C++20 消费者配 C++17 构建的库即出现静默布局错配。实测：
+  不用封装时 MSVC x64 C++20 下 `load_balancer` 从 160 增到 176 字节、`registry`
+  对齐从 8 变 16；用封装后两者在 C++17 与 C++20 下完全一致。测试
+  （`atomic_shared_ptr_keeps_its_owner_layout`）把封装钉在与普通 `shared_ptr`
+  相同的 sizeof 与对齐。
+- 构建脚本新增 `-CxxStandard`/`--cxx-standard 17|20`；标准进入构建目录名
+  （`...-cxx20`），因此 C++20 配置不会静默重配 C++17 目录。新增 CI 任务
+  `linux/gcc/cxx20` 运行 `test.sh --cxx-standard 20`，`tests/test_rpc_response_cpp20.cpp`
+  及其四个 `co_await` 用例从此真正运行——此前没有任何任务传
+  `-DCMAKE_CXX_STANDARD=20`，该文件在所有配置下都是空操作，且库在 C++20 下
+  根本编译不过。
+- 目标平台/标准使其什么都不执行的测试二进制现在打印 `SKIP crpc_test_*` 行而
+  不是静默通过（六个空操作 main），并由 `docs_lint_noop_tests_announce_themselves`
+  强制执行：平凡 `int main()` 必须在自己的函数体内声明原因。守卫会忽略注释/
+  字符串内的出现——其自身文档就引用了被禁止的形状——并要求声明在 main 体内，
+  而非文件任意位置（已证伪：全文件搜索会放行一个什么都不打的 main 变异）。
+- 证据：Windows x64/x86 Debug 与 Release 均 192/192，shared 构建 193/193 且导出
+  门禁通过，Linux gcc Debug 在 C++17 与 C++20 下均 192/192。
+
 ### IPC：命名共享内存、字节环、值队列与通道
 
 - `fs::shared_memory` 提供命名映射，供两个本地进程在不经套接字的情况下交换缓冲区。

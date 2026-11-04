@@ -210,6 +210,10 @@ without registering it here fails the suite.
 - [`db/tidb/retry.hpp`](../../include/crpc/db/tidb/retry.hpp)
 - [`db/types.hpp`](../../include/crpc/db/types.hpp)
 
+### `crpc/detail`
+
+- [`detail/atomic_shared_ptr.hpp`](../../include/crpc/detail/atomic_shared_ptr.hpp)
+
 ### `crpc/fs`
 
 - [`fs/directory.hpp`](../../include/crpc/fs/directory.hpp)

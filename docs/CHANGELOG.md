@@ -4,6 +4,42 @@
 
 ## Unreleased
 
+### C++20 builds: the library compiles and runs under C++20, and a CI job runs them
+
+- The library now builds and passes its full suite under C++20 as well as C++17.
+  The blocker was `std::atomic_load`/`std::atomic_store` on `shared_ptr`, which
+  C++20 deprecates (MSVC STL4029) and `/W4 /WX` turns into a hard error; GCC and
+  clang do not diagnose it. `crpc/detail/atomic_shared_ptr.hpp` wraps the swap
+  used by `cluster::registry` and `resilience::load_balancer` and suppresses the
+  deprecation on the compilers that emit it.
+- The wrapper deliberately keeps a plain `std::shared_ptr` member and the
+  free-function API rather than switching to `std::atomic<std::shared_ptr<T>>`:
+  the specialization is 16-byte aligned on MSVC x64 where `shared_ptr` is 8, so
+  embedding it would change the size/alignment of two exported,
+  consumer-constructible classes *only in C++20 builds* -- a silent layout
+  mismatch for a C++20 consumer of a C++17-built library. Measured: without the
+  wrapper `load_balancer` grew 160 -> 176 bytes and `registry` alignment 8 -> 16
+  on MSVC x64 C++20; with it both are identical in C++17 and C++20. A test
+  (`atomic_shared_ptr_keeps_its_owner_layout`) pins the wrapper to the plain
+  `shared_ptr` size and alignment.
+- Build scripts gained `-CxxStandard`/`--cxx-standard 17|20`; the standard is part
+  of the build directory name (`...-cxx20`) so a C++20 configure cannot
+  reconfigure the C++17 tree. The new CI job `linux/gcc/cxx20` runs
+  `test.sh --cxx-standard 20`, so `tests/test_rpc_response_cpp20.cpp` and its four
+  `co_await` cases actually run somewhere -- previously no job passed
+  `-DCMAKE_CXX_STANDARD=20`, the file was a no-op in every configuration, and the
+  library did not even compile in C++20.
+- A binary whose target platform/standard makes it execute nothing now prints a
+  `SKIP crpc_test_*` line instead of silently passing (six no-op mains), and
+  `docs_lint_noop_tests_announce_themselves` enforces it: a trivial `int main()`
+  must be announced in its own body. The guard ignores occurrences inside
+  comments/strings -- its own documentation quotes the forbidden shape -- and
+  requires the announcement in the main body, not anywhere in the file (a
+  file-wide search was shown to miss a mutated main that printed nothing).
+- Evidence: `ctest` 192/192 on Windows x64/x86 Debug and Release, 193/193 on the
+  shared build with the export gate, and 192/192 on Linux gcc Debug in both C++17
+  and C++20.
+
 ### IPC: named shared memory, a byte ring, a value queue, and a channel
 
 - `fs::shared_memory` adds a named mapping two local processes use to hand each other a

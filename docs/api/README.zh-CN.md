@@ -206,6 +206,10 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`db/tidb/retry.hpp`](../../include/crpc/db/tidb/retry.hpp)
 - [`db/types.hpp`](../../include/crpc/db/types.hpp)
 
+### `crpc/detail`
+
+- [`detail/atomic_shared_ptr.hpp`](../../include/crpc/detail/atomic_shared_ptr.hpp)
+
 ### `crpc/fs`
 
 - [`fs/directory.hpp`](../../include/crpc/fs/directory.hpp)

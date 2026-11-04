@@ -29,6 +29,15 @@ param(
     [ValidateSet('none', 'asan', 'ubsan', 'tsan')]
     [string]$Sanitizer = 'none',
 
+    # Language standard. 17 is the default and what the normal gate builds.
+    # 20 exists because the library must also compile under C++20 (the
+    # co_await support in response<Resp> needs it), and because without a
+    # build that passes this, tests/test_rpc_response_cpp20.cpp is a no-op in
+    # every configuration that exists -- which is exactly what had happened:
+    # its cases had never run anywhere until this switch was added.
+    [ValidateSet('17', '20')]
+    [string]$CxxStandard = '17',
+
     [int]$Jobs = 0,
 
     [switch]$Clean,
@@ -123,11 +132,16 @@ function Get-BuildDirName {
     # gets its own directory: reusing the static one would leave a stale
     # crpc.lib in place and silently link the wrong library type.
     $kind = if ($script:SharedBuild) { '-shared' } else { '' }
-    return "build/$Arch-$Cfg$suffix$kind"
+    # The language standard changes what compiles, so it gets its own tree for
+    # the same reason shared does: reusing one would reconfigure it in place
+    # and leave objects from the other standard behind.
+    $std = if ($script:CxxStandard -eq '17') { '' } else { "-cxx$script:CxxStandard" }
+    return "build/$Arch-$Cfg$suffix$kind$std"
 }
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $script:SharedBuild = [bool]$Shared
+$script:CxxStandard = $CxxStandard
 
 if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir '.opencode/tmp/out' }
 $logDir = Join-Path $BuildRoot 'logs'
@@ -135,7 +149,7 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:LogPath = Join-Path $logDir "build-$Arch-$Config-$Sanitizer-$stamp.log"
 
-Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer shared=$($script:SharedBuild)"
+Write-Log "source=$SourceDir arch=$Arch config=$Config sanitizer=$Sanitizer shared=$($script:SharedBuild) cxx=$CxxStandard"
 Write-Log "log=$script:LogPath"
 
 $cmake = Find-CMake
@@ -207,6 +221,7 @@ foreach ($cfg in $configs) {
         '-G', $generator,
         "-DCMAKE_BUILD_TYPE=$cfg",
         '-DCRPC_WARNINGS_AS_ERRORS=ON',
+        "-DCMAKE_CXX_STANDARD=$script:CxxStandard",
         $(if ($NoTests) { '-DCRPC_BUILD_TESTS=OFF' } else { '-DCRPC_BUILD_TESTS=ON' })
     )
     $configureArgs += $sanFlags[$Sanitizer]

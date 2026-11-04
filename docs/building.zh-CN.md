@@ -168,17 +168,25 @@ Linux/macOS：
 ```sh
 ./scripts/build.sh [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan]
+                   [--cxx-standard 17|20]
                    [--jobs N] [--clean] [--shared]
                    [--examples] [--no-tests] [--bench]
                    [--source DIR] [--build-root DIR]
 ./scripts/test.sh  [--config Debug|Release|Both] [--arch x86|x64]
                    [--compiler gcc|clang] [--sanitizer none|asan|ubsan|tsan|all]
+                   [--cxx-standard 17|20]
                    [--filter REGEX] [--repeat N] [--shared]
                    [--examples] [--no-tests]
                    [--source DIR] [--build-root DIR]
 ```
 
-构建行为：`Config Both` 在独立目录中构建 Debug 与 Release。`-Jobs`/`--jobs` 默认为处理器数量。`-Clean`/`--clean` 只删除所选构建目录，绝不删除源码或整个产物根。Windows 脚本在检测到 `vcvars` 时于其中运行 CMake；POSIX 脚本显式选择 `g++`/`clang++`，`--arch x86` 会传 `-m32`。
+构建行为：`Config Both` 在独立目录中构建 Debug 与 Release。
+`-CxxStandard`/`--cxx-standard` 选择语言标准。`17` 是默认值，也是其余所有作业使用的值。
+`20` 存在的原因有两条：库本身必须能在 C++20 下编译（`response<Resp>::operator co_await`
+需要它）；且若没有任何构建请求它，`tests/test_rpc_response_cpp20.cpp` 在所有配置下都是
+空操作 —— 在加入这个开关之前，它的用例从未在任何地方运行过。标准会进入构建目录名
+（`...-cxx20`），因此 C++20 的配置不会静默地重配 C++17 的目录。
+`-Jobs`/`--jobs` 默认为处理器数量。`-Clean`/`--clean` 只删除所选构建目录，绝不删除源码或整个产物根。Windows 脚本在检测到 `vcvars` 时于其中运行 CMake；POSIX 脚本显式选择 `g++`/`clang++`，`--arch x86` 会传 `-m32`。
 
 测试行为：`test.ps1`/`test.sh` 先构建（调用构建脚本），然后在每个构建目录运行 CTest 并检查输出中的消毒器报告。`-Filter`/`--filter` 是 CTest 正则。`-Repeat`/`--repeat` 把整套 CTest 运行 N 次。`-Sanitizer all` 在独立目录中构建并运行 ASan、UBSan、TSan；这是 Linux/Clang 流程，因为 MSVC 没有 TSan。
 
@@ -244,9 +252,14 @@ Debug 构建遇到 CRT 断言、无效参数、纯虚调用或访问违例时可
 
 | Job | 矩阵 |
 | --- | --- |
-| `linux` | gcc x64 与 clang x64，各 Debug 与 Release |
+| `linux` | gcc x64 与 clang x64，各 Debug 与 Release，静态与共享 |
 | `linux-sanitizers` | `test.sh --sanitizer all`（asan + ubsan + tsan） |
-| `windows` | MSVC x64，Debug 与 Release |
+| `linux/gcc/cxx20` | `test.sh --cxx-standard 20`，使仅 C++20 的代码被编译、其用例真正运行 |
+| `windows` | MSVC x64 与 x86，各 Debug 与 Release |
+| `windows/shared` | MSVC x64 共享构建加导出闸门 |
+| `windows/examples` | 以 `CRPC_BUILD_TESTS=OFF` 构建并运行 `examples/` |
+| `windows/bench-compile` | 编译全部基准，不运行 |
+| `linux/bench-compile` | POSIX 编译器同上 |
 
 两个平台都跑两种优化级，因为只在 Release 出现的缺陷已经发生过两次；Linux 同时跑两个编译器，因为 clang 的 `-Werror` 诊断并不是 MSVC `/W4` 的超集：有 5 处只在 clang 报的警告（未使用的常量、未使用的内部声明）藏在 Windows 上完全干净的代码里。
 

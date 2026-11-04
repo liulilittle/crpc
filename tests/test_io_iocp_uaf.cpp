@@ -28,6 +28,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include <cstdio>
 #include <crpc/io.hpp>
 
 #if defined(_WIN32)
@@ -365,6 +366,9 @@ CRPC_TEST_MAIN()
 // making exactly that mistake: an asan run "passed" 30/30 because main()
 // returned immediately.)
 
-int main() { return 0; }
+int main() {
+    std::printf("SKIP crpc_test_io_iocp_uaf: IOCP does not exist on this platform; this binary executes nothing\n");
+    return 0;
+}
 
 #endif // _WIN32
