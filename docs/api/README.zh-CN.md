@@ -109,6 +109,7 @@
 | 头文件 | 关键类型 | 说明 |
 |---|---|---|
 | [`redis/resp.hpp`](../../include/crpc/redis/resp.hpp) | `resp_value`、`resp_parser`、`resp_encoder`、`resp_protocol` | RESP2/RESP3 值模型、增量解析器与编码器。 |
+| [`redis/command_table.hpp`](../../include/crpc/redis/command_table.hpp) | `command_spec`、`k_command_table`、`lookup_command` | 客户端可发射的每条命令的已入库元数据（arity、键位），与真实服务器保持同步。 |
 | [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp) | `connection`、`connection_pool`、`connection_config`、`pool_config` | 基于 `io::source`/`io::sink` 的字节传输、重连/退避与连接池。 |
 | [`redis/pipeline.hpp`](../../include/crpc/redis/pipeline.hpp) | `command`、`command_executor`、`message_channel`、`command_channel`、`pipeline` | 单条命令流、批量与面向传输的 RESP 通道。 |
 | [`redis/pubsub.hpp`](../../include/crpc/redis/pubsub.hpp) | `pubsub`、`pubsub_message`、`pubsub_kind` | Pub/Sub 订阅/退订、消息解码与 `PUBLISH`/`PUBSUB`。 |
@@ -346,6 +347,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 
 - [`redis/client.hpp`](../../include/crpc/redis/client.hpp)
 - [`redis/cluster.hpp`](../../include/crpc/redis/cluster.hpp)
+- [`redis/command_table.hpp`](../../include/crpc/redis/command_table.hpp)
 - [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp)
 - [`redis/distributed_lock.hpp`](../../include/crpc/redis/distributed_lock.hpp)
 - [`redis/keyspace.hpp`](../../include/crpc/redis/keyspace.hpp)

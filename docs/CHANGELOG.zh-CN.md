@@ -4,6 +4,15 @@
 
 ## 未发布
 
+### Redis：新增与真实服务器交叉校验的命令元数据表
+
+- `redis/command_table.hpp` 记录客户端可发射的每条命令的 arity 与键位。数值取自
+  真实的 Redis 7.0.15 `COMMAND` 应答，而非凭记忆书写，并且不会再漂移：
+  `tests/test_redis_command_table.cpp` 重扫 `src/redis` 与 redis 头文件，凡类型化
+  构造器发射了没有表条目的命令即失败；`CRPC_REDIS_IT` 套件把全部 77 行与真实
+  服务器的应答逐行比对。三类变异（改错 arity、删行、打乱排序）各自把对应测试
+  变红。
+
 ### Redis 分布式锁：新增 `renewal_guard` 作用域守护以自动续租
 
 - `redis::renewal_guard` 用 RAII 包装 `distributed_lock::start_watchdog()` /

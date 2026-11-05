@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+### Redis: a checked-in command table cross-checked against a real server
+
+- `redis/command_table.hpp` records the arity and key positions of every
+  command the client can emit. The numbers were read from a live Redis 7.0.15
+  `COMMAND` reply rather than written from memory, and they cannot drift:
+  `tests/test_redis_command_table.cpp` re-scans `src/redis` and the redis
+  headers so a typed builder that sends a command without a table row fails,
+  and the `CRPC_REDIS_IT` suite compares all 77 rows against the real server's
+  own reply. Each mutation (wrong arity, dropped row, unsorted table) turns the
+  corresponding test red.
+
 ### Redis distributed lock: a `renewal_guard` scope guard for automatic renewal
 
 - `redis::renewal_guard` wraps `distributed_lock::start_watchdog()` /

@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,7 @@
 #include <crpc/error.hpp>
 #include "test_tcp_backend.hpp"
 #include <crpc/redis/client.hpp>
+#include <crpc/redis/command_table.hpp>
 #include <crpc/redis/connection.hpp>
 #include <crpc/redis/pipeline.hpp>
 #include <crpc/redis/resp.hpp>
@@ -955,6 +957,91 @@ CRPC_TEST(it_sentinel_failover_redirects_the_pool) {
         static_cast<unsigned long long>(stats.switch_count),
         static_cast<unsigned long long>(stats.rejected_during_switch),
         stats.master.host.c_str(), stats.master.port);
+}
+
+CRPC_TEST(it_command_table_matches_the_real_server) {
+    using crpc::redis::command_spec;
+    using crpc::redis::k_command_table;
+    using crpc::redis::k_command_table_size;
+    using crpc::redis::lookup_command;
+    using crpc::redis::resp_value;
+    (void)require_redis();
+    tcp_backend backend;
+    crpc::redis::client::options opts = client_options();
+    crpc::redis::client client(opts, backend);
+    CRPC_CHECK(client.connect().ok());
+
+    // Ask the live server for its own metadata on every command the library
+    // can emit, and compare the table row by row. `COMMAND INFO <name>`
+    // replies with a single-element array holding [name, arity, flags...,
+    // first_key, last_key, step], exactly the fields the table stores.
+    std::vector<std::string> args{"COMMAND", "INFO"};
+    for (std::size_t i = 0; i < k_command_table_size; ++i) {
+        args.push_back(std::string(k_command_table[i].name));
+    }
+    crpc::result<resp_value> reply =
+        client.command(crpc::span<const std::string>(args.data(), args.size()));
+    CRPC_CHECK(reply.ok());
+    CRPC_CHECK(!reply.value().is_error());
+
+    // The server reply has one array per requested command. Unsupported
+    // commands come back shortened; only a full-length row is comparable.
+    // `COMMAND` reports names lowercased ("get"); the table stores the canonical
+    // uppercase, so fold before the lookup.
+    std::size_t checked = 0;
+    std::vector<std::string> mismatches;
+    const auto walk = [&](const crpc::redis::resp_value& array) {
+        using crpc::redis::resp_value;
+        const std::vector<resp_value>& items = array.as_array();
+        if (items.size() < 6) {
+            return; // the server does not know this command
+        }
+        const std::string raw = items[0].as_bulk_string();
+        std::string name = raw;
+        for (char& c : name) {
+            c = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(c)));
+        }
+        const command_spec* spec = lookup_command(name);
+        CRPC_CHECK(spec != nullptr);
+        if (spec == nullptr) {
+            return;
+        }
+
+        std::int64_t arity = items[1].as_integer();
+        std::int64_t first_key = items[3].as_integer();
+        std::int64_t last_key = items[4].as_integer();
+        std::int64_t key_step = items[5].as_integer();
+
+        if (arity != spec->arity || first_key != spec->first_key ||
+            last_key != spec->last_key || key_step != spec->key_step) {
+            mismatches.push_back(
+                name + ": table(" + std::to_string(spec->arity) + "," +
+                std::to_string(spec->first_key) + "," +
+                std::to_string(spec->last_key) + "," +
+                std::to_string(spec->key_step) + ") server(" +
+                std::to_string(arity) + "," + std::to_string(first_key) + "," +
+                std::to_string(last_key) + "," + std::to_string(key_step) + ")");
+            return;
+        }
+        ++checked;
+    };
+
+    if (reply.value().is_array()) {
+        const std::vector<crpc::redis::resp_value>& outer = reply.value().as_array();
+        for (const crpc::redis::resp_value& row : outer) {
+            walk(row);
+        }
+    }
+    for (const std::string& m : mismatches) {
+        std::printf("  command table vs server: %s\n", m.c_str());
+    }
+    CRPC_CHECK(mismatches.empty());
+    // Every row must have been compared against a full server reply. A server
+    // too old to know a command is a real signal, not a skip.
+    CRPC_CHECK_EQ(checked, k_command_table_size);
+    std::printf("  command table: %zu rows verified against live server\n",
+                checked);
 }
 
 CRPC_TEST_MAIN()

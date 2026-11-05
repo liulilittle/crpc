@@ -452,7 +452,11 @@ transport-isolated; they are regression baselines, not network capacity.
 - **Typed facade coverage.** `client` exposes convenience methods for strings,
   hashes, lists, sets and sorted sets. Everything else goes through
   `execute(command)` or the `types.hpp` builders; no API is guessed from a
-  command name.
+  command name. The emitted command surface is recorded once in
+  `command_table.hpp` (arity and key positions per command), kept in sync by
+  two directions: a unit guard re-scans the sources so a command emitted
+  without a table row fails, and the `CRPC_REDIS_IT` suite compares every row
+  against the live Redis `COMMAND` reply.
 
 ## 8. See also <a id="s8"></a>
 
