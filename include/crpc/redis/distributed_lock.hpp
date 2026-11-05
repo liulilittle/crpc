@@ -126,7 +126,12 @@ public:
     // Starts or stops the renewal thread. It renews every handle this object
     // handed out at one third of the TTL. Without it a holder that is busy longer
     // than the TTL loses the lock; with it, a paused holder still loses it (by
-    // design — a renewer that cannot run must not be able to keep a lease alive).
+    // design -- a renewer that cannot run must not be able to keep a lease alive).
+    //
+    // Both are ref-counted in the sense that repeated calls are safe: starting
+    // twice does not spawn a second thread, and stopping is a no-op once the
+    // watchdog is already down. What is not automatic is "renew for as long as I
+    // hold the resource" -- use `renewal_guard` for that scope.
     void start_watchdog();
     void stop_watchdog();
 
@@ -138,6 +143,31 @@ private:
 
     struct impl;
     std::shared_ptr<impl> impl_;
+};
+
+// RAII scope guard: brings the renewal thread up for its lifetime and tears it
+// down on exit. This is the deferred "auto-renew" convenience (plan.md 方案 2):
+// a caller that wants "renew this lock for as long as this scope runs" wraps the
+// acquisition in a `renewal_guard` instead of calling start/stop_watchdog itself
+// and (too often) forgetting one end. Additive API, no `lock_options` layout
+// change, so it is a MINOR addition.
+class CRPC_API renewal_guard {
+public:
+    explicit renewal_guard(distributed_lock& lock) noexcept : lock_(&lock) {
+        lock_->start_watchdog();
+    }
+
+    ~renewal_guard() {
+        if (lock_) {
+            lock_->stop_watchdog();
+        }
+    }
+
+    renewal_guard(const renewal_guard&) = delete;
+    renewal_guard& operator=(const renewal_guard&) = delete;
+
+private:
+    distributed_lock* lock_;
 };
 
 } // namespace redis

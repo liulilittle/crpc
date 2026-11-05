@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+### Redis distributed lock: a `renewal_guard` scope guard for automatic renewal
+
+- `redis::renewal_guard` wraps `distributed_lock::start_watchdog()` /
+  `stop_watchdog()` in an RAII scope: the renewal thread is up for the guard's
+  lifetime and torn down on exit, so a caller cannot forget to stop the renewal
+  thread it started (or to start it at all). It is the deferred "auto-renew"
+  convenience (the earlier design called it `lock_options::auto_renew`) delivered
+  as an additive API: a new symbol, no `lock_options` layout change, so it is a
+  MINOR addition.
+- Two new lock tests pin both directions: several renewals must land while the
+  guard is alive and none may be issued after it exits, and acquiring a lock
+  without a guard must not start a renewal thread (the default lifecycle is
+  unchanged). Removing the stop call in the guard's destructor turns the first
+  test red, so the RAII contract has a discriminator.
+
 ### C++20 builds: the library compiles and runs under C++20, and a CI job runs them
 
 - The library now builds and passes its full suite under C++20 as well as C++17.

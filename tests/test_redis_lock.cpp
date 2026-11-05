@@ -31,6 +31,7 @@ namespace {
 using crpc::redis::command;
 using crpc::redis::distributed_lock;
 using crpc::redis::lock_options;
+using crpc::redis::renewal_guard;
 using crpc::redis::resp_value;
 using redis_test::integer;
 using redis_test::null_value;
@@ -503,6 +504,65 @@ CRPC_TEST(redis_lock_fences_are_monotonic_across_owners) {
     CRPC_CHECK(second.value().fence() > first_fence);
     CRPC_CHECK(second.value().token().find(std::to_string(second.value().fence())) !=
                std::string::npos);
+}
+
+// The renewal_guard RAII is the deferred "auto-renew" option (plan.md §2026-10-31
+// 方案 2): it brings the watchdog up for the scope it guards and tears it down on
+// exit, so a caller cannot forget to stop a renewal thread it started. It is an
+// additive API (new symbol, MINOR); it deliberately does not change the layout of
+// lock_options, which would be an ABI MAJOR for a convenience.
+CRPC_TEST(redis_lock_renewal_guard_keeps_renewing_and_stops_on_exit) {
+    lock_executor executor;
+    executor.push_set_result(true);
+    lock_options options = quick_options();
+    options.acquire_timeout = std::chrono::milliseconds(3000);
+    options.ttl = std::chrono::milliseconds(30);
+    options.retry_delay = std::chrono::milliseconds(1);
+    distributed_lock lock(executor, options);
+
+    auto handle = lock.acquire("orders", "worker-guard");
+    CRPC_CHECK(handle.ok());
+    if (!handle.ok()) {
+        return;
+    }
+
+    std::size_t renewals_while_held = 0;
+    {
+        // The guard owns renewal only: the handle stays alive after it exits and
+        // the lock must not be released by the guard's destruction.
+        renewal_guard guard(lock);
+        // Several renewal periods must land while the guard is alive.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        renewals_while_held = executor.executed_count("EVAL");
+        CRPC_CHECK(renewals_while_held >= 2);
+    }
+    CRPC_CHECK_EQ(std::size_t{1}, lock.held());
+    // The guard is gone; no further renewal may be issued while the handle lives.
+    const std::size_t after_guard = executor.executed_count("EVAL");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CRPC_CHECK_EQ(after_guard, executor.executed_count("EVAL"));
+    CRPC_CHECK_EQ(std::size_t{1}, lock.held());
+}
+
+CRPC_TEST(redis_lock_renewal_guard_is_an_opt_in) {
+    // Without the guard, the default lifecycle stays as documented: acquiring does
+    // not start a renewal thread, so nothing renews.
+    lock_executor executor;
+    executor.push_set_result(true);
+    lock_options options = quick_options();
+    options.acquire_timeout = std::chrono::milliseconds(3000);
+    options.ttl = std::chrono::milliseconds(30);
+    options.retry_delay = std::chrono::milliseconds(1);
+    distributed_lock lock(executor, options);
+
+    auto handle = lock.acquire("orders", "worker-optin");
+    CRPC_CHECK(handle.ok());
+    if (!handle.ok()) {
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CRPC_CHECK_EQ(std::size_t{0}, executor.executed_count("EVAL"));
+    CRPC_CHECK_EQ(std::size_t{1}, lock.held());
 }
 
 CRPC_TEST_MAIN()
