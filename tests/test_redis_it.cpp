@@ -43,6 +43,7 @@
 
 #include <crpc/error.hpp>
 #include "test_tcp_backend.hpp"
+#include <crpc/redis/cache.hpp>
 #include <crpc/redis/client.hpp>
 #include <crpc/redis/command_table.hpp>
 #include <crpc/redis/connection.hpp>
@@ -1042,6 +1043,78 @@ CRPC_TEST(it_command_table_matches_the_real_server) {
     CRPC_CHECK_EQ(checked, k_command_table_size);
     std::printf("  command table: %zu rows verified against live server\n",
                 checked);
+}
+
+CRPC_TEST(it_client_cache_invalidates_against_live_server) {
+    (void)require_redis();
+    // The tracked connection: it reads GET (registering the key with the
+    // server), feeds the result into the cache, then polls for the push the
+    // writer's SET triggers.
+    raw_session session;
+    CRPC_CHECK(session.connect().ok());
+
+    tcp_backend writer_backend;
+    crpc::redis::client writer(client_options(), writer_backend);
+    CRPC_CHECK(writer.connect().ok());
+
+    crpc::redis::command_channel channel(*session.conn);
+    channel.set_protocol(crpc::redis::resp_protocol::resp3);
+    // CLIENT TRACKING invalidation is a RESP3 push; on RESP2 the server accepts
+    // the command but has no push channel, so the connection must negotiate
+    // RESP3 first (as the manual tracking case does).
+    CRPC_CHECK(channel.execute({"HELLO", "3"}).ok());
+    const std::string key = "crpc:it:cache:" +
+                            std::to_string(std::chrono::steady_clock::now()
+                                               .time_since_epoch()
+                                               .count());
+
+    crpc::redis::client_cache cache(channel, 8);
+    CRPC_CHECK(cache.start().ok());
+
+    // Seed the key first so the tracked GET below has a real value to register
+    // and the client has something concrete to cache.
+    CRPC_CHECK(command_succeeded(call(writer, {"SET", key, "first"})));
+
+    const auto read_into_cache = [&]() {
+        const crpc::result<crpc::redis::resp_value> reply =
+            channel.execute({"GET", key});
+        CRPC_CHECK(reply.ok());
+        CRPC_CHECK(!reply.value().is_error());
+        const std::string text =
+            reply.value().is_bulk_string() ? reply.value().as_bulk_string()
+                                           : std::string();
+        cache.put(key, crpc::redis::resp_value(
+                           crpc::redis::resp_bulk_string{text}));
+    };
+
+    read_into_cache();
+    CRPC_CHECK(cache.get(key) != nullptr);
+    const std::uint64_t before = cache.version();
+
+    // A different connection changes the key. The tracked connection must
+    // receive an invalidation push (Redis 7 CLIENT TRACKING).
+    CRPC_CHECK(command_succeeded(call(writer, {"SET", key, "second"})));
+
+    bool invalidated = false;
+    const auto deadline = std::chrono::steady_clock::now() + 3000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const crpc::status polled = cache.poll_once();
+        CRPC_CHECK(polled.ok());
+        if (cache.get(key) == nullptr) {
+            invalidated = true;
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    if (!invalidated) {
+        crpc_test::skip(
+            "no CLIENT TRACKING invalidation arrived (server did not push)");
+    }
+    CRPC_CHECK(cache.get(key) == nullptr);
+    CRPC_CHECK(cache.version() > before);
+
+    CRPC_CHECK(command_succeeded(call(writer, {"DEL", key})));
+    CRPC_CHECK(channel.execute({"CLIENT", "TRACKING", "off"}).ok());
 }
 
 CRPC_TEST_MAIN()

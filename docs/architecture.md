@@ -238,7 +238,13 @@ Implemented: the `http/content_coding.hpp` gzip/deflate primitive is wired into 
 
 `cluster::lease_manager` grants TTL leases, renews them, and applies expiry through the registry authority path: critical first, deregistered after a grace period. `cluster::election` provides PreVote, Vote and lease-backed leadership with a fencing epoch; it is explicitly not Raft and provides no log, persistence or membership changes. `cluster::health` provides TTL, TCP-connect and callback checks with consecutive-success/failure thresholds. `cluster::watch_hub` turns registry sink events into snapshot-plus-delta streams ordered by the monotonic index; a gap marks the subscriber for resync, and a slow subscriber is dropped with an observable event.
 
-Missing, all **specified, not implemented**: the network registry service and its HTTP/CRPC methods, node identity/peer pool, discovery, Consul-compatible HTTP endpoints, KV+CAS+ACL storage, gossip/Raft, and multi-node failover. The primitives are present; the service is not.
+Registered scope: `cluster::registry` v1 is the local primitives only -- lease + monotonic
+index + incarnation + direction constraint under a single writer. The **network registry
+service** is deliberately "specified, not implemented" for v1: its HTTP/CRPC methods, node
+identity/peer pool, discovery, Consul-compatible HTTP endpoints, KV+CAS+ACL storage,
+gossip/Raft, and multi-node failover are v1.1 design (as recorded in the project memory).
+The primitives are present; the service is not -- and that is the v1 scope decision, not a
+residual gap.
 
 ## 14. Resilience layer <a id="s14"></a>
 

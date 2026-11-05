@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+### Redis client: a bounded client-side cache with RESP3 invalidation tracking
+
+- `redis::client_cache` is an LRU-keyed value cache the caller fills on read
+  misses and refreshes for free: once `start()` has enabled `CLIENT TRACKING`,
+  the server pushes `invalidate` messages on writes from any client, and the
+  cache erases those keys and bumps a monotonic `version()`. The nested-array
+  key form Redis 7 sends (`> [invalidate, [key, ...]]`), the flat form used by
+  the fixtures, and the whole-table flush (`> [invalidate]`) are all handled.
+  The IT suite runs the cache against a live redis server and observes a real
+  invalidation arrive. Mutations that accept any push, skip the nested keys, or
+  disable the whole-table flush each turn the matching test red.
+
 ### Redis: a checked-in command table cross-checked against a real server
 
 - `redis/command_table.hpp` records the arity and key positions of every

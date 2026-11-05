@@ -4,6 +4,11 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <crpc/http/file_transfer.hpp>
 
@@ -25,7 +30,20 @@ struct temp_root {
     std::filesystem::path path;
     temp_root() {
         std::error_code ec;
-        path = std::filesystem::temp_directory_path(ec) / "crpc_ft_tests";
+        // A per-process directory: two copies of this executable (ctest -j, or a
+        // parallel build tree) otherwise delete each other's fixtures and count
+        // each other's files, which shows up as spurious delete/leak failures
+        // under --repeat or -j. Same pattern as test_http_download.cpp.
+        const auto pid = static_cast<unsigned long long>(
+#if defined(_WIN32)
+            ::GetCurrentProcessId()
+#else
+            ::getpid()
+#endif
+        );
+        path = std::filesystem::temp_directory_path(ec) /
+               ("crpc_ft_tests_" + std::to_string(pid));
+        std::filesystem::remove_all(path, ec);
         std::filesystem::create_directories(path, ec);
     }
     ~temp_root() {

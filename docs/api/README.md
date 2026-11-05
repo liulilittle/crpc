@@ -112,6 +112,7 @@ the authoritative declaration.
 | Header | Key types | What it is |
 |---|---|---|
 | [`redis/resp.hpp`](../../include/crpc/redis/resp.hpp) | `resp_value`, `resp_parser`, `resp_encoder`, `resp_protocol` | RESP2/RESP3 value model, incremental parser and encoder. |
+| [`redis/cache.hpp`](../../include/crpc/redis/cache.hpp) | `client_cache` | Bounded client-side LRU cache refreshed through RESP3 CLIENT TRACKING invalidation pushes. |
 | [`redis/command_table.hpp`](../../include/crpc/redis/command_table.hpp) | `command_spec`, `k_command_table`, `lookup_command` | Checked-in metadata (arity, key positions) for every command the client emits, kept in sync with a live server. |
 | [`redis/connection.hpp`](../../include/crpc/redis/connection.hpp) | `connection`, `connection_pool`, `connection_config`, `pool_config` | Byte transport over `io::source`/`io::sink`, reconnect/backoff and pooling. |
 | [`redis/pipeline.hpp`](../../include/crpc/redis/pipeline.hpp) | `command`, `command_executor`, `message_channel`, `command_channel`, `pipeline` | One command stream, batches and the transport-facing RESP channel. |
@@ -349,6 +350,7 @@ without registering it here fails the suite.
 
 ### `crpc/redis`
 
+- [`redis/cache.hpp`](../../include/crpc/redis/cache.hpp)
 - [`redis/client.hpp`](../../include/crpc/redis/client.hpp)
 - [`redis/cluster.hpp`](../../include/crpc/redis/cluster.hpp)
 - [`redis/command_table.hpp`](../../include/crpc/redis/command_table.hpp)
