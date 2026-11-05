@@ -87,6 +87,15 @@ that `ROLLBACK` does not restore; TiDB inherits the override). The default also
 keeps this a MAJOR rather than a source break: no existing subclass has to
 change.
 
+The unreleased MongoDB transaction work adds one more MAJOR break:
+`db::mongo::connection` gained two data members (`in_transaction_`,
+`txn_started_`) to track the server-side transaction it now starts, commits and
+aborts, so its `sizeof` changed and every consumer must be recompiled. The new
+behaviour is delivered through the existing `db::connection` verbs
+(`begin()`/`commit()`/`rollback()`/`in_transaction()`), which no longer return
+`no_such_method` for MongoDB; no vtable slot moved because none of the base
+virtuals were added or removed.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

@@ -4,6 +4,30 @@
 
 ## Unreleased
 
+### MongoDB: multi-document transactions over the db::connection transaction verbs
+
+- `mongo::connection::begin()` / `commit()` / `rollback()` now start, commit and
+  abort real server-side transactions instead of returning `no_such_method`.
+  `in_transaction()` reports the open transaction. The first command inside a
+  transaction carries `startTransaction:true` plus `autocommit:false` (per the
+  sessions/transactions wire spec a client-side `startTransaction` waits for the
+  first command), every later command echoes the transaction's single `txnNumber`,
+  and `commitTransaction`/`abortTransaction` run against the `admin` database with
+  `autocommit:false`. Transactional reads/writes must not auto-retry, so a lost
+  reply surfaces as an error instead of replaying (only commit/abort replay once,
+  on the same `txnNumber`, which the server deduplicates). A standalone refuses
+  `begin()` (`failed_precondition`) because transactions need a replica set, and a
+  duplicate `begin()` or a `commit()` outside a transaction is reported instead of
+  silently accepted. Unborn transactions (a `begin()` with no command before
+  `commit()`/`rollback()`) are a local no-op, as the wire spec requires. The unit
+  suite pins the command bytes on a scripted channel (startTransaction on the first
+  command only, read/write concern placement, admin database, constant txnNumber,
+  no auto-retry); the live-server suite commits and rolls back against a real
+  replica set. Mutations that drop `startTransaction`, target the wrong database,
+  break txnNumber monotonicity, keep the flag set after commit, or put writeConcern
+  on an in-transaction write each turn the matching test red. **ABI:** `mongo::connection`
+  gained members, so its layout (and the required rebuild) changed.
+
 ### Redis client: a bounded client-side cache with RESP3 invalidation tracking
 
 - `redis::client_cache` is an LRU-keyed value cache the caller fills on read

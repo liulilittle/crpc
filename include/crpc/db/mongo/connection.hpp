@@ -130,7 +130,7 @@ public:
     // db::connection. `sql` is not SQL here: it is a collection name for `query` is
     // meaningless, so both are refused rather than misinterpreted.
     [[nodiscard]] status ping() override;
-    [[nodiscard]] bool in_transaction() const noexcept override { return false; }
+    [[nodiscard]] bool in_transaction() const noexcept override;
     [[nodiscard]] status begin() override;
     [[nodiscard]] status commit() override;
     [[nodiscard]] status rollback() override;
@@ -180,6 +180,16 @@ private:
     // Creates the session if none exists; every application command has one.
     [[nodiscard]] status ensure_session();
     void new_session_id() noexcept;
+    // Runs a transaction control command (`commitTransaction` or `abortTransaction`)
+    // against the admin database, carrying the session's current txnNumber. These two
+    // are the retryable commands of the transaction: the server deduplicates by
+    // lsid+txnNumber, so each may be replayed once on a fresh link with the same
+    // number, even though the data commands inside the transaction must not be.
+    [[nodiscard]] status transaction_control(std::string_view command_name);
+    // True once the server has seen the first command of the open transaction (the one
+    // that carries `startTransaction:true`); a commit/rollback before that has nothing
+    // to tell the server.
+    bool txn_started_ = false;
 
     connection_options options_;
     std::unique_ptr<db::channel> link_;
@@ -191,6 +201,7 @@ private:
     replica_set_topology topology_;
     std::vector<std::byte> session_id_;
     std::int64_t txn_number_ = 0;
+    bool in_transaction_ = false;
     bool authenticated_ = false;
     bool open_ = false;
     rpc_error connect_error_;

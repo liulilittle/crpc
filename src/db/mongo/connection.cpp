@@ -167,6 +167,9 @@ connection::~connection() { close(); }
 
 void connection::fail(const status& error) noexcept {
     open_ = false;
+    // A failed link ends the transaction server-side too; keeping the flag set would
+    // make the pool believe there is something left to roll back on a dead channel.
+    in_transaction_ = false;
     if (link_) {
         link_->close();
     }
@@ -432,6 +435,12 @@ status connection::start_session() {
 }
 
 status connection::end_session() {
+    if (in_transaction_) {
+        // Ending the session would silently abandon the open transaction (the server
+        // aborts it), so it is refused instead of losing the borrower's work.
+        return status{rpc_code::failed_precondition,
+                      "cannot end a session with an open transaction"};
+    }
     if (session_id_.empty()) {
         return status{};
     }
@@ -485,9 +494,12 @@ result<command_result> connection::run_command(const bson_document& command) {
     bson_document request = command;
     const std::string command_name =
         request.empty() ? std::string() : request.fields().front().first;
+    const bool in_transaction = in_transaction_;
     const bool write = is_write_command(command_name);
+    // Inside a transaction every command pins the transaction's own txnNumber and is
+    // never auto-retried; the retryable-write contract only covers standalone writes.
     const bool send_txn =
-        write && (options_.retryable_writes && topology_.replica_set);
+        !in_transaction && write && (options_.retryable_writes && topology_.replica_set);
     const bool auto_retry = send_txn && options_.reconnect;
 
     // Every application command runs inside a session. hello and authentication bypass
@@ -498,9 +510,10 @@ result<command_result> connection::run_command(const bson_document& command) {
     }
 
     // The command name is the first field and $db the last; everything else lands in
-    // between.
+    // between. A command inside a transaction carries none of the read/write-concern
+    // fields: they were fixed by startTransaction and are refused anywhere else.
     std::vector<bson_document::field> extra;
-    if (is_read_command(command_name)) {
+    if (!in_transaction && is_read_command(command_name)) {
         if (options_.read_concern != read_concern_level::local) {
             extra.emplace_back("readConcern", bson_value::make_document(
                                                   make_read_concern_document(options_.read_concern)));
@@ -510,7 +523,7 @@ result<command_result> connection::run_command(const bson_document& command) {
                                                       make_read_preference_document(options_.read_preference)));
         }
     }
-    if (write && options_.write_concern.configured()) {
+    if (!in_transaction && write && options_.write_concern.configured()) {
         extra.emplace_back("writeConcern", bson_value::make_document(
                                                make_write_concern_document(options_.write_concern)));
     }
@@ -525,6 +538,25 @@ result<command_result> connection::run_command(const bson_document& command) {
         // the server's idempotency key would deduplicate them.
         const std::int64_t txn = ++txn_number_;
         extra.emplace_back("txnNumber", bson_value::make_int64(txn));
+    }
+    if (in_transaction) {
+        // Every command in a multi-statement transaction echoes the transaction's
+        // single txnNumber plus `autocommit:false`, which is what marks the command as
+        // belonging to the transaction rather than to a retryable write. The first
+        // command additionally carries `startTransaction:true` and the readConcern
+        // (only when it is not the server default -- a later command with one is
+        // refused). A client startTransaction is a no-op on the wire; the transaction
+        // is born with its first command, which is why this is here and not in begin().
+        extra.emplace_back("txnNumber", bson_value::make_int64(txn_number_));
+        extra.emplace_back("autocommit", bson_value::make_boolean(false));
+        if (!txn_started_) {
+            extra.emplace_back("startTransaction", bson_value::make_boolean(true));
+            if (options_.read_concern != read_concern_level::local) {
+                extra.emplace_back("readConcern", bson_value::make_document(
+                                                      make_read_concern_document(options_.read_concern)));
+            }
+            txn_started_ = true;
+        }
     }
     insert_command_fields(request, std::move(extra));
     // Every OP_MSG request must name a database, and the server refuses one without it:
@@ -761,15 +793,164 @@ status connection::ping() {
 }
 
 status connection::begin() {
-    // MongoDB has no multi-statement transaction over this interface; sessions and
-    // transactions exist but need a session id this client does not create.
-    return status{rpc_code::no_such_method,
-                  "MongoDB transactions need a session; this client does not create one"};
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (in_transaction_) {
+        return status{rpc_code::failed_precondition, "a transaction is already open"};
+    }
+    if (!topology_.replica_set) {
+        // A standalone refuses txnNumber outright (retryable writes already gate on
+        // this), and transactions need a replica set at minimum.
+        return status{rpc_code::failed_precondition,
+                      "MongoDB transactions require a replica set"};
+    }
+    const status session_ready = ensure_session();
+    if (!session_ready) {
+        return session_ready;
+    }
+    // The transaction takes the next txnNumber from the session's sequence, as the
+    // wire protocol requires (one monotonically increasing number per session; the
+    // value stays the same for every command in this transaction).
+    ++txn_number_;
+    // Nothing is sent yet: `startTransaction` is not a wire command, the transaction
+    // is born with its first real command. If the link dies before then, begin() has
+    // cost nothing and the session's txnNumber simply skips a value.
+    in_transaction_ = true;
+    txn_started_ = false;
+    return status{};
 }
 
-status connection::commit() { return begin(); }
+status connection::commit() {
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (!in_transaction_) {
+        return status{rpc_code::failed_precondition, "no transaction is open"};
+    }
+    if (!txn_started_) {
+        // No command ever ran in this transaction; there is nothing for the server to
+        // commit, and sending commitTransaction for an unborn transaction is refused.
+        in_transaction_ = false;
+        return status{};
+    }
+    const status committed = transaction_control("commitTransaction");
+    // The transaction is over even if commit failed: the server ends it either way,
+    // and claiming otherwise would make the pool roll back nothing.
+    in_transaction_ = false;
+    txn_started_ = false;
+    return committed;
+}
 
-status connection::rollback() { return begin(); }
+status connection::rollback() {
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (!in_transaction_) {
+        // Matching the other adapters: rolling back an absent transaction is a no-op,
+        // not an error, so a cleanup path can call it blindly.
+        return status{};
+    }
+    if (!txn_started_) {
+        // No command ever ran; nothing to abort, and abortTransaction on an unborn
+        // transaction is refused by the server.
+        in_transaction_ = false;
+        return status{};
+    }
+    const status aborted = transaction_control("abortTransaction");
+    // The server aborted the transaction regardless of how the reply came back; the
+    // transaction is gone either way.
+    in_transaction_ = false;
+    txn_started_ = false;
+    return aborted;
+}
+
+bool connection::in_transaction() const noexcept { return in_transaction_; }
+
+status connection::transaction_control(std::string_view command) {
+    if (!open_) {
+        return status{rpc_code::shutting_down, "the connection is closed"};
+    }
+    if (session_id_.empty()) {
+        return status{rpc_code::failed_precondition, "no active session"};
+    }
+
+    bson_document request;
+    request.append(std::string(command), bson_value::make_int32(1));
+    {
+        bson_document lsid;
+        lsid.append("id", bson_value::make_binary(session_id_, 4));
+        request.append("lsid", bson_value::make_document(std::move(lsid)));
+    }
+    request.append("txnNumber", bson_value::make_int64(txn_number_));
+    request.append("autocommit", bson_value::make_boolean(false));
+    if (command == "commitTransaction" && options_.write_concern.configured()) {
+        // The transaction's write concern rides on the commit, not on the individual
+        // commands (which must not carry one at all).
+        request.append("writeConcern", bson_value::make_document(
+                                           make_write_concern_document(options_.write_concern)));
+    }
+    // The wire protocol requires both transaction controls to run against admin.
+    request.append("$db", bson_value::make_text("admin"));
+
+    // commitTransaction/abortTransaction are the retryable commands of the
+    // transaction: the server deduplicates by lsid+txnNumber, so a transport failure
+    // or a generic retryable code is worth one replay with the same number.
+    std::uint32_t attempts = 1;
+    result<bson_document> reply = round_trip(request);
+    if (!reply && options_.reconnect && is_transport_error(reply.error().code)) {
+        const status reconnected = reconnect();
+        if (reconnected) {
+            result<bson_document> replayed = round_trip(request);
+            if (replayed) {
+                attempts = 2;
+                reply = std::move(replayed);
+            } else {
+                rpc_error error = replayed.error();
+                error.attempts = 2;
+                return error;
+            }
+        } else {
+            rpc_error error = reply.error();
+            error.attempts = 2;
+            return error;
+        }
+    }
+    if (!reply) {
+        rpc_error error = reply.error();
+        error.attempts = attempts;
+        return error;
+    }
+    if (attempts == 1 && !reply_ok(reply.value())) {
+        std::int64_t server_code = 0;
+        (void)reply.value().get_int64("code", server_code);
+        if (options_.reconnect &&
+            is_retryable_server_error(static_cast<std::int32_t>(server_code))) {
+            const status reconnected = reconnect();
+            if (reconnected) {
+                result<bson_document> replayed = round_trip(request);
+                if (replayed) {
+                    reply = std::move(replayed);
+                } else {
+                    rpc_error error = replayed.error();
+                    error.attempts = 2;
+                    return error;
+                }
+            } else {
+                rpc_error error = reply.error();
+                error.attempts = 2;
+                return error;
+            }
+        }
+    }
+    if (!reply_ok(reply.value())) {
+        std::int64_t code = 0;
+        (void)reply.value().get_int64("code", code);
+        return status{map_mongo_error(static_cast<std::int32_t>(code)),
+                      reply_error_message(reply.value())};
+    }
+    return status{};
+}
 
 status connection::query(std::string_view sql, span<const parameter> params, result_set** out) {
     (void)sql;
@@ -785,6 +966,7 @@ status connection::query(std::string_view sql, span<const parameter> params, res
 
 void connection::close() noexcept {
     open_ = false;
+    in_transaction_ = false;
     if (link_) {
         link_->close();
     }

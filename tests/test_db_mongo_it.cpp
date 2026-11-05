@@ -1177,4 +1177,111 @@ CRPC_TEST(mongo_it_session_lifecycle_on_the_server) {
     CRPC_CHECK_EQ(std::size_t{16}, it.session->session_id().size());
 }
 
+CRPC_TEST(mongo_it_transaction_insert_commits_atomically) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    if (!require_replica_set(*it.session)) {
+        return;
+    }
+    crpc::db::mongo::find_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "txn_people";
+
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("txn_people"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(it.session->run_command(drop)));
+    }
+
+    // Both rows land in one transaction: only one is visible between the insert and
+    // the commit (it is uncommitted), and both are after it.
+    CRPC_CHECK(static_cast<bool>(it.session->begin()));
+    CRPC_CHECK(it.session->in_transaction());
+    {
+        std::vector<crpc::db::mongo::bson_document> documents;
+        documents.push_back(person(100, "commit-one", 1));
+        documents.push_back(person(101, "commit-two", 2));
+        const auto inserted = it.session->insert("txn_people", std::move(documents));
+        CRPC_CHECK(static_cast<bool>(inserted));
+        if (inserted) {
+            CRPC_CHECK_EQ(std::int64_t{2}, inserted.value());
+        }
+    }
+
+    CRPC_CHECK(static_cast<bool>(it.session->commit()));
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+
+    // Both rows are durable.
+    crpc::db::mongo::find_request verify;
+    verify.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    verify.collection = "txn_people";
+    const auto found = it.session->find(verify);
+    CRPC_CHECK(static_cast<bool>(found));
+    if (found) {
+        CRPC_CHECK_EQ(std::size_t{2}, found.value().batch.size());
+    }
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("txn_people"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(it.session->run_command(drop)));
+    }
+}
+
+CRPC_TEST(mongo_it_transaction_rollback_discards_writes) {
+    (void)require_server();
+    it_session it;
+    if (!it.ok()) {
+        report("login", it.session->connect_error());
+        CRPC_CHECK(it.ok());
+        return;
+    }
+    if (!require_replica_set(*it.session)) {
+        return;
+    }
+    crpc::db::mongo::find_request request;
+    request.database = env_or("CRPC_MONGO_DB", "crpc_it");
+    request.collection = "txn_people";
+
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("txn_people"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(it.session->run_command(drop)));
+    }
+
+    CRPC_CHECK(static_cast<bool>(it.session->begin()));
+    {
+        std::vector<crpc::db::mongo::bson_document> documents;
+        documents.push_back(person(200, "rollback-one", 5));
+        const auto inserted = it.session->insert("txn_people", std::move(documents));
+        CRPC_CHECK(static_cast<bool>(inserted));
+    }
+    CRPC_CHECK(static_cast<bool>(it.session->rollback()));
+    CRPC_CHECK_FALSE(it.session->in_transaction());
+
+    // Nothing survived the rollback.
+    const auto found = it.session->find(request);
+    CRPC_CHECK(static_cast<bool>(found));
+    if (found) {
+        CRPC_CHECK_EQ(std::size_t{0}, found.value().batch.size());
+    }
+    {
+        crpc::db::mongo::bson_document drop;
+        drop.append("drop", crpc::db::mongo::bson_value::make_text("txn_people"));
+        drop.append("$db", crpc::db::mongo::bson_value::make_text(
+                               env_or("CRPC_MONGO_DB", "crpc_it")));
+        CRPC_CHECK(static_cast<bool>(it.session->run_command(drop)));
+    }
+}
+
 CRPC_TEST_MAIN()

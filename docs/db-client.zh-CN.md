@@ -329,8 +329,14 @@ auto inserted = session->insert("people", docs);
 * **应答的 `responseTo` 必须匹配请求 id。** 没有多路复用时不可能出现别的应答，接受它就会把另一个
   命令的结果记到这个命令上。
 
-未实现：TLS、压缩、会话与事务（`begin()` 明确报告不支持而不是假装支持）、聚合。
-`killCursors` 存在的原因很实际：被放弃的游标会占用服务端资源直到超时，懂游标的客户端必须发送它。
+未实现：TLS 与压缩。会话是一等公民（`start_session`/`end_session`）；事务走共享的
+`db::connection` 动词——`begin()` 开启多文档事务（按 sessions/transactions 线协议，
+`startTransaction:true` 与 `autocommit:false` 挂在第一条数据命令上），
+`commit()`/`rollback()` 以该事务唯一的 `txnNumber` 对 `admin` 库发送
+`commitTransaction`/`abortTransaction`，`in_transaction()` 报告其状态。事务需要副本集；
+独立部署下 `begin()` 会被拒绝。聚合（`aggregate`）与游标（`next_batch`、`close_cursor`、
+`killCursors`）也已实现；`killCursors` 存在的原因很实际：被放弃的游标会占用服务端资源
+直到超时，懂游标的客户端必须发送它。
 
 ## SQL Server（TDS）
 

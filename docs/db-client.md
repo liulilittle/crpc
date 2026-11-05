@@ -396,9 +396,16 @@ Wire facts that cost a round trip each to find, all now encoded and tested:
   else cannot happen without multiplexing, so accepting it would attribute another
   command's result to this one.
 
-Not implemented: TLS, compression, sessions and transactions (`begin()` says so rather
-than pretending), and aggregation. `killCursors` exists because an abandoned cursor holds
-server resources until it times out; a cursor-aware client must send it.
+Not implemented: TLS and compression. Sessions are first-class (`start_session` /
+`end_session`), and transactions are driven through the shared `db::connection`
+verbs: `begin()` starts a multi-document transaction (the first data command carries
+`startTransaction:true` with `autocommit:false`, per the sessions/transactions wire
+spec), `commit()`/`rollback()` send `commitTransaction`/`abortTransaction` against the
+`admin` database on the transaction's single `txnNumber`, and `in_transaction()`
+reports it. Transactions require a replica set; a standalone refuses `begin()`.
+Aggregation (`aggregate`) and cursors (`next_batch`, `close_cursor`, `killCursors`)
+exist, the latter because an abandoned cursor holds server resources until it times
+out; a cursor-aware client must send it.
 
 ## SQL Server (TDS)
 

@@ -682,4 +682,371 @@ CRPC_TEST(mongo_write_concern_error_is_surfaced_not_swallowed) {
     }
 }
 
+CRPC_TEST(mongo_transaction_first_command_carries_start_transaction) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+    CRPC_CHECK(connection->is_replica_set());
+
+    // begin() itself is a local no-op on the wire: the transaction is born with the
+    // first real command.
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(connection->in_transaction());
+    CRPC_CHECK_EQ(std::size_t{1}, channel->requests().size()); // hello only
+
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    CRPC_CHECK(connection->in_transaction());
+
+    const auto first = request_body(channel->requests()[1]);
+    CRPC_CHECK(static_cast<bool>(first));
+    if (first) {
+        CRPC_CHECK(command_name(first.value(), "find"));
+        // The first command in the transaction carries startTransaction:true.
+        bool started = false;
+        CRPC_CHECK(first.value().get_boolean("startTransaction", started));
+        CRPC_CHECK(started);
+        bool autocommit = true;
+        CRPC_CHECK(first.value().get_boolean("autocommit", autocommit));
+        CRPC_CHECK_FALSE(autocommit);
+        std::int64_t txn = 0;
+        CRPC_CHECK(first.value().get_int64("txnNumber", txn));
+        CRPC_CHECK_EQ(std::int64_t{1}, txn);
+        CRPC_CHECK(has_lsid(first.value(), 16));
+    }
+
+    // A second command inside the transaction echoes the same txnNumber and
+    // autocommit:false, but must NOT repeat startTransaction.
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    const auto second = request_body(channel->requests()[2]);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (second) {
+        CRPC_CHECK(command_name(second.value(), "find"));
+        CRPC_CHECK(second.value().find("startTransaction") == nullptr);
+        std::int64_t txn = 0;
+        CRPC_CHECK(second.value().get_int64("txnNumber", txn));
+        CRPC_CHECK_EQ(std::int64_t{1}, txn);
+        bool autocommit = true;
+        CRPC_CHECK(second.value().get_boolean("autocommit", autocommit));
+        CRPC_CHECK_FALSE(autocommit);
+    }
+
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+    CRPC_CHECK_FALSE(connection->in_transaction());
+}
+
+CRPC_TEST(mongo_transaction_commit_runs_against_admin_with_same_txn_number) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+    CRPC_CHECK_FALSE(connection->in_transaction());
+    CRPC_CHECK(channel->requests().size() >= 3);
+    const auto commit = request_body(channel->requests()[2]);
+    CRPC_CHECK(static_cast<bool>(commit));
+    if (commit) {
+        CRPC_CHECK(command_name(commit.value(), "commitTransaction"));
+        // The commit must run against the admin database (the first command ran
+        // against the connection's configured database).
+        const crpc::db::mongo::bson_value* db = commit.value().find("$db");
+        CRPC_CHECK(db != nullptr);
+        if (db != nullptr) {
+            CRPC_CHECK(db->type == crpc::db::mongo::bson_type::text);
+            CRPC_CHECK_EQ(std::string("admin"), db->text);
+        }
+        // The commit reuses this transaction's txnNumber; it must not be a new one.
+        std::int64_t txn = 0;
+        CRPC_CHECK(commit.value().get_int64("txnNumber", txn));
+        CRPC_CHECK_EQ(std::int64_t{1}, txn);
+        bool autocommit = true;
+        CRPC_CHECK(commit.value().get_boolean("autocommit", autocommit));
+        CRPC_CHECK_FALSE(autocommit);
+        CRPC_CHECK(has_lsid(commit.value(), 16));
+    }
+}
+
+CRPC_TEST(mongo_transaction_rollback_sends_abort_transaction) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+
+    CRPC_CHECK(static_cast<bool>(connection->rollback()));
+    CRPC_CHECK_FALSE(connection->in_transaction());
+    CRPC_CHECK(channel->requests().size() >= 3);
+    const auto abort = request_body(channel->requests()[2]);
+    CRPC_CHECK(static_cast<bool>(abort));
+    if (abort) {
+        CRPC_CHECK(command_name(abort.value(), "abortTransaction"));
+        const crpc::db::mongo::bson_value* db = abort.value().find("$db");
+        CRPC_CHECK(db != nullptr);
+        if (db != nullptr) {
+            CRPC_CHECK(db->type == crpc::db::mongo::bson_type::text);
+            CRPC_CHECK_EQ(std::string("admin"), db->text);
+        }
+        std::int64_t txn = 0;
+        CRPC_CHECK(abort.value().get_int64("txnNumber", txn));
+        CRPC_CHECK_EQ(std::int64_t{1}, txn);
+        bool autocommit = true;
+        CRPC_CHECK(abort.value().get_boolean("autocommit", autocommit));
+        CRPC_CHECK_FALSE(autocommit);
+    }
+}
+
+CRPC_TEST(mongo_transaction_without_a_replica_set_is_refused) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto serve = [](const bytes& request, std::size_t) -> scripted_answer {
+        if (bytes_contain(request, "hello\x00")) {
+            return scripted_answer{false, false, make_reply(request, hello_reply(false))};
+        }
+        bson_document reply;
+        reply.append("ok", bson_value::make_real(1.0));
+        return scripted_answer{false, false, make_reply(request, std::move(reply))};
+    };
+    auto connection = make_connection(options, serve, &channel);
+    CRPC_CHECK(connection->is_open());
+    CRPC_CHECK_FALSE(connection->is_replica_set());
+
+    const crpc::status began = connection->begin();
+    CRPC_CHECK_FALSE(static_cast<bool>(began));
+    if (!began) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                      static_cast<int>(began.error().code));
+    }
+    CRPC_CHECK_FALSE(connection->in_transaction());
+    // begin() sent nothing; only the handshake was exchanged.
+    CRPC_CHECK_EQ(std::size_t{1}, channel->requests().size());
+}
+
+CRPC_TEST(mongo_commit_without_transaction_is_refused_rollback_is_noop) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    const crpc::status committed = connection->commit();
+    CRPC_CHECK_FALSE(static_cast<bool>(committed));
+    if (!committed) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                      static_cast<int>(committed.error().code));
+    }
+    const crpc::status rolled_back = connection->rollback();
+    CRPC_CHECK(static_cast<bool>(rolled_back));
+    CRPC_CHECK_EQ(std::size_t{1}, channel->requests().size()); // no commits or aborts
+}
+
+CRPC_TEST(mongo_double_begin_is_refused) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(connection->in_transaction());
+    const crpc::status again = connection->begin();
+    CRPC_CHECK_FALSE(static_cast<bool>(again));
+    if (!again) {
+        CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::failed_precondition),
+                      static_cast<int>(again.error().code));
+    }
+}
+
+CRPC_TEST(mongo_transaction_txn_number_is_monotonic_across_transactions) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+
+    CRPC_CHECK(channel->requests().size() >= 5);
+    const auto second_first =
+        request_body(channel->requests()[3]); // find of second transaction
+    CRPC_CHECK(static_cast<bool>(second_first));
+    if (second_first) {
+        std::int64_t txn = 0;
+        CRPC_CHECK(second_first.value().get_int64("txnNumber", txn));
+        // The second transaction must use a strictly larger txnNumber on the same
+        // session; the server refuses to reuse one.
+        CRPC_CHECK_EQ(std::int64_t{2}, txn);
+    }
+}
+
+CRPC_TEST(mongo_transaction_read_concern_only_on_the_first_command) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    options.read_concern = crpc::db::mongo::read_concern_level::majority;
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    CRPC_CHECK(static_cast<bool>(connection->find(request)));
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+
+    const auto first = request_body(channel->requests()[1]);
+    CRPC_CHECK(static_cast<bool>(first));
+    if (first) {
+        // The transaction's readConcern rides on the first command.
+        CRPC_CHECK_EQ(std::string("majority"),
+                      nested_text(first.value(), "readConcern", "level"));
+    }
+    const auto second = request_body(channel->requests()[2]);
+    CRPC_CHECK(static_cast<bool>(second));
+    if (second) {
+        // Subsequent commands must not repeat it: a server refuses a readConcern on
+        // any command after the first inside a transaction.
+        CRPC_CHECK(second.value().find("readConcern") == nullptr);
+    }
+}
+
+CRPC_TEST(mongo_transaction_does_not_auto_retry_transport_failures) {
+    // Auto-retry is a property of standalone retryable writes. Inside a transaction
+    // a lost reply is ambiguous (the command may have run), and replaying it with the
+    // same txnNumber could duplicate the work, so the failure surfaces instead.
+    std::vector<bytes> requests;
+    bool reconnected = false;
+    bool injected = false;
+
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    const auto server = [&](const bytes& request, std::size_t) -> scripted_answer {
+        requests.push_back(request);
+        if (bytes_contain(request, "hello\x00")) {
+            return scripted_answer{false, false, make_reply(request, hello_reply(true))};
+        }
+        if (bytes_contain(request, "find\x00") && !injected) {
+            injected = true;
+            return scripted_answer{false, true, {}}; // drop the reply
+        }
+        bson_document reply;
+        reply.append("ok", bson_value::make_real(1.0));
+        return scripted_answer{false, false, make_reply(request, std::move(reply))};
+    };
+    options.reconnect = [&]() -> crpc::result<std::unique_ptr<crpc::db::channel>> {
+        reconnected = true;
+        auto channel = std::make_unique<scripted_channel>(server);
+        std::unique_ptr<crpc::db::channel> base = std::move(channel);
+        return base;
+    };
+
+    auto connection = make_connection(options, server);
+    CRPC_CHECK(connection->is_open());
+
+    crpc::db::mongo::find_request request;
+    request.database = "crpc_it";
+    request.collection = "c";
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    const auto found = connection->find(request);
+    CRPC_CHECK_FALSE(static_cast<bool>(found));
+    CRPC_CHECK_FALSE(reconnected);
+    CRPC_CHECK_EQ(std::size_t{2}, requests.size()); // hello + one failed find
+}
+
+CRPC_TEST(mongo_transaction_write_concern_rides_on_the_commit_only) {
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    options.write_concern = crpc::db::mongo::write_concern_options::count(2);
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    crpc::db::mongo::bson_document document;
+    document.append("_id", bson_value::make_int32(1));
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    const auto inserted =
+        connection->insert("c", std::vector<bson_document>{std::move(document)});
+    CRPC_CHECK(static_cast<bool>(inserted));
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+
+    // The insert inside the transaction must NOT carry writeConcern (the server
+    // refuses it there); the commitTransaction carries it.
+    const auto insert = request_body(channel->requests()[1]);
+    CRPC_CHECK(static_cast<bool>(insert));
+    if (insert) {
+        CRPC_CHECK(insert.value().find("writeConcern") == nullptr);
+    }
+    const auto commit = request_body(channel->requests()[2]);
+    CRPC_CHECK(static_cast<bool>(commit));
+    if (commit) {
+        const bson_document* concern = commit.value().get_document("writeConcern");
+        CRPC_CHECK(concern != nullptr);
+        if (concern != nullptr) {
+            std::int64_t w = 0;
+            CRPC_CHECK(concern->get_int64("w", w));
+            CRPC_CHECK_EQ(std::int64_t{2}, w);
+        }
+    }
+}
+
+CRPC_TEST(mongo_commit_of_an_unborn_transaction_is_a_noop) {
+    // begin() then commit() with no command in between: nothing was sent to the
+    // server, so the "commit" is local bookkeeping, not a commitTransaction.
+    scripted_channel* channel = nullptr;
+    crpc::db::mongo::connection_options options;
+    options.user.clear();
+    auto connection =
+        make_connection(options, replica_set_server(), &channel);
+    CRPC_CHECK(connection->is_open());
+
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(connection->in_transaction());
+    CRPC_CHECK(static_cast<bool>(connection->commit()));
+    CRPC_CHECK_FALSE(connection->in_transaction());
+    CRPC_CHECK_EQ(std::size_t{1}, channel->requests().size()); // hello only
+
+    // Same for rollback of an unborn transaction: no abortTransaction on the wire.
+    CRPC_CHECK(static_cast<bool>(connection->begin()));
+    CRPC_CHECK(static_cast<bool>(connection->rollback()));
+    CRPC_CHECK_FALSE(connection->in_transaction());
+    CRPC_CHECK_EQ(std::size_t{1}, channel->requests().size());
+}
+
 CRPC_TEST_MAIN()

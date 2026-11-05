@@ -4,6 +4,24 @@
 
 ## 未发布
 
+### MongoDB：`db::connection` 事务动词背后的多文档事务支持
+
+- `mongo::connection` 的 `begin()` / `commit()` / `rollback()` 现在真正启动、提交与
+  中止服务器端事务，不再返回 `no_such_method`；`in_transaction()` 报告打开中的事务。
+  事务内第一条命令携带 `startTransaction:true` 与 `autocommit:false`（按
+  sessions/transactions 线协议，客户端侧 `startTransaction` 需等待第一条命令），
+  其后每条命令回显该事务唯一的 `txnNumber`；`commitTransaction`/`abortTransaction`
+  对 `admin` 库发送并带 `autocommit:false`。事务内读写禁止自动重试——丢回复以错误
+  形式浮出而非重放；只有 commit/abort 使用同一 `txnNumber` 重放一次（服务器据此去重）。
+  独立部署下的 `begin()` 被拒绝（`failed_precondition`，事务需要副本集）；
+  重复 `begin()` 与事务外的 `commit()` 会显式报错而非静默接受。尚未出生的空事务
+  （`begin()` 后未发任何命令即 `commit()`/`rollback()`）按线协议要求为本地空操作。
+  单元套件在脚本通道上钉死命令字节（仅首条命令带 startTransaction、读/写关心字段
+  的放置、admin 库、恒定 txnNumber、禁止自动重试）；真机套件在真实副本集上提交与
+  回滚。六类变异——丢掉 startTransaction、目标库写错、破坏 txnNumber 单调性、
+  commit 后标志未清、把 writeConcern 放进事务内写命令——各自把对应测试变红。
+  **ABI：** `mongo::connection` 新增成员，布局（与必需的重新编译）因此改变。
+
 ### Redis 客户端：新增基于 RESP3 使失效追踪的有界客户端缓存
 
 - `redis::client_cache` 是按键序 LRU 缓存，读未命中时由调用方填充、之后自动刷新：
