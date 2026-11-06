@@ -406,6 +406,16 @@ Per-lane byte quotas are kept in the same controller and released with the idemp
 | `net` | implemented | `test_net_address.cpp`, `test_net_ip.cpp`, `test_net_transport.cpp`, `test_net_transport_edge.cpp`, `test_net_pool.cpp`, `test_net_bigread.cpp`, `test_net_backoff.cpp`, `test_net_icmp.cpp` |
 | `ws` | implemented | `test_ws_frame.cpp`, `test_ws_handshake.cpp`, `test_ws_stream.cpp`, `test_ws_e2e.cpp` |
 | `async`, `lock`, `text` | implemented | `test_async_executor.cpp`, `test_lock_local.cpp`, `test_text.cpp` |
+| `actor` | implemented | `test_actor.cpp` |
+| `aspect` | implemented | `test_aspect.cpp` |
+| `numeric` | implemented | `test_numeric_bignum.cpp` |
+| `proactor` | implemented | `test_proactor.cpp` |
+| `reactor` | implemented | `test_reactor.cpp` |
+| `system` | implemented | `test_system_process.cpp`, `test_system_sysinfo.cpp` |
+| `time` | implemented | `test_time_datetime.cpp`, `test_time_timezone.cpp`, `test_time_format.cpp` |
+| `domain` | implemented | `test_domain_ddd.cpp`, `test_domain_cqrs.cpp` |
+| `ftp` | implemented | `test_ftp_reply.cpp`, `test_ftp_client.cpp`, `test_ftp_server.cpp`; `test_ftp_it.cpp` needs a server |
+| `i18n` | implemented | `test_i18n_catalog.cpp`, `test_i18n_format.cpp` |
 
 ## 20. Verification map <a id="s20"></a>
 

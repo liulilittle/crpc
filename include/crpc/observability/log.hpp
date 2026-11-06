@@ -359,7 +359,13 @@ enum class overflow_policy : u8 {
     // Drop the record and increment the ring's drop counter. Default.
     drop_and_count,
     // Spin until the sink makes room. This may stall the caller and must not
-    // be used before the sink thread is running.
+    // be used before the sink thread is running. The stall is a LIVELOCK, not
+    // a delay: `block` has no timeout, so a submit() spins forever whenever
+    // nobody drains the ring -- before start(), after shutdown() (the sink
+    // thread is gone and the synchronous drain in shutdown() has finished), or
+    // with a ring that the sink can never empty fast enough. Only legal while
+    // the sink thread is verifiably running (`logger::running()`), and even
+    // then a saturated sink stalls the caller indefinitely by design.
     block,
     // Yield for a bounded number of attempts, then drop and count.
     throttle
@@ -415,6 +421,16 @@ public:
 
     // Testing/administrative reset. Stops the sink, drops every registered
     // ring and restores defaults. No other thread may be logging.
+    //
+    // Stronger form of that contract: no thread may be INSIDE submit() while
+    // reset() runs. reset() clears the shared ring table and the *calling
+    // thread's* cached ring pointer only; any other thread that is between
+    // `current_ring()` and `push()` keeps a raw pointer to a destroyed ring.
+    // That dangling `thread_local` cache does not self-heal: the violating
+    // thread will keep pushing into freed memory until it exits (its TLS slot
+    // dies with it), or until it observes a reset() from its own thread. If
+    // threads must keep logging across a reset, stop them, reset, and let
+    // their next submit() re-register.
     void reset();
 
     [[nodiscard]] bool running() const noexcept { return running_.load(std::memory_order_acquire); }

@@ -401,6 +401,93 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`ws/server.hpp`](../../include/crpc/ws/server.hpp)
 - [`ws/stream.hpp`](../../include/crpc/ws/stream.hpp)
 
+### `crpc/actor`
+
+- [`actor/actor.hpp`](../../include/crpc/actor/actor.hpp) — `actor`：类型化投递与 stop 生命周期，有界邮箱背压。
+- [`actor/mailbox.hpp`](../../include/crpc/actor/mailbox.hpp) — `mailbox<Message>`：无锁 SPSC，满时返回 `resource_exhausted`。
+
+### `crpc/aspect`
+
+- [`aspect/aspect.hpp`](../../include/crpc/aspect/aspect.hpp) — `advice`、`pointcut`、`aspect_chain`：before/after/around/异常四类通知，热路径零分配。
+
+### `crpc/cache_line`
+
+- [`cache_line.hpp`](../../include/crpc/cache_line.hpp) — `cache_line_size`、`CRPC_CACHE_LINE_ALIGN`：内部热状态的 64 字节对齐。
+
+### `crpc/crypto` 新增
+
+- [`crypto/md5.hpp`](../../include/crpc/crypto/md5.hpp) — `md5`、`md5_digest`：RFC 1321（仅 UUID v3 用途，非安全用途）。
+- [`crypto/uuid.hpp`](../../include/crpc/crypto/uuid.hpp) — `uuid`、`uuid_v1`…`uuid_v7`、`parse_uuid`、`to_string`、`uuid_hash`。
+
+### `crpc/db/sqlite`
+
+- [`db/sqlite/connection.hpp`](../../include/crpc/db/sqlite/connection.hpp) — `sqlite::connection`、`connection_factory`：基于 sqlite3 C API 的嵌入式 SQL 后端。
+
+### `crpc/domain`（DDD/CQRS）
+
+- [`domain/entity.hpp`](../../include/crpc/domain/entity.hpp) — `entity<Id, Derived>`：按标识相等。
+- [`domain/value_object.hpp`](../../include/crpc/domain/value_object.hpp) — `value_object<Derived>`：按值相等。
+- [`domain/aggregate.hpp`](../../include/crpc/domain/aggregate.hpp) — `aggregate_root<Id, Derived>`：一致性边界与未提交事件。
+- [`domain/domain_event.hpp`](../../include/crpc/domain/domain_event.hpp) — `domain_event`：名称/负载/单调序号。
+- [`domain/repository.hpp`](../../include/crpc/domain/repository.hpp) — `repository<T, Id>`、`in_memory_repository`。
+- [`domain/unit_of_work.hpp`](../../include/crpc/domain/unit_of_work.hpp) — `unit_of_work`：原子提交、逆序回滚。
+- [`domain/cqrs.hpp`](../../include/crpc/domain/cqrs.hpp) — `command`、`query`、`handler_registry`、`projection`。
+
+### `crpc/ftp`
+
+- [`ftp/client.hpp`](../../include/crpc/ftp/client.hpp) — `ftp::client`：RFC 959/2228/4217 客户端，PASV/EPSV、断点续传、显式/隐式 FTPS。
+- [`ftp/command.hpp`](../../include/crpc/ftp/command.hpp) — 命令解析与序列化。
+- [`ftp/reply.hpp`](../../include/crpc/ftp/reply.hpp) — `ftp_reply`：单行与多行回复解析。
+- [`ftp/server.hpp`](../../include/crpc/ftp/server.hpp) — `ftp::server`：路径受控的 FTP/FTPS 服务端。
+
+### `crpc/i18n`
+
+- [`i18n/catalog.hpp`](../../include/crpc/i18n/catalog.hpp) — `message_catalog`：区域、回退链、复数规则、参数插值。
+- [`i18n/format.hpp`](../../include/crpc/i18n/format.hpp) — `format_number`、`parse_number`：区域感知的数字格式化。
+
+### `crpc/numeric`
+
+- [`numeric/bigint.hpp`](../../include/crpc/numeric/bigint.hpp) — `uint_big<Bits>` 模板：像内置整型一样的回绕算术。
+- [`numeric/uint128.hpp`](../../include/crpc/numeric/uint128.hpp) — `uint128`。
+- [`numeric/uint192.hpp`](../../include/crpc/numeric/uint192.hpp) — `uint192`。
+- [`numeric/uint256.hpp`](../../include/crpc/numeric/uint256.hpp) — `uint256`。
+- [`numeric/uint384.hpp`](../../include/crpc/numeric/uint384.hpp) — `uint384`。
+- [`numeric/uint512.hpp`](../../include/crpc/numeric/uint512.hpp) — `uint512`。
+
+### `crpc/proactor`
+
+- [`proactor/proactor.hpp`](../../include/crpc/proactor/proactor.hpp) — `proactor<Backend>`：完成事件驱动的 I/O，直接适配 `io::` 契约，每次提交恰好一次完成。
+
+### `crpc/reactor`
+
+- [`reactor/reactor.hpp`](../../include/crpc/reactor/reactor.hpp) — `reactor<Demux>`：就绪事件驱动的分发与解复用适配。
+
+### `crpc/system`
+
+- [`system/process.hpp`](../../include/crpc/system/process.hpp) — `process::run/spawn`、`list_processes`、`query_process`：带 stdin/stdout/stderr 重定向的子进程。
+- [`system/sysinfo.hpp`](../../include/crpc/system/sysinfo.hpp) — `cpu()`、`memory()`、`disks()`、`hostname()`、`uptime_seconds()`。
+
+### `crpc/time`
+
+- [`time/duration.hpp`](../../include/crpc/time/duration.hpp) — `timestamp`、`duration`：纳秒基准，秒/毫秒/微秒辅助。
+- [`time/datetime.hpp`](../../include/crpc/time/datetime.hpp) — `date_time`：公历日历运算、闰年规则、RFC 3339。
+- [`time/format.hpp`](../../include/crpc/time/format.hpp) — `%Y %m %d %H %M %S %f %z` 格式化。
+- [`time/timezone.hpp`](../../include/crpc/time/timezone.hpp) — `timezone_at`、`local_timezone`、`list_timezones`：IANA tzdata，固定偏移回退。
+
+### `crpc/text` 新增
+
+- [`text/encoding.hpp`](../../include/crpc/text/encoding.hpp) — base32/base32hex/base58/base85/ASCII85/uuencode/quoted-printable/punycode/UTF-7/Latin-1/GBK。
+- [`text/pinyin.hpp`](../../include/crpc/text/pinyin.hpp) — `to_pinyin`、`to_pinyin_initials`、`pinyin_candidates`：全 GBK 拼音与词组消歧。
+- [`text/regex.hpp`](../../include/crpc/text/regex.hpp) — `regex`：回溯引擎，带防灾难回溯的硬性步数上限。
+- [`text/string_order.hpp`](../../include/crpc/text/string_order.hpp) — `string_order`、`string_comparison`：.NET StringComparer 风格的 ordinal/invariant 比较。
+- [`text/unicode.hpp`](../../include/crpc/text/unicode.hpp) — `normalize`（NFC/NFD/NFKC/NFKD）、`to_case`、类别查询、字素簇。
+
+### `crpc/algorithm` 新增
+
+- [`algorithm/sort.hpp`](../../include/crpc/algorithm/sort.hpp) — `intro_sort`、`quick_sort`、`heap_sort`、`radix_sort`。
+- [`algorithm/heap.hpp`](../../include/crpc/algorithm/heap.hpp) — `binary_heap`、`make_heap`、`push_heap`、`pop_heap`。
+- [`algorithm/tree_traversal.hpp`](../../include/crpc/algorithm/tree_traversal.hpp) — 非递归前/中/后/层序遍历。
+
 ### `crpc/cluster`
 
 - [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp)

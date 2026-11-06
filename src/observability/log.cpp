@@ -320,6 +320,9 @@ void logger::reset() {
         std::lock_guard<std::mutex> lock(rings_mutex_);
         rings_.clear();
     }
+    // Only the calling thread's cache is refreshed. A thread that is inside
+    // submit() at this moment, or that cached its ring before the reset, keeps
+    // a dangling pointer that never self-heals (see the contract in log.hpp).
     g_thread_ring = nullptr;
 
     allocation_drops_.store(0, std::memory_order_relaxed);
@@ -373,6 +376,9 @@ void logger::submit(const log_record& record) noexcept {
     if (ring == nullptr) {
         return;
     }
+    // `push` honours the configured overflow policy. With `block` this call may
+    // spin forever if no sink is draining (before start(), after shutdown()):
+    // see the overflow_policy contract in log.hpp before choosing it.
     ring->push(record, static_cast<overflow_policy>(overflow_.load(std::memory_order_relaxed)));
 }
 

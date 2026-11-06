@@ -405,6 +405,93 @@ without registering it here fails the suite.
 - [`ws/server.hpp`](../../include/crpc/ws/server.hpp)
 - [`ws/stream.hpp`](../../include/crpc/ws/stream.hpp)
 
+### `crpc/actor`
+
+- [`actor/actor.hpp`](../../include/crpc/actor/actor.hpp) — `actor`, typed post/stop lifecycle, bounded mailbox backpressure.
+- [`actor/mailbox.hpp`](../../include/crpc/actor/mailbox.hpp) — `mailbox<Message>`, lock-free SPSC with `resource_exhausted` on full.
+
+### `crpc/aspect`
+
+- [`aspect/aspect.hpp`](../../include/crpc/aspect/aspect.hpp) — `advice`, `pointcut`, `aspect_chain`: before/after/around/after-throwing with an allocation-free hot path.
+
+### `crpc/cache_line`
+
+- [`cache_line.hpp`](../../include/crpc/cache_line.hpp) — `cache_line_size`, `CRPC_CACHE_LINE_ALIGN`: 64-byte alignment for internal hot state.
+
+### `crpc/crypto` additions
+
+- [`crypto/md5.hpp`](../../include/crpc/crypto/md5.hpp) — `md5`, `md5_digest`: RFC 1321 (UUID v3 only, not for security).
+- [`crypto/uuid.hpp`](../../include/crpc/crypto/uuid.hpp) — `uuid`, `uuid_v1`…`uuid_v7`, `parse_uuid`, `to_string`, `uuid_hash`.
+
+### `crpc/db/sqlite`
+
+- [`db/sqlite/connection.hpp`](../../include/crpc/db/sqlite/connection.hpp) — `sqlite::connection`, `connection_factory`: the embedded SQL backend over the sqlite3 C API.
+
+### `crpc/domain` (DDD/CQRS)
+
+- [`domain/entity.hpp`](../../include/crpc/domain/entity.hpp) — `entity<Id, Derived>`: identity-based equality.
+- [`domain/value_object.hpp`](../../include/crpc/domain/value_object.hpp) — `value_object<Derived>`: value-based equality.
+- [`domain/aggregate.hpp`](../../include/crpc/domain/aggregate.hpp) — `aggregate_root<Id, Derived>`: consistency boundary with uncommitted events.
+- [`domain/domain_event.hpp`](../../include/crpc/domain/domain_event.hpp) — `domain_event`: name/payload/monotonic sequence.
+- [`domain/repository.hpp`](../../include/crpc/domain/repository.hpp) — `repository<T, Id>`, `in_memory_repository`.
+- [`domain/unit_of_work.hpp`](../../include/crpc/domain/unit_of_work.hpp) — `unit_of_work`: atomic commit, reverse-order rollback.
+- [`domain/cqrs.hpp`](../../include/crpc/domain/cqrs.hpp) — `command`, `query`, `handler_registry`, `projection`.
+
+### `crpc/ftp`
+
+- [`ftp/client.hpp`](../../include/crpc/ftp/client.hpp) — `ftp::client`: RFC 959/2228/4217 client with PASV/EPSV, resume, explicit/implicit FTPS.
+- [`ftp/command.hpp`](../../include/crpc/ftp/command.hpp) — command parsing and serialization.
+- [`ftp/reply.hpp`](../../include/crpc/ftp/reply.hpp) — `ftp_reply`: single- and multi-line reply parsing.
+- [`ftp/server.hpp`](../../include/crpc/ftp/server.hpp) — `ftp::server`: path-confined FTP/FTPS server.
+
+### `crpc/i18n`
+
+- [`i18n/catalog.hpp`](../../include/crpc/i18n/catalog.hpp) — `message_catalog`: locales, fallback chains, plural rules, interpolation.
+- [`i18n/format.hpp`](../../include/crpc/i18n/format.hpp) — `format_number`, `parse_number`: locale-aware numeric formatting.
+
+### `crpc/numeric`
+
+- [`numeric/bigint.hpp`](../../include/crpc/numeric/bigint.hpp) — `uint_big<Bits>` template: wraparound arithmetic like built-in integers.
+- [`numeric/uint128.hpp`](../../include/crpc/numeric/uint128.hpp) — `uint128`.
+- [`numeric/uint192.hpp`](../../include/crpc/numeric/uint192.hpp) — `uint192`.
+- [`numeric/uint256.hpp`](../../include/crpc/numeric/uint256.hpp) — `uint256`.
+- [`numeric/uint384.hpp`](../../include/crpc/numeric/uint384.hpp) — `uint384`.
+- [`numeric/uint512.hpp`](../../include/crpc/numeric/uint512.hpp) — `uint512`.
+
+### `crpc/proactor`
+
+- [`proactor/proactor.hpp`](../../include/crpc/proactor/proactor.hpp) — `proactor<Backend>`: completion-driven I/O over the `io::` contract, exactly one completion per submit.
+
+### `crpc/reactor`
+
+- [`reactor/reactor.hpp`](../../include/crpc/reactor/reactor.hpp) — `reactor<Demux>`: readiness-driven dispatch with demux adapter.
+
+### `crpc/system`
+
+- [`system/process.hpp`](../../include/crpc/system/process.hpp) — `process::run/spawn`, `list_processes`, `query_process`: subprocesses with stdin/stdout/stderr redirection.
+- [`system/sysinfo.hpp`](../../include/crpc/system/sysinfo.hpp) — `cpu()`, `memory()`, `disks()`, `hostname()`, `uptime_seconds()`.
+
+### `crpc/time`
+
+- [`time/duration.hpp`](../../include/crpc/time/duration.hpp) — `timestamp`, `duration`: nanosecond base with second/millisecond/microsecond helpers.
+- [`time/datetime.hpp`](../../include/crpc/time/datetime.hpp) — `date_time`: Gregorian calendar arithmetic, leap rules, RFC 3339.
+- [`time/format.hpp`](../../include/crpc/time/format.hpp) — `%Y %m %d %H %M %S %f %z` formatting.
+- [`time/timezone.hpp`](../../include/crpc/time/timezone.hpp) — `timezone_at`, `local_timezone`, `list_timezones`: IANA tzdata with fixed-offset fallback.
+
+### `crpc/text` additions
+
+- [`text/encoding.hpp`](../../include/crpc/text/encoding.hpp) — base32/base32hex/base58/base85/ascii85/uuencode/quoted-printable/punycode/UTF-7/Latin-1/GBK.
+- [`text/pinyin.hpp`](../../include/crpc/text/pinyin.hpp) — `to_pinyin`, `to_pinyin_initials`, `pinyin_candidates`: full-GBK pinyin with phrase disambiguation.
+- [`text/regex.hpp`](../../include/crpc/text/regex.hpp) — `regex`: backtracking engine with a hard step limit against catastrophic backtracking.
+- [`text/string_order.hpp`](../../include/crpc/text/string_order.hpp) — `string_order`, `string_comparison`: .NET StringComparer-style ordinal/invariant comparisons.
+- [`text/unicode.hpp`](../../include/crpc/text/unicode.hpp) — `normalize` (NFC/NFD/NFKC/NFKD), `to_case`, category queries, grapheme clusters.
+
+### `crpc/algorithm` additions
+
+- [`algorithm/sort.hpp`](../../include/crpc/algorithm/sort.hpp) — `intro_sort`, `quick_sort`, `heap_sort`, `radix_sort`.
+- [`algorithm/heap.hpp`](../../include/crpc/algorithm/heap.hpp) — `binary_heap`, `make_heap`, `push_heap`, `pop_heap`.
+- [`algorithm/tree_traversal.hpp`](../../include/crpc/algorithm/tree_traversal.hpp) — non-recursive pre/in/post/level-order traversal.
+
 ### `crpc/cluster`
 
 - [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp)

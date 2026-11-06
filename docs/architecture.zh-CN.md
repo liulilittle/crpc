@@ -395,7 +395,17 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | `pattern` | 已实现 | `test_pattern_memento.cpp`、`test_pattern_constraint.cpp`、`test_pattern_version.cpp` |
 | `net` | 已实现 | `test_net_address.cpp`、`test_net_ip.cpp`、`test_net_transport.cpp`、`test_net_transport_edge.cpp`、`test_net_pool.cpp`、`test_net_bigread.cpp`、`test_net_backoff.cpp`、`test_net_icmp.cpp` |
 | `ws` | 已实现 | `test_ws_frame.cpp`、`test_ws_handshake.cpp`、`test_ws_stream.cpp`、`test_ws_e2e.cpp` |
-| `async`、`lock`、`text` | 已实现 | `test_async_executor.cpp`、`test_lock_local.cpp`、`test_text.cpp` |
+| `async`、`lock`、`text` | 已实现 | `test_async_executor.cpp`、`test_lock_local.cpp`、`test_text.cpp` |
+| `actor` | 已实现 | `test_actor.cpp` |
+| `aspect` | 已实现 | `test_aspect.cpp` |
+| `numeric` | 已实现 | `test_numeric_bignum.cpp` |
+| `proactor` | 已实现 | `test_proactor.cpp` |
+| `reactor` | 已实现 | `test_reactor.cpp` |
+| `system` | 已实现 | `test_system_process.cpp`、`test_system_sysinfo.cpp` |
+| `time` | 已实现 | `test_time_datetime.cpp`、`test_time_timezone.cpp`、`test_time_format.cpp` |
+| `domain` | 已实现 | `test_domain_ddd.cpp`、`test_domain_cqrs.cpp` |
+| `ftp` | 已实现 | `test_ftp_reply.cpp`、`test_ftp_client.cpp`、`test_ftp_server.cpp`；`test_ftp_it.cpp` 需要服务器 |
+| `i18n` | 已实现 | `test_i18n_catalog.cpp`、`test_i18n_format.cpp` |
 
 ## 20. 验证映射 <a id="s20"></a>
 
