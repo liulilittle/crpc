@@ -28,6 +28,10 @@ namespace obs {
 namespace {
 
 thread_local log_ring* g_thread_ring = nullptr;
+// The generation this thread's cached ring was registered under. reset()
+// bumps the logger's global generation; a mismatch on the hot path means the
+// cached pointer dangles and must not be touched.
+thread_local std::uint64_t g_thread_ring_generation = 0;
 
 std::size_t round_up_power_of_two(std::size_t value) noexcept {
     if (value < 2) {
@@ -320,12 +324,19 @@ void logger::reset() {
         std::lock_guard<std::mutex> lock(rings_mutex_);
         rings_.clear();
     }
-    // Only the calling thread's cache is refreshed. A thread that is inside
-    // submit() at this moment, or that cached its ring before the reset, keeps
-    // a dangling pointer that never self-heals (see the contract in log.hpp).
+    // Invalidate every thread's cached ring: the generation bump is what the
+    // hot path checks, so a thread that logged before this reset() observes
+    // the mismatch on its next submit() and drops instead of dereferencing
+    // freed memory. The calling thread's cache is refreshed eagerly.
+    generation_.fetch_add(1, std::memory_order_release);
+    g_thread_ring_generation = generation_.load(std::memory_order_relaxed);
+    // Only the calling thread's cache is refreshed eagerly. Any other thread
+    // that cached its ring before the reset detects the stale generation on
+    // its next submit() and re-registers there.
     g_thread_ring = nullptr;
 
     allocation_drops_.store(0, std::memory_order_relaxed);
+    stale_drops_.store(0, std::memory_order_relaxed);
     written_.store(0, std::memory_order_relaxed);
     level_.store(static_cast<int>(log_level::trace), std::memory_order_relaxed);
     redactor_.store(nullptr, std::memory_order_relaxed);
@@ -344,13 +355,6 @@ void logger::reset() {
     file_size_ = 0;
 }
 
-log_ring* logger::current_ring() noexcept {
-    if (g_thread_ring != nullptr) {
-        return g_thread_ring;
-    }
-    return register_ring();
-}
-
 log_ring* logger::register_ring() noexcept {
     const std::size_t capacity = ring_capacity_.load(std::memory_order_relaxed);
     std::unique_ptr<log_ring> ring(new (std::nothrow) log_ring(capacity));
@@ -367,18 +371,40 @@ log_ring* logger::register_ring() noexcept {
         allocation_drops_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
+    g_thread_ring_generation = generation_.load(std::memory_order_relaxed);
     g_thread_ring = raw;
     return raw;
 }
 
 void logger::submit(const log_record& record) noexcept {
-    log_ring* ring = current_ring();
+    if (g_thread_ring != nullptr) {
+        // Hot path: one acquire load of the generation on top of the old
+        // "branch on the cache" path. It is what makes a foreign reset()
+        // detectable before the cached pointer is touched.
+        if (g_thread_ring_generation ==
+            generation_.load(std::memory_order_acquire)) {
+            // `push` honours the configured overflow policy. With `block` this
+            // call may spin forever if no sink is draining (before start(),
+            // after shutdown()): see the overflow_policy contract in log.hpp
+            // before choosing it.
+            g_thread_ring->push(
+                record,
+                static_cast<overflow_policy>(overflow_.load(std::memory_order_relaxed)));
+            return;
+        }
+        // Contract violation in progress: reset() ran on another thread and
+        // destroyed the ring this cache points at. Drop the record, make the
+        // violation observable, and never dereference the stale pointer; the
+        // next submit() re-registers a fresh ring.
+        g_thread_ring = nullptr;
+        g_thread_ring_generation = generation_.load(std::memory_order_relaxed);
+        stale_drops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    log_ring* ring = register_ring();
     if (ring == nullptr) {
         return;
     }
-    // `push` honours the configured overflow policy. With `block` this call may
-    // spin forever if no sink is draining (before start(), after shutdown()):
-    // see the overflow_policy contract in log.hpp before choosing it.
     ring->push(record, static_cast<overflow_policy>(overflow_.load(std::memory_order_relaxed)));
 }
 
@@ -403,6 +429,7 @@ bool logger::add_field(log_record& record, std::string_view key,
 
 std::uint64_t logger::dropped_total() const {
     std::uint64_t total = allocation_drops_.load(std::memory_order_relaxed);
+    total += stale_drops_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(rings_mutex_);
     for (const auto& ring : rings_) {
         total += ring->dropped();

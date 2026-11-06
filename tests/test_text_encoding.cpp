@@ -993,6 +993,89 @@ CRPC_TEST(gbk_rejects_malformed_input) {
     expect_error(bad_utf8.code(), rpc_code::decode_error);
 }
 
+CRPC_TEST(gbk_error_offsets_and_messages_unchanged) {
+    // The strict-decode contract names the offending byte offset in the
+    // message. These pins hold the fast paths (ASCII batching on decode,
+    // direct-index table on encode) to exactly the messages and offsets the
+    // original implementation produced, including mid-string positions.
+    struct decode_case {
+        std::string_view in;
+        const char* message;
+    };
+    static constexpr decode_case kDecode[] = {
+        {"\x81\x7F", "gbk: invalid trail byte at offset 1"},
+        {"\xD6", "gbk: lone lead byte at offset 0"},
+        {"\x81", "gbk: lone lead byte at offset 0"},
+        {"\xFF", "gbk: byte 0xFF is not a lead byte at offset 0"},
+        {"\xA1\x40", "gbk: unmapped double-byte sequence at offset 0"},
+        {"\xB2\xE2\xA1\x40", "gbk: unmapped double-byte sequence at offset 2"},
+        {"\xB2\xE2\x81\x7F", "gbk: invalid trail byte at offset 3"},
+        {"\xB2\xE2\xFF", "gbk: byte 0xFF is not a lead byte at offset 2"},
+        {"\xB2\xE2\xD6", "gbk: lone lead byte at offset 2"},
+    };
+    for (const decode_case& c : kDecode) {
+        const auto r = enc::gbk_to_utf8(bytes_of(c.in));
+        CRPC_CHECK(!r.ok());
+        CRPC_CHECK_EQ(std::string(c.message),
+                      r.error_or(crpc::rpc_error{}).message);
+    }
+    struct encode_case {
+        std::string_view in;
+        crpc::rpc_code code;
+        const char* message;
+    };
+    static constexpr encode_case kEncode[] = {
+        {"\xE4\xB8", rpc_code::decode_error,
+         "invalid UTF-8: malformed sequence at byte at offset 0"},
+        {"\xF0\x9F\x98\x80", rpc_code::encode_error,
+         "gbk: code point above U+FFFF at offset 0"},
+        {"\xEE\x80\x80", rpc_code::encode_error,
+         "gbk: no mapping for code point at offset 0"},
+        {"ab\xF0\x9F\x98\x80", rpc_code::encode_error,
+         "gbk: code point above U+FFFF at offset 2"},
+        {"\xE4\xB8\xAD\xEE\x80\x80", rpc_code::encode_error,
+         "gbk: no mapping for code point at offset 3"},
+        {"ab\xE4\xB8", rpc_code::decode_error,
+         "invalid UTF-8: malformed sequence at byte at offset 2"},
+    };
+    for (const encode_case& c : kEncode) {
+        const auto r = enc::utf8_to_gbk(c.in);
+        CRPC_CHECK(!r.ok());
+        CRPC_CHECK(r.error_or(crpc::rpc_error{}).code == c.code);
+        CRPC_CHECK_EQ(std::string(c.message),
+                      r.error_or(crpc::rpc_error{}).message);
+    }
+}
+
+CRPC_TEST(gbk_ascii_mixed_corpus_roundtrips) {
+    // Real mixed text alternates ASCII runs and CJK runs. Every boundary
+    // combination must survive both directions byte-exactly.
+    static constexpr std::string_view kMixed[] = {
+        "abc",
+        "\xE4\xB8\xAD",
+        "abc" "\xE4\xB8\xAD",
+        "\xE4\xB8\xAD" "abc",
+        "a" "\xE4\xB8\xAD" "b" "\xE6\x96\x87" "c",
+        "\xE2\x82\xAC\xE4\xB8\xAD\xE2\x82\xAC",
+        "abc" "\xE4\xB8\xAD" "\xE2\x82\xAC" "xyz",
+        "abc" "\xE2\x82\xAC" "\xE4\xB8\xAD",
+        "x" "\xE2\x82\xAC" "y" "\xE2\x82\xAC" "z",
+        "The " "\xE4\xB8\xAD\xE5\x9B\xBD" " bank reported 12% growth in 2026.",
+    };
+    for (const std::string_view text : kMixed) {
+        const auto gbk = enc::utf8_to_gbk(text);
+        CRPC_CHECK(gbk.ok());
+        if (!gbk.ok()) {
+            continue;
+        }
+        const auto back = enc::gbk_to_utf8(span_of(gbk.value()));
+        CRPC_CHECK(back.ok());
+        if (back.ok()) {
+            CRPC_CHECK_EQ(std::string(text), back.value());
+        }
+    }
+}
+
 CRPC_TEST(gbk_every_valid_pair_roundtrips) {
     // The full GBK double-byte space: leads 0x81..0xFE, trails 0x40..0xFE
     // except 0x7F. 21791 of the 23940 combinations are mapped; each mapped

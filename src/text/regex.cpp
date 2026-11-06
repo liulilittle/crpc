@@ -35,6 +35,11 @@ namespace {
 
 constexpr std::size_t unbounded = static_cast<std::size_t>(-1);
 
+// Sentinel for "no child link" in the shared children pool below. The pool is
+// bounded by the pattern length (regex_max_pattern_length), so 32-bit link
+// indices never overflow.
+constexpr std::uint32_t no_child = 0xFFFFFFFFu;
+
 // Group nesting cap. Capturing groups are already capped by
 // regex_max_groups, but `(?:...)` is not, and the parser is the only recursive
 // stage: this bound is what keeps a generated "((((...))))" from exhausting
@@ -148,6 +153,21 @@ struct instruction {
 
 // --- Syntax tree -------------------------------------------------------------
 
+// Children live in one shared pool instead of one heap vector per node: the
+// per-node vectors were the single largest allocation source of a compile (a
+// 15-character literal paid a 1.5x growth chain for the node vector AND a
+// second chain for its concat children). Each node's children form a forward
+// singly linked list (head/tail append, `next` links), so the parser appends
+// in construction order and the emitter walks that order with no scratch
+// buffer — nested emit() calls each traverse their own links and cannot clobber
+// each other. `jump_site` is emitter scratch for alternation back-patching,
+// stored per link so nested alternates cannot alias either.
+struct child_link {
+    std::size_t node;
+    std::uint32_t next;
+    std::uint32_t jump_site;
+};
+
 struct ast_node {
     enum class kind : std::uint8_t {
         empty,
@@ -171,11 +191,13 @@ struct ast_node {
     std::size_t min = 0;
     std::size_t max = 0;
     bool lazy = false;
-    std::vector<std::size_t> children;
+    std::uint32_t child_head = no_child;
+    std::uint32_t child_tail = no_child;
 };
 
 struct ast_tree {
     std::vector<ast_node> nodes;
+    std::vector<child_link> children;
     std::vector<byte_set> classes;
 };
 
@@ -211,9 +233,11 @@ private:
             out = first;
             return {};
         }
-        ast_node node;
-        node.type = ast_node::kind::alternate;
-        node.children.push_back(first);
+        // The alternate node is created before the second branch is parsed so
+        // every child push knows its parent index (children are pooled, not
+        // per-node vectors).
+        const std::size_t alternate = add_alternate();
+        push_child(alternate, first);
         while (peek() == '|') {
             ++pos_;
             std::size_t branch = 0;
@@ -221,29 +245,45 @@ private:
             if (!parsed.ok()) {
                 return parsed;
             }
-            node.children.push_back(branch);
+            push_child(alternate, branch);
         }
-        out = add(std::move(node));
+        out = alternate;
         return {};
     }
 
     status parse_sequence(std::size_t& out) {
-        ast_node node;
-        node.type = ast_node::kind::concat;
+        if (pos_ >= source_.size() || source_[pos_] == '|' ||
+            source_[pos_] == ')') {
+            // An empty sequence matches empty input. The pre-built empty node
+            // (index 0) emits no instruction, exactly like the empty concat
+            // node the per-node-vector layout used to produce.
+            out = 0;
+            return {};
+        }
+        std::size_t item = 0;
+        status parsed = parse_repeat(item);
+        if (!parsed.ok()) {
+            return parsed;
+        }
+        if (pos_ >= source_.size() || source_[pos_] == '|' ||
+            source_[pos_] == ')') {
+            out = item;
+            return {};
+        }
+        // A second item follows: only now does the concat node exist, so the
+        // pooled child pushes have a parent to attach to.
+        const std::size_t concat = add_concat();
+        push_child(concat, item);
         while (pos_ < source_.size() && source_[pos_] != '|' &&
                source_[pos_] != ')') {
-            std::size_t item = 0;
-            const status parsed = parse_repeat(item);
+            std::size_t next = 0;
+            parsed = parse_repeat(next);
             if (!parsed.ok()) {
                 return parsed;
             }
-            node.children.push_back(item);
+            push_child(concat, next);
         }
-        if (node.children.size() == 1) {
-            out = node.children.front();
-            return {};
-        }
-        out = add(std::move(node));
+        out = concat;
         return {};
     }
 
@@ -279,8 +319,9 @@ private:
         node.min = min;
         node.max = max;
         node.lazy = lazy;
-        node.children.push_back(atom);
-        out = add(std::move(node));
+        const std::size_t repeat = add(std::move(node));
+        push_child(repeat, atom);
+        out = repeat;
         return {};
     }
 
@@ -415,7 +456,6 @@ private:
                     "the pattern has more capture groups than the limit");
             }
             group = ++group_count_;
-            closed_.push_back(false);
         }
         if (depth_ + 1 > max_nesting) {
             return limit_error("the pattern nests groups too deeply");
@@ -440,8 +480,9 @@ private:
         ast_node node;
         node.type = ast_node::kind::group;
         node.value = static_cast<std::uint32_t>(group);
-        node.children.push_back(inner);
-        out = add(std::move(node));
+        const std::size_t group_node = add(std::move(node));
+        push_child(group_node, inner);
+        out = group_node;
         return {};
     }
 
@@ -657,9 +698,35 @@ private:
         return pos_ < source_.size() ? source_[pos_] : '\0';
     }
 
+    // Appends `child` to the tail of `parent`'s linked child list in the
+    // shared pool, keeping construction order walkable via `next`.
+    void push_child(std::size_t parent, std::size_t child) {
+        ast_node& node = tree_.nodes[parent];
+        tree_.children.push_back(child_link{child, no_child, no_child});
+        const auto index = static_cast<std::uint32_t>(tree_.children.size() - 1);
+        if (node.child_head == no_child) {
+            node.child_head = index;
+        } else {
+            tree_.children[node.child_tail].next = index;
+        }
+        node.child_tail = index;
+    }
+
     std::size_t add(ast_node node) {
         tree_.nodes.push_back(std::move(node));
         return tree_.nodes.size() - 1;
+    }
+
+    std::size_t add_concat() {
+        ast_node node;
+        node.type = ast_node::kind::concat;
+        return add(std::move(node));
+    }
+
+    std::size_t add_alternate() {
+        ast_node node;
+        node.type = ast_node::kind::alternate;
+        return add(std::move(node));
     }
 
     std::size_t add_plain(ast_node::kind type) {
@@ -690,8 +757,9 @@ private:
     std::size_t group_count_ = 0;
     std::size_t depth_ = 0;
     // closed_[group] tells whether that group's ')' has been seen, so a back
-    // reference inside the very group it names is rejected.
-    std::vector<bool> closed_{false};
+    // reference inside the very group it names is rejected. Capture groups are
+    // capped by regex_max_groups, so a fixed array needs no allocation.
+    std::array<bool, regex_max_groups + 1> closed_{};
 };
 
 // --- Emitter -----------------------------------------------------------------
@@ -716,30 +784,33 @@ bool can_match_empty(const ast_tree& tree, std::size_t index) noexcept {
         // A group can capture the empty string, so a back reference might too.
         return true;
     case ast_node::kind::group:
-        return can_match_empty(tree, node.children.front());
+        return can_match_empty(tree, tree.children[node.child_head].node);
     case ast_node::kind::concat:
-        for (const std::size_t child : node.children) {
-            if (!can_match_empty(tree, child)) {
+        for (std::uint32_t link = node.child_head; link != no_child;
+             link = tree.children[link].next) {
+            if (!can_match_empty(tree, tree.children[link].node)) {
                 return false;
             }
         }
         return true;
     case ast_node::kind::alternate:
-        for (const std::size_t child : node.children) {
-            if (can_match_empty(tree, child)) {
+        for (std::uint32_t link = node.child_head; link != no_child;
+             link = tree.children[link].next) {
+            if (can_match_empty(tree, tree.children[link].node)) {
                 return true;
             }
         }
         return false;
     case ast_node::kind::repeat:
-        return node.min == 0 || can_match_empty(tree, node.children.front());
+        return node.min == 0 ||
+               can_match_empty(tree, tree.children[node.child_head].node);
     }
     return true;
 }
 
 class program_emitter {
 public:
-    program_emitter(const ast_tree& tree, bool icase, std::size_t extra_base,
+    program_emitter(ast_tree& tree, bool icase, std::size_t extra_base,
                     std::vector<instruction>& code)
         : tree_(tree), icase_(icase), extra_base_(extra_base), code_(code) {}
 
@@ -769,8 +840,9 @@ public:
         case ast_node::kind::backref:
             return push(opcode::group_ref, node.value);
         case ast_node::kind::concat:
-            for (const std::size_t child : node.children) {
-                if (!emit(child)) {
+            for (std::uint32_t link = node.child_head; link != no_child;
+                 link = tree_.children[link].next) {
+                if (!emit(tree_.children[link].node)) {
                     return false;
                 }
             }
@@ -804,36 +876,49 @@ private:
         if (!push(opcode::save, slot)) {
             return false;
         }
-        if (!emit(node.children.front())) {
+        if (!emit(tree_.children[node.child_head].node)) {
             return false;
         }
         return push(opcode::save, slot + 1);
     }
 
     bool emit_alternate(const ast_node& node) {
-        std::vector<std::size_t> jumps;
-        for (std::size_t i = 0; i + 1 < node.children.size(); ++i) {
-            const std::size_t split = code_.size();
-            if (!push(opcode::split)) {
+        // Branches 0..n-2 each get a split/jump pair; the last branch falls
+        // through to the join point. The jump sites are parked in the child
+        // links themselves (one link per branch), so a nested alternation
+        // inside a branch cannot clobber this one's back-patch list.
+        for (std::uint32_t link = node.child_head; link != no_child;
+             link = tree_.children[link].next) {
+            child_link& entry = tree_.children[link];
+            const bool last = entry.next == no_child;
+            std::size_t split_site = 0;
+            if (!last) {
+                split_site = code_.size();
+                if (!push(opcode::split)) {
+                    return false;
+                }
+            }
+            if (!emit(entry.node)) {
                 return false;
             }
-            if (!emit(node.children[i])) {
-                return false;
+            if (!last) {
+                const std::size_t jump_site = code_.size();
+                if (!push(opcode::jump)) {
+                    return false;
+                }
+                entry.jump_site = static_cast<std::uint32_t>(jump_site);
+                code_[split_site].a = static_cast<std::uint32_t>(split_site + 1);
+                code_[split_site].b = static_cast<std::uint32_t>(code_.size());
             }
-            const std::size_t jump = code_.size();
-            if (!push(opcode::jump)) {
-                return false;
-            }
-            jumps.push_back(jump);
-            code_[split].a = static_cast<std::uint32_t>(split + 1);
-            code_[split].b = static_cast<std::uint32_t>(code_.size());
-        }
-        if (!emit(node.children.back())) {
-            return false;
         }
         const auto end = static_cast<std::uint32_t>(code_.size());
-        for (const std::size_t jump : jumps) {
-            code_[jump].a = end;
+        for (std::uint32_t link = node.child_head; link != no_child;
+             link = tree_.children[link].next) {
+            child_link& entry = tree_.children[link];
+            if (entry.jump_site != no_child) {
+                code_[entry.jump_site].a = end;
+                entry.jump_site = no_child;
+            }
         }
         return true;
     }
@@ -860,7 +945,7 @@ private:
     // fewer iterations exactly as it could with an expansion; only the code
     // size changed.
 bool emit_repeat(const ast_node& node) {
-        const std::size_t child = node.children.front();
+        const std::size_t child = tree_.children[node.child_head].node;
         if (node.max == unbounded) {
             // `X*`, `X+`, `X{n,}`: `min` mandatory iterations in a counter
             // loop, then the unbounded loop. The mandatory part is exact, so a
@@ -902,7 +987,7 @@ bool emit_repeat(const ast_node& node) {
     // further cannot change the outcome, so the loop exits right there
     // instead of counting empty iterations up to `upper`.
     bool emit_counted(const ast_node& node, std::size_t upper_bound) {
-        const std::size_t child = node.children.front();
+        const std::size_t child = tree_.children[node.child_head].node;
         const auto counter =
             static_cast<std::uint32_t>(extra_base_ + extra_slots_++);
         const auto upper = static_cast<std::uint32_t>(upper_bound);
@@ -1017,7 +1102,7 @@ bool emit_repeat(const ast_node& node) {
         return true;
     }
 
-    const ast_tree& tree_;
+    ast_tree& tree_;
     bool icase_;
     std::size_t extra_base_;
     std::vector<instruction>& code_;
@@ -1398,7 +1483,24 @@ result<regex> regex::compile(std::string_view pattern, regex_options options) {
         return limit_error("the pattern is longer than the length limit");
     }
 
+    // The compile pipeline is allocation-bound (measured: 26 operator-new calls
+    // for a 15-character literal, ~2/3 of them in the parser). Reserve the
+    // structural upper bounds once instead of paying each vector's 1.5x growth
+    // chain. Bounds: every node except concat consumes at least one pattern
+    // character and a concat needs two items, so nodes and child links are at
+    // most ~1.5 * len + 2; a class or class escape needs at least two
+    // characters; the emitter emits at most ~3 instructions per character plus
+    // a fixed head/tail (counted repeats emit a constant-size loop, not an
+    // expansion).
+    const std::size_t tree_bound = pattern.size() + pattern.size() / 2 + 2;
     ast_tree tree;
+    tree.nodes.reserve(tree_bound);
+    tree.children.reserve(tree_bound);
+    // Classes only exist for '[' groups and d/w/s escapes; a reserve on a
+    // classless pattern would be one wasted allocation.
+    if (pattern.find_first_of("[\\") != std::string_view::npos) {
+        tree.classes.reserve(pattern.size() / 2 + 1);
+    }
     tree.nodes.push_back(ast_node{});  // index 0: the empty node
 
     pattern_parser parser(pattern, options, tree);
@@ -1409,6 +1511,7 @@ result<regex> regex::compile(std::string_view pattern, regex_options options) {
     }
 
     std::vector<instruction> program;
+    program.reserve(pattern.size() * 3 + 8);
     program.push_back(instruction{opcode::save, 0, 0, 0});
     // Mark slots live after the capture slots: slot 0/1 hold the whole match
     // and each capture group owns two more, so a mark can never alias one.

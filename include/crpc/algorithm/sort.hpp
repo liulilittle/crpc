@@ -103,6 +103,29 @@ void insertion_sort(It first, It last, Compare comp) {
     }
 }
 
+// Single forward scan over adjacent pairs: true when the range is already
+// non-descending under comp. The all-equal range satisfies this too, so one
+// scan covers both friendly distributions. Cost is n-1 comparisons when the
+// answer is yes; when it is no, the first out-of-order pair ends the scan
+// (1-2 comparisons on average for unordered input), which keeps the overhead
+// on random and adversarial input in the noise. Only comparisons are made --
+// no element is read as an rvalue and nothing is swapped, so exception and
+// move-only semantics are untouched.
+template <typename It, typename Compare>
+bool is_sorted_forward(It first, It last, Compare& comp) {
+    if (last - first < 2) {
+        return true;
+    }
+    It prev = first;
+    for (It current = first + 1; current != last; ++current) {
+        if (comp(*current, *prev)) {
+            return false;
+        }
+        prev = current;
+    }
+    return true;
+}
+
 // Orders `*first`, `*mid`, `*last_minus_one` so that `*first <= *mid <=
 // *last_minus_one`, then swaps the median (`*mid`) into `*first`, where the
 // partition expects it. Equal elements are fine: any of them can act as pivot.
@@ -300,7 +323,12 @@ void radix_sort_impl(It first, It last) {
 
 // Introspective sort: median-of-three three-way quicksort, insertion sort for
 // small ranges, and a heap-sort fallback once the recursion budget of
-// 2*floor(log2(n)) partitions is exhausted. Worst case O(n log n); not stable.
+// 2*floor(log2(n)) partitions is exhausted. A single forward scan before any
+// partitioning returns immediately on already non-descending input (sorted and
+// all-equal ranges), which makes those distributions O(n). Worst case
+// O(n log n); not stable. The scan never replaces the heap-sort fallback: on
+// anything the scan rejects, the full introsort path -- depth budget and heap
+// sort included -- runs as before.
 template <typename It, typename Compare = std::less<>>
 void intro_sort(It first, It last, Compare comp = {}) {
     static_assert(detail::sort_is_random_access<It>,
@@ -308,6 +336,9 @@ void intro_sort(It first, It last, Compare comp = {}) {
                   "iterators");
     const auto count = last - first;
     if (count < 2) {
+        return;
+    }
+    if (detail::is_sorted_forward(first, last, comp)) {
         return;
     }
     const int depth_limit =

@@ -277,30 +277,54 @@ CRPC_TEST(sort_range_overloads) {
                               std::greater<>()));
 }
 
-// M1 gate: intro_sort must reach its depth budget and fall back to heap sort on
-// an adversarial comparison order. Without the fallback the count explodes to
-// the quicksort quadratic behaviour and this bound fails.
+// M1 gate: intro_sort must survive an adversarial comparison order with
+// bounded work, and the heap-sort fallback must stay reachable and effective.
+// Two intro arms pin the two mechanisms:
+//
+//   * public entry: the sorted pre-check plus the full introsort path. With
+//     this adversary every pre-check scan comparison freezes the scan's
+//     second argument and answers "not less", so the public call may
+//     legitimately return after n-1 comparisons; the bound covers both that
+//     outcome and the full partition path.
+//   * direct detail::intro_sort_impl call with the same depth budget the
+//     public entry computes: the exact path the pre-check-free entry took,
+//     where the depth budget and the heap-sort fallback live. With the
+//     fallback this costs ~6*n*log2(n) (measured 5.7-5.9 across n=2^11..2^15);
+//     with the fallback removed the same adversary drives it to the quicksort
+//     quadratic count (~100*n*log2(n) at this size), which is what turns the
+//     arm red.
+//
+// The quick_sort control is unchanged: the same adversary drives it
+// quadratic, proving the adversary itself is still effective and the bounds
+// above are not merely loose.
 CRPC_TEST(sort_intro_survives_killer_adversary) {
     constexpr std::size_t count = 2000;
+    const std::size_t bits = log2_floor(count);
+
     std::vector<int> input(count);
     std::iota(input.begin(), input.end(), 0);
 
     killer_adversary killer(count);
     crpc::algorithm::intro_sort(input.begin(), input.end(), killer);
-    const std::size_t intro_comparisons = killer.comparisons();
+    CRPC_CHECK(killer.comparisons() < 25 * count * bits);
+
+    // Fallback isolation: no pre-check, same depth budget as the public entry.
+    std::vector<int> direct(count);
+    std::iota(direct.begin(), direct.end(), 0);
+    killer_adversary direct_adversary(count);
+    {
+        std::reference_wrapper<killer_adversary> comp(direct_adversary);
+        const int depth_limit = 2 * static_cast<int>(bits);
+        crpc::algorithm::detail::intro_sort_impl(direct.begin(), direct.end(),
+                                                 comp, depth_limit);
+    }
+    CRPC_CHECK(direct_adversary.comparisons() < 25 * count * bits);
 
     std::vector<int> fresh(count);
     std::iota(fresh.begin(), fresh.end(), 0);
     killer_adversary adversary(count);
     crpc::algorithm::quick_sort(fresh.begin(), fresh.end(), adversary);
-    const std::size_t quick_comparisons = adversary.comparisons();
-
-    // Measured values (see the delivery report): intro ~10*n*log2(n), quick
-    // ~n^2/2. The bound sits between them with margin on both sides, so the
-    // case is neither tuned to one machine nor satisfiable by a quadratic run.
-    const std::size_t bits = log2_floor(count);
-    CRPC_CHECK(intro_comparisons < 25 * count * bits);
-    CRPC_CHECK(quick_comparisons > count * count / 8);
+    CRPC_CHECK(adversary.comparisons() > count * count / 8);
 }
 
 CRPC_TEST(sort_radix_unsigned_widths) {
@@ -418,6 +442,40 @@ CRPC_TEST(sort_move_only_elements) {
     CRPC_CHECK_EQ(5, *input[2]);
     CRPC_CHECK_EQ(7, *input[3]);
     CRPC_CHECK_EQ(9, *input[4]);
+}
+
+// The sorted pre-check runs one forward scan before any partitioning: a range
+// that is already non-descending -- which includes the all-equal range --
+// returns after n-1 comparisons. Without the scan the same inputs cost ~2*n
+// comparisons per partition level, so these count bounds are the observable
+// form of the optimization: they fail without the scan and hold with it.
+// Ordering semantics themselves are pinned by the std::sort comparisons in
+// every other case; the counts only pin the O(n) friendly-input path.
+CRPC_TEST(sort_intro_sorted_precheck_comparison_count) {
+    constexpr std::size_t count = 100000;
+    std::vector<int> input(count);
+    std::iota(input.begin(), input.end(), 0);
+
+    std::size_t comparisons = 0;
+    crpc::algorithm::intro_sort(input.begin(), input.end(),
+                                counting_less{&comparisons});
+    CRPC_CHECK(std::is_sorted(input.begin(), input.end()));
+    // n-1 comparisons for the scan plus constant slack. A partition walk on
+    // this input costs ~2*n*log2(n) and cannot approach this bound.
+    CRPC_CHECK(comparisons < count + 2 * log2_floor(count));
+}
+
+CRPC_TEST(sort_intro_all_equal_precheck_comparison_count) {
+    constexpr std::size_t count = 100000;
+    std::vector<int> input(count, 7);
+
+    std::size_t comparisons = 0;
+    crpc::algorithm::intro_sort(input.begin(), input.end(),
+                                counting_less{&comparisons});
+    CRPC_CHECK(std::is_sorted(input.begin(), input.end()));
+    // All-equal is non-descending, so the same scan detects it in n-1
+    // comparisons; the three-way partition alone would cost 2*n here.
+    CRPC_CHECK(comparisons < count + 2 * log2_floor(count));
 }
 
 CRPC_TEST_MAIN()

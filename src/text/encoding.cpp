@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -1471,63 +1472,313 @@ namespace {
 // --- GBK ---------------------------------------------------------------------
 
 // The generated mapping: kGbkDecodeRows is the (lead - 0x81) * 190 +
-// trail_index(trail) decode table and kGbkEncode is the code-point-sorted
-// (code point << 16) | GBK code table.
+// trail_index(trail) decode table, kGbkEncode is the code-point-sorted
+// (code point << 16) | GBK code table (kept as the reference mapping the
+// fallback encode path walks with std::lower_bound), and kGbkEncodeDirect
+// is the direct-index form direct[code point] = GBK code (0 = unmapped)
+// that the hot encode path reads with a single load.
 #include "gbk_table.inc"
 
-// Trail bytes run 0x40..0x7E and 0x80..0xFE; 0x7F is skipped.
-bool gbk_trail_ok(std::uint8_t value) noexcept {
-    return (value >= 0x40u && value <= 0x7Eu) || (value >= 0x80u && value <= 0xFEu);
-}
-
-std::size_t gbk_trail_index(std::uint8_t value) noexcept {
-    return value < 0x7Fu ? static_cast<std::size_t>(value - 0x40u)
-                         : static_cast<std::size_t>(value - 0x80u + 63u);
-}
+// Trail bytes run 0x40..0x7E and 0x80..0xFE; 0x7F is skipped. The LUT folds
+// the validity test and the row index into one load: kGbkTrailInvalid marks a
+// byte that is not a trail byte at all.
+struct gbk_trail_map_t {
+    std::uint16_t index[256];
+    constexpr gbk_trail_map_t() noexcept : index{} {
+        for (int v = 0; v < 256; ++v) {
+            index[v] = 0xFFFFu;
+        }
+        for (int v = 0x40; v <= 0x7E; ++v) {
+            index[v] = static_cast<std::uint16_t>(v - 0x40);
+        }
+        for (int v = 0x80; v <= 0xFE; ++v) {
+            index[v] = static_cast<std::uint16_t>(v - 0x80 + 63);
+        }
+    }
+};
+constexpr gbk_trail_map_t kGbkTrailMap{};
+constexpr std::uint16_t kGbkTrailInvalid = 0xFFFFu;
 
 constexpr std::uint16_t kGbkEuro = 0x20ACu;
+
+// Output staging for the decode: characters are written into a fixed stack
+// buffer and flushed to the result string in chunks. Per-character work is
+// then plain stores with no capacity checks, while the result string is only
+// ever grown by large appends -- and never by a worst-case 3x allocation or
+// zero-fill.
+struct gbk_char_sink {
+    std::string* out;
+    std::size_t filled = 0;
+    char buf[16384];
+
+    void flush() {
+        out->append(buf, filled);
+        filled = 0;
+    }
+    void put(char a, char b, char c) {
+        if (filled + 3 > sizeof(buf)) {
+            flush();
+        }
+        buf[filled] = a;
+        buf[filled + 1] = b;
+        buf[filled + 2] = c;
+        filled += 3;
+    }
+    void put2(char a, char b) {
+        if (filled + 2 > sizeof(buf)) {
+            flush();
+        }
+        buf[filled] = a;
+        buf[filled + 1] = b;
+        filled += 2;
+    }
+    // Long ASCII runs go straight to the string; short ones join the buffer.
+    void put_run(const char* run, std::size_t len) {
+        if (len >= sizeof(buf) / 2) {
+            flush();
+            out->append(run, len);
+            return;
+        }
+        if (filled + len > sizeof(buf)) {
+            flush();
+        }
+        std::memcpy(buf + filled, run, len);
+        filled += len;
+    }
+};
+
+// Output staging for the encode: same chunking, byte output.
+struct gbk_byte_sink {
+    byte_vector* out;
+    std::size_t filled = 0;
+    char buf[16384];
+
+    void flush() {
+        const auto* begin = reinterpret_cast<const std::byte*>(buf);
+        out->insert(out->end(), begin, begin + filled);
+        filled = 0;
+    }
+    void put(char one) {
+        if (filled + 2 > sizeof(buf)) {
+            flush();
+        }
+        buf[filled++] = one;
+    }
+    void put2(char hi, char lo) {
+        if (filled + 2 > sizeof(buf)) {
+            flush();
+        }
+        buf[filled] = hi;
+        buf[filled + 1] = lo;
+        filled += 2;
+    }
+};
+
+// Strict UTF-8 scanner: nullptr when the whole input is valid UTF-8, else the
+// position of the first offending byte. Same rules utf8_to_utf16 enforces
+// (no overlongs, no surrogates, at most U+10FFFF). The hot encode path only
+// runs when this accepts; any rejection falls back to the utf8_to_utf16 path
+// below, so error text and offsets stay byte-identical however the scan goes.
+const char* gbk_utf8_scan(std::string_view text) noexcept {
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const std::uint8_t c = static_cast<std::uint8_t>(text[i]);
+        if (c < 0x80u) {
+            ++i;
+            continue;
+        }
+        if (c < 0xC2u) {
+            return text.data() + i; // stray continuation or overlong lead
+        }
+        if (c < 0xE0u) {
+            if (i + 1 >= n ||
+                (static_cast<std::uint8_t>(text[i + 1]) & 0xC0u) != 0x80u) {
+                return text.data() + i;
+            }
+            i += 2;
+            continue;
+        }
+        if (c < 0xF0u) {
+            if (i + 2 >= n) {
+                return text.data() + i;
+            }
+            const std::uint8_t c1 = static_cast<std::uint8_t>(text[i + 1]);
+            const std::uint8_t c2 = static_cast<std::uint8_t>(text[i + 2]);
+            if ((c1 & 0xC0u) != 0x80u || (c2 & 0xC0u) != 0x80u ||
+                (c == 0xE0u && c1 < 0xA0u) || (c == 0xEDu && c1 >= 0xA0u)) {
+                return text.data() + i;
+            }
+            i += 3;
+            continue;
+        }
+        if (c < 0xF5u) {
+            if (i + 3 >= n) {
+                return text.data() + i;
+            }
+            const std::uint8_t c1 = static_cast<std::uint8_t>(text[i + 1]);
+            const std::uint8_t c2 = static_cast<std::uint8_t>(text[i + 2]);
+            const std::uint8_t c3 = static_cast<std::uint8_t>(text[i + 3]);
+            if ((c1 & 0xC0u) != 0x80u || (c2 & 0xC0u) != 0x80u ||
+                (c3 & 0xC0u) != 0x80u ||
+                (c == 0xF0u && c1 < 0x90u) || (c == 0xF4u && c1 >= 0x90u)) {
+                return text.data() + i;
+            }
+            i += 4;
+            continue;
+        }
+        return text.data() + i; // 0xF5..0xFF never starts a sequence
+    }
+    return nullptr;
+}
 
 } // namespace
 
 result<std::string> gbk_to_utf8(span<const std::byte> data) {
     std::string out;
-    out.reserve(data.size() * 3 / 2);
-    std::size_t i = 0;
-    while (i < data.size()) {
-        const std::uint8_t lead = to_byte(data[i]);
-        if (lead < 0x80u) {
-            out.push_back(static_cast<char>(lead));
-            ++i;
+    out.reserve(data.size() * 3 / 2 + 4);
+    gbk_char_sink sink;
+    sink.out = &out;
+    const std::byte* p = data.data();
+    const std::byte* const end = p + data.size();
+    while (p < end) {
+        const std::uint8_t lead = to_byte(*p);
+        if (lead >= 0x80u) {
+            if (lead == 0x80u) {
+                // U+20AC, the only single-byte mapping above ASCII.
+                sink.put(static_cast<char>(0xE0u | (kGbkEuro >> 12)),
+                         static_cast<char>(0x80u | ((kGbkEuro >> 6) & 0x3Fu)),
+                         static_cast<char>(0x80u | (kGbkEuro & 0x3Fu)));
+                ++p;
+                continue;
+            }
+            if (lead == 0xFFu) {
+                return decode_error("gbk: byte 0xFF is not a lead byte",
+                                    static_cast<std::size_t>(p - data.data()));
+            }
+            if (end - p < 2) {
+                return decode_error("gbk: lone lead byte",
+                                    static_cast<std::size_t>(p - data.data()));
+            }
+            const std::uint16_t trail = kGbkTrailMap.index[to_byte(p[1])];
+            if (trail == kGbkTrailInvalid) {
+                return decode_error("gbk: invalid trail byte",
+                                    static_cast<std::size_t>(p - data.data()) +
+                                        1);
+            }
+            const std::uint16_t code =
+                kGbkDecodeRows[static_cast<std::size_t>(lead - 0x81u) * 190u +
+                               trail];
+            if (code == 0) {
+                return decode_error("gbk: unmapped double-byte sequence",
+                                    static_cast<std::size_t>(p - data.data()));
+            }
+            // Every double-byte entry maps above U+07FF except a small set of
+            // two-byte characters; each form is emitted directly.
+            if (code < 0x800u) {
+                sink.put2(static_cast<char>(0xC0u | (code >> 6)),
+                          static_cast<char>(0x80u | (code & 0x3Fu)));
+            } else {
+                sink.put(static_cast<char>(0xE0u | (code >> 12)),
+                         static_cast<char>(0x80u | ((code >> 6) & 0x3Fu)),
+                         static_cast<char>(0x80u | (code & 0x3Fu)));
+            }
+            p += 2;
             continue;
         }
-        if (lead == 0x80u) {
-            append_utf8(out, kGbkEuro);
-            ++i;
-            continue;
+        // ASCII run. Entered only after the first byte is known ASCII, so
+        // CJK-heavy input never pays the vector scan; inside the run the scan
+        // moves 8 bytes at a time and the whole run is copied in bulk.
+        const std::byte* run = p;
+        while (end - p >= 8) {
+            std::uint64_t chunk;
+            std::memcpy(&chunk, p, 8);
+            if ((chunk & 0x8080808080808080ULL) != 0) {
+                break;
+            }
+            p += 8;
         }
-        if (lead == 0xFFu) {
-            return decode_error("gbk: byte 0xFF is not a lead byte", i);
+        while (p < end && to_byte(*p) < 0x80u) {
+            ++p;
         }
-        if (i + 1 >= data.size()) {
-            return decode_error("gbk: lone lead byte", i);
-        }
-        const std::uint8_t trail = to_byte(data[i + 1]);
-        if (!gbk_trail_ok(trail)) {
-            return decode_error("gbk: invalid trail byte", i + 1);
-        }
-        const std::uint16_t code =
-            kGbkDecodeRows[static_cast<std::size_t>(lead - 0x81u) * 190u +
-                           gbk_trail_index(trail)];
-        if (code == 0) {
-            return decode_error("gbk: unmapped double-byte sequence", i);
-        }
-        append_utf8(out, code);
-        i += 2;
+        sink.put_run(reinterpret_cast<const char*>(run),
+                     static_cast<std::size_t>(p - run));
     }
+    sink.flush();
     return out;
 }
 
 result<byte_vector> utf8_to_gbk(std::string_view utf8_text) {
+    // Hot path: gbk_utf8_scan has confirmed the whole input valid, so every
+    // sequence below is complete and well-formed -- decode inline, map through
+    // the direct-index table, no per-character bounds checks.
+    if (gbk_utf8_scan(utf8_text) == nullptr) {
+        byte_vector out;
+        out.reserve(utf8_text.size());
+        gbk_byte_sink sink;
+        sink.out = &out;
+        std::size_t offset = 0;
+        std::size_t i = 0;
+        const std::size_t n = utf8_text.size();
+        while (i < n) {
+            const std::uint8_t c = static_cast<std::uint8_t>(utf8_text[i]);
+            if (c < 0x80u) {
+                sink.put(static_cast<char>(c));
+                ++i;
+                ++offset;
+                continue;
+            }
+            std::uint32_t code_point;
+            std::size_t width;
+            if (c < 0xE0u) {
+                code_point =
+                    (static_cast<std::uint32_t>(c & 0x1Fu) << 6) |
+                    (static_cast<std::uint8_t>(utf8_text[i + 1]) & 0x3Fu);
+                width = 2;
+            } else if (c < 0xF0u) {
+                code_point =
+                    (static_cast<std::uint32_t>(c & 0x0Fu) << 12) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(utf8_text[i + 1]) & 0x3Fu)
+                     << 6) |
+                    (static_cast<std::uint8_t>(utf8_text[i + 2]) & 0x3Fu);
+                width = 3;
+            } else {
+                code_point =
+                    (static_cast<std::uint32_t>(c & 0x07u) << 18) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(utf8_text[i + 1]) & 0x3Fu)
+                     << 12) |
+                    (static_cast<std::uint32_t>(
+                         static_cast<std::uint8_t>(utf8_text[i + 2]) & 0x3Fu)
+                     << 6) |
+                    (static_cast<std::uint8_t>(utf8_text[i + 3]) & 0x3Fu);
+                width = 4;
+            }
+            if (code_point > 0xFFFFu) {
+                // GBK covers the BMP only, so the direct-index key would
+                // overflow.
+                return encode_error("gbk: code point above U+FFFF", offset);
+            }
+            const std::uint32_t code = kGbkEncodeDirect[code_point];
+            if (code == 0) {
+                return encode_error("gbk: no mapping for code point", offset);
+            }
+            if (code <= 0xFFu) {
+                sink.put(static_cast<char>(code));
+            } else {
+                sink.put2(static_cast<char>(code >> 8),
+                          static_cast<char>(code & 0xFFu));
+            }
+            i += width;
+            offset += width;
+        }
+        sink.flush();
+        return out;
+    }
+    // Cold path (malformed UTF-8, or a scanner false alarm): the authoritative
+    // decoder produces the error, so text and offset are unchanged from the
+    // original implementation.
     const auto points = utf8_to_code_points(utf8_text);
     if (!points.ok()) {
         return points.error();

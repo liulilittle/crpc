@@ -356,6 +356,59 @@ CRPC_TEST(log_throughput_floor) {
     CRPC_CHECK_EQ(static_cast<std::uint64_t>(calls), written + dropped);
 }
 
+// --- Contract-violation guard ------------------------------------------------
+//
+// reset() forbids other threads logging while it runs (see log.hpp). If a
+// thread violates that, the generational guard must turn the dangling cache
+// into a counted drop instead of a use-after-free: the first post-reset submit
+// from a thread that cached its ring before the reset is dropped and counted
+// (exactly one -- the cache invalidates itself), and the following submit
+// re-registers. Every assertion here reads a counter, so the case fails
+// deterministically when the guard is removed -- not only under ASan.
+
+CRPC_TEST(log_reset_violation_drops_instead_of_crashing) {
+    obs::logger& log = obs::logger::instance();
+    log.shutdown();
+    log.reset();
+    log.configure(make_config(1024));
+    log.start();
+    log.set_level(obs::log_level::trace);
+
+    std::atomic<bool> registered{false};
+    std::atomic<bool> release{false};
+    std::thread violator([&] {
+        CRPC_LOG_INFO("violation warm-up {}", 0);  // registers this thread's ring
+        registered.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        // The main thread reset the logger while this thread's cache was
+        // live: the first submit must drop + count (never dereference), the
+        // second re-registers and must not crash.
+        CRPC_LOG_INFO("violation stale submit {}", 1);
+        CRPC_LOG_INFO("violation re-registered submit {}", 2);
+    });
+    while (!registered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    log.reset();  // the documented violation: another thread is still logging
+    release.store(true, std::memory_order_release);
+    violator.join();
+
+    // Exactly the stale submit was dropped by the guard; the re-registered
+    // submit landed in the fresh ring.
+    CRPC_CHECK_EQ(std::uint64_t{1}, log.stale_dropped());
+
+    // Conservation across the violation: of the two post-reset submits, one
+    // was dropped by the guard and one was accepted (drained by the
+    // synchronous shutdown below).
+    log.configure(make_config(1024));  // ensure shutdown drains without a file
+    log.shutdown();
+    const std::uint64_t written_total = log.written_records();
+    log.reset();
+    CRPC_CHECK_EQ(std::uint64_t{1}, written_total);
+}
+
 // --- Drop accounting ---------------------------------------------------------
 
 CRPC_TEST(log_drop_counter_is_exact_when_sink_is_stopped) {

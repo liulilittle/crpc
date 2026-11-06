@@ -424,14 +424,27 @@ public:
     //
     // Stronger form of that contract: no thread may be INSIDE submit() while
     // reset() runs. reset() clears the shared ring table and the *calling
-    // thread's* cached ring pointer only; any other thread that is between
-    // `current_ring()` and `push()` keeps a raw pointer to a destroyed ring.
-    // That dangling `thread_local` cache does not self-heal: the violating
-    // thread will keep pushing into freed memory until it exits (its TLS slot
-    // dies with it), or until it observes a reset() from its own thread. If
-    // threads must keep logging across a reset, stop them, reset, and let
-    // their next submit() re-register.
+    // thread's* cached ring pointer only.
+    //
+    // Guard: every reset() bumps a global generation counter and every cached
+    // ring pointer carries the generation it was registered under. A thread
+    // whose cache went stale (reset() ran on another thread while it kept
+    // logging) detects the mismatch on its next submit(), drops that record,
+    // counts it (see stale_dropped(), also folded into dropped_total()) and
+    // never dereferences the dangling pointer; its following submit()
+    // re-registers a fresh ring. That turns the contract violation from a
+    // use-after-free into an observable, bounded loss. The microscopic window
+    // where reset() races the one submit() that already validated its cache
+    // remains the caller's responsibility -- the guard bounds the violation,
+    // it does not license it.
     void reset();
+
+    // Records dropped because the submitting thread's cached ring was stale
+    // (a reset() ran on another thread against the documented contract). Zero
+    // on every contract-compliant run; also included in dropped_total().
+    [[nodiscard]] std::uint64_t stale_dropped() const noexcept {
+        return stale_drops_.load(std::memory_order_relaxed);
+    }
 
     [[nodiscard]] bool running() const noexcept { return running_.load(std::memory_order_acquire); }
 
@@ -477,7 +490,6 @@ private:
     logger() noexcept;
     ~logger();
 
-    [[nodiscard]] log_ring* current_ring() noexcept;
     [[nodiscard]] log_ring* register_ring() noexcept;
 
     void sink_loop() noexcept;
@@ -504,6 +516,10 @@ private:
     std::vector<std::unique_ptr<log_ring>> rings_;
     std::atomic<std::uint64_t> allocation_drops_{0};
     std::atomic<std::uint64_t> written_{0};
+    // Bumped by reset(); cached ring pointers are validated against it on the
+    // hot path so a stale cache is detected without dereferencing the ring.
+    std::atomic<std::uint64_t> generation_{0};
+    std::atomic<std::uint64_t> stale_drops_{0};
 
     std::atomic<redact_fn> redactor_{nullptr};
     std::atomic<void*> redactor_user_{nullptr};
