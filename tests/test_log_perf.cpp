@@ -27,10 +27,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <string>
 #include <vector>
@@ -473,6 +476,269 @@ CRPC_TEST(log_enabled_check_is_cheap) {
     CRPC_CHECK_EQ(std::size_t{0}, after - before);
     CRPC_CHECK(ns_per_call < kMaxAbsoluteNsPerCall / 10.0);
     stop_logger();
+}
+
+// --- %.6g double formatter: differential contract -----------------------------
+//
+// The hot path formats double fields with detail::format_double_g6 instead of
+// snprintf. The replacement is only sound if its output is byte-identical to
+// snprintf("%.6g") for every double, so the contract is pinned here against
+// the CRT itself: one explicit boundary table (the values where %.6g semantics
+// is sharpest) plus a fuzz pool over 1e6 doubles. The pools mix uniform bit
+// patterns, dense normal-space sampling, exact/near decimal ties, carry-chain
+// structures (999999.5-style), ulp walks around the f/e switch anchors,
+// subnormals and the exponent extremes. Deterministic seeds: a failure must
+// reproduce, not flicker.
+
+namespace {
+
+void g6_check(double value, std::size_t* checked, std::size_t* failed) {
+    char reference[64];
+    const int written = std::snprintf(reference, sizeof(reference), "%.6g", value);
+    char actual[40];
+    const std::size_t count = obs::detail::format_double_g6(actual, sizeof(actual), value);
+    ++*checked;
+    const bool ok = written > 0 && count == static_cast<std::size_t>(written) &&
+                    std::memcmp(actual, reference, count) == 0;
+    if (!ok) {
+        ++*failed;
+        if (*failed <= 8) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            std::printf("  G6 MISMATCH bits=%016llx value=%.17e snprintf=[%s] formatter=[%s]\n",
+                        static_cast<unsigned long long>(bits), value, reference, actual);
+        }
+    }
+}
+
+double g6_from_bits(std::uint64_t bits) {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+double g6_next_ulp(double value, int steps) {
+    const double huge = 1e308 * 10.0;
+    for (int i = 0; i < (steps < 0 ? -steps : steps); ++i) {
+        value = steps < 0 ? std::nextafter(value, 0.0) : std::nextafter(value, huge);
+        if (!std::isfinite(value)) {
+            break;
+        }
+    }
+    return value;
+}
+
+struct g6_rng {
+    std::uint64_t state;
+    std::uint64_t next() {
+        std::uint64_t x = state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state = x;
+        return x * 0x9E3779B97F4A7C15ull;
+    }
+    double bit_pattern() { return g6_from_bits(next()); }
+    std::uint64_t below(std::uint64_t bound) { return next() % bound; }
+};
+
+// Deterministic boundary anchors for the ulp-walk pool: every value where the
+// %.6g semantics is known to be knife-edged (f/e switch, carry chains, exact
+// powers of ten, tie forms, exponent extremes).
+const double* g6_anchor_values(std::size_t* count) {
+    static const double anchors[] = {
+        0.5,           1.0,          1.5,               0.1,               0.2,
+        1.0 / 3.0,     2.0 / 3.0,    1e-5,              9.999995e-5,       1e-4,
+        1e-6,          1e-7,         1e5,               100000.5,          100001.5,
+        123456.5,      123457.5,     999999.0,          999999.5,          1e6,
+        1.0000005e6,   1000005.0,    1500005.0,         5000005.0,         1234567.0,
+        1e7,           1e22,         1e23,              1e-22,             1e-23,
+        1e-308,        1e308,        DBL_MIN,           DBL_MAX,           DBL_TRUE_MIN,
+        385.0 / 64.0,  120000.0,     1.2e-7,            0.000123456789,    0.0};
+    *count = sizeof(anchors) / sizeof(anchors[0]);
+    return anchors;
+}
+
+} // namespace
+
+CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
+    std::size_t checked = 0;
+    std::size_t failed = 0;
+
+    // The task's explicit boundary list, both signs where meaningful.
+    const double boundaries[] = {
+        0.0,          -0.0,          1.0,          -1.0,          1e-5,
+        -1e-5,        9.999995e-5,   -9.999995e-5, 1e-6,          -1e-6,
+        999999.5,     -999999.5,     1e6,          -1e6,          1.0000005e6,
+        -1.0000005e6, DBL_MIN,       -DBL_MIN,     DBL_MAX,       -DBL_MAX,
+        DBL_TRUE_MIN, -DBL_TRUE_MIN, 1e-308,       -1e-308,       1e308,
+        -1e308,       1.0 / 3.0,     -1.0 / 3.0};
+    for (const double value : boundaries) {
+        g6_check(value, &checked, &failed);
+    }
+
+    // infinities as explicit bit patterns (a literal 1.0/0.0 is a compile-time
+    // divide-by-zero under /W4).
+    g6_check(g6_from_bits(0x7FF0000000000000ull), &checked, &failed);
+    g6_check(g6_from_bits(0xFFF0000000000000ull), &checked, &failed);
+
+    // NaN payloads: the CRT spelling depends on payload and sign, so every
+    // form must round-trip through the same fallback as the real formatter.
+    const std::uint64_t nan_patterns[] = {0x7ff8000000000000ull, 0xfff8000000000000ull,
+                                          0x7ff0000000000001ull, 0xfff0000000000001ull,
+                                          0x7ff8deadbeef0000ull, 0xfff8deadbeef0000ull,
+                                          0x7ff4000000000000ull};
+    for (const std::uint64_t bits : nan_patterns) {
+        g6_check(g6_from_bits(bits), &checked, &failed);
+    }
+
+    // Tie forms (exact .5 at the 7th significant digit): half-even on the CRT
+    // side, the formatter must agree byte-for-byte.
+    const double ties[] = {123456.5,  123457.5, 100000.5, 100001.5, 385.0 / 64.0,
+                           5000005.0, 1500005.0, 999999.5, -999999.5, 12.5,
+                           0.5,       1.5,      2.5,      3.5,      4.5};
+    for (const double value : ties) {
+        g6_check(value, &checked, &failed);
+    }
+
+    // f/e switch right at the carry edge, both directions of the 7th digit.
+    const double switches[] = {9.999995e-5,       9.99999999e-5,      0.0001,            0.000123456789,
+                               999999.0,          999999.99999999988, 99999.99999999999, 100000.0,
+                               999999.49999999,   1000000.49999,      123456.499999999985, 120000.0,
+                               1.2e-7,            1.0 / 3.0,          2.0 / 3.0,         1e23};
+    for (const double value : switches) {
+        g6_check(value, &checked, &failed);
+    }
+
+    // Exact powers of ten across the whole exponent range: these are the
+    // k-estimation edge cases (the fast path's decade classification is
+    // computed from the binary exponent, and exact decades sit on the edge).
+    for (int j = -22; j <= 22; ++j) {
+        const double power = std::pow(10.0, static_cast<double>(j));
+        g6_check(power, &checked, &failed);
+        g6_check(-power, &checked, &failed);
+        g6_check(g6_next_ulp(power, -1), &checked, &failed);
+        g6_check(g6_next_ulp(power, 1), &checked, &failed);
+        g6_check(g6_next_ulp(power, -2), &checked, &failed);
+        g6_check(g6_next_ulp(power, 2), &checked, &failed);
+    }
+
+    // End-to-end through log_buffer: the append_float integration must hold
+    // the same byte-identity (this is the call the logger actually makes).
+    const double through_buffer[] = {3.14159265358979, 2.718281828459045, 0.0, -0.0,
+                                     1e-5, 999999.5, 1e6, DBL_MIN, DBL_MAX, 1.0 / 3.0};
+    for (const double value : through_buffer) {
+        char reference[64];
+        std::snprintf(reference, sizeof(reference), "%.6g", value);
+        char buffer[64];
+        obs::log_buffer out(buffer, sizeof(buffer));
+        out.append_float(value);
+        const std::size_t count = out.size();
+        ++checked;
+        if (count != std::strlen(reference) || std::memcmp(buffer, reference, count) != 0) {
+            ++failed;
+            std::printf("  G6 BUFFER MISMATCH value=%.17e snprintf=[%s] buffer=[%.*s]\n", value,
+                        reference, static_cast<int>(count), buffer);
+        }
+    }
+
+    std::printf("g6 boundary differential: %zu checked, %zu failures\n", checked, failed);
+    CRPC_CHECK_EQ(std::size_t{0}, failed);
+}
+
+CRPC_TEST(log_double_formatter_matches_snprintf_fuzz_over_1m) {
+    std::size_t checked = 0;
+    std::size_t failed = 0;
+    g6_rng rng{0x0B5EEDC0FFEEULL};
+
+    // Pool A: uniform bit patterns (includes non-finites and subnormals at
+    // their natural frequency -- every pool entry is checked either way).
+    for (std::size_t i = 0; i < 400000; ++i) {
+        g6_check(rng.bit_pattern(), &checked, &failed);
+    }
+
+    // Pool B: dense normal-space sampling (random exponent field, random
+    // mantissa), sign toggled per value.
+    for (std::size_t i = 0; i < 150000; ++i) {
+        const std::uint64_t exponent = static_cast<std::uint64_t>(rng.below(2046)) + 1;
+        const std::uint64_t bits =
+            (exponent << 52) | (rng.next() & 0xFFFFFFFFFFFFFull) | ((rng.next() & 1) << 63);
+        g6_check(g6_from_bits(bits), &checked, &failed);
+    }
+
+    // Pool C: decimal structures -- N, N.5 and 7-digit forms scaled by exact
+    // decades. These are the carry-chain shapes (999999.5 * 10^j families)
+    // where %.6g switches between %f and %e or gains a digit.
+    for (std::size_t i = 0; i < 150000; ++i) {
+        const int j = static_cast<int>(rng.below(31)) - 15;
+        const std::uint64_t shape = rng.below(4);
+        const std::uint64_t n = 1 + rng.below(2000000);
+        double value;
+        switch (shape) {
+        case 0:
+            value = static_cast<double>(n);
+            break;
+        case 1:
+            value = static_cast<double>(n) + 0.5;
+            break;
+        case 2:
+            value = static_cast<double>(n * 10 + 5);
+            break;
+        default:
+            value = static_cast<double>(n) / 2.0;
+            break;
+        }
+        const double scaled = value * std::pow(10.0, static_cast<double>(j));
+        g6_check(rng.next() & 1 ? scaled : -scaled, &checked, &failed);
+    }
+
+    // Pool D: ulp walks around the anchors (both directions, 1..64 ulps),
+    // which sweeps the rounding-boundary neighborhoods hard enough to catch an
+    // off-by-one-ulp digit decision.
+    std::size_t anchor_count = 0;
+    const double* anchors = g6_anchor_values(&anchor_count);
+    for (std::size_t i = 0; i < 100000; ++i) {
+        const double anchor = anchors[rng.below(anchor_count)];
+        const int direction = (rng.next() & 1) ? 1 : -1;
+        const int steps = 1 + static_cast<int>(rng.below(64));
+        g6_check(g6_next_ulp(anchor, direction * steps), &checked, &failed);
+    }
+
+    // Pool E: subnormal sweep -- dense sampling of the first 2^52 bit
+    // patterns (every subnormal), plus the DBL_MIN boundary from both sides.
+    for (std::size_t i = 0; i < 100000; ++i) {
+        g6_check(g6_from_bits(rng.below(0x10000000000000ull)), &checked, &failed);
+    }
+    for (std::uint64_t bits = 0x000FFFFFFFFFFFF0ull; bits <= 0x001000000000000Full; ++bits) {
+        g6_check(g6_from_bits(bits), &checked, &failed);
+        g6_check(g6_from_bits(bits | 0x8000000000000000ull), &checked, &failed);
+    }
+
+    // Pool F: exponent extremes -- DBL_MAX, DBL_MIN and denorm_min
+    // neighborhoods, both signs (the decade estimate and the band loop are
+    // most stressed here).
+    for (std::size_t i = 0; i < 50000; ++i) {
+        const std::uint64_t sign = (rng.next() & 1) << 63;
+        g6_check(g6_from_bits((0x7FEFFFFFFFFFFFFFull - rng.below(4096)) | sign), &checked,
+                 &failed);
+        g6_check(g6_from_bits((0x0010000000000000ull + rng.below(4096)) | sign), &checked,
+                 &failed);
+        g6_check(g6_from_bits((0x0000000000000001ull + rng.below(4096)) | sign), &checked,
+                 &failed);
+    }
+
+    // Pool G: exact binary fractions i/2^j -- long finite decimal expansions
+    // whose digits past the 6th are exercised deterministically.
+    for (std::size_t i = 0; i < 100000; ++i) {
+        const int j = static_cast<int>(rng.below(60));
+        const double value =
+            static_cast<double>(rng.below(1000000000000ull)) / std::pow(2.0, static_cast<double>(j));
+        g6_check(rng.next() & 1 ? value : -value, &checked, &failed);
+    }
+
+    std::printf("g6 fuzz differential: %zu checked, %zu failures\n", checked, failed);
+    CRPC_CHECK(checked >= 1000000);
+    CRPC_CHECK_EQ(std::size_t{0}, failed);
 }
 
 CRPC_TEST_MAIN()

@@ -80,6 +80,260 @@ constexpr bool compile_enabled(int level_number) noexcept {
            compile_max_level() <= level_number;
 }
 
+// --- %.6g double formatter ---------------------------------------------------
+//
+// Contract: byte-identical to snprintf("%.6g", value) for every double on this
+// platform. The differential suite in test_log_perf.cpp pins the contract
+// against the CRT itself (explicit boundary table + >=1e6 fuzzed doubles), so
+// any deviation is a test failure, not a silent output change.
+//
+// Algorithm (self-written; no third-party code): fixed-precision decimal
+// generation in the spirit of Dragon4 (Steele & White, "How to Print
+// Floating-Point Numbers Accurately", PLDI 1990, fixed-precision mode) with a
+// Grisu-style fast/slow split (Loitsch 2010's uncertainty-window idea):
+//
+//   1. The exact value is |v| = m * 2^e with m a 53-bit integer. Writing
+//      log10|v| = (e+52)*log10(2) + log10(mu) with mu in [1,2) (normals), the
+//      decade k = floor(log10|v|) is estimated from the first term alone; the
+//      estimate errs by at most one decade for normals and at most ~16 for
+//      subnormals, and a bounded correction loop (multiplying/dividing x by
+//      exactly 10) puts x = |v| * 10^(5-k) into [1e5, 1e6).
+//   2. x is computed in double arithmetic from a split power-of-ten table;
+//      the accumulated float error stays below ~1e-14 relative (< 1e-8
+//      absolute on x in [1e5, 1e6)). The 7th-digit remainder frac(x)
+//      therefore decides the rounding exactly whenever it is farther than
+//      1e-6 from {0, 1/2, 1} -- which is to say, whenever snprintf's own
+//      decimal rounding is not at (or within a hair of) a round-half-even
+//      tie.
+//   3. Every input the estimate cannot decide -- exact/near ties, carries
+//      within the window of an integer, non-finite spellings (the CRT prints
+//      "nan", "-nan(ind)" and "nan(snan)" depending on payload and sign) --
+//      is dispatched back to snprintf. The window makes byte-identity total
+//      by construction; it costs one CRT call for ~4e-6 of random doubles.
+//
+// The %f/%e selection uses the exponent AFTER rounding (C %g rule: X in
+// [-4, P-1] selects %f; 999999.5 -> 1e+06, 9.999995e-5 -> 0.0001). The
+// platform probe (.opencode/tmp/opt-float/probe_snprintf.cpp) pins the
+// remaining syntax: at least two exponent digits ("1e-05", "1e+06", three
+// from |X| >= 100), trailing fractional zeros trimmed, "-0" for negative
+// zero.
+
+// 10^i for i in [-165, 165], split as 10^(16h) * 10^j so that no table entry
+// accumulates more than ~12 roundings (~1.3e-15 relative) and every factor
+// used below stays inside the normal double range.
+struct g6_pow10_table {
+    double value[331];
+};
+
+constexpr int g6_pow10_bias = 165;
+
+constexpr g6_pow10_table make_g6_pow10_table() {
+    g6_pow10_table table{};
+    double smalls[16] = {};
+    smalls[0] = 1.0;
+    for (int j = 1; j < 16; ++j) {
+        smalls[j] = smalls[j - 1] * 10.0;  // 10^j <= 1e15: exact
+    }
+    double bigs[11] = {};
+    bigs[0] = 1.0;
+    for (int h = 1; h <= 10; ++h) {
+        bigs[h] = bigs[h - 1] * 1e16;  // 1e16 is exact; <= 10 roundings total
+    }
+    for (int i = 0; i <= 165; ++i) {
+        table.value[g6_pow10_bias + i] = bigs[i / 16] * smalls[i % 16];
+    }
+    for (int i = 1; i <= 165; ++i) {
+        table.value[g6_pow10_bias - i] = 1.0 / table.value[g6_pow10_bias + i];
+    }
+    return table;
+}
+
+inline constexpr g6_pow10_table g_pow10_g6 = make_g6_pow10_table();
+
+// Emits `value` zero-padded on the left to exactly `width` digits when width
+// exceeds the digit count; `trim` drops TRAILING zeros of the emitted string
+// (the C %g rule trims the fractional part). Returns the character count.
+inline std::size_t g6_emit_u32(char* out, std::uint32_t value, int width, bool trim) noexcept {
+    char reversed[10] = {};
+    std::size_t count = 0;
+    do {
+        reversed[count++] = static_cast<char>('0' + value % 10u);
+        value /= 10u;
+    } while (value != 0);
+    while (count < static_cast<std::size_t>(width)) {
+        reversed[count++] = '0';  // padding lands on the high-order side
+    }
+    std::size_t low = 0;
+    if (trim) {
+        // Trailing zeros of the final big-endian string are the FRONT
+        // elements of this little-endian buffer; the zero padding sits on the
+        // other side and survives the trim.
+        while (low < count && reversed[low] == '0') {
+            ++low;
+        }
+    }
+    std::size_t written = 0;
+    for (std::size_t i = count; i > low; --i) {
+        out[written++] = reversed[i - 1];
+    }
+    return written;
+}
+
+inline std::size_t g6_snprintf_fallback(char* out, std::size_t capacity, double value) noexcept {
+    const int written = std::snprintf(out, capacity, "%.6g", value);
+    if (written <= 0) {
+        return 0;
+    }
+    return static_cast<std::size_t>(written) < capacity ? static_cast<std::size_t>(written)
+                                                        : capacity - 1;
+}
+
+inline std::size_t format_double_g6(char* out, std::size_t capacity, double value) noexcept {
+    if (capacity == 0) {
+        return 0;
+    }
+
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint64_t magnitude_bits = bits & 0x7FFFFFFFFFFFFFFFull;
+
+    // Zero and non-finite inputs: "-0"/"0" and the payload-dependent NaN
+    // spellings are handed to the CRT; neither class is hot.
+    if (magnitude_bits == 0 || magnitude_bits >= 0x7FF0000000000000ull) {
+        return g6_snprintf_fallback(out, capacity, value);
+    }
+
+    const int biased = static_cast<int>(magnitude_bits >> 52);
+    std::uint64_t mantissa = magnitude_bits & 0x000FFFFFFFFFFFFFull;
+    int binary_exponent;
+    if (biased == 0) {
+        binary_exponent = -1074;  // subnormal: |v| = mantissa * 2^-1074
+    } else {
+        mantissa |= 0x0010000000000000ull;
+        binary_exponent = biased - 1075;  // normal: |v| = mantissa * 2^e
+    }
+
+    // Decade estimate: floor((e+52)*log10(2)). Normals land in {k-1, k};
+    // subnormals in [k, k+16]. The correction loop fixes either direction.
+    const double decade_estimate =
+        static_cast<double>(binary_exponent + 52) * 0.3010299956639812;
+    int decade = static_cast<int>(decade_estimate);
+    if (decade_estimate < 0.0 && static_cast<double>(decade) != decade_estimate) {
+        --decade;  // floor, not truncation, for negative estimates
+    }
+
+    // x = |v| * 10^(5-decade), aimed at [1e5, 1e6). The power of ten is split
+    // into two table factors; every intermediate product stays within the
+    // normal double range for every reachable decade.
+    const int e10 = 5 - decade;
+    const int half_a = e10 >= 0 ? e10 / 2 : -((-e10) / 2);
+    const int half_b = e10 - half_a;
+    double magnitude;
+    std::memcpy(&magnitude, &magnitude_bits, sizeof(magnitude));
+    double x = magnitude * g_pow10_g6.value[g6_pow10_bias + half_a] *
+               g_pow10_g6.value[g6_pow10_bias + half_b];
+
+    // Band correction by exact factors of ten (<= ~19 steps by construction;
+    // the guard is a proof-backed safety net that falls back, never guesses).
+    for (int guard = 0; guard < 40; ++guard) {
+        if (x >= 1e6) {
+            x /= 10.0;
+            ++decade;
+        } else if (x < 1e5) {
+            x *= 10.0;
+            --decade;
+        } else {
+            break;
+        }
+    }
+    if (!(x >= 1e5) || !(x < 1e6)) {
+        return g6_snprintf_fallback(out, capacity, value);
+    }
+
+    const std::uint32_t integral = static_cast<std::uint32_t>(x);
+    const double remainder = x - static_cast<double>(integral);  // exact (Sterbenz)
+
+    // Rounding window: within 1e-6 of {0, 1/2, 1} the estimate (error < 1e-8)
+    // cannot decide the 7th-digit rounding; dispatch to the CRT.
+    constexpr double g6_window = 1e-6;
+    if (remainder < g6_window || 1.0 - remainder < g6_window ||
+        (remainder > 0.5 - g6_window && remainder < 0.5 + g6_window)) {
+        return g6_snprintf_fallback(out, capacity, value);
+    }
+
+    const std::uint32_t rounded = integral + (remainder > 0.5 ? 1u : 0u);
+    // A carry out of the 6th digit bumps the exponent (999999.5 -> 1e+06).
+    std::uint32_t digits;
+    int decimal_exponent;
+    if (rounded == 1000000u) {
+        digits = 100000u;
+        decimal_exponent = decade + 1;
+    } else {
+        digits = rounded;
+        decimal_exponent = decade;
+    }
+
+    char text[32];
+    std::size_t length = 0;
+    if ((bits >> 63) != 0) {
+        text[length++] = '-';
+    }
+
+    if (decimal_exponent >= -4 && decimal_exponent <= 5) {
+        // %f style: -4 <= X_after <= 5.
+        if (decimal_exponent == 5) {
+            length += g6_emit_u32(text + length, digits, 6, false);
+        } else if (decimal_exponent >= 0) {
+            static const std::uint32_t g6_scales[6] = {1u, 10u, 100u, 1000u, 10000u, 100000u};
+            const int fraction_length = 5 - decimal_exponent;
+            const std::uint32_t whole = digits / g6_scales[fraction_length];
+            const std::uint32_t fraction = digits % g6_scales[fraction_length];
+            length += g6_emit_u32(text + length, whole, 0, false);
+            if (fraction != 0) {
+                text[length++] = '.';
+                length += g6_emit_u32(text + length, fraction, fraction_length, true);
+            }
+        } else {
+            text[length++] = '0';
+            text[length++] = '.';
+            for (int i = 0; i < -1 - decimal_exponent; ++i) {
+                text[length++] = '0';
+            }
+            length += g6_emit_u32(text + length, digits, 6, true);
+        }
+    } else {
+        // %e style: d.ddddd e±XX (two exponent digits minimum, three from 100).
+        const std::uint32_t leading = digits / 100000u;
+        const std::uint32_t tail = digits % 100000u;
+        length += g6_emit_u32(text + length, leading, 0, false);
+        if (tail != 0) {
+            text[length++] = '.';
+            length += g6_emit_u32(text + length, tail, 5, true);
+        }
+        text[length++] = 'e';
+        int exponent = decimal_exponent;
+        if (exponent < 0) {
+            text[length++] = '-';
+            exponent = -exponent;
+        } else {
+            text[length++] = '+';
+        }
+        if (exponent >= 100) {
+            text[length++] = static_cast<char>('0' + exponent / 100);
+            text[length++] = static_cast<char>('0' + (exponent / 10) % 10);
+            text[length++] = static_cast<char>('0' + exponent % 10);
+        } else {
+            text[length++] = static_cast<char>('0' + exponent / 10);
+            text[length++] = static_cast<char>('0' + exponent % 10);
+        }
+    }
+
+    const std::size_t count = length < capacity ? length : capacity - 1;
+    std::memcpy(out, text, count);
+    out[count] = '\0';
+    return count;
+}
+
 } // namespace detail
 
 [[nodiscard]] inline const char* to_string(log_level level) noexcept {
@@ -162,15 +416,9 @@ public:
     }
 
     void append_float(double value) noexcept {
-        char text[64];
-        const int written = std::snprintf(text, sizeof(text), "%.6g", value);
-        if (written > 0) {
-            const std::size_t count =
-                static_cast<std::size_t>(written) < sizeof(text)
-                    ? static_cast<std::size_t>(written)
-                    : sizeof(text) - 1;
-            append(text, count);
-        }
+        char text[40];
+        const std::size_t count = detail::format_double_g6(text, sizeof(text), value);
+        append(text, count);
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }

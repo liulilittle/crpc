@@ -40,6 +40,7 @@
 #ifndef CRPC_ALGORITHM_SORT_HPP
 #define CRPC_ALGORITHM_SORT_HPP
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <functional>
