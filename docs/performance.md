@@ -289,15 +289,17 @@ Unreliable `ONE_WAY`, median delivered M calls/s (16 B; all drained, 0 errors):
 | 16 | 0.028 | 0.019 | 0.020 |
 | 64 | 0.025 | 0.018 | 0.019 |
 
-The reliable pipelined path is not usable at high batch x concurrency in this
-Debug build: the concurrent issue path and the in-process backend's synchronous
-completion path deadlock, so the watchdog kills the case and records the
-closed-loop fallback instead of a pipelined number. The ONE_WAY path does not
-deadlock (its issue path does not wait), so its pipelined numbers are complete.
-The deadlock is a library finding, not a benchmark artefact; a stack trace was captured
-with those measurements and recorded as a limitation in [distributed-testing.md §8](distributed-testing.md#s8).
-The hang is timing-dependent, so the exact set of hanging cases varies between
-runs; the fallback is always recorded explicitly.
+The reliable table above is a historical run from 2026-10-26, taken before the
+pipelined deadlock was removed. A `hang` cell is the closed-loop fallback the
+watchdog recorded when the completion path and the handle-destruction path took
+`completion_mutex_` and `map_mutex_` in opposite orders (an ABBA). The deadlock
+was a library defect, not a benchmark artefact: one lock order now applies
+everywhere, and `tests/test_pipeline_deadlock.cpp` guards the high-batch
+shapes with a watchdog (exit 42 on a hang). The suite is 2 cases / 6 checks /
+0 failures on this tree, so the reliable path no longer hangs. A stack trace
+from that run was captured and the limitation was recorded in
+[distributed-testing.md §8](distributed-testing.md#s8). The `ONE_WAY` path
+never waited on completion, so its pipelined numbers are unaffected.
 
 **Redis client (isolated layers).** The pool case uses a null transport; the
 pipeline case uses a wire-shaped executor (RESP encode + parse), so neither

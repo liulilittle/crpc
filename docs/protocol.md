@@ -97,9 +97,9 @@ The frame codec validates the header and the scope of every type. It does not pa
 | 2 | `0x04` | `CRC32C` | `ext` carries CRC32C of the payload |
 | 3 | `0x08` | `ORDERED` | 16-byte lane extension follows the header |
 | 4 | `0x10` | `UNRELIABLE` | best-effort delivery; no retransmission |
-| 5–7 | `0xE0` | `ALGO` | 0 none, 1 lz4, 2 zstd, 3 gzip, 4–7 reserved |
+| 5–7 | `0xE0` | `ALGO` | 0 none, 1 lz4, 2 zstd, 3 gzip, 4 deflate, 5 lz77, 6 zip, 7 reserved |
 
-`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a non-zero `ALGO` (`1` lz4 is implemented; `2` zstd and `3` gzip are reserved and fail closed with `protocol_error` in this build; `4`-`7` are reserved); `ONE_WAY` requires `UNRELIABLE`. Frame-level compression is normative in section 24. A decoder that cannot decompress the advertised algorithm fails closed with `protocol_error`; it never delivers the compressed bytes as a payload. Compression is defined only for `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`; a `COMPRESSED` control frame is `protocol_error`. The header validator still accepts such a header (it checks flag consistency only) so the whole-frame paths can reject it with the payload in hand.
+`COMPRESSED = 0` requires `ALGO = 0`; `COMPRESSED = 1` requires a non-zero `ALGO` (`1` lz4, `3` gzip, `4` deflate, `5` lz77 and `6` zip are implemented; `2` zstd is reserved and fails closed with `protocol_error` in this build; `7` is reserved); `ONE_WAY` requires `UNRELIABLE`. Frame-level compression is normative in section 24. A decoder that cannot decompress the advertised algorithm fails closed with `protocol_error`; it never delivers the compressed bytes as a payload. Compression is defined only for `REQUEST`, `RESPONSE`, `DATA`, `ONE_WAY` and `PUSH`; a `COMPRESSED` control frame is `protocol_error`. The header validator still accepts such a header (it checks flag consistency only) so the whole-frame paths can reject it with the payload in hand.
 
 ## 6. Ordered extension <a id="s6"></a>
 

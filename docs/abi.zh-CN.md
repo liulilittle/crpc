@@ -322,6 +322,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::net::icmp_options`
 - `::crpc::net::icmp_ping_result`
 - `::crpc::net::icmp_ping_statistics`
+- `::crpc::net::ping_reply`
 - `::crpc::net::resolve_options`
 - `::crpc::net::retry_report`
 - `::crpc::obs::log_record`
@@ -367,6 +368,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::resilience::instance`
 - `::crpc::resilience::retry_policy`
 - `::crpc::resilience::smart_policy`
+- `::crpc::system::cpu_affinity`
 - `::crpc::system::cpu_info`
 - `::crpc::system::disk_info`
 - `::crpc::system::memory_info`

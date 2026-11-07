@@ -199,10 +199,11 @@ $env:CRPC_BENCH_RPC_CALLS = '200'
 .\crpc_bench_rpc_matrix.exe latency
 ```
 
-`pipeline` 过滤器运行流水线批次用例。每个用例在带 watchdog 超时的子进程中运行，因为
-Debug 构建下可靠流水线路径可能死锁；超时的用例会被杀掉，harness 为其记录闭环回退。
+`pipeline` 过滤器运行流水线批次用例。每个用例在带 watchdog 超时的子进程中运行，以便把
+挂起报告为被终止的用例而不是让整轮阻塞；超时的用例会被杀掉，harness 为其记录闭环回退。
 watchdog 在 Windows（`CreateProcess`）上实现；其他平台上流水线用例在进程内运行，超时
-不适用。
+不适用。促使 Debug 构建引入该 watchdog 的死锁已在 `59936b6` 中修复（见 §7）；watchdog
+保留为挂起探测器，`tests/test_pipeline_deadlock.cpp` 守护同一形状。
 
 每个用例先预热，多次运行取中位数；harness 同时打印编译器、构建类型与架构。基准不
 参与 CI 的通过/失败门禁。
@@ -276,10 +277,10 @@ Release 或生产容量。
 
 日志：`.opencode/tmp/distbench-redis.log`。
 
-### 6.6 流水线批次吞吐（Debug）
+### 6.6 流水线批次吞吐（Debug，2026-10-26 历史运行）
 
-可靠，中位数 ns/call（payload × batch × 并发；3 轮 × 10000 调用）。`hang` 表示流水线用例
-死锁，watchdog 记录了闭环回退：
+可靠，中位数 ns/call（payload × batch × 并发；3 轮 × 10000 调用）。该轮记录早于死锁修复；
+`hang` 表示流水线用例死锁，watchdog 记录了闭环回退：
 
 | Payload | batch | c=1 | c=2 | c=4 |
 |---|---:|---:|---:|---:|
@@ -299,7 +300,8 @@ Release 或生产容量。
 | 64 | 0.025 | 0.018 | 0.019 |
 
 日志：`.opencode/tmp/bench-pipeline-watchdog2.log`。挂起是时序相关的，因此挂起的用例集合在
-多次运行间会变化；回退总是被显式记录。
+多次运行间会变化；回退总是被显式记录。该死锁已在 `59936b6` 中移除（见 §7）；该表保留为
+修复前的记录。
 
 ## 7. 如何解读结果 <a id="s7"></a>
 
@@ -314,10 +316,13 @@ Release 或生产容量。
   是低延迟选择。
 - **Redis 数字是分层隔离的。** 连接池用例使用空传输，测的是池记账而非 Redis；
   pipeline 用例使用线缆形状的 executor，包含 RESP 编解码但不含服务器与网络。
-- **可靠流水线路径在 Debug 下死锁。** 并发发射路径与进程内后端的同步完成路径在客户端
-  完成锁上竞争，而服务端 handler 协程持有该锁，导致高 batch × 并发用例停止推进。
-  harness 用子进程 watchdog 运行每个流水线用例，超时时记录闭环回退；回退绝不被当作
-  流水线数字。`ONE_WAY` 路径不会死锁，因为其发射路径不等待。
+- **可靠流水线路径曾在 Debug 下死锁，该缺陷已修复。** 并发发射路径与进程内后端的同步
+  完成路径以相反顺序获取 `completion_mutex_` 与 `map_mutex_`（ABBA），导致高 batch ×
+  并发的用例可能停止推进。提交 `59936b6` 统一了加锁顺序（`completion_mutex_` 外层、
+  `map_mutex_` 内层），挂起已消失：`tests/test_pipeline_deadlock.cpp` 用无进展 watchdog
+  守护高 batch 形状（挂起时以退出码 42 结束），本树上 2 cases / 6 checks / 0 failures
+  通过。harness 仍为每个流水线用例运行带 watchdog 的子进程，但它是挂起探测器而不是已知
+  局限；闭环回退绝不被当作流水线数字。`ONE_WAY` 路径从不在完成上等待，因此不受影响。
 - **Debug 与 Release。** 不带构建类型的数字不可比较。记录表是 Debug；Release 结论
   必须在 Release 构建下重跑同一命令。
 
@@ -340,9 +345,12 @@ Release 或生产容量。
    与任何在途回调同步。该修复由 `tests/test_server_client.cpp` 中的
    `facade_handle_destroy_races_completion` 覆盖。闭环用例保留为可复现基线，流水线
    批次用例（§6.6）补充吞吐调用方使用的发射形状；两种选择都不改变库源码。
-4. **Debug 下可靠流水线路径在高 batch × 并发死锁。** 并发发射路径与进程内后端的同步
-   完成路径死锁（见 §7）；harness 用子进程 watchdog 检测并记录闭环回退。这是库的
-   发现，需父代理处理，不是基准假象；调用栈随该次测量一并留存。
+4. **可靠流水线死锁是历史记录，不是当前局限。** Debug 构建在高 batch × 并发下曾死锁：
+   并发发射路径与进程内后端的同步完成路径以相反顺序获取 `completion_mutex_` 与
+   `map_mutex_`（ABBA）。提交 `59936b6` 统一加锁顺序，移除了该死锁。
+   `tests/test_pipeline_deadlock.cpp` 用无进展 watchdog 守护该形状，本树上 2 cases /
+   6 checks / 0 failures 通过。§6.6 的基准表与日志中的 `hang` 单元格保留为修复前记录；
+   该次运行的调用栈随原始测量一并留存。
 5. **Debug 数字。** 尤其压缩编码吞吐不具代表性，见 §7。
 5. **`none` 解码不是解压。** 它的「解码吞吐」是 header 解析 + payload 借用，仅作
    基线。

@@ -76,7 +76,9 @@ export CRPC_COROCC_DIR=/path/to/corocc
 | `CRPC_RTTI_DIR` | 空 | RTTI 仓库根（环境回退） |
 | `CRPC_COROCC_DIR` | 空 | corocc 仓库根（环境回退） |
 
-`CRPC_WITH_OPENSSL` 会链接 `OpenSSL::SSL` 与 `OpenSSL::Crypto`，但尚无 TLS 源码消费该宏；HTTPS 属于**已设计，未实现**。启用该选项不应被理解为启用了 HTTPS。
+`CRPC_WITH_OPENSSL` 链接 `OpenSSL::SSL` 与 `OpenSSL::Crypto` 并定义 `CRPC_HAVE_OPENSSL`。TLS 装饰器实现在 `src/io/tls_openssl.cpp`，经 `include/crpc/io/tls.hpp` 与 `http_server::listen_tls` 暴露；公共头从不包含 OpenSSL 头。关闭该选项时，同一组入口返回 `tls_errc::ssl_not_available`，`test_tls` 打印其文档化的 skip 行。
+
+验证状态：guarded 分支已在 WSL + OpenSSL 3.0.13 与 Windows + OpenSSL 4.0.3（OpenSSL-Win64）下以 `CRPC_WITH_OPENSSL=ON` 构建并运行；两种配置的 `crpc_test_tls` 均为 8 cases / 80 assertions 全绿。该套件覆盖握手与 ALPN、验证失败、干净 EOF、背压与恢复、截断记录、会话恢复、证书重载以及成对的装饰器入口。Windows HTTPS 在该配置下已验证。
 
 ### 编译器特性要求
 

@@ -113,11 +113,12 @@ the option off, the same entry points return `tls_errc::ssl_not_available` and
 `test_tls` prints its documented skip line.
 
 Verification status: the guarded branch was built and run under WSL with
-OpenSSL 3.0.13 (8 cases / 80 assertions green, `CRPC_WITH_OPENSSL=ON`). On
-Windows only the unguarded build has been exercised: the OpenSSL branch has not
-been linked or run there, and the source records that it was code-reviewed
-rather than compiled in that environment. Treat Windows HTTPS as unverified.
-The source records the same limitation at `src/io/tls_openssl.cpp:9-11`.
+OpenSSL 3.0.13, and on Windows with `CRPC_WITH_OPENSSL=ON` against
+OpenSSL 4.0.3 (OpenSSL-Win64); `crpc_test_tls` is 8 cases / 80 assertions green
+in both configurations. The suite covers the handshake and ALPN, verification
+failure, clean EOF, backpressure and resume, truncated records, session
+resumption, certificate reload and the paired decorator entry points. Windows
+HTTPS is therefore verified for this configuration.
 
 ### Compiler feature requirements
 

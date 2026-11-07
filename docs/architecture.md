@@ -411,7 +411,8 @@ Per-lane byte quotas are kept in the same controller and released with the idemp
 | `numeric` | implemented | `test_numeric_bignum.cpp` |
 | `proactor` | implemented | `test_proactor.cpp` |
 | `reactor` | implemented | `test_reactor.cpp` |
-| `system` | implemented | `test_system_process.cpp`, `test_system_sysinfo.cpp` |
+| `concurrency` | implemented | `test_concurrency_volatile.cpp`; acquire/release publication of an ordinary payload through `volatile_read`/`volatile_write`, plus `full_fence`/`signal_fence` callability |
+| `system` | implemented | `test_system_process.cpp`, `test_system_sysinfo.cpp`, `test_system_cpu.cpp`; processor counts, thread affinity and thread priority |
 | `time` | implemented | `test_time_datetime.cpp`, `test_time_timezone.cpp`, `test_time_format.cpp` |
 | `domain` | implemented | `test_domain_ddd.cpp`, `test_domain_cqrs.cpp` |
 | `ftp` | implemented | `test_ftp_reply.cpp`, `test_ftp_client.cpp`, `test_ftp_server.cpp`; `test_ftp_it.cpp` needs a server |

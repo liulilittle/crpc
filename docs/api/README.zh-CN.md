@@ -170,6 +170,10 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 
 - [`async/executor.hpp`](../../include/crpc/async/executor.hpp)
 
+### `crpc/concurrency`
+
+- [`concurrency/volatile.hpp`](../../include/crpc/concurrency/volatile.hpp) — `volatile_read`、`volatile_write`、`full_fence`、`signal_fence`：对普通 1/2/4/8 字节值的 acquire/release 访问。
+
 ### `crpc/crypto`
 
 - [`crypto/base64.hpp`](../../include/crpc/crypto/base64.hpp)
@@ -312,6 +316,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`net/icmp.hpp`](../../include/crpc/net/icmp.hpp)
 - [`net/ip.hpp`](../../include/crpc/net/ip.hpp)
 - [`net/listener.hpp`](../../include/crpc/net/listener.hpp)
+- [`net/ping.hpp`](../../include/crpc/net/ping.hpp)
 - [`net/udp.hpp`](../../include/crpc/net/udp.hpp)
 
 ### `crpc/observability`
@@ -464,6 +469,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 
 ### `crpc/system`
 
+- [`system/cpu.hpp`](../../include/crpc/system/cpu.hpp) — `logical_processor_count`、`physical_processor_count`、`get/set_current_thread_affinity`、`get/set_current_thread_priority`：查询并控制调用线程的处理器放置与调度优先级。
 - [`system/process.hpp`](../../include/crpc/system/process.hpp) — `process::run/spawn`、`list_processes`、`query_process`：带 stdin/stdout/stderr 重定向的子进程。
 - [`system/sysinfo.hpp`](../../include/crpc/system/sysinfo.hpp) — `cpu()`、`memory()`、`disks()`、`hostname()`、`uptime_seconds()`。
 
@@ -473,6 +479,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`time/datetime.hpp`](../../include/crpc/time/datetime.hpp) — `date_time`：公历日历运算、闰年规则、RFC 3339。
 - [`time/format.hpp`](../../include/crpc/time/format.hpp) — `%Y %m %d %H %M %S %f %z` 格式化。
 - [`time/timezone.hpp`](../../include/crpc/time/timezone.hpp) — `timezone_at`、`local_timezone`、`list_timezones`：IANA tzdata，固定偏移回退。
+- [`time/clock.hpp`](../../include/crpc/time/clock.hpp) — `now_unix`、`utc_now`、`gmt_now`、`system_tick`、`process_tick`、`steady_now_ticks`、`steady_frequency`：墙钟与单调 tick 读数。
 
 ### `crpc/text` 新增
 

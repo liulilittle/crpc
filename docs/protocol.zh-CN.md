@@ -97,9 +97,9 @@ HTTP/2 是例外：它的头部和整数是大端。CRPC 二进制帧与 HTTP/2 
 | 2 | `0x04` | `CRC32C` | `ext` 携带负载的 CRC32C |
 | 3 | `0x08` | `ORDERED` | 头部之后跟 16 字节 lane 扩展 |
 | 4 | `0x10` | `UNRELIABLE` | 尽力投递；不重传 |
-| 5–7 | `0xE0` | `ALGO` | 0 none，1 lz4，2 zstd，3 gzip，4–7 保留 |
+| 5–7 | `0xE0` | `ALGO` | 0 none，1 lz4，2 zstd，3 gzip，4 deflate，5 lz77，6 zip，7 保留 |
 
-`COMPRESSED = 0` 要求 `ALGO = 0`；`COMPRESSED = 1` 要求非零 `ALGO`（`1` lz4 已实现；`2` zstd 与 `3` gzip 保留，本版本以 `protocol_error` 失败关闭；`4`-`7` 保留）；`ONE_WAY` 要求 `UNRELIABLE`。帧级压缩的规范见第 24 节。解码器无法解压所宣告的算法时必须 fail-closed 返回 `protocol_error`，绝不把压缩字节当作 payload 交付。压缩仅定义于 `REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH`；控制帧带 `COMPRESSED` 是 `protocol_error`。头部校验仍接受这样的帧头（只校验标志一致性），拒绝发生在整帧路径。
+`COMPRESSED = 0` 要求 `ALGO = 0`；`COMPRESSED = 1` 要求非零 `ALGO`（`1` lz4、`3` gzip、`4` deflate、`5` lz77 与 `6` zip 已实现；`2` zstd 保留，本版本以 `protocol_error` 失败关闭；`7` 保留）；`ONE_WAY` 要求 `UNRELIABLE`。帧级压缩的规范见第 24 节。解码器无法解压所宣告的算法时必须 fail-closed 返回 `protocol_error`，绝不把压缩字节当作 payload 交付。压缩仅定义于 `REQUEST`、`RESPONSE`、`DATA`、`ONE_WAY`、`PUSH`；控制帧带 `COMPRESSED` 是 `protocol_error`。头部校验仍接受这样的帧头（只校验标志一致性），拒绝发生在整帧路径。
 
 ## 6. 有序扩展 <a id="s6"></a>
 
@@ -244,7 +244,7 @@ decode: (u >> 1) ^ (~(u & 1) + 1)
 | 没有 `has_extensions` 却有扩展字段 | `protocol_error` |
 | 响应状态不是 0/1 | `protocol_error` |
 | `ONE_WAY` 没有 `UNRELIABLE` | `protocol_error` |
-| 不支持的 `ALGO`（zstd、本版本 gzip、保留值） | `protocol_error` |
+| 不支持的 `ALGO`（zstd、保留值 7） | `protocol_error` |
 | 压缩 payload 短于 5 字节 | `protocol_error` |
 | `uncompressed_len` 为零或大于 `max_frame` | `protocol_error` |
 | 码流畸形或解出长度不符 | `protocol_error` |

@@ -1,8 +1,13 @@
 // CRPC -- client channel implementation.
 #include <crpc/rpc/client.hpp>
 
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
 #include <crpc/endian.hpp>
@@ -25,6 +30,106 @@ u32 next_candidate(u32& counter) noexcept {
 u64 duration_ns_since_epoch(std::chrono::steady_clock::time_point point) noexcept {
     return static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count());
+}
+
+// --- Public PING probes ------------------------------------------------------
+//
+// `client::ping()` is the public counterpart of the flow-control probe. Both
+// use the same wire frame (PING with an 8-byte payload, answered by a PONG that
+// echoes it), so the reply has to be told apart by the token itself. A public
+// token sets bit 63; a flow token is a steady-clock send timestamp, which
+// cannot reach 2^63 ns (292 years of uptime) on the clocks `client_options`
+// accepts. handle_pong routes a marked token here and leaves the flow path
+// exactly as it was.
+constexpr u64 k_public_ping_token_bit = u64{1} << 63;
+
+struct public_ping_waiter {
+    // The connection the probe was sent on. A PONG arriving on a different
+    // client must not complete it: two connections in one process share the
+    // token space, and only the connection whose writer staged the frame can
+    // legitimately see its echo.
+    const client* owner = nullptr;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool replied = false;
+    std::chrono::nanoseconds rtt{0};
+    std::chrono::steady_clock::time_point sent_at{};
+};
+
+struct public_ping_registry {
+    std::mutex mutex;
+    std::unordered_map<u64, std::shared_ptr<public_ping_waiter>> waiters;
+};
+
+// Kept out of `rpc::client` on purpose: the class layout is ABI-pinned
+// (docs/abi.md §4), and a probe that does not use flow control must not force
+// a member on every connection. A token is unique per process, so the registry
+// needs no client key.
+public_ping_registry& public_pings() {
+    static public_ping_registry registry;
+    return registry;
+}
+
+u64 next_public_ping_token() noexcept {
+    static std::atomic<u64> counter{0};
+    const u64 sequence = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    return k_public_ping_token_bit | (sequence & ~k_public_ping_token_bit);
+}
+
+std::shared_ptr<public_ping_waiter> register_public_ping(const client* owner,
+                                                         u64 token) {
+    auto waiter = std::make_shared<public_ping_waiter>();
+    waiter->owner = owner;
+    std::lock_guard<std::mutex> lock(public_pings().mutex);
+    public_pings().waiters.emplace(token, waiter);
+    return waiter;
+}
+
+// Returns true when this call removed the registration, i.e. the timeout won
+// the race against the reply. False means the reply path already claimed it and
+// is about to publish `done`.
+bool remove_public_ping(u64 token,
+                        const std::shared_ptr<public_ping_waiter>& waiter) {
+    std::lock_guard<std::mutex> lock(public_pings().mutex);
+    const auto it = public_pings().waiters.find(token);
+    if (it == public_pings().waiters.end() || it->second != waiter) {
+        return false;
+    }
+    public_pings().waiters.erase(it);
+    return true;
+}
+
+// Called from the reader for a PONG whose token carries the public marker.
+// Returns false when no probe with that token is outstanding on `owner` (a late
+// reply after its timeout, or a token that belongs to another connection): such
+// a PONG is dropped.
+bool complete_public_ping(const client* owner, u64 token,
+                          std::chrono::steady_clock::time_point now) {
+    std::shared_ptr<public_ping_waiter> waiter;
+    {
+        std::lock_guard<std::mutex> lock(public_pings().mutex);
+        const auto it = public_pings().waiters.find(token);
+        if (it == public_pings().waiters.end() || it->second->owner != owner) {
+            return false;
+        }
+        waiter = std::move(it->second);
+        public_pings().waiters.erase(it);
+    }
+    {
+        std::lock_guard<std::mutex> lock(waiter->mutex);
+        std::chrono::nanoseconds rtt = now - waiter->sent_at;
+        if (rtt < std::chrono::nanoseconds::zero()) {
+            // A caller-supplied clock can step backwards; a negative round trip
+            // is not a measurement, so it is reported as zero.
+            rtt = std::chrono::nanoseconds::zero();
+        }
+        waiter->rtt = rtt;
+        waiter->replied = true;
+        waiter->done = true;
+    }
+    waiter->cv.notify_all();
+    return true;
 }
 
 } // namespace
@@ -493,6 +598,14 @@ void client::handle_pong(const frame& value) {
         return;
     }
     const u64 token = endian::load_le64(value.payload.data());
+    if ((token & k_public_ping_token_bit) != 0) {
+        // A public `client::ping()` probe: the registry is a leaf lock, and
+        // the waiter's own mutex is the next one; neither takes a client lock,
+        // so no edge is added to the four-lock order.
+        (void)complete_public_ping(this, token,
+                                   options_.clock(options_.clock_ctx));
+        return;
+    }
     std::lock_guard<std::mutex> map(map_mutex_);
     if (flow_ == nullptr) {
         return;
@@ -1188,6 +1301,95 @@ void client::remove_deadline(call_slot& slot) {
             return;
         }
     }
+}
+
+rpc_result<std::chrono::nanoseconds> client::ping(std::chrono::nanoseconds timeout) {
+    if (timeout < std::chrono::nanoseconds::zero()) {
+        return rpc_error{rpc_code::invalid_argument, "ping timeout is negative"};
+    }
+    if (timeout == std::chrono::nanoseconds::zero()) {
+        // Documented as an immediate deadline: no probe is put on the wire.
+        return rpc_error{rpc_code::deadline_exceeded, "ping timeout is zero"};
+    }
+
+    const u64 token = next_public_ping_token();
+    const std::shared_ptr<public_ping_waiter> waiter =
+        register_public_ping(this, token);
+
+    // Stage the PING exactly like `stage_probe` stages a flow probe: the frame
+    // is not charged to the flow-control byte window (it measures the path,
+    // and a window gating its own probes could never learn the path
+    // recovered), but it must still fit `max_pending_write_bytes` so a stalled
+    // sink cannot grow the output queue without bound.
+    bool staged = false;
+    {
+        write_lock w(*this);
+        if (!closed_.load(std::memory_order_acquire) && conn_ != nullptr &&
+            conn_->is_open()) {
+            std::byte payload[8];
+            endian::store_le64(payload, token);
+            frame ping;
+            ping.header.type = frame_type::ping;
+            ping.header.stream_id = 0;
+            ping.payload = span<const std::byte>(payload, sizeof(payload));
+            const std::size_t size = encoded_frame_size(ping);
+            if (out_.size() - out_sent_ + size <=
+                options_.max_pending_write_bytes) {
+                frame_scratch_.clear();
+                if (frame_scratch_.reserve(size)) {
+                    std::size_t written = 0;
+                    if (encode_frame(span<std::byte>(frame_scratch_.data(), size),
+                                     ping, written)
+                            .ok() &&
+                        enqueue_raw(span<const std::byte>(
+                            frame_scratch_.data(), written))) {
+                        {
+                            // The reader reads `sent_at` under this mutex when
+                            // the PONG arrives, so the send timestamp must be
+                            // published the same way.
+                            std::lock_guard<std::mutex> lock(waiter->mutex);
+                            waiter->sent_at = options_.clock(options_.clock_ctx);
+                        }
+                        staged = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!staged) {
+        (void)remove_public_ping(token, waiter);
+        if (closed_.load(std::memory_order_acquire) || conn_ == nullptr ||
+            !conn_->is_open()) {
+            return rpc_error{rpc_code::unavailable, "the connection is closed"};
+        }
+        return rpc_error{rpc_code::resource_exhausted,
+                         "the ping frame could not be queued"};
+    }
+
+    // Flushing outside the write lock is required: on the synchronous inproc
+    // path the flush drains the peer, which re-enters `on_data` and thereby
+    // `handle_pong` (see `flush_pending`'s contract in the header).
+    flush_pending();
+
+    std::unique_lock<std::mutex> lock(waiter->mutex);
+    if (!waiter->cv.wait_for(lock, timeout, [&] { return waiter->done; })) {
+        lock.unlock();
+        // The timeout and the reply race for the registration. Whoever removes
+        // it owns the outcome; the loser waits for the winner to publish
+        // `done` instead of reporting a second, contradictory result.
+        if (remove_public_ping(token, waiter)) {
+            return rpc_error{rpc_code::deadline_exceeded,
+                             "no PONG reply arrived in time"};
+        }
+        lock.lock();
+        waiter->cv.wait(lock, [&] { return waiter->done; });
+    }
+    if (!waiter->replied) {
+        return rpc_error{rpc_code::internal,
+                         "the ping completed without a reply"};
+    }
+    return waiter->rtt;
 }
 
 void client::poll() noexcept {

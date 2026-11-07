@@ -174,6 +174,10 @@ without registering it here fails the suite.
 
 - [`async/executor.hpp`](../../include/crpc/async/executor.hpp)
 
+### `crpc/concurrency`
+
+- [`concurrency/volatile.hpp`](../../include/crpc/concurrency/volatile.hpp) — `volatile_read`, `volatile_write`, `full_fence`, `signal_fence`: acquire/release access to ordinary 1/2/4/8-byte values.
+
 ### `crpc/crypto`
 
 - [`crypto/base64.hpp`](../../include/crpc/crypto/base64.hpp)
@@ -316,6 +320,7 @@ without registering it here fails the suite.
 - [`net/icmp.hpp`](../../include/crpc/net/icmp.hpp)
 - [`net/ip.hpp`](../../include/crpc/net/ip.hpp)
 - [`net/listener.hpp`](../../include/crpc/net/listener.hpp)
+- [`net/ping.hpp`](../../include/crpc/net/ping.hpp)
 - [`net/udp.hpp`](../../include/crpc/net/udp.hpp)
 
 ### `crpc/observability`
@@ -468,6 +473,7 @@ without registering it here fails the suite.
 
 ### `crpc/system`
 
+- [`system/cpu.hpp`](../../include/crpc/system/cpu.hpp) — `logical_processor_count`, `physical_processor_count`, `get/set_current_thread_affinity`, `get/set_current_thread_priority`: query and control the calling thread's processor placement and scheduling priority.
 - [`system/process.hpp`](../../include/crpc/system/process.hpp) — `process::run/spawn`, `list_processes`, `query_process`: subprocesses with stdin/stdout/stderr redirection.
 - [`system/sysinfo.hpp`](../../include/crpc/system/sysinfo.hpp) — `cpu()`, `memory()`, `disks()`, `hostname()`, `uptime_seconds()`.
 
@@ -477,6 +483,7 @@ without registering it here fails the suite.
 - [`time/datetime.hpp`](../../include/crpc/time/datetime.hpp) — `date_time`: Gregorian calendar arithmetic, leap rules, RFC 3339.
 - [`time/format.hpp`](../../include/crpc/time/format.hpp) — `%Y %m %d %H %M %S %f %z` formatting.
 - [`time/timezone.hpp`](../../include/crpc/time/timezone.hpp) — `timezone_at`, `local_timezone`, `list_timezones`: IANA tzdata with fixed-offset fallback.
+- [`time/clock.hpp`](../../include/crpc/time/clock.hpp) — `now_unix`, `utc_now`, `gmt_now`, `system_tick`, `process_tick`, `steady_now_ticks`, `steady_frequency`: wall-clock and monotonic tick readings.
 
 ### `crpc/text` additions
 

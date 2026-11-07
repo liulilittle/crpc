@@ -605,6 +605,26 @@ public:
         push::delivery_mode mode = push::delivery_mode::reliable,
         bool ordered = false);
 
+    // Sends one PING probe and waits up to `timeout` for the matching PONG
+    // echo, returning the measured round trip.
+    //
+    // The wire format is the connection's existing probe protocol: a PING on
+    // stream 0 whose payload is exactly 8 bytes, answered by a PONG on stream
+    // 0 that echoes those bytes (the server does this in
+    // src/server/server.cpp; this client itself answers a peer's PING in
+    // `handle_ping`). The public token sets bit 63, which separates it from
+    // the flow-control probes whose token is a raw steady-clock timestamp, so
+    // a public reply can never be fed to the congestion controller as a
+    // sample. The reply is matched by the echoed token.
+    //
+    // A zero timeout fails `deadline_exceeded` without sending; a negative one
+    // fails `invalid_argument`. A closed connection fails `unavailable`, and
+    // a write queue that cannot hold the 24-byte frame fails
+    // `resource_exhausted`. Must not be called from a completion callback
+    // running inside this client (it takes the writer lock).
+    [[nodiscard]] rpc_result<std::chrono::nanoseconds> ping(
+        std::chrono::nanoseconds timeout);
+
     // Advances the injected clock and expires overdue calls. Idempotent; a
     // client with no deadlines does nothing.
     void poll() noexcept;

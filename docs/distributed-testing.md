@@ -224,11 +224,13 @@ $env:CRPC_BENCH_RPC_CALLS = '200'
 ```
 
 The `pipeline` filter runs the pipelined batch cases. Each one runs in a child
-process with a watchdog timeout, because the reliable pipelined path can deadlock
-in a Debug build; a case that exceeds the timeout is killed and the harness
+process with a watchdog timeout, so a hang is reported as a killed case instead
+of stalling the run; a case that exceeds the timeout is killed and the harness
 records the closed-loop fallback for it. The watchdog is implemented for
 Windows (`CreateProcess`); on other platforms the pipelined case runs in-process
-and the timeout does not apply.
+and the timeout does not apply. The Debug-build deadlock that motivated the
+watchdog was fixed in `59936b6` (see §7); the watchdog stays as a hang detector,
+and `tests/test_pipeline_deadlock.cpp` guards the same shape.
 
 Every case warms up, runs several times and reports the median; the harness also
 prints the compiler, build type and architecture. Benchmarks are not part of the
@@ -305,11 +307,11 @@ final `chosen` is `none`. The run recorded 120 cases
 
 Log: `.opencode/tmp/distbench-redis.log`.
 
-### 6.6 Pipelined batch throughput (Debug)
+### 6.6 Pipelined batch throughput (Debug, historical 2026-10-26 run)
 
 Reliable, median ns/call (payload x batch x concurrency; 3 rounds x 10000 calls).
-`hang` means the pipelined case deadlocked and the watchdog recorded the
-closed-loop fallback:
+This run predates the deadlock fix; `hang` means the pipelined case deadlocked
+and the watchdog recorded the closed-loop fallback:
 
 | Payload | batch | c=1 | c=2 | c=4 |
 |---|---:|---:|---:|---:|
@@ -330,7 +332,8 @@ Unreliable `ONE_WAY`, median delivered M calls/s (16 B; all drained, 0 errors):
 
 Log: `.opencode/tmp/bench-pipeline-watchdog2.log`. The hang is timing-dependent,
 so the exact set of hanging cases varies between runs; the fallback is always
-recorded explicitly.
+recorded explicitly. The deadlock was removed in `59936b6` (see §7); the table
+is kept as the pre-fix record.
 
 ## 7. Reading the results <a id="s7"></a>
 
@@ -351,13 +354,18 @@ recorded explicitly.
 - **The Redis numbers isolate layers.** The pool case uses a null transport, so
   it measures pool bookkeeping, not Redis. The pipeline case uses a wire-shaped
   executor, so it includes RESP encode/parse but not a server or network.
-- **The reliable pipelined path deadlocks in Debug.** The concurrent issue path
-  and the in-process backend's synchronous completion path contend on the client's
-  completion lock while a server handler coroutine holds it, so a high batch x
-  concurrency case stops making progress. The harness runs each pipelined case in
-  a child process with a watchdog timeout and records the closed-loop fallback
-  when it hangs; the fallback is never presented as a pipelined number. The
-  `ONE_WAY` path does not deadlock because its issue path does not wait.
+- **The reliable pipelined path deadlocked in Debug; the defect is fixed.** The
+  concurrent issue path and the in-process backend's synchronous completion path
+  took `completion_mutex_` and `map_mutex_` in opposite orders (an ABBA), so a
+  high batch x concurrency case could stop making progress. Commit `59936b6`
+  enforces one order (`completion_mutex_` outer, `map_mutex_` inner) and the
+  hang is gone: `tests/test_pipeline_deadlock.cpp` runs the high-batch shapes
+  under a no-progress watchdog (exit 42 on a hang) and passes 2 cases / 6 checks
+  / 0 failures on this tree. The harness still runs each pipelined case in a
+  child process with a watchdog timeout, as a hang detector rather than a known
+  limitation, and records the closed-loop fallback when it hangs; the fallback
+  is never presented as a pipelined number. The `ONE_WAY` path never waited on
+  completion, so it was unaffected.
 - **Debug vs Release.** A number without its build type is not comparable. The
   recorded tables are Debug; re-run the same command after a Release build for a
   Release claim.
@@ -392,12 +400,16 @@ recorded explicitly.
    reproducible baseline, and the pipelined batch cases (§6.6) add the issue
    shape a throughput caller uses; the library source is not changed by either
    choice.
-4. **The reliable pipelined path deadlocks in Debug at high batch x
-   concurrency.** The concurrent issue path and the in-process backend's
-   synchronous completion path deadlock (see §7); the harness detects it with a
-   child-process watchdog and records the closed-loop fallback. This is a library
-   finding for the parent, not a benchmark artefact; a stack trace was
-   captured with those measurements.
+4. **The reliable pipelined path deadlock is historical, not current.** Debug
+   builds at high batch x concurrency used to deadlock: the concurrent issue
+   path and the in-process backend's synchronous completion path took
+   `completion_mutex_` and `map_mutex_` in opposite orders (an ABBA). Commit
+   `59936b6` removed it by enforcing one lock order.
+   `tests/test_pipeline_deadlock.cpp` guards the shape with a no-progress
+   watchdog and passes 2 cases / 6 checks / 0 failures on this tree. The
+   benchmark table in §6.6 and the logged `hang` cells stay as the pre-fix
+   record; a stack trace from that run was captured with the original
+   measurements.
 5. **Debug numbers.** Compression encode throughput in particular is not
    representative; see §7.
 5. **`none` decode is not decompression.** Its "decode throughput" is header

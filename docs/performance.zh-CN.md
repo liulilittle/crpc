@@ -252,11 +252,14 @@ disconnect），并把聚合值与全量扫描会得到的结果对比。
 | 16 | 0.028 | 0.019 | 0.020 |
 | 64 | 0.025 | 0.018 | 0.019 |
 
-在本 Debug 构建中，可靠流水线路径在高 batch × 并发下不可用：并发发射路径与进程内后端的同步
-完成路径死锁，watchdog 杀掉用例并记录闭环回退，而不是流水线数字。`ONE_WAY` 路径不会死锁
-（其发射路径不等待），因此其流水线数字是完整的。该死锁是库层发现，不是基准假象；调用栈随该次测量一并留存，并记为
-[distributed-testing.zh-CN.md §8](distributed-testing.zh-CN.md#s8) 的局限。挂起是时序相关的，
-因此挂起的用例集合在多次运行间会变化；回退总是被显式记录。
+上表是 2026-10-26 的实测数据，记录于可靠流水线死锁修复之前。`hang` 单元格是完成
+路径与句柄销毁路径以相反顺序获取 `completion_mutex_` 与 `map_mutex_`（ABBA）时，
+watchdog 记录的闭环回退。该死锁是库缺陷，不是基准假象：现在所有路径统一
+加锁顺序，`tests/test_pipeline_deadlock.cpp` 用 watchdog 守护高 batch 形状（挂起时以
+退出码 42 结束）。本树上该套件为 2 cases / 6 checks / 0 failures，可靠路径不再挂起。
+该次运行的调用栈与当时的局限记录在
+[distributed-testing.zh-CN.md §8](distributed-testing.zh-CN.md#s8)。`ONE_WAY` 路径从不
+等待完成，因此其流水线数字不受影响。
 
 **Redis 客户端（分层隔离）。** 连接池用例使用空传输；pipeline 用例使用线缆形状的
 executor（RESP 编码 + 解析），两者都不含真实服务器或网络。

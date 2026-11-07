@@ -401,7 +401,8 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | `numeric` | 已实现 | `test_numeric_bignum.cpp` |
 | `proactor` | 已实现 | `test_proactor.cpp` |
 | `reactor` | 已实现 | `test_reactor.cpp` |
-| `system` | 已实现 | `test_system_process.cpp`、`test_system_sysinfo.cpp` |
+| `concurrency` | 已实现 | `test_concurrency_volatile.cpp`；普通载荷经 `volatile_read`/`volatile_write` 的 release/acquire 发布，以及 `full_fence`/`signal_fence` 可调用性 |
+| `system` | 已实现 | `test_system_process.cpp`、`test_system_sysinfo.cpp`、`test_system_cpu.cpp`；处理器数量、线程亲和性与线程优先级 |
 | `time` | 已实现 | `test_time_datetime.cpp`、`test_time_timezone.cpp`、`test_time_format.cpp` |
 | `domain` | 已实现 | `test_domain_ddd.cpp`、`test_domain_cqrs.cpp` |
 | `ftp` | 已实现 | `test_ftp_reply.cpp`、`test_ftp_client.cpp`、`test_ftp_server.cpp`；`test_ftp_it.cpp` 需要服务器 |

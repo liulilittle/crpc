@@ -505,6 +505,7 @@ struct tls_it_session {
     }
 };
 
+#if defined(CRPC_HAVE_OPENSSL)
 // Reads a single-string status value (SHOW STATUS / SELECT @@...), empty on
 // any failure.
 std::string it_scalar(crpc::db::mysql::connection& session, const char* sql) {
@@ -527,6 +528,7 @@ std::string it_scalar(crpc::db::mysql::connection& session, const char* sql) {
     }
     return std::string(rows->get_text(value_column).value());
 }
+#endif // CRPC_HAVE_OPENSSL
 
 // Restores require_secure_transport=OFF no matter how the case ends: the
 // variable is global, and leaving it ON would poison every later MySQL

@@ -21,7 +21,10 @@
 //     require an explicit user schema specialization. Using one without a
 //     schema fails with a clear diagnostic (a compile-time static_assert in the
 //     format adapter, a typed error status through encode_into/decode_from);
-//     it is never a silent empty payload.
+//     it is never a silent empty payload. A registered proto3 message whose
+//     fields are all defaults encodes to a legal zero-byte payload (protoc
+//     emits the same); that is distinguished from conversion failure by the
+//     adapter's error_code, not by the output length.
 //
 // crpc-binary v1 wire format
 // --------------------------
@@ -1136,6 +1139,11 @@ struct json_format {
         return rtti::json::serialize<T>(value);
     }
     template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        out = serialize<T>(value);
+        return !out.empty();
+    }
+    template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
         return rtti::json::parse_as<T>(text);
     }
@@ -1151,6 +1159,11 @@ struct xml_format {
     template <typename T>
     static std::string serialize(const T& value) {
         return rtti::xml::serialize<T>(value);
+    }
+    template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        out = serialize<T>(value);
+        return !out.empty();
     }
     template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
@@ -1170,6 +1183,11 @@ struct ini_format {
         return rtti::ini::serialize<T>(value);
     }
     template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        out = serialize<T>(value);
+        return !out.empty();
+    }
+    template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
         return rtti::ini::parse_as<T>(text);
     }
@@ -1185,6 +1203,11 @@ struct toml_format {
     template <typename T>
     static std::string serialize(const T& value) {
         return rtti::toml::serialize<T>(value);
+    }
+    template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        out = serialize<T>(value);
+        return !out.empty();
     }
     template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
@@ -1209,6 +1232,20 @@ struct protobuf_format {
             return std::string();
         }
         return out;
+    }
+    // protobuf and FlatBuffers report conversion failure through an error_code
+    // and can legitimately produce a zero-byte document: a proto3 message whose
+    // fields are all defaults is exactly zero bytes on the wire (protoc emits
+    // the same), so "empty" is not a failure for this format. The other text
+    // formats keep the non-empty rule because their empty string is the only
+    // failure signal their serialize<T> gives.
+    template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        static_assert(rtti::proto::schema<T>::count > 0,
+                      "crpc protobuf codec: specialize rtti::proto::schema<T> "
+                      "for this type before using it");
+        out.clear();
+        return rtti::proto::serialize(value, out) == rtti::error_code::ok;
     }
     template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
@@ -1239,6 +1276,14 @@ struct flatbuffers_format {
         return out;
     }
     template <typename T>
+    static bool serialize_checked(const T& value, std::string& out) {
+        static_assert(rtti::flat::schema<T>::count > 0,
+                      "crpc FlatBuffers codec: specialize rtti::flat::schema<T> "
+                      "for this type before using it");
+        out.clear();
+        return rtti::flat::serialize(value, out) == rtti::error_code::ok;
+    }
+    template <typename T>
     static rtti::result<T> parse(rtti::string_view text) {
         static_assert(rtti::flat::schema<T>::count > 0,
                       "crpc FlatBuffers codec: specialize rtti::flat::schema<T> "
@@ -1259,12 +1304,11 @@ namespace detail {
 template <typename Format, typename T>
 status encode_text_erased(const void* value, buffer& out, std::size_t) {
     try {
-        const std::string text =
-            Format::template serialize<T>(*static_cast<const T*>(value));
-        if (text.empty()) {
-            const rpc_error failure(
-                rpc_code::encode_error,
-                "text codec: RTTI conversion failed (empty document)");
+        std::string text;
+        if (!Format::template serialize_checked<T>(
+                *static_cast<const T*>(value), text)) {
+            const rpc_error failure(rpc_code::encode_error,
+                                    "text codec: RTTI conversion failed");
             return status{failure};
         }
         if (!out.append(text.data(), text.size())) {
@@ -1367,11 +1411,10 @@ public:
     template <typename T>
     status encode_typed(const T& value, buffer& out) const {
         try {
-            const std::string text = Format::template serialize<T>(value);
-            if (text.empty()) {
-                const rpc_error failure(
-                    rpc_code::encode_error,
-                    "text codec: RTTI conversion failed (empty document)");
+            std::string text;
+            if (!Format::template serialize_checked<T>(value, text)) {
+                const rpc_error failure(rpc_code::encode_error,
+                                        "text codec: RTTI conversion failed");
                 return status{failure};
             }
             if (!out.append(text.data(), text.size())) {
