@@ -49,6 +49,7 @@ namespace {
 constexpr crpc::u64 kService = 200;
 constexpr crpc::u64 kProbe = 10;
 constexpr crpc::u64 kBlock = 11;
+constexpr crpc::u64 kEcho = 12;
 
 // One service whose handlers record what a lane-ordered consumer needs:
 // the execution order as `(lane, seq, saw-token)`, the concurrency peak and a
@@ -115,6 +116,20 @@ struct lane_service {
         }
         return probe(self, envelope, body, out, ctx);
     }
+
+    // Echoes an arbitrary-length body without decoding it: the byte-cap
+    // end-to-end cases drive the cap with multi-KiB frames, which no
+    // fixed-size codec can decode.
+    static crpc::status echo_blob(void* self, const crpc::call_envelope&,
+                                  crpc::span<const std::byte> body, crpc::buffer& out,
+                                  crpc::rpc::call_context& ctx) {
+        auto* state = static_cast<lane_service*>(self);
+        state->record(ctx, 0);
+        const crpc::status encoded = out.append(body) ? crpc::status{}
+                                                      : crpc::status{crpc::rpc_code::encode_error};
+        state->leave();
+        return encoded;
+    }
 };
 
 long long steady_ms() noexcept {
@@ -139,7 +154,8 @@ struct gate_opener {
 };
 
 struct env_guard {
-    explicit env_guard(const char* value) : name_("CRPC_LANE_GAP_TIMEOUT_MS") {
+    explicit env_guard(const char* value, const char* name = "CRPC_LANE_GAP_TIMEOUT_MS")
+        : name_(name) {
 #if defined(_MSC_VER)
         char* previous = nullptr;
         std::size_t size = 0;
@@ -205,6 +221,7 @@ struct lane_fixture {
         sb.add_service(kService, "lane_svc");
         sb.add_raw_method(kService, kProbe, "probe", &lane_service::probe, &service);
         sb.add_raw_method(kService, kBlock, "block", &lane_service::block, &service);
+        sb.add_raw_method(kService, kEcho, "echo_blob", &lane_service::echo_blob, &service);
         sb.shards(shards);
         // Shutdown must not sit out a long drain when a handler is parked on
         // the gate; the tests below hold that bound explicitly.
@@ -742,6 +759,166 @@ CRPC_TEST(lanes_e2e_many_lanes_leave_no_accounting) {
     f.cli->close();
     CRPC_CHECK(crpc_test::wait_for(
         [&] { return f.srv->stats().in_flight_calls == 0; }, 5000));
+}
+
+// The production path for `admission::rejected`: a lane whose buffered frame
+// bytes would exceed the 16 KiB per-lane budget refuses the new call with
+// `rpc_code::overload` (a real server response, not a drop), nothing already
+// buffered is evicted, and the lane keeps running for the calls that fit.
+// Driven through the real inproc server. The frames arrive out of order --
+// seq 1 first (buffered behind the gap for seq 0), seq 2 next (two ~9 KiB
+// buffered frames would exceed the default 16 KiB cap: refused), seq 0 last
+// (runs immediately and drains seq 1 in order). No handler ever parks, so
+// the shard thread stays live for every admission.
+CRPC_TEST(lanes_e2e_lane_byte_cap_answers_overload) {
+    lane_fixture f;
+    f.name = "lane-e2e-bytecap";
+    CRPC_CHECK(f.start());
+    if (!f.srv) {
+        return;
+    }
+    auto c = raw_client(f);
+    CRPC_CHECK(c != nullptr);
+    if (!c) {
+        return;
+    }
+
+    const std::string big(9 * 1024, 'x');
+    const crpc::span<const std::byte> big_body(
+        reinterpret_cast<const std::byte*>(big.data()), big.size());
+    // seq 1 arrives first: buffered behind the gap (seq 0 has not arrived).
+    auto first = c->start_call<std::vector<std::byte>>(kService, kEcho, big_body,
+                                                       lane_ctx(21, 1));
+    CRPC_CHECK(first.ok());
+    // seq 2 arrives next: the lane would buffer ~18 KiB > the 16 KiB default,
+    // so it is refused with overload. Nothing already queued is evicted.
+    auto refused = c->start_call<std::vector<std::byte>>(kService, kEcho, big_body,
+                                                         lane_ctx(21, 2));
+    CRPC_CHECK(refused.ok());
+    if (!first.ok() || !refused.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first).value();
+    auto refused_handle = std::move(refused).value();
+
+    const auto refused_result = refused_handle.get();
+    CRPC_CHECK_FALSE(refused_result.ok());
+    if (!refused_result.ok()) {
+        CRPC_CHECK_EQ(crpc::rpc_code::overload, refused_result.code());
+    }
+
+    // seq 0 arrives last: it is next, the lane is idle and everything
+    // buffered sits above it, so it runs now and drains seq 1 in order.
+    crpc::buffer head;
+    CRPC_CHECK(encode_u64(0, head));
+    auto running = c->start_call<crpc::u64>(kService, kProbe, head.readable(),
+                                            lane_ctx(21, 0));
+    CRPC_CHECK(running.ok());
+    if (!running.ok()) {
+        return;
+    }
+    auto running_handle = std::move(running).value();
+    const auto first_result = first_handle.get();
+    CRPC_CHECK(first_result.ok());
+    if (first_result.ok()) {
+        CRPC_CHECK_EQ(big.size(), first_result.value().size());
+    }
+    const auto running_result = running_handle.get();
+    CRPC_CHECK(running_result.ok());
+    if (running_result.ok()) {
+        CRPC_CHECK_EQ(static_cast<crpc::u64>(0), running_result.value());
+    }
+
+    // The refusal consumed no position: seq 2 is admitted fresh.
+    auto again = c->start_call<std::vector<std::byte>>(kService, kEcho, big_body,
+                                                       lane_ctx(21, 2));
+    CRPC_CHECK(again.ok());
+    if (again.ok()) {
+        auto again_handle = std::move(again).value();
+        const auto again_result = again_handle.get();
+        CRPC_CHECK(again_result.ok());
+        if (again_result.ok()) {
+            CRPC_CHECK_EQ(big.size(), again_result.value().size());
+        }
+    }
+    // The call handles above must outlive no pool: the client (and its slot
+    // pool) is destroyed by reverse declaration order after every handle is
+    // gone, so no explicit reset here.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.srv->stats().in_flight_calls == 0; }, 8000));
+    std::lock_guard<std::mutex> lk(f.service.order_mutex);
+    // The refusal must not have reordered or dropped the lane's work: the
+    // head ran first, then seq 1, then the retried seq 2.
+    CRPC_CHECK_EQ(3, static_cast<int>(f.service.order.size()));
+    if (f.service.order.size() == 3) {
+        CRPC_CHECK_EQ(21u, f.service.order[0].lane);
+        CRPC_CHECK_EQ(0u, f.service.order[0].seq);
+        CRPC_CHECK_EQ(1u, f.service.order[1].seq);
+        CRPC_CHECK_EQ(2u, f.service.order[2].seq);
+    }
+}
+
+// A malformed `CRPC_LANE_MAX_BUFFERED_BYTES` falls back to the default
+// instead of parsing as zero (which would refuse every buffered frame): the
+// server behaves exactly as with the variable unset.
+CRPC_TEST(lanes_e2e_lane_byte_cap_env_malformed_falls_back_to_default) {
+    env_guard bad("not-a-number", "CRPC_LANE_MAX_BUFFERED_BYTES");
+    lane_fixture f;
+    f.name = "lane-e2e-bytecap-env";
+    CRPC_CHECK(f.start());
+    if (!f.srv) {
+        return;
+    }
+    auto c = raw_client(f);
+    CRPC_CHECK(c != nullptr);
+    if (!c) {
+        return;
+    }
+
+    const std::string big(9 * 1024, 'y');
+    const crpc::span<const std::byte> big_body(
+        reinterpret_cast<const std::byte*>(big.data()), big.size());
+    // The same out-of-order arrival: seq 1 buffered, seq 2 refused (the
+    // default 16 KiB budget is in force), seq 0 runs and drains.
+    auto first = c->start_call<std::vector<std::byte>>(kService, kEcho, big_body,
+                                                       lane_ctx(22, 1));
+    CRPC_CHECK(first.ok());
+    auto refused = c->start_call<std::vector<std::byte>>(kService, kEcho, big_body,
+                                                         lane_ctx(22, 2));
+    CRPC_CHECK(refused.ok());
+    if (!first.ok() || !refused.ok()) {
+        return;
+    }
+    auto first_handle = std::move(first).value();
+    auto refused_handle = std::move(refused).value();
+
+    const auto refused_result = refused_handle.get();
+    CRPC_CHECK_FALSE(refused_result.ok());
+    if (!refused_result.ok()) {
+        CRPC_CHECK_EQ(crpc::rpc_code::overload, refused_result.code());
+    }
+
+    crpc::buffer head;
+    CRPC_CHECK(encode_u64(0, head));
+    auto running = c->start_call<crpc::u64>(kService, kProbe, head.readable(),
+                                            lane_ctx(22, 0));
+    CRPC_CHECK(running.ok());
+    if (!running.ok()) {
+        return;
+    }
+    auto running_handle = std::move(running).value();
+    const auto first_result = first_handle.get();
+    CRPC_CHECK(first_result.ok());
+    if (first_result.ok()) {
+        CRPC_CHECK_EQ(big.size(), first_result.value().size());
+    }
+    const auto running_result = running_handle.get();
+    CRPC_CHECK(running_result.ok());
+    // The call handles above must outlive no pool: the client (and its slot
+    // pool) is destroyed by reverse declaration order after every handle is
+    // gone, so no explicit reset here.
+    CRPC_CHECK(crpc_test::wait_for(
+        [&] { return f.srv->stats().in_flight_calls == 0; }, 8000));
 }
 
 CRPC_TEST_MAIN()

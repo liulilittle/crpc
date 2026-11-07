@@ -65,12 +65,22 @@
 //     buffered call. A sequence that arrives after its position was skipped is
 //     answered as a duplicate. The timer hooks are optional: without them a gap
 //     blocks the lane until the missing call arrives or the lane is failed.
-//   * Failures. A call that fails -- handler error, deadline, decode error, a
-//     local admission refusal -- has still consumed its position; the lane
-//     continues with the next sequence. Only connection loss or scheduler
-//     teardown ends a lane outright, and then every buffered call is dropped
-//     with `fail_all` (the server answers them with an explicit error where
-//     the transport still allows one).
+    //   * Buffered-byte caps. A call that would push the summed `frame_size`
+    //     of its lane's buffered calls over `options::lane_max_buffered_bytes`
+    //     (default 16 KiB, the design budget for one lane), or the scheduler's
+    //     buffered total over `options::max_buffered_bytes` (default 64 KiB,
+    //     the connection-level bound), is answered `rejected` and the server
+    //     refuses it with `rpc_code::overload`. The refusal consumes no
+    //     position and evicts nothing: the queue, the sequence state and the
+    //     byte accounting are exactly as they were, so a retry after a drain
+    //     is possible. A call that runs immediately is never buffered and is
+    //     never refused by these caps.
+    //   * Failures. A call that fails -- handler error, deadline, decode error, a
+    //     local admission refusal -- has still consumed its position; the lane
+    //     continues with the next sequence. Only connection loss or scheduler
+    //     teardown ends a lane outright, and then every buffered call is dropped
+    //     with `fail_all` (the server answers them with an explicit error where
+    //     the transport still allows one).
 //   * `lane_id == 0`. The scheduler itself keys lanes opaquely; the server
 //     never admits `lane_id == 0` (and a frame without the ORDERED extension
 //     carries no token at all). Both keep the pre-lane behaviour: no ordering,
@@ -124,6 +134,17 @@ public:
         // How long a gap blocks the lane before the missing sequences are
         // skipped. Zero skips on the first observation of the gap.
         std::chrono::nanoseconds gap_timeout{std::chrono::seconds(5)};
+        // Byte caps on buffered work. A call that would push its lane over
+        // `lane_max_buffered_bytes`, or the scheduler's buffered total over
+        // `max_buffered_bytes`, is refused with `admission::rejected`
+        // (answered with `rpc_code::overload` by the server); nothing already
+        // buffered is ever evicted. The per-lane default is the design budget
+        // for one lane (docs/design.md §17.1); the 64 KiB total bounds how
+        // the per-lane cap multiplies across lanes (four full lanes) and
+        // follows the design's fast-failure policy. Zero admits only
+        // zero-byte frames.
+        std::uint64_t lane_max_buffered_bytes = 16 * 1024;
+        std::uint64_t max_buffered_bytes = 64 * 1024;
         clock_fn now = nullptr;
         void* now_ctx = nullptr;
         arm_fn arm = nullptr;
@@ -134,9 +155,14 @@ public:
     // One queued unit of work. The scheduler never inspects `payload`; `drop`
     // releases it without executing (lane teardown, connection close,
     // shutdown). Ownership of `payload` transfers to the scheduler on
-    // `buffered` and back to the caller on `pop_runnable`.
+    // `buffered` and back to the caller on `pop_runnable`. `frame_size` is
+    // the exact encoded size of the arriving frame
+    // (`rpc::client::predicted_frame_size` at the call site); it feeds the
+    // buffered-byte admission caps and is charged only while the call is
+    // buffered.
     struct item {
         std::uint64_t seq = 0;
+        std::uint64_t frame_size = 0;
         void* payload = nullptr;
         void (*drop)(void* payload) noexcept = nullptr;
     };
@@ -152,7 +178,15 @@ public:
         buffered,
         // The sequence was already consumed (executed, buffered or skipped).
         // The scheduler took no ownership; the caller rejects the call.
-        duplicate
+        duplicate,
+        // The call would push the buffered frame bytes of its lane -- or of
+        // the whole scheduler -- over the configured cap
+        // (`options::lane_max_buffered_bytes` / `options::max_buffered_bytes`).
+        // Nothing was consumed: the position is untouched and the scheduler
+        // took no ownership, so a retry with a drain in between is possible.
+        // The caller must not treat this as a duplicate; the server answers
+        // `rpc_code::overload` and the client owns the retry.
+        rejected
     };
 
     lane_queue() noexcept = default;
@@ -175,18 +209,32 @@ public:
         lane_state& ls = lane_for(lane_id);
         if (work.seq < ls.next_run) {
             return admission::duplicate;
-        }        const bool claimed = work.seq == ls.next_run;
-        if (claimed) {
-            ls.next_run = work.seq + 1;
         }
+        const bool claimed = work.seq == ls.next_run;
         const bool idle = !ls.running;
         const bool ahead_of_everything =
             ls.waiting.empty() || ls.waiting.begin()->first > work.seq;
         if (idle && claimed && ahead_of_everything) {
+            // The call runs immediately and is never buffered: the byte caps
+            // cannot refuse it.
+            ls.next_run = work.seq + 1;
             ls.running = true;
             return admission::run_now;
         }
+        // The call is about to be parked. Enforce the buffered-byte caps
+        // before anything is consumed: a refusal leaves the position, the
+        // queue and the byte accounting exactly as they were, so a retry
+        // after a drain is possible and nothing already queued is evicted.
+        if (ls.buffered_bytes + work.frame_size > opt_.lane_max_buffered_bytes ||
+            buffered_total_ + work.frame_size > opt_.max_buffered_bytes) {
+            return admission::rejected;
+        }
+        if (claimed) {
+            ls.next_run = work.seq + 1;
+        }
         if (ls.waiting.emplace(work.seq, work).second) {
+            ls.buffered_bytes += work.frame_size;
+            buffered_total_ += work.frame_size;
             const std::uint64_t head = ls.waiting.begin()->first;
             if (head <= ls.next_run) {
                 // No blocking gap in front of the queue. An armed gap timer
@@ -230,6 +278,10 @@ public:
             // all run; `head == next_run` closes a gap that filled in time.
             item work = ls.waiting.begin()->second;
             ls.waiting.erase(ls.waiting.begin());
+            // The call leaves the queue: refund its bytes to the lane and to
+            // the scheduler total.
+            ls.buffered_bytes -= work.frame_size;
+            buffered_total_ -= work.frame_size;
             if (head == ls.next_run) {
                 ls.next_run = head + 1;
             }
@@ -297,6 +349,8 @@ public:
         }
         lanes_.clear();
         consumed_.clear();
+        // Every buffered call was released above; no lane state survives.
+        buffered_total_ = 0;
         return dropped;
     }
 
@@ -318,6 +372,21 @@ public:
         return total;
     }
 
+    // Buffered frame bytes across all lanes (running calls are not counted).
+    // This is the quantity `options::max_buffered_bytes` caps.
+    [[nodiscard]] std::uint64_t buffered_bytes() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return buffered_total_;
+    }
+
+    // Buffered frame bytes of one lane, or zero when the lane has no entry.
+    // This is the quantity `options::lane_max_buffered_bytes` caps.
+    [[nodiscard]] std::uint64_t lane_buffered_bytes(std::uint64_t lane_id) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const auto it = lanes_.find(lane_id);
+        return it != lanes_.end() ? it->second->buffered_bytes : 0;
+    }
+
 private:
     struct lane_state {
         std::uint64_t lane_id = 0;
@@ -337,6 +406,12 @@ private:
         // callback that still holds the lane id validates through `skip_gap`,
         // which finds nothing.
         bool detached = false;
+        // Summed `frame_size` of this lane's buffered calls. Charged on
+        // admission, refunded on pop; checked against
+        // `options::lane_max_buffered_bytes` before a call is parked. The
+        // entry is released only when `waiting` is empty, so it is zero
+        // there; the release still refunds defensively.
+        std::uint64_t buffered_bytes = 0;
         std::map<std::uint64_t, item> waiting;
     };
 
@@ -413,6 +488,10 @@ private:
         // watermark must stay a duplicate even though the queue entry -- the
         // part that scales with load -- is released here.
         consumed_[ls.lane_id] = ls.next_run;
+        // A released lane has no buffered call left, so this refunds zero in
+        // the nominal case; the subtraction keeps the invariant explicit.
+        buffered_total_ -= ls.buffered_bytes;
+        ls.buffered_bytes = 0;
         lanes_.erase(it);
     }
 
@@ -424,6 +503,10 @@ private:
     options opt_{};
     mutable std::mutex mutex_;
     lane_table lanes_;
+    // Summed `frame_size` across every lane's buffered calls; checked against
+    // `options::max_buffered_bytes` before a call is parked, refunded on
+    // pop/release and cleared by `fail_all` (teardown releases everything).
+    std::uint64_t buffered_total_ = 0;
     // Per-lane consumed watermark, kept after the queue entry is released.
     // One word per distinct lane id; cleared by `fail_all` (teardown has no
     // ordering left to protect).

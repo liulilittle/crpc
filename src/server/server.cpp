@@ -59,6 +59,17 @@ inline constexpr std::size_t send_buffer_retain_bytes_default = 1u << 20; // 1 M
 // skips a missing sequence as soon as the gap is observed.
 inline constexpr std::size_t lane_gap_timeout_default_ms = 5000;
 
+// Default buffered-byte caps for ordered lanes (verdict G35 D5): 16 KiB per
+// lane (the design's per-lane queue budget) and 64 KiB for the connection's
+// total across lanes (four full lanes; bounds how the per-lane cap
+// multiplies). Same precedent as the gap timeout: not `server::options`
+// fields (MAJOR ABI break). `CRPC_LANE_MAX_BUFFERED_BYTES` overrides the
+// per-lane cap, `CRPC_LANE_TOTAL_BUFFERED_BYTES` the connection total;
+// zero is legal and caps buffering at zero bytes. A malformed value falls
+// back to the default (see `env_lane_bytes_or`).
+inline constexpr std::size_t lane_max_buffered_bytes_default = 16 * 1024;
+inline constexpr std::size_t lane_total_buffered_bytes_default = 64 * 1024;
+
 // Overridable through the environment so a test or a benchmark can exercise a
 // small cap and a small retain limit without a recompile. Read once, when the
 // pool is built. A missing or empty variable keeps the default.
@@ -83,6 +94,53 @@ inline constexpr std::size_t lane_gap_timeout_default_ms = 5000;
         return fallback;
     }
     return static_cast<std::size_t>(std::strtoull(value, nullptr, 10));
+#endif
+}
+
+// Byte-cap variant of `env_size_or` for the ordered-lane buffered-byte caps:
+// a value that is not a plain non-negative decimal number falls back to the
+// default instead of parsing as zero, so a mistyped override degrades to the
+// documented budget rather than to "admit only zero-byte frames". Zero itself
+// stays a legal value (it caps buffering at zero bytes). The variable names
+// and this fallback rule are documented in docs/performance.md (per-lane
+// queue budget, §3).
+[[nodiscard]] std::size_t env_lane_bytes_or(const char* name,
+                                            std::size_t fallback) noexcept {
+#if defined(_WIN32)
+    char* owned = nullptr;
+    std::size_t size = 0;
+    const bool present =
+        (_dupenv_s(&owned, &size, name) == 0 && owned != nullptr);
+    if (!present || owned == nullptr) {
+        std::free(owned);
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(owned, &end, 10);
+    const bool valid = owned[0] >= '0' && owned[0] <= '9' && end != nullptr &&
+                       *end == '\0';
+    std::free(owned);
+    if (!valid) {
+        return fallback;
+    }
+    return parsed > static_cast<unsigned long long>(~static_cast<std::size_t>(0))
+               ? fallback
+               : static_cast<std::size_t>(parsed);
+#else
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    const bool valid = value[0] >= '0' && value[0] <= '9' && end != nullptr &&
+                       *end == '\0';
+    if (!valid) {
+        return fallback;
+    }
+    return parsed > static_cast<unsigned long long>(~static_cast<std::size_t>(0))
+               ? fallback
+               : static_cast<std::size_t>(parsed);
 #endif
 }
 
@@ -580,6 +638,11 @@ struct server::impl {
     // the timeout without waiting for the default; read once, here.
     std::chrono::milliseconds lane_gap_timeout{lane_gap_timeout_default_ms};
 
+    // Buffered-byte caps for ordered lanes (verdict G35 D5), read once with
+    // the same environment fallback rules as the gap timeout.
+    std::size_t lane_max_buffered_bytes{lane_max_buffered_bytes_default};
+    std::size_t lane_total_buffered_bytes{lane_total_buffered_bytes_default};
+
     std::atomic<u64> push_published{0};
     std::atomic<u64> push_delivered{0};
     std::atomic<u64> push_overflow_dropped{0};
@@ -606,7 +669,12 @@ struct server::impl {
                                 send_buffer_retain_bytes_default)),
           lane_gap_timeout(std::chrono::milliseconds(
               env_size_or("CRPC_LANE_GAP_TIMEOUT_MS",
-                          lane_gap_timeout_default_ms))) {
+                          lane_gap_timeout_default_ms))),
+          lane_max_buffered_bytes(env_lane_bytes_or(
+              "CRPC_LANE_MAX_BUFFERED_BYTES", lane_max_buffered_bytes_default)),
+          lane_total_buffered_bytes(env_lane_bytes_or(
+              "CRPC_LANE_TOTAL_BUFFERED_BYTES",
+              lane_total_buffered_bytes_default)) {
         // An invalid clock keeps the pre-injection behaviour without making
         // `server::options`'s default construction call into the library (see
         // the field comment in server.hpp).
@@ -735,6 +803,8 @@ struct server::impl {
             // may be called from the reader or control thread at teardown.
             rpc::lane_queue::options lane_opts;
             lane_opts.gap_timeout = lane_gap_timeout;
+            lane_opts.lane_max_buffered_bytes = lane_max_buffered_bytes;
+            lane_opts.max_buffered_bytes = lane_total_buffered_bytes;
             lane_opts.now = &lane_queue_now_hook;
             lane_opts.now_ctx = sc.get();
             lane_opts.arm = &lane_gap_arm_hook;
@@ -1347,7 +1417,7 @@ struct server::impl {
         // rpc/lane_queue.hpp). A frame with the ORDERED extension and a
         // non-zero lane id consumes its `(lane_id, seq)` position before any
         // admission stage runs, so a locally refused call still keeps the
-        // lane's sequence contiguous. The three outcomes:
+        // lane's sequence contiguous. The four outcomes:
         //   duplicate -> the position was already consumed. A replay that
         //                carries an idempotency key is a retry of a known
         //                logical call: it bypasses the gate and lets the
@@ -1360,12 +1430,21 @@ struct server::impl {
         //   buffered  -> parked behind its predecessor or a gap; the lane
         //                drain or the gap timer owns the call from here and
         //                the in-flight accounting stays held;
+        //   rejected  -> the buffered-byte cap refused the call without
+        //                consuming its position and without evicting anything
+        //                already queued: the caller is answered with
+        //                `rpc_code::overload` and the client owns the retry;
         //   run_now   -> execute immediately; the drain after the call
         //                releases the buffered successors in seq order.
         bool lane_run_now = false;
         if (job.lane_ordered && job.lane_id != 0 && !job.lane_dequeued) {
             rpc::lane_queue::item work;
             work.seq = job.lane_seq;
+            // The exact encoded wire size of this frame (the same predicate
+            // the client's `predicted_frame_size` answers): header, ORDERED
+            // extension and envelope payload. It feeds the lane's
+            // buffered-byte admission cap.
+            work.frame_size = encoded_frame_size(request);
             work.payload = &job;
             work.drop = &drop_lane_item;
             rpc::lane_queue::admission verdict;
@@ -1405,6 +1484,20 @@ struct server::impl {
                 // Ownership transferred to the scheduler: run_job must not
                 // delete this job (see the flag's contract on request_job).
                 job.lane_parked = true;
+                return;
+            } else if (verdict == rpc::lane_queue::admission::rejected) {
+                // The lane's buffered-byte cap refused the call: the position
+                // was not consumed, nothing already queued was evicted, and
+                // the job was never handed to the scheduler (run_job keeps
+                // ownership and releases it below). Counted and answered like
+                // the other local admission refusals: overload, back off.
+                rejected.fetch_add(1, std::memory_order_relaxed);
+                if (wants_response) {
+                    send_error(sc, job.header.stream_id, rpc_code::overload,
+                               std::chrono::milliseconds(0),
+                               "lane buffered-byte cap exceeded");
+                }
+                complete_call(sc, job.counted);
                 return;
             } else {
                 lane_run_now = true;

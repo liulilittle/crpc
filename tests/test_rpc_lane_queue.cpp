@@ -79,11 +79,13 @@ void drop_payload(void* raw) noexcept {
 }
 
 
-lane_queue::item item_for(std::uint64_t seq, std::vector<std::uint64_t>* dropped) {
+lane_queue::item item_for(std::uint64_t seq, std::vector<std::uint64_t>* dropped,
+                          std::uint64_t frame_size = 0) {
     lane_queue::item work;
     work.seq = seq;
     work.payload = new recorded_payload{seq, dropped};
     work.drop = &drop_payload;
+    work.frame_size = frame_size;
     return work;
 }
 
@@ -92,15 +94,23 @@ lane_queue::item item_for(std::uint64_t seq, std::vector<std::uint64_t>* dropped
 // never transfers ownership, so the test deletes the payload in both
 // cases; only a `buffered` verdict leaves the scheduler owning it (the
 // item is then released by a pop or by `fail_all`).
-lane_queue::admission admit_one(lane_queue& queue, std::uint64_t lane_id,
-                                std::uint64_t seq,
-                                std::vector<std::uint64_t>* dropped) {
-    lane_queue::item work = item_for(seq, dropped);
+// Same ownership contract as below, with an explicit encoded frame size
+// (`rpc::client::predicted_frame_size` at the call site).
+lane_queue::admission admit_size(lane_queue& queue, std::uint64_t lane_id,
+                                 std::uint64_t seq, std::uint64_t frame_size,
+                                 std::vector<std::uint64_t>* dropped) {
+    lane_queue::item work = item_for(seq, dropped, frame_size);
     const lane_queue::admission verdict = queue.admit(lane_id, work);
     if (verdict != lane_queue::admission::buffered) {
         delete static_cast<recorded_payload*>(work.payload);
     }
     return verdict;
+}
+
+lane_queue::admission admit_one(lane_queue& queue, std::uint64_t lane_id,
+                                std::uint64_t seq,
+                                std::vector<std::uint64_t>* dropped) {
+    return admit_size(queue, lane_id, seq, 0, dropped);
 }
 
 
@@ -491,6 +501,170 @@ CRPC_TEST(lane_queue_rearm_after_partial_progress) {
     CRPC_CHECK_FALSE(queue->pop_runnable(2).has_value());
     CRPC_CHECK_EQ(0u, queue->active_lanes());
     CRPC_CHECK(dropped.empty());
+}
+
+// The byte caps default to the design budgets: 16 KiB per lane (docs/design.md
+// §17.1 per-lane queue budget) and a connection-level total of 64 KiB that
+// bounds how the per-lane cap multiplies across lanes.
+CRPC_TEST(lane_queue_byte_cap_defaults_match_budget) {
+    lane_queue::options opts;
+    CRPC_CHECK_EQ(16384u, opts.lane_max_buffered_bytes);
+    CRPC_CHECK_EQ(65536u, opts.max_buffered_bytes);
+}
+
+// A call that would push its lane over the per-lane cap is refused with
+// `rejected` (the server answers `rpc_code::overload`), nothing already
+// buffered is evicted, and the refusal consumes no sequence position: the
+// same seq is admitted again once a frame that fits arrives.
+CRPC_TEST(lane_queue_per_lane_byte_cap_rejects_without_evicting) {
+    timer_bridge timers;
+    auto queue = std::make_shared<lane_queue>();
+    lane_queue::options opts = timers.options(50ms);
+    opts.lane_max_buffered_bytes = 100; // two 60-byte frames do not fit
+    queue->set_options(opts);
+    std::vector<std::uint64_t> dropped;
+
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 7, 0, 60, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 7, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+    CRPC_CHECK_EQ(60u, queue->lane_buffered_bytes(7));
+
+    // 60 buffered + 60 new = 120 > 100: refused, first copy stays queued.
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::rejected),
+                  static_cast<int>(admit_size(*queue, 7, 2, 60, &dropped)));
+    CRPC_CHECK_EQ(1u, queue->buffered_calls());
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+    CRPC_CHECK(dropped.empty()); // nothing was evicted
+    CRPC_CHECK_FALSE(queue->is_parked(7, 2)); // no position was consumed
+
+    // The same seq with a frame that fits (60 + 40 = 100 <= 100) is admitted.
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 7, 2, 40, &dropped)));
+    CRPC_CHECK_EQ(2u, queue->buffered_calls());
+    CRPC_CHECK_EQ(100u, queue->buffered_bytes());
+
+    // Draining returns the bytes, so the lane can take new work again.
+    std::optional<lane_queue::item> next = queue->pop_runnable(7);
+    CRPC_CHECK(next.has_value());
+    if (next.has_value()) {
+        CRPC_CHECK_EQ(1u, next->seq);
+        delete static_cast<recorded_payload*>(next->payload);
+    }
+    CRPC_CHECK_EQ(40u, queue->buffered_bytes());
+    next = queue->pop_runnable(7);
+    CRPC_CHECK(next.has_value());
+    if (next.has_value()) {
+        CRPC_CHECK_EQ(2u, next->seq);
+        delete static_cast<recorded_payload*>(next->payload);
+    }
+    CRPC_CHECK_EQ(0u, queue->buffered_bytes());
+    // The final pop finds the lane empty and releases its entry.
+    CRPC_CHECK_FALSE(queue->pop_runnable(7).has_value());
+    CRPC_CHECK_EQ(0u, queue->active_lanes());
+    CRPC_CHECK(dropped.empty());
+}
+
+// The connection-level cap sums the buffered bytes of every lane: a call that
+// fits its own lane is still refused when the total would exceed it, and a
+// drained lane frees its share for the next lane.
+CRPC_TEST(lane_queue_global_byte_cap_rejects_across_lanes) {
+    timer_bridge timers;
+    auto queue = std::make_shared<lane_queue>();
+    lane_queue::options opts = timers.options(50ms);
+    opts.lane_max_buffered_bytes = 1000; // per-lane stays under
+    opts.max_buffered_bytes = 100;       // the total across lanes is 100
+    queue->set_options(opts);
+    std::vector<std::uint64_t> dropped;
+
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 10, 0, 60, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 10, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 11, 0, 60, &dropped)));
+    // 60 buffered + 60 new = 120 > 100 total: refused even though lane 11's
+    // own share is empty.
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::rejected),
+                  static_cast<int>(admit_size(*queue, 11, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(1u, queue->buffered_calls());
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+    CRPC_CHECK(dropped.empty());
+
+    // Lane 10 drains: the total returns to 0 and lane 11 is admitted again.
+    std::optional<lane_queue::item> next = queue->pop_runnable(10);
+    CRPC_CHECK(next.has_value());
+    if (next.has_value()) {
+        CRPC_CHECK_EQ(1u, next->seq);
+        delete static_cast<recorded_payload*>(next->payload);
+    }
+    CRPC_CHECK_EQ(0u, queue->buffered_bytes());
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 11, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+
+    CRPC_CHECK_EQ(1u, queue->fail_all());
+    CRPC_CHECK_EQ(1u, dropped.size());
+    CRPC_CHECK_EQ(0u, queue->buffered_bytes());
+}
+
+// A call that will run immediately is never buffered, so the byte cap cannot
+// refuse it; only the buffering decision is capped. A zero-byte frame always
+// fits, whatever the cap.
+CRPC_TEST(lane_queue_byte_cap_never_refuses_a_run_now) {
+    timer_bridge timers;
+    auto queue = std::make_shared<lane_queue>();
+    lane_queue::options opts = timers.options(50ms);
+    opts.lane_max_buffered_bytes = 0; // nothing may be buffered
+    opts.max_buffered_bytes = 0;
+    queue->set_options(opts);
+    std::vector<std::uint64_t> dropped;
+
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 3, 0, 999999, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::rejected),
+                  static_cast<int>(admit_size(*queue, 3, 1, 1, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 3, 1, 0, &dropped)));
+    CRPC_CHECK_EQ(0u, queue->buffered_bytes());
+    CRPC_CHECK(dropped.empty());
+}
+
+// Teardown releases the byte accounting together with the buffered calls; a
+// fresh scheduler (or a re-admitted lane) starts from zero. The `drop`
+// contract is unchanged: every buffered call is released, never executed.
+CRPC_TEST(lane_queue_fail_all_releases_byte_accounting) {
+    timer_bridge timers;
+    auto queue = std::make_shared<lane_queue>();
+    lane_queue::options opts = timers.options(50ms);
+    opts.lane_max_buffered_bytes = 100;
+    queue->set_options(opts);
+    std::vector<std::uint64_t> dropped;
+
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 1, 0, 60, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 1, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+
+    CRPC_CHECK_EQ(1u, queue->fail_all());
+    CRPC_CHECK_EQ(1u, dropped.size());
+    // The drop records the released call's seq (the payload's marker value).
+    CRPC_CHECK_EQ(1u, dropped.front());
+    CRPC_CHECK_EQ(0u, queue->active_lanes());
+    CRPC_CHECK_EQ(0u, queue->buffered_bytes());
+
+    // A drained scheduler accepts new lanes again, byte accounting included.
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
+                  static_cast<int>(admit_size(*queue, 1, 0, 60, &dropped)));
+    CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::buffered),
+                  static_cast<int>(admit_size(*queue, 1, 1, 60, &dropped)));
+    CRPC_CHECK_EQ(60u, queue->buffered_bytes());
+    CRPC_CHECK_EQ(1u, queue->fail_all());
+    CRPC_CHECK_EQ(2u, dropped.size());
 }
 
 CRPC_TEST_MAIN()

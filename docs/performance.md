@@ -425,7 +425,36 @@ pair measured in one process, so it cannot be attributed to the server alone;
 it is an upper bound and still 12.9x the 160 KiB budget. A server-only active
 number is **not verified** (W5).
 
+Slot-pool memory after the G35 capacity change (`probe_g35_memory`, MSVC 19.51
+x64 Release `/O2 /MD`, AMD Ryzen 9 7945HX, Windows; source and raw output in
+`.opencode/tmp/g35-exec/probe_g35_memory.cpp` and
+`.opencode/tmp/g35-exec/e4-memory-run2.txt`; PrivateUsage, not RSS; single run,
+deltas sampled inside one process so later scenes reuse released heap):
 
+| Scene | Result |
+|---|---:|
+| `sizeof(call_slot)` | 464 B (unchanged by G35) |
+| pool-only idle, capacity 1024 (new default) | 479,232 B (468.0 KiB, 468.0 B/slot) — was 30,998,528 B (30.9 MB) at capacity 65536 |
+| idle inproc connection, no calls | +12,288 B (12.0 KiB) over the baseline; the pool reuses the heap freed above |
+| pool-only reference, capacity 16384 | 7,622,656 B (7.3 MiB, 465.2 B/slot) |
+| pool-only reference, capacity 131072 | 61,997,056 B (59.1 MiB, 473.0 B/slot) |
+| active, 1024 in-flight (pool 1024) | 1,449,984 B PrivateUsage in total; 604.0 B/call delta |
+| active, 10 000 in-flight (pool 16384) | 9,752,576 B PrivateUsage in total; 836.8 B/call delta |
+| active, 100 000 in-flight (pool 131072) | 74,014,720 B PrivateUsage in total; 728.1 B/call delta |
+| global buffered-byte cap, 5 lanes x 16 KiB | 4 lanes buffered to exactly 65,536 B, lane 5 refused (`admission::rejected`), nothing evicted |
+
+The same probe also exercises the connection-level cap end to end: five lanes
+each buffering one 16 KiB frame fill the 64 KiB total with the first four and
+the fifth is refused. Every load scene completes all calls correctly
+(checksum of returned values matches the issued sequence), so the measured
+state is "every call finished, every slot still held".
+
+The per-slot bytes are not a constant across capacities (468.0 at 1024,
+465.2 at 16384, 473.0 at 131072): the slot body is a constant 464 B and the
+spread is the free-list vector (8 B per slot, `reserve(capacity)`), heap
+block headers and 64 KiB commit granularity, with small capacities diluted
+by the fixed pool structure. All three points fall in the 465-473 B/slot
+band the verdict adopted as the 472 B/slot engineering figure.
 
 ## 3. Budgets and targets <a id="s3"></a>
 
@@ -435,12 +464,12 @@ Memory budgets are from design §17.1; status is assessed against the code.
 |---|---|---|
 | idle connection | ≤ 2 KiB | **not met**: 69 716 B committed per idle IOCP connection (median of 3, §2.6), 34.0x the budget |
 | active connection | ≤ 160 KiB | **not verified server-only**: a same-process client+server pair with one 4 KiB call in flight costs 2 063 552 B (1.97 MiB, §2.6), 12.9x the budget as an upper bound; the server-only share could not be separated |
-| call slot | 128 B | **not met**: **464 B** measured on MSVC x64 by a compile-time probe (§2.6), 3.63x the budget; the historical 440 B figure is stale |
+| call slot | 128 B | **not met**: **464 B** measured on MSVC x64 by a compile-time probe (§2.6), 3.63x the budget; the historical 440 B figure is stale. The default slot-pool capacity dropped from 65536 to 1024 (G35): idle pool memory per connection fell from ~30.9 MB to a measured 479,232 B (468.0 KiB, `probe_g35_memory`), a 64.7x reduction |
 | shard fixed | ≤ 8 MiB | not measured; the shard runtime exists (`src/runtime/runtime.cpp`) but no per-shard fixed-memory number has been recorded |
-| 100k in-flight calls | ≤ 64 MiB | the slot array alone is 464 B x 100k = 44.3 MiB; end-to-end in-flight memory is not measured |
+| 100k in-flight calls | ≤ 64 MiB | **not met at the current slot size**: the slot array alone is 464 B x 100k = 44.3 MiB; measured end to end (G35, `probe_g35_memory`, Release x64): a 131072-slot pool pins 59.1 MiB and a process holding 100,000 in-flight calls plus bookkeeping and handles reaches 74.0 MB PrivateUsage; a 128 B slot (coroutine parking) is the path back inside the budget |
 | 10k idle connections | ≤ 20 MiB | **not met**: 697 163 776 B (664.9 MiB) private delta for 10 000 idle IOCP connections (§2.6), 33.2x the budget |
 | subscription table | ≤ 5 MiB | design target; hub bounds are per-subscription, not a global table |
-| per-lane queue | ≤ 16 KiB | specified, not implemented (the queue has `gap_timeout` but no byte cap) |
+| per-lane queue | ≤ 16 KiB | **met by admission cap (G35)**: per-lane cap default 16 KiB plus a connection-level total of 64 KiB (4 full lanes — the 64 KiB figure is the *global* cap across lanes, not a second per-lane number); an arrival that would exceed either cap is refused with `rpc_code::overload` (`admission::rejected`), nothing already buffered is evicted, and a refused call consumes no sequence position. The caps are the summed *encoded frame bytes* (`predicted_frame_size` on the client, `encoded_frame_size` on the server). Overridable through `CRPC_LANE_MAX_BUFFERED_BYTES` (per lane) and `CRPC_LANE_TOTAL_BUFFERED_BYTES` (connection total); a malformed value falls back to the default, zero is legal and caps buffering at zero bytes |
 | send ring per connection | ≤ 256 KiB | epoll default 64 KiB; IOCP default 256 KiB |
 
 Performance targets:

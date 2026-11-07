@@ -978,8 +978,12 @@ public:
         codec_id codec = codec_id::crpc_binary;
         // Connections kept per endpoint.
         std::size_t pool_size = 1;
-        // Call slots preallocated per connection.
-        std::size_t slot_capacity = 4096;
+        // Call slots preallocated per connection. The default equals the
+        // default `max_inflight_per_connection` (1024): a larger pool would
+        // pin dead slots (~472 B each) the in-flight cap can never hand out.
+        // Raising one requires raising the other with it, or the extra slots
+        // are unreachable.
+        std::size_t slot_capacity = 1024;
         // In-flight cap per connection. Zero disables the cap.
         std::size_t max_inflight_per_connection = 1024;
         // Load balancing across endpoints.

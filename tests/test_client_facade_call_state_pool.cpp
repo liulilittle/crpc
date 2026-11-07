@@ -138,4 +138,14 @@ CRPC_TEST(facade_start_encoded_uses_the_pool) {
     CRPC_CHECK_EQ(std::size_t{kCalls}, reuses());
 }
 
+// The facade's default slot pool cannot be larger than the default in-flight
+// cap: every slot beyond `max_inflight_per_connection` is dead memory the cap
+// can never hand out (~472 B pinned per connection). The two defaults must
+// stay consistent so the idle pool matches the per-connection design budget.
+CRPC_TEST(facade_default_slot_capacity_never_exceeds_default_inflight_cap) {
+    crpc::client::options options;
+    CRPC_CHECK_EQ(std::size_t{1024}, options.slot_capacity);
+    CRPC_CHECK(options.slot_capacity <= options.max_inflight_per_connection);
+}
+
 CRPC_TEST_MAIN()

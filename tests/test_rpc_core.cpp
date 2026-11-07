@@ -513,6 +513,30 @@ CRPC_TEST(slot_pool_zero_capacity) {
     CRPC_CHECK(pool.try_acquire() == nullptr);
 }
 
+// The pool default is the per-connection design budget (1024 in-flight slots,
+// about 471 KiB of idle pool per connection at 472 B per slot), not the
+// per-shard capacity of 65536, which would pin ~30 MB for a pool that can
+// never fill (docs/design.md: per-connection in-flight default 1024).
+CRPC_TEST(slot_pool_default_capacity_is_1024) {
+    call_slot_pool pool;
+    CRPC_CHECK_EQ(1024u, pool.capacity());
+    CRPC_CHECK_EQ(1024u, pool.available());
+}
+
+// An explicit capacity still wins over the default: a deployment that wants
+// burst headroom passes 2048 and gets exactly that.
+CRPC_TEST(slot_pool_explicit_capacity_overrides_default) {
+    call_slot_pool pool(2048);
+    CRPC_CHECK_EQ(2048u, pool.capacity());
+}
+
+// The client's per-connection options share the same default, because the
+// client's pool is what actually pins the idle memory on every connection.
+CRPC_TEST(client_options_default_slot_capacity_is_1024) {
+    client_options options;
+    CRPC_CHECK_EQ(1024u, options.slot_capacity);
+}
+
 // --- Stream id allocation ----------------------------------------------------
 
 struct in_flight_set {

@@ -390,8 +390,11 @@ CRPC_API void set_state(call_slot& slot, call_state state) noexcept;
 // construction; acquire/release perform no allocation. Thread-safe.
 class CRPC_API call_slot_pool {
 public:
-    // Default capacity matches the design budget for one connection.
-    explicit call_slot_pool(u32 capacity = 65536);
+    // Default capacity matches the per-connection design budget (1024
+    // in-flight slots, about 471 KiB of idle pool at 472 B per slot). The
+    // per-shard 65536 figure would pin ~30 MB per connection for a pool that
+    // can never fill; deployments that want burst headroom pass 2048.
+    explicit call_slot_pool(u32 capacity = 1024);
     ~call_slot_pool();
 
     call_slot_pool(const call_slot_pool&) = delete;

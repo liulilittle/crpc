@@ -113,8 +113,10 @@ using clock_fn = std::chrono::steady_clock::time_point (*)(void* ctx) noexcept;
 [[nodiscard]] CRPC_API std::chrono::steady_clock::time_point system_clock_now(void* ctx) noexcept;
 
 struct client_options {
-    // Call slots preallocated for this connection.
-    u32 slot_capacity = 65536;
+    // Call slots preallocated for this connection. The default matches the
+    // per-connection design budget (1024 in-flight, ~471 KiB of idle pool);
+    // raise it for a connection that must hold more in-flight calls.
+    u32 slot_capacity = 1024;
     // Upper bound on bytes staged for the sink but not yet accepted. A frame
     // that would exceed it is rejected with resource_exhausted.
     std::size_t max_pending_write_bytes = 4u * 1024u * 1024u;
