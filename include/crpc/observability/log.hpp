@@ -31,6 +31,7 @@
 
 #include <array>
 #include <atomic>
+#include <cfenv>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -46,6 +47,15 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+// MXCSR is the authoritative rounding-direction register for the SSE2 double
+// arithmetic on x86/x64; the intrinsic is one instruction, while UCRT's
+// fegetround() costs ~12 ns per call (measured: .opencode/tmp/opt-float2).
+#if (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)) &&                   \
+    (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||                     \
+     (defined(__i386__) && defined(__SSE__)))
+#include <xmmintrin.h>
+#endif
 
 #include <crpc/config.hpp>
 #include <crpc/observability/context.hpp>
@@ -83,9 +93,10 @@ constexpr bool compile_enabled(int level_number) noexcept {
 // --- %.6g double formatter ---------------------------------------------------
 //
 // Contract: byte-identical to snprintf("%.6g", value) for every double on this
-// platform. The differential suite in test_log_perf.cpp pins the contract
-// against the CRT itself (explicit boundary table + >=1e6 fuzzed doubles), so
-// any deviation is a test failure, not a silent output change.
+// platform, in the SAME floating-point rounding mode. The differential suite in
+// test_log_perf.cpp pins the contract against the CRT itself (explicit boundary
+// table + >=1e6 fuzzed doubles in the default mode, plus 4 fenv modes x 100k),
+// so any deviation is a test failure, not a silent output change.
 //
 // Algorithm (self-written; no third-party code): fixed-precision decimal
 // generation in the spirit of Dragon4 (Steele & White, "How to Print
@@ -188,9 +199,32 @@ inline std::size_t g6_snprintf_fallback(char* out, std::size_t capacity, double 
                                                         : capacity - 1;
 }
 
+// The fast path below decides one half-even rounding of the 7th significant
+// digit. snprintf only behaves that way in FE_TONEAREST: under FE_UPWARD,
+// FE_DOWNWARD or FE_TOWARDZERO it rounds every discarded digit in the current
+// direction instead (probe: opt-float2/probe_fenv.cpp -- e.g. 123456.5 prints
+// "123457" upward, and the ungated fast path disagreed with the CRT on ~50% of
+// random values in each directed mode). Those modes therefore delegate to the
+// CRT. The register is read directly because UCRT fegetround() costs ~12 ns,
+// more than the fast path itself; MXCSR RC bits 13:14 are 00 exactly for
+// round-to-nearest. Non-x86 targets use the portable query.
+inline bool g6_rounding_is_nearest() noexcept {
+#if (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)) &&                   \
+    (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) ||                     \
+     (defined(__i386__) && defined(__SSE__)))
+    return (_mm_getcsr() & 0x6000) == 0;
+#else
+    return std::fegetround() == FE_TONEAREST;
+#endif
+}
+
 inline std::size_t format_double_g6(char* out, std::size_t capacity, double value) noexcept {
     if (capacity == 0) {
         return 0;
+    }
+
+    if (!g6_rounding_is_nearest()) {
+        return g6_snprintf_fallback(out, capacity, value);
     }
 
     std::uint64_t bits = 0;

@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfenv>
 #include <chrono>
 #include <cfloat>
 #include <cmath>
@@ -559,11 +560,12 @@ const double* g6_anchor_values(std::size_t* count) {
     return anchors;
 }
 
-} // namespace
-
-CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
-    std::size_t checked = 0;
-    std::size_t failed = 0;
+// Shared boundary corpus: 338 values (explicit list, non-finites, NaN
+// payloads, exact ties, f/e switches, and +/-1/2-ulp walks around every exact
+// decade) plus the 10 log_buffer leg values = 348 checks. Built once under
+// FE_TONEAREST so the four-mode case compares identical bit patterns.
+std::vector<double> g6_boundary_values() {
+    std::vector<double> values;
 
     // The task's explicit boundary list, both signs where meaningful.
     const double boundaries[] = {
@@ -573,14 +575,13 @@ CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
         -1.0000005e6, DBL_MIN,       -DBL_MIN,     DBL_MAX,       -DBL_MAX,
         DBL_TRUE_MIN, -DBL_TRUE_MIN, 1e-308,       -1e-308,       1e308,
         -1e308,       1.0 / 3.0,     -1.0 / 3.0};
-    for (const double value : boundaries) {
-        g6_check(value, &checked, &failed);
-    }
+    values.insert(values.end(), boundaries,
+                  boundaries + sizeof(boundaries) / sizeof(boundaries[0]));
 
     // infinities as explicit bit patterns (a literal 1.0/0.0 is a compile-time
     // divide-by-zero under /W4).
-    g6_check(g6_from_bits(0x7FF0000000000000ull), &checked, &failed);
-    g6_check(g6_from_bits(0xFFF0000000000000ull), &checked, &failed);
+    values.push_back(g6_from_bits(0x7FF0000000000000ull));
+    values.push_back(g6_from_bits(0xFFF0000000000000ull));
 
     // NaN payloads: the CRT spelling depends on payload and sign, so every
     // form must round-trip through the same fallback as the real formatter.
@@ -589,40 +590,40 @@ CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
                                           0x7ff8deadbeef0000ull, 0xfff8deadbeef0000ull,
                                           0x7ff4000000000000ull};
     for (const std::uint64_t bits : nan_patterns) {
-        g6_check(g6_from_bits(bits), &checked, &failed);
+        values.push_back(g6_from_bits(bits));
     }
 
     // Tie forms (exact .5 at the 7th significant digit): half-even on the CRT
     // side, the formatter must agree byte-for-byte.
     const double ties[] = {123456.5,  123457.5, 100000.5, 100001.5, 385.0 / 64.0,
                            5000005.0, 1500005.0, 999999.5, -999999.5, 12.5,
-                           0.5,       1.5,      2.5,      3.5,      4.5};
-    for (const double value : ties) {
-        g6_check(value, &checked, &failed);
-    }
+                           0.5,       1.5,      2.5,      3.5,       4.5};
+    values.insert(values.end(), ties, ties + sizeof(ties) / sizeof(ties[0]));
 
     // f/e switch right at the carry edge, both directions of the 7th digit.
     const double switches[] = {9.999995e-5,       9.99999999e-5,      0.0001,            0.000123456789,
                                999999.0,          999999.99999999988, 99999.99999999999, 100000.0,
                                999999.49999999,   1000000.49999,      123456.499999999985, 120000.0,
                                1.2e-7,            1.0 / 3.0,          2.0 / 3.0,         1e23};
-    for (const double value : switches) {
-        g6_check(value, &checked, &failed);
-    }
+    values.insert(values.end(), switches,
+                  switches + sizeof(switches) / sizeof(switches[0]));
 
     // Exact powers of ten across the whole exponent range: these are the
     // k-estimation edge cases (the fast path's decade classification is
     // computed from the binary exponent, and exact decades sit on the edge).
     for (int j = -22; j <= 22; ++j) {
         const double power = std::pow(10.0, static_cast<double>(j));
-        g6_check(power, &checked, &failed);
-        g6_check(-power, &checked, &failed);
-        g6_check(g6_next_ulp(power, -1), &checked, &failed);
-        g6_check(g6_next_ulp(power, 1), &checked, &failed);
-        g6_check(g6_next_ulp(power, -2), &checked, &failed);
-        g6_check(g6_next_ulp(power, 2), &checked, &failed);
+        values.push_back(power);
+        values.push_back(-power);
+        values.push_back(g6_next_ulp(power, -1));
+        values.push_back(g6_next_ulp(power, 1));
+        values.push_back(g6_next_ulp(power, -2));
+        values.push_back(g6_next_ulp(power, 2));
     }
+    return values;
+}
 
+void g6_check_buffer_leg(std::size_t* checked, std::size_t* failed) {
     // End-to-end through log_buffer: the append_float integration must hold
     // the same byte-identity (this is the call the logger actually makes).
     const double through_buffer[] = {3.14159265358979, 2.718281828459045, 0.0, -0.0,
@@ -634,13 +635,31 @@ CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
         obs::log_buffer out(buffer, sizeof(buffer));
         out.append_float(value);
         const std::size_t count = out.size();
-        ++checked;
+        ++*checked;
         if (count != std::strlen(reference) || std::memcmp(buffer, reference, count) != 0) {
-            ++failed;
+            ++*failed;
             std::printf("  G6 BUFFER MISMATCH value=%.17e snprintf=[%s] buffer=[%.*s]\n", value,
                         reference, static_cast<int>(count), buffer);
         }
     }
+}
+
+void g6_check_boundary_corpus(const std::vector<double>& values, std::size_t* checked,
+                              std::size_t* failed) {
+    for (const double value : values) {
+        g6_check(value, checked, failed);
+    }
+    g6_check_buffer_leg(checked, failed);
+}
+
+} // namespace
+
+CRPC_TEST(log_double_formatter_matches_snprintf_boundary_values) {
+    std::size_t checked = 0;
+    std::size_t failed = 0;
+
+    const std::vector<double> values = g6_boundary_values();
+    g6_check_boundary_corpus(values, &checked, &failed);
 
     std::printf("g6 boundary differential: %zu checked, %zu failures\n", checked, failed);
     CRPC_CHECK_EQ(std::size_t{0}, failed);
@@ -739,6 +758,120 @@ CRPC_TEST(log_double_formatter_matches_snprintf_fuzz_over_1m) {
     std::printf("g6 fuzz differential: %zu checked, %zu failures\n", checked, failed);
     CRPC_CHECK(checked >= 1000000);
     CRPC_CHECK_EQ(std::size_t{0}, failed);
+}
+
+// --- %.6g under every fenv rounding mode -------------------------------------
+//
+// The contract is same-mode byte identity: whatever the current rounding
+// direction is, format_double_g6 must print exactly what snprintf("%.6g")
+// prints under that same mode. Direct rounding changes %g's result for almost
+// every value (snprintf rounds the 6th significant digit up/down/truncate
+// whenever any digit is discarded, instead of half-even at a tie), so the
+// formatter's fast path -- which decides one 7th-digit rounding -- is only
+// sound under FE_TONEAREST and must delegate otherwise. This case pins both
+// the delegation and the platform facts:
+//
+//   * fesetround is actually applied (fegetround echoes it, 1+2^-53 moves);
+//   * the CRT's printf either follows the mode or not -- a platform fact, not
+//     a failure: same-mode byte identity holds either way;
+//   * 348 boundary checks + 100k random values per mode compare byte-for-byte.
+//
+// Probe on this platform (opt-float2/probe_fenv.cpp): UCRT 14.51 x64 and
+// glibc 2.39 both honor fesetround in printf, e.g. 123456.5 prints
+// "123456" (nearest) / "123457" (upward) / "123456" (downward) / "123456"
+// (toward zero), and the ungated fast path mismatched ~50% of 200k random
+// values in each directed mode.
+CRPC_TEST(log_double_formatter_matches_snprintf_under_every_fenv_rounding_mode) {
+    struct mode_entry {
+        int mode;
+        const char* name;
+    };
+    const mode_entry modes[] = {
+        {FE_TONEAREST, "FE_TONEAREST"},
+        {FE_UPWARD, "FE_UPWARD"},
+        {FE_DOWNWARD, "FE_DOWNWARD"},
+        {FE_TOWARDZERO, "FE_TOWARDZERO"},
+    };
+
+    const int saved_mode = std::fegetround();
+
+    // One corpus and one random pool, built under round-to-nearest so every
+    // mode formats the exact same bit patterns (pow/nextafter/division run
+    // once, not once per mode).
+    CRPC_CHECK_EQ(0, std::fesetround(FE_TONEAREST));
+    const std::vector<double> boundaries = g6_boundary_values();
+
+    std::vector<double> random_values;
+    random_values.reserve(100000);
+    g6_rng rng{0xFEEDFACE5EEDULL};
+    // Uniform bit patterns: includes non-finites and subnormals at their
+    // natural frequency.
+    for (std::size_t i = 0; i < 50000; ++i) {
+        random_values.push_back(rng.bit_pattern());
+    }
+    // Dense normal-space sampling, sign toggled per value.
+    for (std::size_t i = 0; i < 30000; ++i) {
+        const std::uint64_t exponent = static_cast<std::uint64_t>(rng.below(2046)) + 1;
+        const std::uint64_t bits =
+            (exponent << 52) | (rng.next() & 0xFFFFFFFFFFFFFull) | ((rng.next() & 1) << 63);
+        random_values.push_back(g6_from_bits(bits));
+    }
+    // Decimal shapes (N.5 and 7-digit forms scaled by exact decades): the
+    // carry-chain families where the 6th/7th digit is knife-edged.
+    for (std::size_t i = 0; i < 20000; ++i) {
+        const int j = static_cast<int>(rng.below(31)) - 15;
+        const std::uint64_t n = 1 + rng.below(2000000);
+        const double shape = (rng.next() & 1) != 0 ? static_cast<double>(n) + 0.5
+                                                   : static_cast<double>(n * 10 + 5);
+        const double scaled = shape * std::pow(10.0, static_cast<double>(j));
+        random_values.push_back((rng.next() & 1) != 0 ? scaled : -scaled);
+    }
+
+    char tie_text[4][64] = {};
+    for (std::size_t index = 0; index < sizeof(modes) / sizeof(modes[0]); ++index) {
+        const mode_entry& entry = modes[index];
+        const int set_rc = std::fesetround(entry.mode);
+        const int echo = std::fegetround();
+        std::snprintf(tie_text[index], sizeof(tie_text[index]), "%.6g", 123456.5);
+
+        // Does the hardware/CRT actually change arithmetic under this mode?
+        // volatile operands keep the compiler from folding 1.0 + 2^-53.
+        volatile double one = 1.0;
+        volatile double half_ulp = 0x1p-53;
+        volatile double neg_one = -1.0;
+        const double sum = one + half_ulp;
+        const double neg_sum = neg_one - half_ulp;
+
+        std::size_t checked = 0;
+        std::size_t failed = 0;
+        g6_check_boundary_corpus(boundaries, &checked, &failed);
+        for (const double value : random_values) {
+            g6_check(value, &checked, &failed);
+        }
+
+        std::printf(
+            "[%s] fesetround_rc=%d fegetround=%d(%s) 1+2^-53=%.17g -1-2^-53=%.17g "
+            "snprintf_tie_123456.5=[%s] checked=%zu failures=%zu\n",
+            entry.name, set_rc, echo, echo == entry.mode ? "echo-ok" : "echo-MISMATCH", sum,
+            neg_sum, tie_text[index], checked, failed);
+
+        CRPC_CHECK_EQ(0, set_rc);
+        CRPC_CHECK_EQ(entry.mode, echo);
+        CRPC_CHECK(checked >= 100000);
+        CRPC_CHECK_EQ(std::size_t{0}, failed);
+    }
+
+    // Platform difference, recorded not asserted: a CRT whose printf ignores
+    // fesetround is still contract-conforming on its own platform, because the
+    // formatter delegates to that same snprintf.
+    const bool printf_follows_mode = std::strcmp(tie_text[0], tie_text[1]) != 0 ||
+                                     std::strcmp(tie_text[0], tie_text[2]) != 0 ||
+                                     std::strcmp(tie_text[0], tie_text[3]) != 0;
+    std::printf("platform fact: snprintf follows fesetround = %s\n",
+                printf_follows_mode ? "yes" : "no");
+
+    CRPC_CHECK_EQ(0, std::fesetround(saved_mode));
+    CRPC_CHECK_EQ(saved_mode, std::fegetround());
 }
 
 CRPC_TEST_MAIN()

@@ -1472,11 +1472,13 @@ namespace {
 // --- GBK ---------------------------------------------------------------------
 
 // The generated mapping: kGbkDecodeRows is the (lead - 0x81) * 190 +
-// trail_index(trail) decode table, kGbkEncode is the code-point-sorted
-// (code point << 16) | GBK code table (kept as the reference mapping the
-// fallback encode path walks with std::lower_bound), and kGbkEncodeDirect
-// is the direct-index form direct[code point] = GBK code (0 = unmapped)
-// that the hot encode path reads with a single load.
+// trail_index(trail) decode table, kGbkDecodeUtf8 precomposes every mapped
+// pair into the bytes gbk_to_utf8 emits (indexed by the raw trail byte),
+// kGbkEncode is the code-point-sorted (code point << 16) | GBK code table
+// (kept as the reference mapping the fallback encode path walks with
+// std::lower_bound), and kGbkEncodeDirect is the direct-index form
+// direct[code point] = GBK code (0 = unmapped) that the hot encode path
+// reads with a single load.
 #include "gbk_table.inc"
 
 // Trail bytes run 0x40..0x7E and 0x80..0xFE; 0x7F is skipped. The LUT folds
@@ -1501,51 +1503,10 @@ constexpr std::uint16_t kGbkTrailInvalid = 0xFFFFu;
 
 constexpr std::uint16_t kGbkEuro = 0x20ACu;
 
-// Output staging for the decode: characters are written into a fixed stack
-// buffer and flushed to the result string in chunks. Per-character work is
-// then plain stores with no capacity checks, while the result string is only
-// ever grown by large appends -- and never by a worst-case 3x allocation or
-// zero-fill.
-struct gbk_char_sink {
-    std::string* out;
-    std::size_t filled = 0;
-    char buf[16384];
-
-    void flush() {
-        out->append(buf, filled);
-        filled = 0;
-    }
-    void put(char a, char b, char c) {
-        if (filled + 3 > sizeof(buf)) {
-            flush();
-        }
-        buf[filled] = a;
-        buf[filled + 1] = b;
-        buf[filled + 2] = c;
-        filled += 3;
-    }
-    void put2(char a, char b) {
-        if (filled + 2 > sizeof(buf)) {
-            flush();
-        }
-        buf[filled] = a;
-        buf[filled + 1] = b;
-        filled += 2;
-    }
-    // Long ASCII runs go straight to the string; short ones join the buffer.
-    void put_run(const char* run, std::size_t len) {
-        if (len >= sizeof(buf) / 2) {
-            flush();
-            out->append(run, len);
-            return;
-        }
-        if (filled + len > sizeof(buf)) {
-            flush();
-        }
-        std::memcpy(buf + filled, run, len);
-        filled += len;
-    }
-};
+// Bit 24 of a kGbkDecodeUtf8 entry marks one of the 157 sub-U+0800 mappings
+// whose UTF-8 form is two bytes instead of three; the bulk loops leave such
+// entries to the scalar path, which knows both widths.
+constexpr std::uint32_t kGbkTwoByteEntry = 0x01000000u;
 
 // Output staging for the encode: same chunking, byte output.
 struct gbk_byte_sink {
@@ -1635,76 +1596,152 @@ const char* gbk_utf8_scan(std::string_view text) noexcept {
 } // namespace
 
 result<std::string> gbk_to_utf8(span<const std::byte> data) {
+    // The result is written straight into the string's buffer. Double-byte
+    // pairs emit at most three bytes per two input bytes and ASCII emits one
+    // per byte, so size + size / 2 + 4 bounds everything except the euro
+    // byte: it is the only single-byte source above ASCII and is grown on
+    // demand below.
     std::string out;
-    out.reserve(data.size() * 3 / 2 + 4);
-    gbk_char_sink sink;
-    sink.out = &out;
-    const std::byte* p = data.data();
-    const std::byte* const end = p + data.size();
+    std::size_t capacity = data.size() + data.size() / 2 + 4;
+    out.resize(capacity);
+    char* base = out.data();
+
+    const std::uint8_t* const begin =
+        reinterpret_cast<const std::uint8_t*>(data.data());
+    const std::uint8_t* p = begin;
+    const std::uint8_t* const end = begin + data.size();
+    std::size_t written = 0;
+
+    // Four double-byte characters (eight input bytes) at a time: four
+    // independent precomposed-table loads and two 8-byte stores, no
+    // per-character branch. The loop stops at anything that is not a plain
+    // three-byte pair -- ASCII, the euro sign, a two-byte mapping, an
+    // invalid or an unmapped pair -- and the scalar loop classifies it with
+    // the exact same precedence the original implementation used.
+    while (end - p >= 8) {
+        const std::uint8_t lead0 = p[0];
+        const std::uint8_t lead1 = p[2];
+        const std::uint8_t lead2 = p[4];
+        const std::uint8_t lead3 = p[6];
+        if (lead0 < 0x81u || lead0 > 0xFEu || lead1 < 0x81u ||
+            lead1 > 0xFEu || lead2 < 0x81u || lead2 > 0xFEu ||
+            lead3 < 0x81u || lead3 > 0xFEu) {
+            break;
+        }
+        const std::uint32_t seq0 =
+            kGbkDecodeUtf8[static_cast<std::size_t>(lead0 - 0x81u) * 256u +
+                           p[1]];
+        const std::uint32_t seq1 =
+            kGbkDecodeUtf8[static_cast<std::size_t>(lead1 - 0x81u) * 256u +
+                           p[3]];
+        const std::uint32_t seq2 =
+            kGbkDecodeUtf8[static_cast<std::size_t>(lead2 - 0x81u) * 256u +
+                           p[5]];
+        const std::uint32_t seq3 =
+            kGbkDecodeUtf8[static_cast<std::size_t>(lead3 - 0x81u) * 256u +
+                           p[7]];
+        // A group is safe to bulk-emit only when all four entries are plain
+        // three-byte sequences. seq == 0 (unmapped pair) is detected per
+        // entry: subtracting one turns it into 0xFFFFFFFF, so the OR of the
+        // four differences has bit 31 set if any entry was zero. (Testing
+        // "all four are zero" instead would let one invalid pair slip through
+        // masked by its three neighbours -- the fuzz test caught exactly
+        // that.)
+        const std::uint32_t zero = (seq0 - 1u) | (seq1 - 1u) | (seq2 - 1u) |
+                                   (seq3 - 1u);
+        const std::uint32_t any = seq0 | seq1 | seq2 | seq3;
+        if ((zero & 0x80000000u) != 0 ||
+            (any & kGbkTwoByteEntry) != 0) {
+            break;
+        }
+        const std::uint64_t first =
+            static_cast<std::uint64_t>(seq0) |
+            (static_cast<std::uint64_t>(seq1) << 24);
+        const std::uint64_t second =
+            static_cast<std::uint64_t>(seq2) |
+            (static_cast<std::uint64_t>(seq3) << 24);
+        std::memcpy(base + written, &first, 8);
+        std::memcpy(base + written + 6, &second, 8);
+        written += 12;
+        p += 8;
+    }
+
     while (p < end) {
-        const std::uint8_t lead = to_byte(*p);
-        if (lead >= 0x80u) {
-            if (lead == 0x80u) {
-                // U+20AC, the only single-byte mapping above ASCII.
-                sink.put(static_cast<char>(0xE0u | (kGbkEuro >> 12)),
-                         static_cast<char>(0x80u | ((kGbkEuro >> 6) & 0x3Fu)),
-                         static_cast<char>(0x80u | (kGbkEuro & 0x3Fu)));
-                ++p;
-                continue;
-            }
-            if (lead == 0xFFu) {
-                return decode_error("gbk: byte 0xFF is not a lead byte",
-                                    static_cast<std::size_t>(p - data.data()));
-            }
+        const std::uint8_t lead = *p;
+        if (lead >= 0x81u && lead <= 0xFEu) {
             if (end - p < 2) {
                 return decode_error("gbk: lone lead byte",
-                                    static_cast<std::size_t>(p - data.data()));
+                                    static_cast<std::size_t>(p - begin));
             }
-            const std::uint16_t trail = kGbkTrailMap.index[to_byte(p[1])];
-            if (trail == kGbkTrailInvalid) {
-                return decode_error("gbk: invalid trail byte",
-                                    static_cast<std::size_t>(p - data.data()) +
-                                        1);
+            const std::uint32_t seq =
+                kGbkDecodeUtf8[static_cast<std::size_t>(lead - 0x81u) * 256u +
+                               p[1]];
+            if (seq == 0) {
+                // Only the cold path pays for telling the two error kinds
+                // apart, and the precedence matches the original decoder:
+                // a trail outside 0x40..0xFE (0x7F excluded) is reported at
+                // its own offset, a valid but unmapped pair at the lead.
+                if (kGbkTrailMap.index[p[1]] == kGbkTrailInvalid) {
+                    return decode_error(
+                        "gbk: invalid trail byte",
+                        static_cast<std::size_t>(p - begin) + 1);
+                }
+                return decode_error(
+                    "gbk: unmapped double-byte sequence",
+                    static_cast<std::size_t>(p - begin));
             }
-            const std::uint16_t code =
-                kGbkDecodeRows[static_cast<std::size_t>(lead - 0x81u) * 190u +
-                               trail];
-            if (code == 0) {
-                return decode_error("gbk: unmapped double-byte sequence",
-                                    static_cast<std::size_t>(p - data.data()));
-            }
-            // Every double-byte entry maps above U+07FF except a small set of
-            // two-byte characters; each form is emitted directly.
-            if (code < 0x800u) {
-                sink.put2(static_cast<char>(0xC0u | (code >> 6)),
-                          static_cast<char>(0x80u | (code & 0x3Fu)));
+            if ((seq & kGbkTwoByteEntry) != 0) {
+                base[written] = static_cast<char>(seq);
+                base[written + 1] = static_cast<char>(seq >> 8);
+                written += 2;
             } else {
-                sink.put(static_cast<char>(0xE0u | (code >> 12)),
-                         static_cast<char>(0x80u | ((code >> 6) & 0x3Fu)),
-                         static_cast<char>(0x80u | (code & 0x3Fu)));
+                std::memcpy(base + written, &seq, 4);
+                written += 3;
             }
             p += 2;
             continue;
         }
-        // ASCII run. Entered only after the first byte is known ASCII, so
-        // CJK-heavy input never pays the vector scan; inside the run the scan
-        // moves 8 bytes at a time and the whole run is copied in bulk.
-        const std::byte* run = p;
-        while (end - p >= 8) {
-            std::uint64_t chunk;
-            std::memcpy(&chunk, p, 8);
-            if ((chunk & 0x8080808080808080ULL) != 0) {
-                break;
+        if (lead == 0x80u) {
+            // U+20AC, the only single-byte mapping above ASCII.
+            if (written + 3 > capacity) {
+                capacity = capacity * 2 + 16;
+                out.resize(capacity);
+                base = out.data();
             }
-            p += 8;
-        }
-        while (p < end && to_byte(*p) < 0x80u) {
+            base[written] = static_cast<char>(0xE0u | (kGbkEuro >> 12));
+            base[written + 1] =
+                static_cast<char>(0x80u | ((kGbkEuro >> 6) & 0x3Fu));
+            base[written + 2] =
+                static_cast<char>(0x80u | (kGbkEuro & 0x3Fu));
+            written += 3;
             ++p;
+            continue;
         }
-        sink.put_run(reinterpret_cast<const char*>(run),
-                     static_cast<std::size_t>(p - run));
+        if (lead < 0x80u) {
+            // ASCII run. Entered only after the first byte is known ASCII, so
+            // CJK-heavy input never pays the vector scan; inside the run the
+            // scan moves 8 bytes at a time and the run is copied in bulk.
+            const std::uint8_t* run = p;
+            while (end - p >= 8) {
+                std::uint64_t chunk;
+                std::memcpy(&chunk, p, 8);
+                if ((chunk & 0x8080808080808080ULL) != 0) {
+                    break;
+                }
+                p += 8;
+            }
+            while (p < end && *p < 0x80u) {
+                ++p;
+            }
+            const std::size_t length = static_cast<std::size_t>(p - run);
+            std::memcpy(base + written, run, length);
+            written += length;
+            continue;
+        }
+        return decode_error("gbk: byte 0xFF is not a lead byte",
+                            static_cast<std::size_t>(p - begin));
     }
-    sink.flush();
+    out.resize(written);
     return out;
 }
 

@@ -505,6 +505,29 @@ struct tls_it_session {
     }
 };
 
+// Reads a single-string status value (SHOW STATUS / SELECT @@...), empty on
+// any failure.
+std::string it_scalar(crpc::db::mysql::connection& session, const char* sql) {
+    crpc::db::result_set* rows = nullptr;
+    const crpc::status ran = session.query(sql, {}, &rows);
+    crpc::db::statement_guard guard(rows);
+    if (!ran.ok()) {
+        std::printf("  scalar query '%s' failed: %s\n", sql, ran.error().message.c_str());
+        return std::string();
+    }
+    if (rows == nullptr || !rows->next()) {
+        std::printf("  scalar query '%s': no row\n", sql);
+        return std::string();
+    }
+    // SHOW STATUS has two columns (name, value); SELECT @@... has one.
+    const std::size_t value_column = rows->column_count() > 1 ? 1 : 0;
+    if (rows->is_null(value_column)) {
+        std::printf("  scalar query '%s': null value\n", sql);
+        return std::string();
+    }
+    return std::string(rows->get_text(value_column).value());
+}
+
 // Restores require_secure_transport=OFF no matter how the case ends: the
 // variable is global, and leaving it ON would poison every later MySQL
 // session on this server.

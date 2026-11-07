@@ -1133,6 +1133,284 @@ CRPC_TEST(gbk_every_mappable_bmp_code_point_roundtrips) {
     CRPC_CHECK_EQ(kExpectedMappable, mappable);
 }
 
+// Strictly decodes exactly one UTF-8 scalar: -1 unless the string is the
+// shortest-form encoding of one scalar in range (no overlongs, no surrogates,
+// nothing above U+10FFFF, no trailing bytes).
+long decode_one_strict_utf8(std::string_view text) {
+    const auto byte_at = [&](std::size_t i) {
+        return static_cast<unsigned>(
+            static_cast<unsigned char>(text[i]));
+    };
+    if (text.empty()) {
+        return -1;
+    }
+    const unsigned b0 = byte_at(0);
+    if (b0 < 0x80u) {
+        return text.size() == 1 ? static_cast<long>(b0) : -1;
+    }
+    if (b0 < 0xC2u) {
+        return -1;
+    }
+    if (b0 < 0xE0u) {
+        if (text.size() != 2 || (byte_at(1) & 0xC0u) != 0x80u) {
+            return -1;
+        }
+        return static_cast<long>(((b0 & 0x1Fu) << 6) | (byte_at(1) & 0x3Fu));
+    }
+    if (b0 < 0xF0u) {
+        if (text.size() != 3 || (byte_at(1) & 0xC0u) != 0x80u ||
+            (byte_at(2) & 0xC0u) != 0x80u ||
+            (b0 == 0xE0u && byte_at(1) < 0xA0u) ||
+            (b0 == 0xEDu && byte_at(1) >= 0xA0u)) {
+            return -1;
+        }
+        return static_cast<long>(((b0 & 0x0Fu) << 12) |
+                                 ((byte_at(1) & 0x3Fu) << 6) |
+                                 (byte_at(2) & 0x3Fu));
+    }
+    if (b0 < 0xF5u) {
+        if (text.size() != 4 || (byte_at(1) & 0xC0u) != 0x80u ||
+            (byte_at(2) & 0xC0u) != 0x80u ||
+            (byte_at(3) & 0xC0u) != 0x80u ||
+            (b0 == 0xF0u && byte_at(1) < 0x90u) ||
+            (b0 == 0xF4u && byte_at(1) >= 0x90u)) {
+            return -1;
+        }
+        return static_cast<long>(((b0 & 0x07u) << 18) |
+                                 ((byte_at(1) & 0x3Fu) << 12) |
+                                 ((byte_at(2) & 0x3Fu) << 6) |
+                                 (byte_at(3) & 0x3Fu));
+    }
+    return -1;
+}
+
+bool is_canonical_utf8(std::string_view text) {
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const auto b = static_cast<unsigned>(
+            static_cast<unsigned char>(text[i]));
+        std::size_t width = 1;
+        if (b >= 0xF0u) {
+            width = 4;
+        } else if (b >= 0xE0u) {
+            width = 3;
+        } else if (b >= 0xC0u) {
+            width = 2;
+        }
+        if (i + width > text.size() ||
+            decode_one_strict_utf8(text.substr(i, width)) < 0) {
+            return false;
+        }
+        i += width;
+    }
+    return true;
+}
+
+CRPC_TEST(gbk_decode_emits_canonical_utf8_for_every_mapped_pair) {
+    // Independently of the round trip, every decoded pair must be the
+    // shortest-form UTF-8 encoding of one scalar -- this is what catches a
+    // mistranslated precomposed table entry even if the encoder happened to
+    // agree with it.
+    static constexpr std::size_t kExpectedMapped = 21791;
+    std::size_t mapped = 0;
+    std::vector<std::byte> pair(2);
+    for (unsigned lead = 0x81u; lead <= 0xFEu; ++lead) {
+        for (unsigned trail = 0x40u; trail <= 0xFEu; ++trail) {
+            if (trail == 0x7Fu) {
+                continue;
+            }
+            pair[0] = std::byte{static_cast<std::uint8_t>(lead)};
+            pair[1] = std::byte{static_cast<std::uint8_t>(trail)};
+            const auto utf8 = enc::gbk_to_utf8(span_of(pair));
+            if (!utf8.ok()) {
+                continue;
+            }
+            ++mapped;
+            const long cp = decode_one_strict_utf8(utf8.value());
+            CRPC_CHECK(cp >= 0);
+            if (cp < 0) {
+                continue;
+            }
+            std::string canonical;
+            append_utf8(canonical, static_cast<std::uint32_t>(cp));
+            CRPC_CHECK_EQ(canonical, utf8.value());
+            const auto gbk = enc::utf8_to_gbk(utf8.value());
+            CRPC_CHECK(gbk.ok());
+            if (gbk.ok()) {
+                CRPC_CHECK(gbk.value() == pair);
+            }
+        }
+    }
+    CRPC_CHECK_EQ(kExpectedMapped, mapped);
+}
+
+CRPC_TEST(gbk_decode_fuzz_streams_match_reference) {
+    // Random streams built from ASCII, the euro byte, mapped pairs and a few
+    // deliberately invalid tokens. Valid streams must decode to the
+    // concatenation of their tokens' own decodes; invalid ones must report
+    // decode_error -- a fast path that skipped or replaced bytes would fail.
+    std::mt19937 engine(0x5EEDBEEFu);
+    const auto next = [&](unsigned bound) {
+        return static_cast<unsigned>(engine() % bound);
+    };
+
+    std::vector<std::uint16_t> mapped_pairs;
+    {
+        std::vector<std::byte> one(2);
+        for (unsigned lead = 0x81u; lead <= 0xFEu; ++lead) {
+            for (unsigned trail = 0x40u; trail <= 0xFEu; ++trail) {
+                if (trail == 0x7Fu) {
+                    continue;
+                }
+                one[0] = std::byte{static_cast<std::uint8_t>(lead)};
+                one[1] = std::byte{static_cast<std::uint8_t>(trail)};
+                if (enc::gbk_to_utf8(span_of(one)).ok()) {
+                    mapped_pairs.push_back(static_cast<std::uint16_t>(
+                        (lead << 8) | trail));
+                }
+            }
+        }
+        CRPC_CHECK_EQ(static_cast<std::size_t>(21791), mapped_pairs.size());
+    }
+
+    for (int iteration = 0; iteration < 240; ++iteration) {
+        std::string stream;
+        std::string expected;
+        bool valid = true;
+        const unsigned tokens = 1 + next(60);
+        std::vector<std::byte> token(2);
+        for (unsigned t = 0; t < tokens; ++t) {
+            const unsigned kind = next(10);
+            if (kind < 5) {
+                const std::uint16_t pair =
+                    mapped_pairs[next(static_cast<unsigned>(
+                        mapped_pairs.size()))];
+                token[0] = std::byte{static_cast<std::uint8_t>(pair >> 8)};
+                token[1] = std::byte{
+                    static_cast<std::uint8_t>(pair & 0xFFu)};
+                stream.push_back(static_cast<char>(pair >> 8));
+                stream.push_back(static_cast<char>(pair & 0xFFu));
+                const auto one = enc::gbk_to_utf8(span_of(token));
+                CRPC_CHECK(one.ok());
+                if (one.ok()) {
+                    expected += one.value();
+                }
+            } else if (kind < 8) {
+                const unsigned chars = 1 + next(12);
+                for (unsigned c = 0; c < chars; ++c) {
+                    const char ch =
+                        static_cast<char>('a' + next(26));
+                    stream.push_back(ch);
+                    expected.push_back(ch);
+                }
+            } else if (kind == 8) {
+                stream.push_back(static_cast<char>(0x80));
+                expected += "\xE2\x82\xAC";
+            } else {
+                valid = false;
+                const unsigned bad = next(2);
+                if (bad == 0) {
+                    stream.push_back(static_cast<char>(0xFF));
+                } else {
+                    stream.push_back(static_cast<char>(0x81));
+                    stream.push_back(static_cast<char>(0x7F));
+                }
+            }
+        }
+        const auto r = enc::gbk_to_utf8(span_of(stream));
+        if (valid) {
+            CRPC_CHECK(r.ok());
+            if (r.ok()) {
+                CRPC_CHECK_EQ(expected, r.value());
+                CRPC_CHECK(is_canonical_utf8(r.value()));
+            }
+        } else {
+            CRPC_CHECK(!r.ok());
+            expect_error(r.error_or(crpc::rpc_error{}).code,
+                         rpc_code::decode_error);
+        }
+    }
+}
+
+CRPC_TEST(gbk_decode_large_mixed_stream_roundtrips) {
+    // Crosses every internal chunk/unroll boundary many times, and is
+    // euro-dense enough that the output exceeds 3/2 of the input size.
+    std::string text;
+    for (int i = 0; i < 20000; ++i) {
+        append_utf8(text, 0x4E00u + static_cast<std::uint32_t>(i % 500));
+        text.push_back(static_cast<char>('a' + (i % 26)));
+        if (i % 7 == 0) {
+            append_utf8(text, 0x20ACu);
+        }
+        if (i % 11 == 0) {
+            text += "\xE4\xB8\xAD\xE6\x96\x87";
+        }
+    }
+    const auto gbk = enc::utf8_to_gbk(text);
+    CRPC_CHECK(gbk.ok());
+    if (!gbk.ok()) {
+        return;
+    }
+    const auto back = enc::gbk_to_utf8(span_of(gbk.value()));
+    CRPC_CHECK(back.ok());
+    if (back.ok()) {
+        CRPC_CHECK_EQ(text, back.value());
+    }
+}
+
+CRPC_TEST(gbk_decode_error_classification_covers_all_trail_bytes) {
+    // Every (lead, trail) pair must be classified exactly like the original
+    // decoder: a trail outside 0x40..0x7E / 0x80..0xFE is an invalid trail
+    // reported at its own offset; a valid trail without a mapping is reported
+    // at the lead. Mapped pairs are covered by the round-trip tests.
+    std::vector<std::byte> pair(2);
+    for (unsigned lead = 0x81u; lead <= 0xFEu; ++lead) {
+        for (unsigned trail = 0x00u; trail <= 0xFFu; ++trail) {
+            pair[0] = std::byte{static_cast<std::uint8_t>(lead)};
+            pair[1] = std::byte{static_cast<std::uint8_t>(trail)};
+            const auto r = enc::gbk_to_utf8(span_of(pair));
+            const bool trail_valid =
+                (trail >= 0x40u && trail <= 0x7Eu) ||
+                (trail >= 0x80u && trail <= 0xFEu);
+            if (r.ok()) {
+                CRPC_CHECK(trail_valid);
+                continue;
+            }
+            CRPC_CHECK(!r.ok());
+            const std::string message =
+                r.error_or(crpc::rpc_error{}).message;
+            if (trail_valid) {
+                CRPC_CHECK_EQ(
+                    std::string(
+                        "gbk: unmapped double-byte sequence at offset 0"),
+                    message);
+            } else {
+                CRPC_CHECK_EQ(
+                    std::string("gbk: invalid trail byte at offset 1"),
+                    message);
+            }
+        }
+    }
+}
+
+CRPC_TEST(gbk_decode_euro_dense_stream_grows_exactly) {
+    // 0x80 is the only single-byte source that emits three bytes, hence the
+    // only path that can outgrow the 3/2 * size initial capacity. An
+    // all-euro stream forces the growth branch in the real decoder.
+    const std::string gbk(70000u, static_cast<char>(0x80));
+    const auto r = enc::gbk_to_utf8(span_of(gbk));
+    CRPC_CHECK(r.ok());
+    if (!r.ok()) {
+        return;
+    }
+    std::string expected;
+    expected.reserve(70000u * 3u);
+    for (std::size_t i = 0; i < 70000u; ++i) {
+        expected += "\xE2\x82\xAC";
+    }
+    CRPC_CHECK_EQ(expected, r.value());
+}
+
 } // namespace
 
 CRPC_TEST_MAIN()

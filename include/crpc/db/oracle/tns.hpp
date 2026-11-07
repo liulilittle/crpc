@@ -1,12 +1,17 @@
 // CRPC -- Oracle TNS (Transparent Network Substrate) packet framing.
 //
-// END-TO-END UNVERIFIED. There is no Oracle server in this project's test
-// environment (no listener, no instance, no container), so nothing here has ever
-// been exchanged with a database. Every field was taken from Oracle's own
-// python-oracledb (thin mode) and checked against bytes that the reference
-// client actually emitted; see docs/oracle-ttc-evidence.md for the citations and
-// the captured vectors. Authentication is deliberately absent: it needs a
-// server round trip and could not be verified at all.
+// CONNECT/ACCEPT/REFUSE VERIFIED END TO END. On 2026-11-07 the connection layer
+// was exercised against a real Oracle listener: Oracle AI Database 26ai Free
+// (container image container-registry.oracle.com/database/free:latest, image id
+// sha256:f988b0c04c4c386cd306a2a914c0d7a9702d83acc31b064a28ad8eb6278a8fba,
+// image label version 23.26.0, Oracle Linux 8.10). The listener accepted the
+// CONNECT with protocol version 319 and SDU 8192, and refused an unregistered
+// service with (ERR=12514); tests/test_db_oracle_it.cpp (CRPC_ORACLE_IT=1) is
+// the reproduction. The rest of the fields still come from Oracle's own
+// python-oracledb (thin mode), checked against bytes that the reference client
+// actually emitted; see docs/oracle-ttc-evidence.md for the citations and the
+// captured vectors. Authentication is deliberately absent: it needs a full TTC
+// exchange and could not be verified at all.
 //
 // This is a codec, not an adapter. db::connection has no Oracle backend, and
 // adding one before authentication can be validated would make the library claim

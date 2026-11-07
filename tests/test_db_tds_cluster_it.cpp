@@ -162,6 +162,19 @@ CRPC_TEST(tds_cluster_it_dead_secondary_is_ejected_and_reads_fall_back) {
         CRPC_CHECK_EQ(std::int64_t{42}, rows.value()->get_int64(0).value());
     }
     drop(rows);
+    // Ejection is contractual: cluster_options::replica_failure_threshold defaults
+    // to three consecutive transport failures, and the health state is checked
+    // against that default. One read only proves the fallback; drive the remaining
+    // two failures the default requires before asserting the replica is out.
+    for (int attempt = 1; attempt < 3; ++attempt) {
+        const crpc::result<crpc::db::result_set*> retry = cluster.db->query("SELECT 42 AS n");
+        CRPC_CHECK(retry.ok());
+        if (retry.ok() && retry.value() != nullptr) {
+            CRPC_CHECK(retry.value()->next());
+            CRPC_CHECK_EQ(std::int64_t{42}, retry.value()->get_int64(0).value());
+        }
+        drop(retry);
+    }
     const std::vector<crpc::db::replica_health> health = cluster.db->replica_health();
     CRPC_CHECK_EQ(std::size_t{1}, health.size());
     CRPC_CHECK_FALSE(health.at(0).alive);
