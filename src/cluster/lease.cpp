@@ -83,11 +83,8 @@ result<lease> lease_manager::grant(const std::string& service,
 
     const key instance_key{service, node_id};
     const auto existing = by_instance_.find(instance_key);
-    if (existing != by_instance_.end()) {
-        leases_.erase(existing->second);
-        by_instance_.erase(existing);
-    }
-    if (config_.max_leases != 0 && leases_.size() >= config_.max_leases) {
+    if (existing == by_instance_.end() && config_.max_leases != 0 &&
+        leases_.size() >= config_.max_leases) {
         return rpc_error(rpc_code::resource_exhausted, "lease limit reached");
     }
 
@@ -105,6 +102,25 @@ result<lease> lease_manager::grant(const std::string& service,
     next.token.fence = next_fence_locked();
     next.state = phase::active;
     next.remove_at = monotonic_clock::time_point{};
+
+    // Fence barrier (P13): publish the new fence for the key before the new
+    // holder starts writing, so a replaced lease's old fence is rejected even
+    // if the new holder has not written yet. Lock order lease -> registry is
+    // the documented order.
+    write_context barrier_context;
+    barrier_context.node_id = node_id;
+    barrier_context.incarnation = next.token.incarnation;
+    barrier_context.fence = next.token.fence;
+    const result<u64> barrier = catalog_.fence_barrier(
+        service, node_id, next.token.fence, barrier_context);
+    if (!barrier.ok()) {
+        return barrier.error();
+    }
+
+    if (existing != by_instance_.end()) {
+        leases_.erase(existing->second);
+        by_instance_.erase(existing);
+    }
 
     const lease token = next.token;
     leases_.emplace(id, std::move(next));
@@ -133,11 +149,28 @@ result<lease> lease_manager::renew(u64 lease_id, std::chrono::milliseconds ttl) 
         return rpc_error(rpc_code::deadline_exceeded,
                          "lease expired past its critical grace period");
     }
+    // P4: an active lease whose expiry has already passed is expired even
+    // before the sweep observes it. Renewal must not resurrect it; is_active()
+    // and renew() use the same boundary.
+    if (current.state == phase::active && now >= current.token.expiry) {
+        return rpc_error(rpc_code::deadline_exceeded,
+                         "lease has already expired");
+    }
 
     const u64 live_incarnation =
         current_incarnation(current.token.service, current.token.node_id);
-    if (live_incarnation != 0) {
-        current.token.incarnation = live_incarnation;
+    if (current.token.incarnation == 0) {
+        // P7: a lease granted before the instance existed binds to the first
+        // incarnation it observes.
+        if (live_incarnation != 0) {
+            current.token.incarnation = live_incarnation;
+        }
+    } else if (live_incarnation != 0 &&
+               live_incarnation != current.token.incarnation) {
+        // The instance moved to a newer incarnation (restart). This lease no
+        // longer represents it and must not renew against the new one.
+        return rpc_error(rpc_code::failed_precondition,
+                         "lease is bound to a superseded incarnation");
     }
 
     if (current.state == phase::critical) {
@@ -214,6 +247,24 @@ lease_sweep_result lease_manager::expire_now(monotonic_clock::time_point now) {
         if (current.state == phase::active) {
             if (now < current.token.expiry) {
                 ++it;
+                continue;
+            }
+            // P7: bind an unbound lease to the incarnation that exists now, so
+            // grant-before-register expiry is applied instead of being lost as
+            // a stale write. A lease bound to an older incarnation no longer
+            // represents the instance and is dropped without writing.
+            const u64 live_incarnation = current_incarnation(
+                current.token.service, current.token.node_id);
+            if (current.token.incarnation == 0) {
+                if (live_incarnation != 0) {
+                    current.token.incarnation = live_incarnation;
+                }
+            } else if (live_incarnation != 0 &&
+                       live_incarnation != current.token.incarnation) {
+                ++sweep.rejected;
+                by_instance_.erase(
+                    key{current.token.service, current.token.node_id});
+                it = leases_.erase(it);
                 continue;
             }
             const result<write_result> marked =

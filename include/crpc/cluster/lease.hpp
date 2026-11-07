@@ -89,13 +89,20 @@ public:
     // Grant (or replace) the lease for (service, node_id). A ttl of zero uses
     // default_ttl. The instance does not have to exist yet; expiry is a no-op
     // for an instance that is absent or already a tombstone.
+    //
+    // A grant publishes a fencing barrier for the key before returning, so a
+    // replaced lease can no longer write with its old fence even before the
+    // new holder writes (P13). A lease granted before the instance exists
+    // binds to the first incarnation it observes on renew/sweep (P7).
     [[nodiscard]] result<lease> grant(const std::string& service,
                                       const std::string& node_id,
                                       std::chrono::milliseconds ttl =
                                           std::chrono::milliseconds{0});
 
     // Extend the lease. Renewing a critical lease restores the instance to
-    // passing through the registry authority path.
+    // passing through the registry authority path. An active lease whose
+    // expiry already passed is rejected with deadline_exceeded; it is never
+    // resurrected (P4). A lease bound to a superseded incarnation is rejected.
     [[nodiscard]] result<lease> renew(u64 lease_id,
                                       std::chrono::milliseconds ttl =
                                           std::chrono::milliseconds{0});

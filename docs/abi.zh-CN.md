@@ -42,6 +42,17 @@ MAJOR.MINOR.PATCH
 
 未发布的数据库连接池会话复位在 2.0.0 之上再增加一次 MAJOR：`db::connection` 新增虚函数 `reset_session()`。它插在 `rollback()` 之后，会移动其后所有虚表槽位，因此 `db::connection` 及其所有派生类的 vtable 布局改变，所有消费者必须重编。它必须加在基类上：池只持有 `db::connection*`，无从知道背后的连接是否保有会话状态。默认实现返回 `status{}` 且什么都不碰，因此 mongo、ODBC、TDS 适配器零成本（`mysql::connection` 覆写它，因为 `autocommit` 是 `ROLLBACK` 不会复位的会话变量；TiDB 继承该覆写）。默认实现也让这次变更停留在 MAJOR 而不是源码破坏：已有的子类无需改动。
 
+未发布的 G19 Phase 0 集群原语硬化在 2.0.0 之上再增加一次 MAJOR，并新增 MINOR 符号。四个消费者可见的 cluster 类型布局改变，所有消费者必须用同一份头文件重编（尺寸以 MSVC 19.51、x64 Debug 对旧头文件实测）：
+
+- `cluster::registry_config` 从 88 字节增至 104 字节：末尾新增四个字段（`separate_state_writers`、`strict_fencing`、`strict_incarnation`、`max_fence_lead`）。`registry` 构造函数按值接收它，因此这既是导出签名变化也是布局变化（§1、§4）。
+- `cluster::registry` 从 368 字节增至 432 字节：私有 tombstone incarnation 高水位与已 fencing 键表。消费者自行分配 registry，因此其宽度属于契约。
+- `cluster::watch_hub` 从 144 字节增至 192 字节（有界 replay ring 及其容量），并新增第二个构造函数。
+- `cluster::watch_stream` 从 312 字节增至 320 字节（取消屏障状态：正在派发的线程 id 与回调中标志）。
+
+`cluster::lease_manager`（200 字节）、`cluster::lease`（120）、`cluster::lease_config`（32）、`cluster::health_monitor`（64）、`cluster::registry_snapshot`（40）、`cluster::service_instance`（192）、`cluster::write_context`（96）、`cluster::write_result`（24）、`cluster::watch_event`（72）布局不变。新增符号为 MINOR 追加：`cluster::registry::fence_barrier(const std::string&, const std::string&, u64, const write_context&)`、`cluster::watch_stream::park()`、`cluster::watch_stream::cancel()`、`cluster::watch_hub::watch_hub(registry&, std::size_t, std::size_t)`。没有枚举值、wire 字段或协议字节变化；语义修复（grace 为零立即 purge、tombstone 高水位、调用方 fence 有界、过期 lease 拒绝续租、purge 推进 index 并发 remove 事件、TTL 边界包含等号、watch 取消屏障/park/replay）只是行为变化。`registry_config` 的三个新开关**默认开启**：`separate_state_writers=true`、`strict_fencing=true`、`strict_incarnation=true`。依赖历史覆盖语义的既有进程内用法必须显式把它们设为 `false`；该 legacy 配置在任何多写入方部署中都不安全：注册会覆盖 health/lease 裁决，已接受外部 fencing 的键在更新时会静默丢失 fence，同 incarnation 换 payload 会直接覆盖而不是报冲突。
+
+另有两条纯行为语义属于本节。成功写入在 `write_result::fence` 中返回该键的生效 fence 高水位（不会低于 lease `fence_barrier`，可直接用于同一键的下一次写入）；`stale_fence` 拒绝会在追加的 `registry.fence` 错误元数据键中携带该高水位，`health_bridge` 据此重锚。`strict_fencing` 下只有**从未存在过**的键允许以 `fence=0` 创建；tombstone 高水位或 fence 高水位在 purge 后仍保留的键不属于全新键，零 fence 创建返回 `registry.reason=fence_required`。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

@@ -764,7 +764,28 @@ CRPC_TEST(distributed_registry_partition_and_watch_replay) {
     // Rejoining with a newer incarnation converges to exactly one instance per
     // node, with the newest endpoint for the nodes that restarted.
     nodes[1].name = unique_name("dist-reg-rejoined");
-    CRPC_CHECK(register_node(registry, nodes[1], 2));
+    CRPC_CHECK(register_node(registry, nodes[1], 3));
+
+    // The strict replay default rejects a second write for the same
+    // (key, incarnation) with a different endpoint: an endpoint change must
+    // bump the incarnation, not silently overwrite.
+    cl::service_instance conflicting;
+    conflicting.service = k_service_name;
+    conflicting.node_id = states[1].id;
+    conflicting.address.host = partitioned_endpoint;
+    conflicting.address.port = 0;
+    conflicting.incarnation = 3;
+    conflicting.state = cl::instance_state::passing;
+    cl::write_context conflicting_context;
+    conflicting_context.node_id = states[1].id;
+    conflicting_context.incarnation = 3;
+    const auto conflicting_write =
+        registry.register_instance(conflicting, conflicting_context);
+    CRPC_CHECK_FALSE(conflicting_write.ok());
+    CRPC_CHECK(conflicting_write.code() == rpc_code::failed_precondition);
+    const std::string* conflict_reason =
+        conflicting_write.error().metadata.find("registry.reason");
+    CRPC_CHECK(conflict_reason != nullptr && *conflict_reason == "conflict");
 
     const route_table table = discover(registry);
     CRPC_CHECK_EQ(std::size_t{3}, table.endpoints.size());

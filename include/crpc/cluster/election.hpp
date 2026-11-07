@@ -25,6 +25,19 @@
 // vote RPCs, persists term/vote, replicates its log, and calls campaign() only
 // after its log is at least as up to date as the quorum's.
 //
+// Deployment scope (v1)
+// ---------------------
+// This class is a SINGLE-PROCESS primitive, not a multi-node authority. It
+// does not provide mutual exclusion on its own: leases are keyed per candidate
+// (lease_service, candidate_id), so two candidates can both hold a lease
+// against a permissive quorum stub, and the locally derived epoch is not
+// comparable across processes (it comes from the local registry index/fence).
+// v1 therefore runs exactly ONE registry authority, configured and fenced by an
+// operator-supplied authority epoch; it never uses election to pick it. Real
+// multi-node failover needs either a central leader lease key on the authority
+// or a Raft implementation with persisted term/vote/log, both of which are
+// v1.1 scope. Do not advertise this class as "multi-node leader election".
+//
 // Concurrency contract
 // --------------------
 //   * election is not thread-safe; it is owned by one authority shard thread.

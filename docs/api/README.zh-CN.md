@@ -83,6 +83,7 @@
 | [`observability/context.hpp`](../../include/crpc/observability/context.hpp) | `obs::trace_context`、`obs::span` | W3C `traceparent`/baggage 链路上下文。 |
 | [`observability/interceptor.hpp`](../../include/crpc/observability/interceptor.hpp) | `obs::interceptor_chain` | AOP 拦截器链。 |
 | [`observability/log.hpp`](../../include/crpc/observability/log.hpp) | `obs::logger`、`log_record` | 高性能异步结构化日志。 |
+| [`observability/metrics.hpp`](../../include/crpc/observability/metrics.hpp) | `obs::metrics`、`obs::counter`、`obs::gauge`、`obs::histogram` | 计数器、仪表与直方图，未配置时零成本。 |
 | [`observability/tracer.hpp`](../../include/crpc/observability/tracer.hpp) | `obs::tracer` | span、头部采样与异步导出。 |
 
 ## 集群与流控
@@ -93,6 +94,7 @@
 | [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp) | `cluster::lease_manager` | 租约/会话管理器。 |
 | [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp) | `cluster::election` | 选主原语。 |
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | 健康检查器。 |
+| [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`、`cluster::health_instance_set` | 带去抖的“健康结果→注册表”单写者，以及只读负载均衡视图。 |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | 基于索引的目录 watch/订阅。 |
 | [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`、`flow::pacer`、`flow::congestion_window`、`flow::rtt_tracker` | 自适应流控原语。 |
 | [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`、`rpc::flow_control_options`、`rpc::flow_state` | 连接级流控：字节窗口、PING/PONG 探针、每 lane 配额、pacer。 |
@@ -324,6 +326,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`observability/context.hpp`](../../include/crpc/observability/context.hpp)
 - [`observability/interceptor.hpp`](../../include/crpc/observability/interceptor.hpp)
 - [`observability/log.hpp`](../../include/crpc/observability/log.hpp)
+- [`observability/metrics.hpp`](../../include/crpc/observability/metrics.hpp)
 - [`observability/tracer.hpp`](../../include/crpc/observability/tracer.hpp)
 
 ### `crpc/orm`
@@ -499,6 +502,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 
 - [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp)
 - [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp)
+- [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp)
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)

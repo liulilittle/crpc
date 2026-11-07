@@ -20,6 +20,8 @@
 #include <vector>
 
 #include <crpc/endian.hpp>
+#include <crpc/observability/metrics.hpp>
+#include <crpc/observability/tracer.hpp>
 #include <crpc/resilience/admission.hpp>
 #include <crpc/resilience/fallback.hpp>
 #include <crpc/rpc/call.hpp>
@@ -1668,6 +1670,34 @@ struct server::impl {
             probe_admitted.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // --- Automatic dispatch observability ------------------------------
+        //
+        // Zero cost when unused: both calls below are one atomic load and a
+        // predictable branch, and no trace context is built when the tracer
+        // is disabled. With a tracer, a propagated wire context becomes the
+        // parent of a span covering the handler execution. The wire carries
+        // no sampled bit, so the receiver reproduces the sender's decision by
+        // running the same pure function over the same trace id.
+        obs::metrics::increment(obs::metric_id::rpc_server_calls);
+        obs::metrics::add_gauge(obs::metric_id::rpc_server_inflight, 1);
+        obs::span call_span;
+        if (obs::tracer::instance().enabled()) {
+            obs::trace_context parent;
+            if (envelope.extensions.has(trace_extension::has_trace_id) &&
+                envelope.extensions.has(trace_extension::has_span_id)) {
+                parent.trace.bytes = envelope.extensions.trace_id;
+                parent.span.bytes = envelope.extensions.span_id;
+                if (parent.trace.valid() && parent.span.valid()) {
+                    parent.set_sampled(
+                        obs::tracer::instance().sampled(parent.trace));
+                } else {
+                    parent = obs::trace_context{};
+                }
+            }
+            call_span =
+                obs::tracer::instance().start_span("rpc.server.call", parent);
+        }
+
         buffer response;
         bool has_response = false;
         bool handler_ran = false;
@@ -1696,6 +1726,15 @@ struct server::impl {
             if (rpc::decode_response(response.readable(), coded, ignored, body).ok()) {
                 outcome_code = coded;
             }
+        }
+
+        if (call_span.active()) {
+            call_span.set_status(outcome_code);
+            call_span.finish();
+        }
+        obs::metrics::add_gauge(obs::metric_id::rpc_server_inflight, -1);
+        if (outcome_code != rpc_code::ok) {
+            obs::metrics::increment(obs::metric_id::rpc_server_errors);
         }
 
         // --- AOP response hook -------------------------------------------------

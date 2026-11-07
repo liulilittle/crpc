@@ -30,12 +30,20 @@
 //   * A write carrying an incarnation lower than the stored incarnation is
 //     rejected. A tombstone (deregistered instance) rejects every incarnation
 //     that is not strictly greater, so an older registration can never
-//     penetrate a deletion ("NULL cannot penetrate").
-//   * Every accepted mutation returns a fence. The fence is derived from the
-//     monotonic index (never from a wall clock). If a caller supplies a higher
-//     fencing token (for example a leader epoch), that token is preserved so
-//     epochs stay comparable. A supplied fence lower than the last accepted
-//     fence for the key is rejected.
+//     penetrate a deletion ("NULL cannot penetrate"). The tombstone incarnation
+//     high-water survives purge_expired_tombstones(), so a purged key cannot be
+//     resurrected by an old incarnation either.
+//   * One (key, incarnation) names one write: an identical replay is idempotent
+//     (same index, no event) and a different payload for the same incarnation
+//     is a conflict. All strict defaults can be turned off per registry for
+//     legacy compatibility; the flags document their risk.
+//   * The authority allocates a strictly increasing fence from the accepted
+//     mutation count and raises it to a caller-supplied token only within
+//     registry_config::max_fence_lead (a larger token is rejected, so a single
+//     peer can no longer pin the fence domain at UINT64_MAX). A supplied fence
+//     lower than the last accepted fence for the key is rejected. With
+//     strict_fencing, an update of a key that has accepted an external epoch
+//     must carry a non-zero token.
 //
 // Bounded resources
 // -----------------
@@ -158,8 +166,14 @@ struct write_context {
 
 struct write_result {
     u64 index = 0;
-    // Globally strictly increasing across accepted mutations. Derived from the
-    // monotonic index and any higher caller-supplied fencing token.
+    // Globally strictly increasing across accepted mutations. The authority
+    // allocates a monotonically increasing value from the accepted count,
+    // raises it to a caller-supplied fencing token within
+    // registry_config::max_fence_lead (a larger token is rejected), and never
+    // lowers it below the key's effective high-water (including a lease
+    // fence_barrier). A successful write therefore returns a value that a
+    // subsequent write of the same key can present as context.fence without
+    // being rejected as stale.
     u64 fence = 0;
     u64 incarnation = 0;
 };
@@ -176,6 +190,39 @@ struct registry_config {
     u64 tombstone_grace = 4096;
     // Empty disables the admin path.
     std::string admin_token;
+    // Field-writer separation (default ON, the correct Phase 0 semantics).
+    // register_instance() never writes the health/lease-owned state: an update
+    // keeps the stored state, so a registration cannot clobber a health or
+    // lease verdict. Set this to false only for legacy compatibility: the
+    // historical whole-instance overwrite is then restored and a registration
+    // can silently reset a critical verdict to passing. New code must keep the
+    // default and write state through set_state().
+    bool separate_state_writers = true;
+    // Strict fencing (default ON). An update (register/set_state/deregister) of
+    // a key that has accepted an external fencing epoch must carry a non-zero
+    // fence; a zero fence on such a key is rejected with
+    // registry.reason=fence_required. A create of a key that has never existed
+    // is allowed unfenced so a pre-granted lease can be followed by its first
+    // registration. A key with a surviving tombstone watermark is NOT fresh:
+    // purge_expired_tombstones() keeps the fence epoch, so a zero-fence create
+    // after a purge is rejected with registry.reason=fence_required as well.
+    // Set this to false only for legacy compatibility: unfenced peers can then
+    // pierce an established epoch.
+    bool strict_fencing = true;
+    // Strict incarnation replay (default ON). A register with the same
+    // (service, node_id, incarnation) but a different identity payload is
+    // rejected as a conflict (failed_precondition/conflict) instead of
+    // overwriting; an identical replay is idempotent and never emits a second
+    // event. Set this to false only for legacy compatibility: a same-incarnation
+    // endpoint change silently overwrites and loses the exactly-once anchor.
+    bool strict_incarnation = true;
+    // A caller-supplied fencing token may lead the authority high-water by at
+    // most this much; a larger token is rejected with
+    // registry.reason=fence_out_of_range. This bounds the damage one peer can
+    // do to the shared fence domain (a single write can no longer pin the
+    // global fence at UINT64_MAX). Zero restores the unbounded historical
+    // behaviour and is not recommended.
+    u64 max_fence_lead = 1ull << 32;
 };
 
 struct registry_snapshot {
@@ -225,6 +272,16 @@ public:
                                                   const std::string& node_id,
                                                   const write_context& context);
 
+    // Advance the fencing high-water for (service, node_id) without changing
+    // the catalog content, the global index or the sink events. Used by
+    // lease_manager::grant (and election after a campaign) to publish the new
+    // fence before the new holder starts writing, so a replaced holder's old
+    // fence is rejected. Returns the effective per-key fence.
+    [[nodiscard]] result<u64> fence_barrier(const std::string& service,
+                                            const std::string& node_id,
+                                            u64 fence,
+                                            const write_context& context);
+
     // Update the state of a live instance (health reports, lease expiry).
     // Passing, warning, critical and maintenance are accepted; deregistered is
     // rejected because it must carry the tombstone semantics of deregister().
@@ -249,9 +306,12 @@ public:
     [[nodiscard]] result<u64> add_sink(catalog_sink sink, void* context);
     [[nodiscard]] status remove_sink(u64 sink_id);
 
-    // Remove tombstones older than registry_config::tombstone_grace accepted
-    // mutations. Returns the number removed. Logical catalog content does not
-    // change (tombstones are already invisible to query()).
+    // Remove tombstones at least registry_config::tombstone_grace accepted
+    // mutations old (zero means "eligible immediately"). Returns the number
+    // removed. Every removal advances the global index and emits one
+    // catalog_event_kind::remove event, because the include_deregistered view
+    // changed; the tombstone incarnation high-water is kept so an old
+    // incarnation cannot resurrect the key afterwards.
     [[nodiscard]] std::size_t purge_expired_tombstones();
 
     [[nodiscard]] const registry_config& config() const noexcept { return config_; }
@@ -280,15 +340,43 @@ private:
     [[nodiscard]] bool is_admin(const write_context& context) const noexcept;
     [[nodiscard]] bool check_authority(const write_context& context,
                                        const std::string& owner) const noexcept;
-    [[nodiscard]] bool check_fence(const key& id, u64 fence) const noexcept;
+    enum class fence_verdict : u8 {
+        ok = 0,
+        stale = 1,
+        out_of_range = 2,
+        required = 3
+    };
+    [[nodiscard]] fence_verdict check_fence(const key& id, u64 fence,
+                                            bool creating) const noexcept;
+    // Authority allocation. It is bounded by registry_config::max_fence_lead:
+    // check_fence() rejects a caller token farther ahead of the published
+    // high-water, so a single peer cannot pin the fence domain at UINT64_MAX.
+    // key_high_water is the per-key effective floor (a lease fence_barrier can
+    // push it above the global allocation); the result is always >= it, so a
+    // successful write reports a token that is directly usable on the key.
     [[nodiscard]] bool allocate_fence(u64 requested, u64 next_index,
-                                      u64& out) noexcept;
+                                      u64 key_high_water, u64& out) noexcept;
+    // Must be called with mutex_ held. Records the accepted caller token and
+    // the per-key high-water; the returned value is the effective per-key
+    // fence after the write (>= authority, >= requested, >= the previous
+    // high-water), never the bare authority allocation.
+    [[nodiscard]] u64 record_fence_locked(const key& id, u64 requested,
+                                          u64 authority);
+    [[nodiscard]] u64 published_fence_locked() const noexcept;
     [[nodiscard]] static rpc_error reject(rpc_code code, const char* message,
                                           const char* reason);
+    // Builds the stale_fence rejection with the key's current effective
+    // high-water in `registry.fence` metadata, so a client (notably the health
+    // bridge) can re-anchor above it instead of retrying a permanently stale
+    // token (F3). Must be called with mutex_ held.
+    [[nodiscard]] rpc_error reject_stale_fence_locked(const key& id) const;
     [[nodiscard]] std::size_t count_instances(const std::string& service) const;
     [[nodiscard]] std::size_t count_services() const;
     [[nodiscard]] bool service_exists(const std::string& service) const;
     [[nodiscard]] static std::size_t metadata_size(const metadata_list& meta);
+    [[nodiscard]] static bool identity_equal(const service_instance& a,
+                                             const service_instance& b,
+                                             bool compare_state) noexcept;
 
     // Builds a snapshot from the current one with one instance replaced or
     // appended. Must be called with mutex_ held.
@@ -300,13 +388,27 @@ private:
     registry_config config_;
     mutable std::mutex mutex_;
     std::map<key, service_instance, key_less> instances_;
+    // Per-key accepted fence high-water. Survives a tombstone purge: an old
+    // holder (or an old incarnation) must never write again just because the
+    // visible row was physically removed.
     std::map<key, u64, key_less> last_fence_;
+    // Per-key tombstone incarnation high-water. purge_expired_tombstones()
+    // removes the visible row but keeps this watermark, so an old incarnation
+    // cannot resurrect a purged key ("NULL cannot penetrate"). One u64 per key
+    // ever seen; a zero watermark is never stored.
+    std::map<key, u64, key_less> tombstone_watermark_;
+    // Keys that have accepted an external (caller-supplied) fencing epoch or a
+    // lease barrier. With strict_fencing, an update of such a key must carry a
+    // non-zero fence.
+    std::map<key, bool, key_less> fenced_keys_;
     // Swapped atomically on every publish; readers keep the snapshot they
     // loaded. Holds a plain shared_ptr and uses the free-function atomic API;
     // see detail/atomic_shared_ptr.hpp for why (layout must not depend on the
     // language standard, and the C++20 atomic<shared_ptr> is 16-aligned).
     ::crpc::detail::atomic_shared_ptr<const registry_snapshot> snapshot_;
     u64 index_ = 0;
+    // Authority allocation high-water (accepted count plus the bounded caller
+    // lead and any lease barrier).
     u64 last_global_fence_ = 0;
 
     mutable std::mutex sinks_mutex_;

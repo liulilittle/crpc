@@ -74,7 +74,7 @@ health_state ttl_health_check::poll(monotonic_clock::time_point now) {
                               now - reference)
                         : std::chrono::milliseconds{0};
 
-    if (age > ttl_) {
+    if (age >= ttl_) {
         record(false, now);
     } else if (age > ttl_ / 2 && state_ != health_state::critical) {
         // Approaching expiry is a warning, not a failure. A critical state from

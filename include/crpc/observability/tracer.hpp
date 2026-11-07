@@ -198,6 +198,13 @@ public:
     // exposed so tests and other modules can make the same decision.
     [[nodiscard]] static bool sample_trace(trace_id trace, double rate) noexcept;
 
+    // The sampling decision this tracer would make for `trace` under its
+    // configured rate. Used by a receiver that reconstructs a parent context
+    // from the wire (which carries no sampled bit): applying the same pure
+    // function to the same trace id reproduces the sender's decision when both
+    // processes are configured with the same rate.
+    [[nodiscard]] bool sampled(trace_id trace) const noexcept;
+
     [[nodiscard]] std::uint64_t dropped_spans() const noexcept {
         return dropped_.load(std::memory_order_relaxed);
     }

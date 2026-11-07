@@ -389,6 +389,11 @@ bool tracer::sample_trace(trace_id trace, double rate) noexcept {
     return sampled_by_threshold(trace, rate_threshold(rate));
 }
 
+bool tracer::sampled(trace_id trace) const noexcept {
+    return sampled_by_threshold(
+        trace, sample_threshold_.load(std::memory_order_relaxed));
+}
+
 std::uint64_t tracer::current_time() const noexcept {
     if (clock_ != nullptr) {
         return clock_(clock_user_);

@@ -2,7 +2,7 @@
 
 [English](performance.md) | **简体中文**
 
-版本 2.0 / 2026-10-24
+版本 2.1 / 2026-11-07
 
 本文说明仓库中真正测过什么、在什么硬件与工具链上测的、哪些只是预算，以及库将如何基准测试。目标是目标，
 不是结果。不存在的数字会明确标为缺失，而不是估算。
@@ -13,7 +13,8 @@
 |---|---|
 | [1](#s1) | 测量方法 |
 | [2](#s2) | 已记录证据 |
-| [2.5](#s2-5) | 压缩、RPC 矩阵与 Redis 基准（2026-10-26） |
+| [2.5](#s2-5) | 压缩、RPC 矩阵与 Redis 基准（2026-10-26，历史） |
+| [2.6](#s2-6) | 重测基线（2026-11-07） |
 | [3](#s3) | 预算与目标 |
 | [4](#s4) | 基准计划 |
 | [5](#s5) | 设计拒绝的反模式 |
@@ -43,6 +44,10 @@ RTT”或把“每 RTT 64 帧”换算成 RPC/s 得出（设计 R10）。这些�
 IOCP TCP loopback（§2.3）。`bench/bench_core.cpp` 覆盖线格式/编解码微基准。
 下面的裸 loopback 探针与对象布局探针早于该基准，作为历史保留。
 
+**历史章节。** §2.3（2026-10-19）、§2.4（2026-10-24）与 §2.5（2026-10-26）
+保留用于对比。它们记录于流水线死锁修复（59936b6）之前、阶段 5 工作树改动之前；
+当前基线是 §2.6（2026-11-07）。
+
 1. **裸 loopback 探针**，记录于本节。硬件：AMD Ryzen 9 7945HX，16 核 / 32 线程。工具链：MSVC
    2022、`/O2`、Windows loopback。负载：16 字节帧、阻塞 socket 回显、
    1,000,000 次 RPC、一条连接、一个线程对，不含协程、编解码或多路复用。
@@ -71,7 +76,7 @@ IOCP TCP loopback（§2.3）。`bench/bench_core.cpp` 覆盖线格式/编解码�
 字节调用槽预算未被当前实现满足（`std::mutex`、`condition_variable`、
 缓冲区、`rpc_error` 与回调存储占主导）。
 
-### 2.3 端到端 RPC 实测（2026-10-19）
+### 2.3 端到端 RPC 实测（2026-10-19，历史）
 
 源码：`bench/bench_rpc.cpp`；命令：`crpc_bench_rpc`（Windows MSVC Release）与
 在 WSL 下构建的同一目标（GCC Release）。
@@ -117,7 +122,7 @@ issue 2612 ns + wait 934 ns；仅 0.6% 的调用在发起时已完成，说明�
 
 在本文之前不存在 p99/p999、跨分片交接、编解码或韧性流水线实测；上文 p99/p999 现已实测，跨分片交接与韧性流水线预算仍未测量。
 
-### 2.4 CRC32C 与推送 hub 统计（2026-10-24） <a id="s2-4"></a>
+### 2.4 CRC32C 与推送 hub 统计（2026-10-24，历史） <a id="s2-4"></a>
 
 源码：`bench/bench_core.cpp`（`crpc_bench_core crc32c`）。工具链：MSVC 19.51
 x64 Release、`NDEBUG`、关闭消毒器。机器：AMD Ryzen 9 7945HX，16 核 /
@@ -168,7 +173,7 @@ disconnect），并把聚合值与全量扫描会得到的结果对比。
 `frame_decoder_external_matches_feed` 在每一种切分点（包括在一帧中间切分）都
 验证产生相同的帧流。
 
-### 2.5 压缩、RPC 矩阵与 Redis 基准（2026-10-26） <a id="s2-5"></a>
+### 2.5 压缩、RPC 矩阵与 Redis 基准（2026-10-26，历史） <a id="s2-5"></a>
 
 源码：`bench/bench_compression.cpp`、`bench/bench_rpc_matrix.cpp` 与
 `bench/bench_redis.cpp`（目标 `crpc_bench_compression`、
@@ -279,38 +284,131 @@ executor（RESP 编码 + 解析），两者都不含真实服务器或网络。
 文件、5 + 3 个用例、150 + 64 个断言、0 失败，各连续运行 5 次零失败。见
 [distributed-testing.zh-CN.md §3](distributed-testing.zh-CN.md#s3)。
 
+### 2.6 重测基线（2026-11-07） <a id="s2-6"></a>
+
+以下数字全部来自当前树（HEAD `5a4abaf` + 未提交的阶段 5 模块）的全新构建根，
+不是从历史表格抄来的。构建命令：
+`.\scripts\build.ps1 -Config Release -BuildRoot F:\crpc\.build-bench5 -Bench`。
+工具链：MSVC 19.51 x64 Release（`/O2 /Ob2 /GL /DNDEBUG /MD`、`/W4 /WX`）；
+机器：AMD Ryzen 9 7945HX，16 核 / 32 线程，Windows loopback；关闭消毒器。
+每个目标跑 3 个独立进程（每个进程内部再取 7/5 次中位），表中取 3 个进程的中位数。
+原始输出在 `.opencode/tmp/bench5/raw/`。
+
+**干扰声明。** 测量窗口内本机还有其它工作负载：
+`Win32_Processor.LoadPercentage` 在 54%～90% 之间。因此数字整体偏保守。
+最明显的异常是第三次 IOCP 运行（p99 3117.8 µs、depth 16 p999 14.4 ms）；
+前两次运行与低负载的韧性流水线运行作为稳定性参考保留。
+
+`bench/bench_core.cpp` 的结果：
+
+| 用例 | 3 次运行中位数 |
+|---|---:|
+| `codec/binary_encode_small`（`bench_request`，非 64 B） | 411.2 ns |
+| `codec/binary_decode_small`（`bench_request`，非 64 B） | 290.7 ns |
+| `crc32c/optimized_256B` | 58.7 ns |
+| `crc32c/optimized_16KiB` | 3617.7 ns |
+| `frame/feed_copy_1KiB_per_frame` | 76.4 ns/帧 |
+| `frame/feed_external_1KiB_per_frame` | 17.5 ns/帧 |
+
+`bench/bench_rpc.cpp`（64 B `std::string` 回显，inproc 与 IOCP loopback）：
+
+| 用例 | 3 次运行中位数 |
+|---|---:|
+| inproc p50 / p90 / p99 / p999 | 3.30 / 6.40 / 35.70 / 79.60 µs |
+| inproc max | 444.7 µs |
+| 吞吐 depth 1 / 16 / 64 | 0.093 / 0.165 / 0.165 M RPC/s |
+| 多分片 1 / 2 / 4（depth 16） | 0.15 / 0.15 / 0.15 M RPC/s |
+| 8 客户端线程 × 8 分片 | 0.577 M RPC/s |
+| IOCP p50 / p99 / p999，depth 1 | 125.20 / 218.40 / 319.10 µs |
+| IOCP 吞吐 depth 1 / 16 | 0.008 / 0.022 M RPC/s |
+| IOCP p99 depth 16 | 209.30 µs |
+
+编译期布局探针（`probe_sizes.cpp`，同样编译选项；`sizeof` 由编译器从公开头文件计算）：
+
+| 类型 | `sizeof` |
+|---|---:|
+| `rpc::call_slot` | **464 B** |
+| `rpc::call<int>` | 24 B |
+| `rpc::client` | 1024 B |
+| `push::hub` | 8 B（pimpl 指针） |
+| `cluster::registry` | 336 B |
+| `cluster::lease_manager` | 184 B |
+
+因此 128 B 调用槽预算在该工具链上 **超标 3.63×**；历史 440 B 数字已过期。
+`rpc::client` 为 1024 B，而非历史的 568 B；`docs/abi.md` 的消费者探针与本构建一致。
+
+恰好 64 字节的 codec。历史 `codec/binary_*_small` 用例使用 `bench_request`
+（string + vector），不是 64 字节测量。探针 `probe_codec64.cpp` 测量
+`call_codec<std::string>`（输出缓冲保留容量、解码目标复用）：**encode 4.34 ns、
+decode 4.88 ns**（3 个进程中位）。该路径满足 `< 100 ns` 预算。
+
+韧性流水线。`probe_resilience.cpp` 按 facade 成功路径顺序运行
+（`rate.try_acquire -> bulkhead.try_enter -> breaker.allow ->
+load_balancer.select`，随后 `breaker.success()` 与 permit 释放）：
+**每次成功调用 211.49 ns** 中位（低负载最好一轮 157.85 ns）。其中熔断器单独
+145.91 ns、限流 43.52 ns、舱壁 5.64 ns、选择 14.09 ns。35–65 ns 预算超标
+3.25×–6.04×（最好一轮 2.43×）。
+
+跨分片交接。公开 API 只有 `runtime::post`：每次调用一次 inbox 入队加一次
+doorbell `wake()`（`src/runtime/runtime.cpp:177`）。没有批量 post API，
+也没有专用基准目标。探针测得**每条消息入队 80.87 ns**、端到端 80.88 ns；
+一次 post 携带合成的 64 条消息时为 1818.75 ns/消息，主要受唤醒/调度延迟支配，
+不是真实批量 API。15–30 ns/批量消息预算超标 2.70×–5.39×。
+
+连接内存。`probe_conn_memory.cpp` 运行真实 IOCP server 并保持裸 loopback
+socket 空闲，采样 `PrivateUsage`/`WorkingSetSize`：
+
+| 场景 | 3 次有效运行中位数 |
+|---|---:|
+| 1000 条 idle 连接，每连接 committed | 70 300 B |
+| 10000 条 idle 连接，private 总增量 | 697 163 776 B（664.9 MiB） |
+| 10000 条 idle 连接，每连接 committed | 69 716 B（68.1 KiB） |
+| 128 条活跃连接（每条 1 个 4 KiB 在途调用），每对 private | 2 063 552 B（1.97 MiB） |
+
+idle 预算（2 KiB）超标 34.0×，10k idle 预算（20 MiB）超标 33.2×。
+原因在树中可直接看到：IOCP 后端在每次 accept 时分配 64 KiB 接收缓冲
+（`include/crpc/io/iocp_backend.hpp:78`、`src/io/iocp_backend.cpp:1398`）。
+active 数字是**同进程 client+server 两端合计**，不能单独归因 server 端；
+它只是上界，仍是 160 KiB 预算的 12.9×。server-only 的 active 数字**未验证**（W5）。
+
+
+
 ## 3. 预算与目标 <a id="s3"></a>
 
 内存预算来自设计 §17.1；状态按代码实际情况评估。
 
 | 项 | 预算 | 状态 |
 |---|---|---|
-| 空闲连接 | ≤ 2 KiB | 设计目标；未测量 |
-| 活跃连接 | ≤ 160 KiB | 设计目标；epoll 发送环 64 KiB、IOCP 发送队列 256 KiB、读缓冲 64 KiB |
-| 调用槽 | 128 B | **未达成**：MSVC x64 实测 440 B |
-| 每分片固定开销 | ≤ 8 MiB | 不适用：尚无分片/协程池 |
-| 10 万在途调用 | ≤ 64 MiB | 基于 128 B 槽的设计目标；当前槽大小本身对 10 万即约 44 MB |
-| 1 万空闲连接 | ≤ 20 MiB | 设计目标；未测量 |
+| 空闲连接 | ≤ 2 KiB | **未达成**：IOCP 下每条 idle 连接 committed 69 716 B（3 次中位，§2.6），超预算 34.0× |
+| 活跃连接 | ≤ 160 KiB | **server-only 未验证**：同进程 client+server 一对连接、各 1 个 4 KiB 在途调用为 2 063 552 B（1.97 MiB，§2.6），作为上界超预算 12.9×；server 端份额无法拆分 |
+| 调用槽 | 128 B | **未达成**：编译期探针实测 **464 B**（MSVC x64，§2.6），超预算 3.63×；历史 440 B 已过期 |
+| 每分片固定开销 | ≤ 8 MiB | 未测量；分片运行时已存在（`src/runtime/runtime.cpp`），但没有每分片固定内存实测 |
+| 10 万在途调用 | ≤ 64 MiB | 仅槽数组为 464 B × 100k = 44.3 MiB；端到端在途内存未测量 |
+| 1 万空闲连接 | ≤ 20 MiB | **未达成**：10 000 条 idle IOCP 连接 private 增量 697 163 776 B（664.9 MiB，§2.6），超预算 33.2× |
 | 订阅表 | ≤ 5 MiB | 设计目标；hub 只按订阅设边界，没有全局表 |
-| 每 lane 队列 | ≤ 16 KiB | 已设计，未实现 |
+| 每 lane 队列 | ≤ 16 KiB | 已设计，未实现（队列只有 `gap_timeout`，没有字节上限） |
 | 每连接发送环 | ≤ 256 KiB | epoll 默认 64 KiB；IOCP 默认 256 KiB |
 
 性能目标：
 
 | 指标 | 目标 | 状态 |
 |---|---|---|
-| 聚合吞吐 | 5M RPC/s | **未达成**：单客户端最佳实测 0.275M RPC/s（inproc，MSVC，depth 64）；八客户端线程四线程分片 0.773M RPC/s（§2.3）；IOCP loopback 0.024M |
-| 单连接对、批处理 | ≥ 1M RPC/s | **未达成**：inproc 实测 0.275M RPC/s（§2.3） |
-| p99 延迟 | < 100 µs | **部分达成**：inproc 22.6 µs（MSVC）；IOCP loopback 170.2 µs；WSL inproc 151.8 µs |
-| 跨分片交接 | 每条批量消息 15–30 ns | 预算；未测量 |
-| 编解码，64 字节消息 | 编码与解码均 < 100 ns | **未证明**：`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt` 记录 `codec/binary_encode_small` 218.8 ns 与 `codec/binary_decode_small` 232.9 ns。基准负载是小型 `bench_request`（string/vector 字段），并非恰好 64 字节，因此这些数字不能与预算直接比较；但它们仍说明目标未达成。 |
-| 韧性流水线 | 每次成功调用 35–65 ns | 预算；未测量 |
+| 聚合吞吐 | 5M RPC/s | **未达成**：单客户端 inproc 0.165M RPC/s（depth 64，3 次中位，§2.6）；8 客户端线程 × 8 分片 0.577M；IOCP loopback depth 16 为 0.022M。差距 30.3× / 8.7× / 227×。历史 2026-10-19 数字：inproc 单客户端 0.275M、多线程 0.773M、IOCP 0.024M。 |
+| 单连接对、批处理 | ≥ 1M RPC/s | **未达成**：inproc 实测 0.165M RPC/s（§2.6），差 6.1× |
+| p99 延迟 | < 100 µs | **部分达成**：inproc 35.70 µs（MSVC，3 次中位）；IOCP loopback depth 1 218.40 µs；IOCP depth 16 209.30 µs（§2.6）。进程内达标；IOCP 超 2.09×–2.18× |
+| 跨分片交接 | 每条批量消息 15–30 ns | **未达成 / 无批量 API**：`runtime::post` 入队 80.87 ns/消息、端到端 80.88 ns（3 次中位，§2.6），超预算 2.70×–5.39×。没有批量 post API，设计中的 MPSC+doorbell 批量交接未实现，也没有专用基准目标。 |
+| 编解码，64 字节消息 | 编码与解码均 < 100 ns | **字符串路径已达标**：`call_codec<std::string>` 恰好 64 字节时 encode 4.34 ns、decode 4.88 ns（§2.6）。历史警告仍适用于 `codec/binary_*_small`：它测的是 `bench_request`（411.2 ns 编 / 290.7 ns 解），不是 64 字节负载。 |
+| 韧性流水线 | 每次成功调用 35–65 ns | **未达成**：经过 rate -> bulkhead -> breaker -> load-balancer 加 teardown 的成功调用 211.49 ns（3 次中位）；低负载最好一轮 157.85 ns（§2.6）。差距 3.25×–6.04×（最好 2.43×）。其中熔断器单独 145.91 ns。 |
 
-编解码预算需要直接警示：上文记录的微基准是真实测量，但它超出 `< 100 ns` 目标
-2.2–2.3×，且使用了与「64 字节消息」不同的负载。不应把它读作通过的结果。
+编解码预算现在有两个不同答案。恰好 64 字节的字符串路径达标（encode 4.34 ns /
+decode 4.88 ns，§2.6）；反射式 `bench_request` 微基准仍为 411.2 ns / 290.7 ns，
+即 `< 100 ns` 的 4.1× / 2.9×。两者负载不同，不能混为一谈：RPC 字符串路径所用
+codec 达标，反射式小对象路径未证明。
 
-今天唯一可辩护的陈述是：传输层围绕有界队列与批处理设计，Windows loopback
-裸探针显示批处理把吞吐改变约 50 倍。这解释了设计动机，不证明目标。
+传输层围绕有界队列与批处理设计，Windows loopback 裸探针仍显示批处理把吞吐改变
+约 50 倍。这解释了设计动机，不证明 5M 目标。本轮同步往返的实测天花板是单客户端
+0.165M RPC/s、八客户端线程 0.577M（§2.6），所以剩余差距在同步往返本身，而不在
+分配或锁调优。
 
 ## 4. 基准计划 <a id="s4"></a>
 
@@ -369,7 +467,12 @@ executor（RESP 编码 + 解析），两者都不含真实服务器或网络。
 不得用推算替代缺失的测量。
 
 当前状态：库有功能测试覆盖、HTTP 服务端门面、进程内与 IOCP 端到端 RPC 基准（§2.3）、
-线格式/编解码微基准，以及 §2.5 的压缩/RPC 矩阵/Redis 基准。5M RPC/s 与 IOCP p99 目标**未达成**（实测 inproc 单客户端 0.275M RPC/s、
-多线程 0.773M RPC/s、IOCP p99 170.2 µs）；进程内 p99 目标在 MSVC 上以 22.6 µs **达成**。128 字节调用槽预算在
-已测工具链上仍是**未达成的 440 字节**。实测数值、被否决的实验与剩余差距记录于 §2 与 §3；
-随仓库发布的微基准日志为 `docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`。
+线格式/编解码微基准，以及 §2.5 的压缩/RPC 矩阵/Redis 基准。2026-11-07 重测（§2.6）
+取代旧基线：5M RPC/s 与 IOCP p99 目标**未达成**（inproc 单客户端 0.165M RPC/s、
+八客户端线程 0.577M、IOCP depth 1 p99 218.4 µs）；进程内 p99 目标在 MSVC 上以
+35.70 µs **达成**。128 字节调用槽预算在已测工具链上仍是**未达成的 464 字节**。
+64 字节字符串 codec 达标（4.34/4.88 ns）；韧性流水线（211.49 ns）与跨分片交接
+（80.87 ns/消息）未达标；空闲连接内存为预算的 34×。实测数值、被否决的实验与剩余
+差距记录于 §2 与 §3；随仓库发布的微基准日志为
+`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`（历史），2026-11-07 原始日志在
+`.opencode/tmp/bench5/raw/`。

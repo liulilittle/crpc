@@ -60,6 +60,33 @@ watch_stream::watch_stream(std::string service, u64 snapshot_index,
       snapshot_index_(snapshot_index),
       last_seen_(snapshot_index) {}
 
+bool watch_stream::invoke_callback(const watch_event& event) {
+    if (callback_ == nullptr) {
+        return false;
+    }
+    // Cancellation barrier. callback_mutex_ serialises callbacks; taking it
+    // before the closed_ check closes the race between "cancel returned" and
+    // "callback starts". cancel() takes the same mutex, except when it is
+    // called from the callback itself (then the running callback is the last
+    // one).
+    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
+            return false;
+        }
+        in_callback_ = true;
+        callback_thread_ = std::this_thread::get_id();
+    }
+    callback_(context_, event);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        in_callback_ = false;
+        callback_thread_ = std::thread::id{};
+    }
+    return true;
+}
+
 std::size_t watch_stream::deliver_initial() {
     std::shared_ptr<const std::vector<service_instance>> snapshot;
     u64 index = 0;
@@ -78,14 +105,33 @@ std::size_t watch_stream::deliver_initial() {
         return 0;
     }
 
-    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
     watch_event event;
     event.index = index;
     event.kind = kind;
     event.service = service_;
     event.snapshot = snapshot.get();
-    callback_(context_, event);
-    return 1;
+    return invoke_callback(event) ? 1 : 0;
+}
+
+void watch_stream::park() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    initial_delivered_ = true;
+}
+
+void watch_stream::cancel() noexcept {
+    bool self = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        queue_.clear();
+        self = in_callback_ &&
+               callback_thread_ == std::this_thread::get_id();
+    }
+    if (!self) {
+        // Wait for an in-flight callback (if any) to finish. After this point
+        // the closed_ flag stops every later callback.
+        std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+    }
 }
 
 void watch_stream::on_event(u64 index, const std::string& service,
@@ -160,7 +206,7 @@ std::size_t watch_stream::apply_resync(u64 index,
                                        std::vector<service_instance> snapshot) {
     if (callback_ == nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_ || dropped_) {
+        if (closed_ || dropped_ || index < last_seen_) {
             return 0;
         }
         snapshot_ = std::make_shared<const std::vector<service_instance>>(
@@ -177,7 +223,9 @@ std::size_t watch_stream::apply_resync(u64 index,
         std::move(snapshot));
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_ || dropped_) {
+        // W4: a snapshot older than the applied anchor must never roll the
+        // stream back or discard already queued newer events.
+        if (closed_ || dropped_ || index < last_seen_) {
             return 0;
         }
         snapshot_ = next;
@@ -188,14 +236,12 @@ std::size_t watch_stream::apply_resync(u64 index,
         queue_.clear();
     }
 
-    std::lock_guard<std::mutex> callback_lock(callback_mutex_);
     watch_event event;
     event.index = index;
     event.kind = watch_event_kind::resync;
     event.service = service_;
     event.snapshot = next.get();
-    callback_(context_, event);
-    return 1;
+    return invoke_callback(event) ? 1 : 0;
 }
 
 std::size_t watch_stream::dispatch() {
@@ -210,7 +256,6 @@ std::size_t watch_stream::dispatch() {
         }
         if (dropped_) {
             emit_dropped = true;
-            closed_ = true;
             queue_.clear();
         } else {
             local.swap(queue_);
@@ -218,36 +263,44 @@ std::size_t watch_stream::dispatch() {
     }
 
     if (emit_dropped) {
-        if (callback_ != nullptr) {
-            std::lock_guard<std::mutex> callback_lock(callback_mutex_);
-            watch_event event;
-            event.index = last_index();
-            event.kind = watch_event_kind::dropped;
-            event.service = service_;
-            callback_(context_, event);
+        watch_event event;
+        event.index = last_index();
+        event.kind = watch_event_kind::dropped;
+        event.service = service_;
+        // The dropped event is the last callback, so closed_ is set after it
+        // (setting it before would suppress it through the cancel barrier).
+        if (invoke_callback(event)) {
             ++delivered;
         }
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
         return delivered;
     }
 
     for (const auto& queued : local) {
-        if (callback_ == nullptr) {
-            continue;
-        }
-        std::lock_guard<std::mutex> callback_lock(callback_mutex_);
         watch_event event;
         event.index = queued.index;
         event.kind = watch_event_kind::delta;
         event.service = service_;
         event.instance = &queued.instance;
-        callback_(context_, event);
+        // W1: cancel() from this callback (or another thread) stops the batch
+        // before the next callback starts.
+        if (!invoke_callback(event)) {
+            break;
+        }
         ++delivered;
     }
     return delivered;
 }
 
 watch_hub::watch_hub(registry& catalog, std::size_t max_subscribers)
-    : catalog_(catalog), max_subscribers_(max_subscribers) {
+    : watch_hub(catalog, max_subscribers, 256) {}
+
+watch_hub::watch_hub(registry& catalog, std::size_t max_subscribers,
+                     std::size_t max_replay)
+    : catalog_(catalog),
+      max_subscribers_(max_subscribers),
+      max_replay_(max_replay) {
     const result<u64> added = catalog_.add_sink(&watch_hub::sink_bridge, this);
     if (added.ok()) {
         sink_id_ = added.value();
@@ -274,6 +327,15 @@ void watch_hub::on_catalog_event(const catalog_event& event) noexcept {
         entry.second.stream->on_event(event.index, event.instance.service,
                                       event.instance);
     }
+    // Bounded replay ring: a reconnect at from_index < current replays the
+    // missed deltas when this still covers them; otherwise it falls back to a
+    // resync snapshot.
+    if (max_replay_ != 0) {
+        replay_.push_back(event);
+        while (replay_.size() > max_replay_) {
+            replay_.pop_front();
+        }
+    }
 }
 
 result<u64> watch_hub::watch(const std::string& service, u64 from_index,
@@ -285,6 +347,7 @@ result<u64> watch_hub::watch(const std::string& service, u64 from_index,
 
     u64 id = 0;
     std::shared_ptr<watch_stream> created;
+    bool park = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!sink_registered_) {
@@ -305,20 +368,72 @@ result<u64> watch_hub::watch(const std::string& service, u64 from_index,
                              "from_index is ahead of the registry index");
         }
 
-        std::vector<service_instance> initial =
-            filter_snapshot(*current, service);
-        const watch_event_kind initial_kind =
-            (from_index != 0 && from_index < current->index)
-                ? watch_event_kind::resync
-                : watch_event_kind::snapshot;
+        std::vector<service_instance> initial;
+        std::vector<catalog_event> replay;
+        watch_event_kind initial_kind = watch_event_kind::snapshot;
+        u64 anchor = current->index;
+
+        if (from_index != 0 && from_index < current->index) {
+            // Collect the ring entries that cover (from_index, current]. The
+            // ring may be unordered under concurrent writers, so sort a copy
+            // and require one contiguous event per index.
+            for (const auto& event : replay_) {
+                if (event.index > from_index && event.index <= current->index) {
+                    replay.push_back(event);
+                }
+            }
+            std::sort(replay.begin(), replay.end(),
+                      [](const catalog_event& a, const catalog_event& b) {
+                          return a.index < b.index;
+                      });
+            bool contiguous = !replay.empty();
+            u64 expected = from_index + 1;
+            for (const auto& event : replay) {
+                if (event.index != expected) {
+                    contiguous = false;
+                    break;
+                }
+                if (expected != std::numeric_limits<u64>::max()) {
+                    ++expected;
+                }
+            }
+            if (contiguous) {
+                contiguous = replay.back().index == current->index;
+            }
+            if (contiguous) {
+                // Incremental replay: the queued deltas are the initial
+                // delivery, so no snapshot is sent.
+                initial_kind = watch_event_kind::snapshot;
+                anchor = from_index;
+                park = true;
+            } else {
+                replay.clear();
+                initial = filter_snapshot(*current, service);
+                initial_kind = watch_event_kind::resync;
+            }
+        } else if (from_index == 0) {
+            initial = filter_snapshot(*current, service);
+        } else {
+            // from_index == current: park until the next change. No immediate
+            // snapshot is delivered.
+            anchor = from_index;
+            park = true;
+        }
 
         id = next_id_++;
         if (id == 0) {
             id = next_id_++;
         }
         created = std::make_shared<watch_stream>(
-            service, current->index, std::move(initial), callback, context,
-            max_queue, initial_kind);
+            service, anchor, std::move(initial), callback, context, max_queue,
+            initial_kind);
+        if (park) {
+            created->park();
+            for (const auto& event : replay) {
+                created->on_event(event.index, event.instance.service,
+                                  event.instance);
+            }
+        }
         subscriber entry;
         entry.id = id;
         entry.service = service;
@@ -331,8 +446,18 @@ result<u64> watch_hub::watch(const std::string& service, u64 from_index,
 }
 
 status watch_hub::cancel(u64 subscription_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    subscribers_.erase(subscription_id);
+    std::shared_ptr<watch_stream> stream;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = subscribers_.find(subscription_id);
+        if (found == subscribers_.end()) {
+            return status{};
+        }
+        stream = found->second.stream;
+        subscribers_.erase(found);
+    }
+    // Delivery barrier: after cancel returns no callback starts on the stream.
+    stream->cancel();
     return status{};
 }
 

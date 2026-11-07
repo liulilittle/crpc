@@ -4,6 +4,73 @@
 
 ## Unreleased
 
+### Cluster primitives: G19 Phase 0 hardening before the network registry
+
+- **Tombstone purge (P1/P2/P9).** `tombstone_grace == 0` now means "eligible
+  immediately" (the check is `age >= grace`), every physically removed
+  tombstone advances the global index and emits one
+  `catalog_event_kind::remove` event, and the tombstone incarnation plus the
+  per-key fence high-water survive the purge. An old incarnation can therefore
+  no longer resurrect a purged key, and the same index never denotes two
+  different `include_deregistered` views.
+- **Fencing (P3/P6/P13).** A caller-supplied token can lead the published fence
+  by at most `registry_config::max_fence_lead`; a larger token is rejected with
+  `registry.fence_out_of_range`, so one peer can no longer pin the fence domain
+  at `UINT64_MAX`. With `strict_fencing` (default **on**), an update of a key
+  that has accepted an external epoch must carry a non-zero token
+  (`registry.reason=fence_required`). Only a key that has never existed may be
+  created with `fence=0`: a pre-granted lease can still be followed by its first
+  registration. A key that has a surviving tombstone watermark or fence
+  high-water is **not** fresh — even after `purge_expired_tombstones()` removed
+  the visible row — so a zero-fence create on it is rejected with
+  `registry.reason=fence_required` instead of resetting the epoch.
+  `lease_manager::grant` publishes a fence barrier through the new
+  `registry::fence_barrier` before it returns, so a replaced lease cannot write
+  with its old fence. A successful write now reports the key's effective fence
+  high-water (never below a lease barrier) in `write_result::fence`, and a
+  `stale_fence` rejection carries the current high-water in the
+  `registry.fence` metadata so a client (such as `health_bridge`) can re-anchor
+  instead of retrying a permanently stale token.
+- **Lease lifecycle (P4/P7).** Renewing an active lease whose expiry already
+  passed returns `deadline_exceeded` instead of resurrecting it. A lease granted
+  before the instance exists binds to the first incarnation it observes and is
+  applied on expiry, so grant-before-register no longer loses the expiry as a
+  stale write. A lease bound to a superseded incarnation is rejected/dropped
+  instead of following the new registration.
+- **Registration (P5/P8/P11/P12).** A registration now requires a non-empty
+  endpoint host; a non-empty host with port 0 remains the inproc sentinel.
+  `separate_state_writers` (default **on**) keeps the health/lease-owned state
+  on an update, so registration cannot clobber a health verdict.
+  `strict_incarnation` (default **on**) makes an identical
+  `(key, incarnation, payload)` retry idempotent (same index, no event) and
+  rejects a different payload for the same incarnation with
+  `registry.reason=conflict`. Set either switch to `false` only to keep the
+  historical in-process behaviour; that legacy mode is unsafe with more than one
+  writer (a registration overwrites a health/lease verdict and a same-
+  incarnation payload change silently replaces the previous one).
+- **Health (P10).** A TTL check expires at `age >= ttl`; the boundary is no
+  longer one tick late.
+- **Watch (W1-W4).** `cancel()` is a delivery barrier (after it returns no new
+  callback starts; the one running in the callback is the last). A watch at
+  `from_index == current` parks instead of returning an immediate snapshot. A
+  bounded replay ring serves a reconnect one or more indices behind as
+  incremental deltas, falling back to a resync snapshot only when the ring no
+  longer covers the gap. `apply_resync` rejects a snapshot older than the
+  applied anchor, so a stale snapshot cannot roll the anchor back or discard
+  already queued events.
+- **Election (E1).** `election.hpp` now states the deployment scope explicitly:
+  the class is a single-process primitive; v1 runs exactly one registry
+  authority with an operator-supplied epoch; a central leader lease key or Raft
+  (persisted term/vote/log) is v1.1. It is not advertised as multi-node leader
+  election.
+- **ABI:** MAJOR layout change; consumers must rebuild. `cluster::registry_config`
+  88 -> 104 bytes, `cluster::registry` 368 -> 432, `cluster::watch_hub`
+  144 -> 192, `cluster::watch_stream` 312 -> 320. The lease, health, snapshot and
+  result records keep their layout. New MINOR symbols:
+  `cluster::registry::fence_barrier`, `cluster::watch_stream::park`,
+  `cluster::watch_stream::cancel`, and the three-argument
+  `cluster::watch_hub` constructor. Details in [abi.md](abi.md).
+
 ### MongoDB: multi-document transactions over the db::connection transaction verbs
 
 - `mongo::connection::begin()` / `commit()` / `rollback()` now start, commit and

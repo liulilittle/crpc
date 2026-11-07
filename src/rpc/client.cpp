@@ -11,9 +11,37 @@
 #include <vector>
 
 #include <crpc/endian.hpp>
+#include <crpc/observability/metrics.hpp>
+#include <crpc/observability/tracer.hpp>
 
 namespace crpc::rpc {
 namespace {
+
+// Live spans, one per traced call. They are kept in a side table keyed by the
+// owning client rather than in `client` itself: `rpc::client` is an exported
+// class with an ABI size probe, and observability must not grow it. A bucket is
+// created on the first traced call of a client and removed when the client is
+// destroyed; when no bucket exists the terminal path pays one acquire load and
+// returns. Both paths are internal wiring and never appear on the wire.
+struct trace_bucket {
+    std::mutex mutex;
+    std::unordered_map<u32, obs::span> spans;
+};
+
+struct trace_registry {
+    std::mutex mutex;
+    std::unordered_map<const client*, std::unique_ptr<trace_bucket>> buckets;
+};
+
+trace_registry& trace_registry_instance() {
+    static trace_registry value;
+    return value;
+}
+
+// Published with release after a span is stored; read with acquire before the
+// registry lookup. It only avoids taking the registry lock when tracing was
+// never used in this process.
+std::atomic<bool> g_live_spans{false};
 
 // Advances the 31-bit stream-id counter, skipping zero and the reserved high
 // bit. The caller re-checks the in-flight set after each step.
@@ -206,6 +234,14 @@ client::~client() {
         // free it before the connection. Unbind explicitly: bind_source waits
         // for any in-flight delivery before returning.
         conn_->bind_source(nullptr);
+    }
+    // `close()` completed every in-flight call, so no completion path can
+    // still reach the side table. Any span left behind (a call that never got
+    // a terminal claim) is finished by its destructor when the bucket is
+    // erased.
+    {
+        std::lock_guard<std::mutex> lock(trace_registry_instance().mutex);
+        trace_registry_instance().buckets.erase(this);
     }
 }
 
@@ -660,6 +696,7 @@ void client::flush_write() {
             out_sent_ = 0;
             return;
         }
+        metrics_queue_depth(remaining);
         requested_ = remaining;
         write_error_ = false;
         short_write_ = false;
@@ -1165,6 +1202,12 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
         std::lock_guard<std::mutex> map(map_mutex_);
         remove_in_flight(slot, acknowledged);
     }
+    // Close the call's span and metric accounting before the callback runs:
+    // the callback is allowed to recycle sibling slots, and a later reader
+    // must not see a live span for a call that has already terminated.
+    const u32 stream_id = slot.stream_id;
+    metrics_end(code);
+    trace_end(stream_id, code);
     // The atomic claim inside invoke_callback decides whether `then` or this
     // completion path runs the callback exactly once.
     slot.invoke_callback();
@@ -1173,6 +1216,7 @@ void client::finish(call_slot& slot, call_state terminal, rpc_code code, rpc_err
 void client::cancel_slot(call_slot& slot) noexcept {
     bool won = false;
     bool written = false;
+    u32 stream_id = 0;
     {
         // `completion_mutex_` is the outer lock and `map_mutex_` the inner one.
         // Holding both across the claim and the in-flight removal keeps the slot
@@ -1184,6 +1228,7 @@ void client::cancel_slot(call_slot& slot) noexcept {
                           span<const std::byte>());
         if (won) {
             written = slot.written;
+            stream_id = slot.stream_id;
             // A cancellation never received a response, so it returns the
             // window bytes without growing the window.
             remove_in_flight(slot, false);
@@ -1192,6 +1237,8 @@ void client::cancel_slot(call_slot& slot) noexcept {
     if (!won) {
         return;
     }
+    metrics_end(rpc_code::canceled);
+    trace_end(stream_id, rpc_code::canceled);
     // The RST is a write, and writing takes `write_mutex_` whose path re-enters
     // the reader and therefore `completion_mutex_`. A cancel that runs inside a
     // `then` callback (a callback destroying a written sibling) is nested inside
@@ -1505,8 +1552,104 @@ void client::release_slot_under_lock(call_slot* slot) noexcept {
     completion_guard lk(*this);
     std::lock_guard<std::mutex> map(map_mutex_);
     // A handle destroyed without a terminal claim never received a response.
+    const bool terminal = result_ready(*slot);
+    const u32 stream_id = slot->stream_id;
     remove_in_flight(*slot, false);
     pool_.release(slot);
+    if (!terminal) {
+        metrics_end(rpc_code::canceled);
+        trace_end(stream_id, rpc_code::canceled);
+    }
+}
+
+// --- Automatic observability -------------------------------------------------
+
+obs::trace_context client::trace_begin(u32 stream_id,
+                                       const obs::trace_context& parent) noexcept {
+    obs::tracer& tracer = obs::tracer::instance();
+    if (!tracer.enabled()) {
+        return parent;
+    }
+    try {
+        obs::span span = tracer.start_span("rpc.client.call", parent);
+        const obs::trace_context context = span.context();
+        // An unsampled span has no parent link to export and must not turn a
+        // sampling decision made upstream into a sampled one at the server.
+        // The wire format has no sampled bit, so the only honest thing to do
+        // is leave the caller's context untouched.
+        if (!span.sampled()) {
+            return parent;
+        }
+
+        trace_registry& registry = trace_registry_instance();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        std::unique_ptr<trace_bucket>& bucket = registry.buckets[this];
+        if (!bucket) {
+            bucket.reset(new trace_bucket());
+        }
+        std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+        bucket->spans[stream_id] = std::move(span);
+        g_live_spans.store(true, std::memory_order_release);
+        return context;
+    } catch (...) {
+        return parent;
+    }
+}
+
+void client::trace_end(u32 stream_id, rpc_code status) noexcept {
+    if (!g_live_spans.load(std::memory_order_acquire)) {
+        return;
+    }
+    obs::span span;
+    bool found_span = false;
+    try {
+        trace_registry& registry = trace_registry_instance();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        const auto bucket_entry = registry.buckets.find(this);
+        if (bucket_entry == registry.buckets.end()) {
+            return;
+        }
+        trace_bucket* bucket = bucket_entry->second.get();
+        {
+            std::lock_guard<std::mutex> bucket_lock(bucket->mutex);
+            const auto found = bucket->spans.find(stream_id);
+            if (found == bucket->spans.end()) {
+                return;
+            }
+            span = std::move(found->second);
+            bucket->spans.erase(found);
+            found_span = true;
+        }
+        if (bucket->spans.empty()) {
+            registry.buckets.erase(bucket_entry);
+        }
+        if (registry.buckets.empty()) {
+            g_live_spans.store(false, std::memory_order_release);
+        }
+    } catch (...) {
+        return;
+    }
+    if (found_span) {
+        span.set_status(status);
+        span.finish();
+    }
+}
+
+void client::metrics_begin() noexcept {
+    obs::metrics::increment(obs::metric_id::rpc_client_calls);
+    obs::metrics::add_gauge(obs::metric_id::rpc_client_inflight, 1);
+}
+
+void client::metrics_end(rpc_code code) noexcept {
+    if (code != rpc_code::ok) {
+        obs::metrics::increment(obs::metric_id::rpc_client_errors);
+    }
+    obs::metrics::add_gauge(obs::metric_id::rpc_client_inflight, -1);
+}
+
+void client::metrics_queue_depth(std::size_t bytes) noexcept {
+    obs::metrics::record(obs::metric_id::rpc_client_queue_depth,
+                         static_cast<u64>(bytes));
 }
 
 rpc_code client::map_error(std::error_code ec) noexcept {

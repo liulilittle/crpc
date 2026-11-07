@@ -1,4 +1,4 @@
-﻿// CRPC -- cluster module tests (registry, lease, election, health, watch).
+// CRPC -- cluster module tests (registry, lease, election, health, watch).
 #include "test_framework.hpp"
 
 #include <atomic>
@@ -283,7 +283,9 @@ CRPC_TEST(registry_rejects_stale_incarnation) {
         make_instance("api", "n1", 8001, 4), make_ctx("n1"));
     CRPC_CHECK_FALSE(stale.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
-    CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8002, 5),
+    // A changed endpoint is a new incarnation under the strict replay default;
+    // the same incarnation with a different payload is a conflict.
+    CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8002, 6),
                                      make_ctx("n1")).ok());
 }
 
@@ -373,18 +375,34 @@ CRPC_TEST(registry_tombstone_purge) {
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
                                      make_ctx("n1")).ok());
     CRPC_CHECK(reg.deregister("api", "n1", make_ctx("n1", 0, 1)).ok());
-    CRPC_CHECK_EQ(std::size_t{0}, reg.purge_expired_tombstones());
 
-    CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+    // Zero grace means "eligible immediately": the very next purge removes the
+    // tombstone, and because the include_deregistered view changes it advances
+    // the index exactly once for that removal.
+    const crpc::u64 index_before = reg.index();
     CRPC_CHECK_EQ(std::size_t{1}, reg.purge_expired_tombstones());
+    CRPC_CHECK_EQ(index_before + 1, reg.index());
+
+    // The purged row cannot be resurrected by an old incarnation: the
+    // tombstone incarnation high-water (2) survives the physical removal.
+    const auto stale = reg.register_instance(make_instance("api", "n1", 8001, 1),
+                                             make_ctx("n1"));
+    CRPC_CHECK_FALSE(stale.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
+
+    // The purged tombstone watermark survives, so the key is no longer fresh:
+    // under the strict fencing default the resurrection must carry an epoch
+    // above the surviving high-water (F4).
+    CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 3),
+                                     make_ctx("n1", 3)).ok());
+    CRPC_CHECK_EQ(std::size_t{0}, reg.purge_expired_tombstones());
 
     cl::query_options options;
     options.include_deregistered = true;
     auto result = reg.query(options);
     CRPC_CHECK(result.ok());
     CRPC_CHECK_EQ(std::size_t{1}, result.value().instances.size());
-    CRPC_CHECK_EQ(std::string("n2"), result.value().instances[0].node_id);
+    CRPC_CHECK_EQ(std::string("n1"), result.value().instances[0].node_id);
 }
 
 // --- Lease ------------------------------------------------------------------

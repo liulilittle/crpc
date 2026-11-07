@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <crpc/cluster/registry.hpp>
@@ -86,6 +87,18 @@ public:
     // delivered it, 0 otherwise.
     [[nodiscard]] std::size_t deliver_initial();
 
+    // Suppresses the initial snapshot while keeping the index anchor at the
+    // construction index. Used for a watch created at the current index (park
+    // until the next change) and for an incremental replay (the queued deltas
+    // are the initial delivery). Idempotent.
+    void park() noexcept;
+
+    // Cancels delivery and acts as a barrier: when cancel() returns, no new
+    // user callback starts on this stream. It may be called from inside a
+    // callback; the currently executing callback is then the last one. Safe to
+    // call more than once.
+    void cancel() noexcept;
+
     // Feeds one catalog event. Events for other services still advance the
     // global index, so unrelated traffic does not create false gaps.
     void on_event(u64 index, const std::string& service,
@@ -114,6 +127,10 @@ private:
         service_instance instance;
     };
 
+    // Runs one callback under the cancellation barrier. Returns false when the
+    // stream was cancelled before the callback could start.
+    bool invoke_callback(const watch_event& event);
+
     std::string service_;
     watch_callback callback_ = nullptr;
     void* context_ = nullptr;
@@ -130,11 +147,20 @@ private:
     bool dropped_ = false;
     bool closed_ = false;
     bool initial_delivered_ = false;
+    bool in_callback_ = false;
+    std::thread::id callback_thread_{};
 };
 
 class CRPC_API watch_hub {
 public:
     explicit watch_hub(registry& catalog, std::size_t max_subscribers = 1024);
+    // Same as above with an explicit bounded replay ring. Events are retained
+    // by global index; a reconnect at from_index < current replays the missed
+    // deltas from the ring instead of forcing a full snapshot. When the ring
+    // no longer covers from_index+1, the watch falls back to a resync
+    // snapshot.
+    watch_hub(registry& catalog, std::size_t max_subscribers,
+              std::size_t max_replay);
     ~watch_hub();
 
     watch_hub(const watch_hub&) = delete;
@@ -142,13 +168,18 @@ public:
     watch_hub(watch_hub&&) = delete;
     watch_hub& operator=(watch_hub&&) = delete;
 
-    // from_index == 0 starts a fresh watch. A smaller non-zero from_index means
-    // the caller missed history, so the initial snapshot is tagged resync. A
+    // from_index == 0 starts a fresh watch with an immediate snapshot.
+    // from_index == current parks until the next change (no immediate event).
+    // A smaller non-zero from_index replays the missed deltas when the bounded
+    // ring covers them, otherwise the initial snapshot is tagged resync. A
     // future index is rejected with invalid_argument.
     [[nodiscard]] result<u64> watch(const std::string& service, u64 from_index,
                                     watch_callback callback, void* context,
                                     std::size_t max_queue = 64);
 
+    // Cancels a subscription. Acts as a delivery barrier: when cancel returns,
+    // no callback starts on the stream (the one currently executing, if any,
+    // is the last). Removing an unknown id is a no-op.
     [[nodiscard]] status cancel(u64 subscription_id);
 
     // Drives resync and delta delivery. Returns the number of callbacks.
@@ -171,8 +202,11 @@ private:
 
     registry& catalog_;
     std::size_t max_subscribers_ = 1024;
+    std::size_t max_replay_ = 256;
     mutable std::mutex mutex_;
     std::map<u64, subscriber> subscribers_;
+    // Bounded replay ring, keyed by the global catalog index.
+    std::deque<catalog_event> replay_;
     u64 next_id_ = 1;
     u64 sink_id_ = 0;
     bool sink_registered_ = false;

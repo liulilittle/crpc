@@ -96,6 +96,55 @@ behaviour is delivered through the existing `db::connection` verbs
 `no_such_method` for MongoDB; no vtable slot moved because none of the base
 virtuals were added or removed.
 
+The unreleased G19 Phase 0 cluster-primitive hardening adds one more MAJOR
+break plus MINOR symbols. Four consumer-visible cluster types changed layout,
+so every consumer must be rebuilt from the same headers (sizes measured with
+MSVC 19.51, x64 Debug, against the previous headers):
+
+- `cluster::registry_config` grew from 88 to 104 bytes: four trailing fields
+  (`separate_state_writers`, `strict_fencing`, `strict_incarnation`,
+  `max_fence_lead`). The `registry` constructor takes it by value, so this is
+  an exported signature change as well as a layout change (§1, §4).
+- `cluster::registry` grew from 368 to 432 bytes: private tombstone
+  incarnation high-water and fenced-key maps. Consumers allocate a registry, so
+  its width is part of the contract.
+- `cluster::watch_hub` grew from 144 to 192 bytes (bounded replay ring and
+  capacity) and gained a second constructor.
+- `cluster::watch_stream` grew from 312 to 320 bytes (cancel-barrier state:
+  the dispatching thread id and an in-callback flag).
+
+`cluster::lease_manager` (200 bytes), `cluster::lease` (120),
+`cluster::lease_config` (32), `cluster::health_monitor` (64),
+`cluster::registry_snapshot` (40), `cluster::service_instance` (192),
+`cluster::write_context` (96), `cluster::write_result` (24) and
+`cluster::watch_event` (72) keep their layout. The new symbols are MINOR
+additions: `cluster::registry::fence_barrier(const std::string&, const
+std::string&, u64, const write_context&)`, `cluster::watch_stream::park()`,
+`cluster::watch_stream::cancel()` and
+`cluster::watch_hub::watch_hub(registry&, std::size_t, std::size_t)`.
+No enum value, wire field or protocol byte changed; the semantic fixes
+(grace-zero purge, tombstone high-water, bounded caller fencing, expired-lease
+renewal rejection, purge index/remove events, inclusive TTL boundary, watch
+cancel barrier/park/replay) are behaviour changes only. The three new
+`registry_config` switches are **on by default**:
+`separate_state_writers=true`, `strict_fencing=true`,
+`strict_incarnation=true`. A pre-existing in-process deployment that relied on
+the historical overwrite semantics must set them to `false` explicitly. That
+legacy configuration is unsafe for any deployment with more than one writer:
+registration can clobber a health/lease verdict, an update of an externally
+fenced key can silently drop its fence, and a same-incarnation payload change
+overwrites instead of reporting the conflict.
+
+Two further behaviour-only details belong to this section. A successful write
+reports the key's effective fence high-water in `write_result::fence` (it is
+never below a lease `fence_barrier`, so it can be presented to the next write of
+the same key); a `stale_fence` rejection carries that high-water in the additive
+`registry.fence` error-metadata key, which is how `health_bridge` re-anchors.
+Under `strict_fencing`, only a key that has never existed may be created with
+`fence=0`; a key whose tombstone watermark or fence high-water survived a purge
+is not fresh and a zero-fence create is rejected with
+`registry.reason=fence_required`.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

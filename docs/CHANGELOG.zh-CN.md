@@ -4,6 +4,55 @@
 
 ## 未发布
 
+### 集群原语：网络注册中心之前的 G19 Phase 0 硬化
+
+- **Tombstone purge（P1/P2/P9）。** `tombstone_grace == 0` 现在表示"立即可清理"
+  （判定改为 `age >= grace`）；每一次物理删除都会推进全局 index 并发出一个
+  `catalog_event_kind::remove` 事件；tombstone incarnation 高水位与每键 fence 高水位
+  在 purge 后保留。旧 incarnation 无法复活已清理的键，同一 index 也不会再对应两种
+  不同的 `include_deregistered` 视图。
+- **Fencing（P3/P6/P13）。** 调用方 token 最多只能领先已发布 fence
+  `registry_config::max_fence_lead`，更大的值以 `registry.fence_out_of_range`
+  拒绝，单个 peer 无法再把 fence 域钉死在 `UINT64_MAX`。`strict_fencing`
+  （默认**开启**）要求已接受外部 epoch 的键在更新时携带非零 token
+  （`registry.reason=fence_required`）。只有**从未存在过**的键才允许以
+  `fence=0` 创建：先 grant 的 lease 仍可跟随首次注册。保留有 tombstone
+  高水位或 fence 高水位的键**不属于全新键**——即使
+  `purge_expired_tombstones()` 已物理删除可见行——对它做零 fence 创建会返回
+  `registry.reason=fence_required`，而不是重置 epoch。`lease_manager::grant`
+  在返回前通过新的 `registry::fence_barrier` 发布 fence 屏障，被替换的 lease
+  无法再用旧 fence 写入。成功写入现在在 `write_result::fence` 返回该键的
+  生效高水位（不会低于 lease 屏障）；`stale_fence` 拒绝会在
+  `registry.fence` 元数据中携带当前高水位，客户端（如 `health_bridge`）据此
+  重锚，而不是重复提交永久 stale 的 token。
+- **Lease 生命周期（P4/P7）。** 对已过期但尚未 sweep 的 active lease 续租返回
+  `deadline_exceeded`，不再复活；实例尚不存在时 grant 的 lease 在首次观察到
+  incarnation 时绑定，并在到期时生效，grant 先于 register 不再丢失到期写入；
+  绑定到已被取代 incarnation 的 lease 会被拒绝/丢弃，而不是跟随新注册。
+- **注册（P5/P8/P11/P12）。** 注册要求非空 endpoint host；非空 host + port 0
+  仍是 inproc sentinel。`separate_state_writers`（默认**开启**）在更新时保留
+  health/lease 所有的 state，注册不会覆盖健康裁决。`strict_incarnation`
+  （默认**开启**）让相同的 `(key, incarnation, payload)` 重试幂等
+  （index 不变、无事件），并拒绝同一 incarnation 的不同 payload
+  （`registry.reason=conflict`）。仅在需要保留进程内历史语义时才把任一开关设为
+  `false`；该 legacy 模式在多写入方部署中不安全（注册会覆盖 health/lease
+  裁决，同 incarnation 换 payload 会静默覆盖前值）。
+- **健康（P10）。** TTL 检查在 `age >= ttl` 到期，边界不再晚一拍。
+- **Watch（W1-W4）。** `cancel()` 是投递屏障（返回后不会开始新的回调；正在执行的
+  回调是最后一个）。`from_index == current` 的 watch 进入 park，而不是立即返回
+  快照。有界 replay ring 让落后一个或多个 index 的重连拿到增量 delta，只有当
+  ring 已不覆盖缺口时才回退到 resync 快照。`apply_resync` 拒绝低于已应用锚点的
+  快照，旧快照不能回滚锚点或丢弃已排队事件。
+- **Election（E1）。** `election.hpp` 明确部署范围：该类是单进程原语；v1 只运行
+  一个 registry authority，epoch 由运维提供；中心 leader lease key 或 Raft
+  （持久化 term/vote/log）属于 v1.1。不再把它宣传为多节点选主。
+- **ABI：** MAJOR 布局变更，消费者必须重编。`cluster::registry_config`
+  88 -> 104 字节，`cluster::registry` 368 -> 432，`cluster::watch_hub`
+  144 -> 192，`cluster::watch_stream` 312 -> 320。lease、health、快照与结果
+  记录布局不变。新增 MINOR 符号：`cluster::registry::fence_barrier`、
+  `cluster::watch_stream::park`、`cluster::watch_stream::cancel`，以及三参数
+  `cluster::watch_hub` 构造函数。详见 [abi.zh-CN.md](abi.zh-CN.md)。
+
 ### MongoDB：`db::connection` 事务动词背后的多文档事务支持
 
 - `mongo::connection` 的 `begin()` / `commit()` / `rollback()` 现在真正启动、提交与

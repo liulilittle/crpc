@@ -552,6 +552,11 @@ public:
         if (slot == nullptr) {
             return rpc_result<call<Resp>>(std::move(failure));
         }
+        // Observability is attached before the frame is staged: a synchronous
+        // in-process backend can complete the call inside `start_request`, so
+        // the span must already be published when the terminal path runs.
+        ctx.trace = trace_begin(slot->stream_id, ctx.trace);
+        metrics_begin();
         const status written =
             start_request(*slot, service_id, method_id, request_body, ctx, begun);
         if (!written.ok()) {
@@ -560,7 +565,11 @@ public:
             // rebuilt one: a local admission refusal carries its reason in
             // `metadata` (`crpc.flow_rejected`), and rebuilding from code and
             // message would silently drop it.
+            const rpc_code failure_code = written.code();
+            const u32 stream_id = slot->stream_id;
             pool_.release(slot);
+            metrics_end(failure_code);
+            trace_end(stream_id, failure_code);
             return rpc_result<call<Resp>>(written.error());
         }
         call<Resp> handle;
@@ -827,6 +836,22 @@ private:
     static void detach_thunk(void* ctx, call_slot* slot) noexcept;
     static void release_thunk(void* ctx, call_slot* slot) noexcept;
     static rpc_code map_error(std::error_code ec) noexcept;
+
+    // --- Automatic observability -------------------------------------------
+    //
+    // The templated `start_call` calls these after a slot is acquired and from
+    // every terminal path. With no tracer/exporter installed each one is a
+    // single atomic load plus a predictable branch; the span map is not even
+    // allocated. When tracing is enabled, `trace_begin` stores the span in an
+    // internal map keyed by stream id (the only allocation on that path) and
+    // returns the context to put in the call envelope, so the server sees the
+    // client span as its parent. `trace_end` finishes and removes it.
+    [[nodiscard]] obs::trace_context trace_begin(
+        u32 stream_id, const obs::trace_context& parent) noexcept;
+    void trace_end(u32 stream_id, rpc_code status) noexcept;
+    void metrics_begin() noexcept;
+    void metrics_end(rpc_code code) noexcept;
+    void metrics_queue_depth(std::size_t bytes) noexcept;
 
     std::unique_ptr<connection> conn_;
     client_options options_;

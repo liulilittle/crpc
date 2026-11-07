@@ -86,6 +86,7 @@ the authoritative declaration.
 | [`observability/context.hpp`](../../include/crpc/observability/context.hpp) | `obs::trace_context`, `obs::span` | W3C `traceparent`/baggage trace context. |
 | [`observability/interceptor.hpp`](../../include/crpc/observability/interceptor.hpp) | `obs::interceptor_chain` | AOP interceptor chain. |
 | [`observability/log.hpp`](../../include/crpc/observability/log.hpp) | `obs::logger`, `log_record` | High-performance asynchronous structured logger. |
+| [`observability/metrics.hpp`](../../include/crpc/observability/metrics.hpp) | `obs::metrics`, `obs::counter`, `obs::gauge`, `obs::histogram` | Counters, gauges and histograms with a zero-cost disabled path. |
 | [`observability/tracer.hpp`](../../include/crpc/observability/tracer.hpp) | `obs::tracer` | Spans, head sampling and asynchronous export. |
 
 ## Cluster and flow control
@@ -96,6 +97,7 @@ the authoritative declaration.
 | [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp) | `cluster::lease_manager` | Lease/session manager. |
 | [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp) | `cluster::election` | Leader election primitives. |
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | Health checkers. |
+| [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`, `cluster::health_instance_set` | Debounced health-to-registry writer and read-only load-balancer view. |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | Index-based watch/subscription over the registry. |
 | [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`, `flow::pacer`, `flow::congestion_window`, `flow::rtt_tracker` | Adaptive flow-control primitives. |
 | [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`, `rpc::flow_control_options`, `rpc::flow_state` | Connection-level flow control: byte window, PING/PONG probes, per-lane quotas, pacer. |
@@ -328,6 +330,7 @@ without registering it here fails the suite.
 - [`observability/context.hpp`](../../include/crpc/observability/context.hpp)
 - [`observability/interceptor.hpp`](../../include/crpc/observability/interceptor.hpp)
 - [`observability/log.hpp`](../../include/crpc/observability/log.hpp)
+- [`observability/metrics.hpp`](../../include/crpc/observability/metrics.hpp)
 - [`observability/tracer.hpp`](../../include/crpc/observability/tracer.hpp)
 
 ### `crpc/orm`
@@ -503,6 +506,7 @@ without registering it here fails the suite.
 
 - [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp)
 - [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp)
+- [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp)
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)

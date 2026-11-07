@@ -2,7 +2,7 @@
 
 [简体中文](performance.zh-CN.md) | **English**
 
-Version 2.0 / 2026-10-24
+Version 2.1 / 2026-11-07
 
 This document states what has actually been measured in the repository, on what
 hardware and toolchain, what is only a budget, and how the library will be
@@ -15,7 +15,8 @@ absent rather than estimated.
 |---|---|
 | [1](#s1) | Measurement method |
 | [2](#s2) | Recorded evidence |
-| [2.5](#s2-5) | Compression, RPC matrix and Redis benchmarks (2026-10-26) |
+| [2.5](#s2-5) | Compression, RPC matrix and Redis benchmarks (2026-10-26, historical) |
+| [2.6](#s2-6) | Re-measured baseline (2026-11-07) |
 | [3](#s3) | Budgets and targets |
 | [4](#s4) | Benchmark plan |
 | [5](#s5) | Anti-patterns the design rejects |
@@ -49,6 +50,11 @@ microbenchmarks in `bench/bench_core.cpp` cover the wire/codec layers. The raw
 loopback probe and the object-layout probe below predate the benchmark target
 and are kept as history.
 
+**Historical sections.** §2.3 (2026-10-19), §2.4 (2026-10-24) and §2.5
+(2026-10-26) are kept for comparison. They were recorded before the pipeline
+deadlock fix (59936b6) and before the phase-5 working tree changes; the current
+baseline is §2.6 (2026-11-07).
+
 1. **Raw loopback probe**, recorded in this section. Hardware: AMD
    Ryzen 9 7945HX, 16 cores / 32 threads. Toolchain: MSVC 2022, `/O2`, Windows
    loopback. Workload: 16-byte frame, blocking socket echo, 1,000,000 RPCs, one
@@ -79,7 +85,7 @@ and are kept as history.
    not met by the current slot (`std::mutex`, `condition_variable`, buffer,
    `rpc_error` and callback storage dominate).
 
-### 2.3 Measured end-to-end RPC (2026-10-19)
+### 2.3 Measured end-to-end RPC (2026-10-19, historical) <a id="s2-3"></a>
 
 Source: `bench/bench_rpc.cpp`; command:
 `crpc_bench_rpc` (Windows MSVC Release) and the same target built under WSL
@@ -137,7 +143,7 @@ No p99, p999, cross-shard handoff, codec or resilience-pipeline measurement
 existed before this document; the p99/p999 figures above are now measured, the
 cross-shard handoff and resilience-pipeline budgets remain unmeasured.
 
-### 2.4 CRC32C and push-hub statistics (2026-10-24) <a id="s2-4"></a>
+### 2.4 CRC32C and push-hub statistics (2026-10-24, historical) <a id="s2-4"></a>
 
 Source: `bench/bench_core.cpp` (`crpc_bench_core crc32c`). Toolchain: MSVC 19.51
 x64 Release, `NDEBUG`, sanitizer off. Machine: AMD Ryzen 9 7945HX, 16 cores /
@@ -198,7 +204,7 @@ not a timing: a `feed()` payload points into the decoder while a
 `frame_decoder_external_matches_feed` checks that the same frame stream is
 produced at every split point, including a split inside a frame.
 
-### 2.5 Compression, RPC matrix and Redis benchmarks (2026-10-26) <a id="s2-5"></a>
+### 2.5 Compression, RPC matrix and Redis benchmarks (2026-10-26, historical) <a id="s2-5"></a>
 
 Sources: `bench/bench_compression.cpp`, `bench/bench_rpc_matrix.cpp` and
 `bench/bench_redis.cpp` (targets `crpc_bench_compression`,
@@ -321,42 +327,146 @@ so the numbers and their environment can be found together: two executables,
 5 + 3 cases, 150 + 64 checks, 0 failures, each run five times with zero
 failures. See [distributed-testing.md §3](distributed-testing.md#s3).
 
+### 2.6 Re-measured baseline (2026-11-07) <a id="s2-6"></a>
+
+Everything below was measured on the current tree (HEAD `5a4abaf` plus the
+uncommitted phase-5 modules) with a fresh build root, not copied from the
+historical tables. Build command:
+`.\scripts\build.ps1 -Config Release -BuildRoot F:\crpc\.build-bench5 -Bench`.
+Toolchain: MSVC 19.51 x64 Release (`/O2 /Ob2 /GL /DNDEBUG /MD`, `/W4 /WX`);
+machine: AMD Ryzen 9 7945HX, 16 cores / 32 threads, Windows loopback;
+sanitizers off. Each target was run in three independent processes (each
+process also takes its own 7/5-run median); the table reports the median of the
+three. Raw output is in `.opencode/tmp/bench5/raw/`.
+
+**Contention caveat.** Other workloads ran on this machine during the window:
+`Win32_Processor.LoadPercentage` moved between 54 % and 90 %. The numbers are
+therefore conservative. The clearest artefact is the third IOCP run (p99
+3117.8 µs and depth-16 p999 14.4 ms); the first two runs and the low-load
+resilience run are kept as the stability reference.
+`bench/bench_core.cpp` results:
+
+| Case | Median of 3 runs |
+|---|---:|
+| `codec/binary_encode_small` (`bench_request`, not 64 B) | 411.2 ns |
+| `codec/binary_decode_small` (`bench_request`, not 64 B) | 290.7 ns |
+| `crc32c/optimized_256B` | 58.7 ns |
+| `crc32c/optimized_16KiB` | 3617.7 ns |
+| `frame/feed_copy_1KiB_per_frame` | 76.4 ns/frame |
+| `frame/feed_external_1KiB_per_frame` | 17.5 ns/frame |
+
+`bench/bench_rpc.cpp` (64 B `std::string` echo, inproc and IOCP loopback):
+
+| Case | Median of 3 runs |
+|---|---:|
+| inproc p50 / p90 / p99 / p999 | 3.30 / 6.40 / 35.70 / 79.60 µs |
+| inproc max | 444.7 µs |
+| throughput depth 1 / 16 / 64 | 0.093 / 0.165 / 0.165 M RPC/s |
+| multishard 1 / 2 / 4 (depth 16) | 0.15 / 0.15 / 0.15 M RPC/s |
+| 8 client threads over 8 shards | 0.577 M RPC/s |
+| IOCP p50 / p99 / p999, depth 1 | 125.20 / 218.40 / 319.10 µs |
+| IOCP throughput depth 1 / 16 | 0.008 / 0.022 M RPC/s |
+| IOCP p99 depth 16 | 209.30 µs |
+
+Compile-time layout probe (`probe_sizes.cpp`, same flags; `sizeof` is evaluated
+by the compiler from the public headers):
+
+| Type | `sizeof` |
+|---|---:|
+| `rpc::call_slot` | **464 B** |
+| `rpc::call<int>` | 24 B |
+| `rpc::client` | 1024 B |
+| `push::hub` | 8 B (pimpl pointer) |
+| `cluster::registry` | 336 B |
+| `cluster::lease_manager` | 184 B |
+
+The 128-byte call-slot budget is therefore missed by **3.63x** on this
+toolchain; the historical 440 B figure is stale. `rpc::client` is 1024 B, not
+the historical 568 B; `docs/abi.md`'s consumer probe agrees with this build.
+
+Codec at exactly 64 bytes. The historical `codec/binary_*_small` cases use a
+`bench_request` (string + vector), so they are not a 64-byte measurement. The
+probe `probe_codec64.cpp` measures `call_codec<std::string>` with the buffer
+capacity retained and the decode target reused: **encode 4.34 ns, decode
+4.88 ns** per 64-byte message (median of three processes). The `< 100 ns`
+budget is met for this path.
+
+Resilience pipeline. `probe_resilience.cpp` runs the success path in facade
+order (`rate.try_acquire -> bulkhead.try_enter -> breaker.allow ->
+load_balancer.select`, then `breaker.success()` and the permit release):
+**211.49 ns per successful call** median (best low-load run 157.85 ns). The
+circuit breaker alone is 145.91 ns; rate 43.52 ns, bulkhead 5.64 ns, selection
+14.09 ns. The 35-65 ns budget is missed by 3.25x-6.04x (2.43x on the best run).
+
+Cross-shard handoff. The only public handoff surface is `runtime::post`: one
+inbox entry plus a doorbell `wake()` per call (`src/runtime/runtime.cpp:177`).
+There is no batched-post API and `bench/CMakeLists.txt` only globs
+`bench_*.cpp`, so no dedicated handoff target exists. The probe measures
+**80.87 ns per message** enqueued and 80.88 ns end to end on the target shard;
+a synthetic 64-message payload carried by one post costs 1818.75 ns per message
+because it is dominated by wake/scheduling latency, not a real batch API. The
+15-30 ns per batched message budget is missed by 2.70x-5.39x.
+
+Connection memory. `probe_conn_memory.cpp` runs the real IOCP server and holds
+raw loopback sockets idle, sampling `PrivateUsage`/`WorkingSetSize`:
+
+| Case | Median of 3 valid runs |
+|---|---:|
+| 1 000 idle connections, committed per connection | 70 300 B |
+| 10 000 idle connections, private total | 697 163 776 B (664.9 MiB) |
+| 10 000 idle connections, committed per connection | 69 716 B (68.1 KiB) |
+| 128 active connections (one 4 KiB call each), private per pair | 2 063 552 B (1.97 MiB) |
+
+The idle budget (2 KiB) is missed by 34.0x and the 10k-idle budget (20 MiB) by
+33.2x. The cause is visible in the tree: the IOCP backend allocates the 64 KiB
+receive buffer on every accept (`include/crpc/io/iocp_backend.hpp:78`,
+`src/io/iocp_backend.cpp:1398`). The active number is a **client+server**
+pair measured in one process, so it cannot be attributed to the server alone;
+it is an upper bound and still 12.9x the 160 KiB budget. A server-only active
+number is **not verified** (W5).
+
+
+
 ## 3. Budgets and targets <a id="s3"></a>
 
 Memory budgets are from design §17.1; status is assessed against the code.
 
 | Item | Budget | Status |
 |---|---|---|
-| idle connection | ≤ 2 KiB | design target; not measured |
-| active connection | ≤ 160 KiB | design target; epoll ring is 64 KiB, IOCP send queue 256 KiB, read buffer 64 KiB |
-| call slot | 128 B | **not met**: 440 B measured on MSVC x64 |
-| shard fixed | ≤ 8 MiB | not applicable: no shard/coroutine pool yet |
-| 100k in-flight calls | ≤ 64 MiB | design target based on 128 B slots; the current slot size alone is ~44 MB for 100k |
-| 10k idle connections | ≤ 20 MiB | design target; not measured |
+| idle connection | ≤ 2 KiB | **not met**: 69 716 B committed per idle IOCP connection (median of 3, §2.6), 34.0x the budget |
+| active connection | ≤ 160 KiB | **not verified server-only**: a same-process client+server pair with one 4 KiB call in flight costs 2 063 552 B (1.97 MiB, §2.6), 12.9x the budget as an upper bound; the server-only share could not be separated |
+| call slot | 128 B | **not met**: **464 B** measured on MSVC x64 by a compile-time probe (§2.6), 3.63x the budget; the historical 440 B figure is stale |
+| shard fixed | ≤ 8 MiB | not measured; the shard runtime exists (`src/runtime/runtime.cpp`) but no per-shard fixed-memory number has been recorded |
+| 100k in-flight calls | ≤ 64 MiB | the slot array alone is 464 B x 100k = 44.3 MiB; end-to-end in-flight memory is not measured |
+| 10k idle connections | ≤ 20 MiB | **not met**: 697 163 776 B (664.9 MiB) private delta for 10 000 idle IOCP connections (§2.6), 33.2x the budget |
 | subscription table | ≤ 5 MiB | design target; hub bounds are per-subscription, not a global table |
-| per-lane queue | ≤ 16 KiB | specified, not implemented |
+| per-lane queue | ≤ 16 KiB | specified, not implemented (the queue has `gap_timeout` but no byte cap) |
 | send ring per connection | ≤ 256 KiB | epoll default 64 KiB; IOCP default 256 KiB |
 
 Performance targets:
 
 | Metric | Target | Status |
 |---|---|---|
-| aggregate throughput | 5M RPC/s | **not met**: 0.275M RPC/s best single-client measured (inproc, MSVC, depth 64); 0.773M RPC/s with eight client threads over four shards (§2.3); 0.024M over IOCP loopback |
-| per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.275M RPC/s inproc measured (§2.3) |
-| p99 latency | < 100 µs | **partly met**: 22.6 µs inproc (MSVC); 170.2 µs IOCP loopback; 151.8 µs WSL inproc |
-| cross-shard handoff | 15–30 ns per batched message | budget; not measured |
-| codec, 64-byte message | < 100 ns encode and decode | **not demonstrated**: `docs/benchmarks/2026-10-19-core-x64-msvc-release.txt` records `codec/binary_encode_small` 218.8 ns and `codec/binary_decode_small` 232.9 ns. The benchmark payload is a small `bench_request` (string/vector fields), not exactly 64 bytes, so the numbers are not directly comparable to the budget; they still show the target is not met. |
-| resilience pipeline | 35–65 ns per successful call | budget; not measured |
+| aggregate throughput | 5M RPC/s | **not met**: 0.165M RPC/s single-client inproc (depth 64, median of 3, §2.6); 0.577M RPC/s with eight client threads over eight shards; 0.022M over IOCP loopback (depth 16). Gaps 30.3x / 8.7x / 227x. Historical 2026-10-19 numbers: 0.275M inproc single-client, 0.773M multi-thread, 0.024M IOCP. |
+| per-connection pair, batched | ≥ 1M RPC/s | **not met**: 0.165M RPC/s inproc measured (§2.6), 6.1x gap |
+| p99 latency | < 100 µs | **partly met**: 35.70 µs inproc (MSVC, median of 3); 218.40 µs IOCP loopback depth 1; 209.30 µs IOCP depth 16 (§2.6). In-process met; IOCP 2.09x-2.18x over. |
+| cross-shard handoff | 15–30 ns per batched message | **not met / no batch API**: `runtime::post` costs 80.87 ns/message to enqueue and 80.88 ns end to end (median of 3, §2.6), 2.70x-5.39x over the budget. There is no batched-post API; the design's MPSC-plus-doorbell batch handoff is not implemented, and no dedicated benchmark target exists. |
+| codec, 64-byte message | < 100 ns encode and decode | **met for the string path**: `call_codec<std::string>` at exactly 64 bytes costs 4.34 ns encode and 4.88 ns decode (§2.6). The historical warning still applies to `codec/binary_*_small`, which measures a `bench_request` (411.2 ns encode / 290.7 ns decode) and is not a 64-byte payload. |
+| resilience pipeline | 35–65 ns per successful call | **not met**: 211.49 ns per successful call through rate -> bulkhead -> breaker -> load-balancer plus teardown (median of 3); best low-load run 157.85 ns (§2.6). Gap 3.25x-6.04x (2.43x best). The circuit breaker alone is 145.91 ns. |
 
-The codec budget deserves a direct warning: the recorded microbenchmark above is
-a real measurement, but it is 2.2-2.3x over the `< 100 ns` target and uses a
-different payload than "64-byte message". It should not be read as a passing
-result.
+The codec budget now has two distinct answers. The exact 64-byte string path
+meets it (4.34 ns encode / 4.88 ns decode, §2.6), while the reflective
+`bench_request` microbenchmark remains 4.1x/2.9x over `< 100 ns` at 411.2 ns /
+290.7 ns. Those are different payloads and must not be conflated: the budget is
+met for the codec the RPC string path uses, and not demonstrated for the
+reflective small-object path.
 
-The only defensible statement today is: the transport layer is designed around
-bounded queues and batching, and a raw Windows loopback probe shows that
-batching changes throughput by roughly 50x. That motivates the design; it does
-not prove the target.
+The transport layer is designed around bounded queues and batching, and the raw
+Windows loopback probe still shows that batching changes throughput by roughly
+50x. That motivates the design; it does not prove the 5M target. The measured
+ceiling of the current round trip is 0.165M RPC/s single-client and 0.577M with
+eight client threads (§2.6), so the remaining gap is the synchronous round trip,
+not allocation or lock tuning.
 
 ## 4. Benchmark plan <a id="s4"></a>
 
@@ -429,11 +539,15 @@ with a projection.
 
 Current status: the library has functional test coverage, an HTTP server facade,
 an in-process and IOCP end-to-end RPC benchmark (§2.3), a wire/codec
-microbenchmark, and the compression/RPC-matrix/Redis benchmarks in §2.5. The 5M
-RPC/s and IOCP p99 targets are **not met** (measured
-0.275M RPC/s inproc single-client, 0.773M RPC/s multi-thread, and 170 µs p99
-over IOCP); the in-process p99 target is met
-at 22.6 µs on MSVC. The 128-byte call-slot budget remains **unmet** at 440 bytes
-on the measured toolchain. The measured figures, the rejected experiments and
-the remaining gaps are recorded in §2 and §3; the shipped microbenchmark log is
-`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt`.
+microbenchmark, and the compression/RPC-matrix/Redis benchmarks in §2.5. The
+2026-11-07 re-measurement (§2.6) supersedes the earlier baseline: the 5M RPC/s
+target and IOCP p99 target are **not met** (0.165M RPC/s single-client inproc,
+0.577M with eight client threads, 218.4 µs IOCP p99 depth 1); the in-process
+p99 target is met at 35.70 µs on MSVC. The 128-byte call-slot budget remains
+**unmet** at 464 bytes. The 64-byte string codec meets its `< 100 ns` budget
+(4.34/4.88 ns), the resilience pipeline (211.49 ns) and cross-shard handoff
+(80.87 ns/message) do not, and idle-connection memory is 34x its budget. The
+measured figures, the rejected experiments and the remaining gaps are recorded
+in §2 and §3; the shipped microbenchmark log is
+`docs/benchmarks/2026-10-19-core-x64-msvc-release.txt` (historical), and the
+2026-11-07 raw logs are under `.opencode/tmp/bench5/raw/`.
