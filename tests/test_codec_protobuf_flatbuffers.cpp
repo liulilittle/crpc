@@ -81,7 +81,7 @@ struct trip_blank {
 RTTI_DEFINE_TYPE(trip_blank, count, label, values)
 
 struct trip_empty {};
-RTTI_DEFINE_TYPE(trip_empty)
+RTTI_DEFINE_TYPE(trip_empty, /* no fields */)
 
 struct pb_enum_record {
     trip_kind kind;

@@ -374,7 +374,7 @@ status encode_members(const T& value, const Tuple& members, u64 offset,
                       buffer& out, std::size_t depth, std::size_t limit,
                       std::index_sequence<I...>) {
     status result;
-    const auto step = [&](auto index_constant) {
+    [[maybe_unused]] const auto step = [&](auto index_constant) {
         constexpr std::size_t index = decltype(index_constant)::value;
         if (result.ok()) {
             result = encode_field(out, offset + index + 1,
@@ -589,7 +589,7 @@ status decode_member_dispatch(u64 id, u64 id_offset, byte_reader& reader,
                               bool strict, const Members& members,
                               bool& handled, std::index_sequence<I...>) {
     status result;
-    const auto step = [&](auto index_constant) {
+    [[maybe_unused]] const auto step = [&](auto index_constant) {
         constexpr std::size_t index = decltype(index_constant)::value;
         if (handled || !result.ok()) {
             return;
