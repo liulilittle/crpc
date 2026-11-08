@@ -167,6 +167,20 @@ unchanged. Automatic sharding is opt-in only (it is mutually exclusive with
 PUSH), so the default behaviour is identical and this is a MINOR addition, not
 a MAJOR one.
 
+The unreleased build-gate work adds **exported symbols only, with no layout or
+vtable change**, which is a MINOR addition: the value types
+`crpc::time::date_time`, `crpc::time::duration` and `crpc::time::timestamp` gain
+a class-level `CRPC_API`, so the DLL now exposes their existing out-of-line
+members (`date_time::is_valid`/`validate`, `duration::absolute`/`checked_*` and
+the `from_*` factories); `date_time::validate()` keeps its signature and moves
+from a member-level to the class-level decoration (MSVC rejects both spellings
+together as C2487). The abstract interface `crpc::resilience::instance_set` also
+gains `CRPC_API` because the exported class
+`crpc::cluster::health_instance_set` derives from it (rule E), which is what
+removes the MSVC C4275 warning. No virtual slot is added or moved and no field,
+offset or `sizeof` changes: only the export table grows, so consumers keep the
+same layout.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

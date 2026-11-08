@@ -54,7 +54,7 @@ struct instance {
 // Read-only view of the candidate instances. Implementations must keep `at()`
 // valid for concurrent reads and must monotonically increase `version()` on any
 // change to membership, health or weight.
-class instance_set {
+class CRPC_API instance_set {
 public:
     virtual ~instance_set() = default;
 

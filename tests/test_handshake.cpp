@@ -654,7 +654,7 @@ CRPC_TEST(handshake_hs32_split_header_big_settings_rejected_before_copy) {
     (void)c.source().on_data(view(first));
     const std::size_t before = g_alloc_bytes.load(std::memory_order_relaxed);
     (void)c.source().on_data(view(second));
-    const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
+    [[maybe_unused]] const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
 
 #if !defined(CRPC_SHARED)
     // The check runs on the completed header; the 16 MiB payload is never
@@ -685,7 +685,7 @@ CRPC_TEST(handshake_hs32_same_chunk_small_then_big_settings_rejected_before_copy
 
     const std::size_t before = g_alloc_bytes.load(std::memory_order_relaxed);
     (void)c.source().on_data(view(chunk));
-    const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
+    [[maybe_unused]] const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
 
 #if !defined(CRPC_SHARED)
     CRPC_CHECK(delta < 1024u * 1024u);
@@ -724,7 +724,7 @@ CRPC_TEST(handshake_hs32_residual_frame_then_big_settings_rejected_before_copy) 
 
     const std::size_t before = g_alloc_bytes.load(std::memory_order_relaxed);
     (void)c.source().on_data(view(chunk));
-    const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
+    [[maybe_unused]] const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
 
 #if !defined(CRPC_SHARED)
     // Only the 8 bytes that complete the PING frame may be copied. A regression
@@ -752,7 +752,7 @@ CRPC_TEST(handshake_hs32_bytewise_header_big_settings_rejected_before_copy) {
             break;
         }
     }
-    const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
+    [[maybe_unused]] const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
 
 #if !defined(CRPC_SHARED)
     CRPC_CHECK(delta < 1024u * 1024u);
@@ -856,7 +856,7 @@ CRPC_TEST(handshake_hs32_reentrant_inner_fatal_propagates) {
     std::vector<std::byte> inner(header.begin(), header.end());
     const std::size_t before = g_alloc_bytes.load(std::memory_order_relaxed);
     (void)c.source().on_data(view(inner));
-    const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
+    [[maybe_unused]] const std::size_t delta = g_alloc_bytes.load(std::memory_order_relaxed) - before;
 
 #if !defined(CRPC_SHARED)
     CRPC_CHECK(delta < 1024u * 1024u);

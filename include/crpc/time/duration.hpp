@@ -35,7 +35,7 @@
 namespace crpc {
 namespace time {
 
-class duration;
+class CRPC_API duration;
 
 // --- timestamp ---------------------------------------------------------------
 //
@@ -43,7 +43,7 @@ class duration;
 // purpose: serialisation and arithmetic code reads and writes it directly, and
 // the type is a plain two's complement cell with no invariants beyond that.
 
-struct timestamp {
+struct CRPC_API timestamp {
     std::int64_t nanoseconds = 0;
 
     constexpr timestamp() noexcept = default;
@@ -119,7 +119,7 @@ struct timestamp {
 
 // A signed span, stored as 64-bit nanoseconds. All arithmetic that is marked
 // "checked" reports 64-bit overflow as `rpc_code::invalid_argument`.
-class duration {
+class CRPC_API duration {
 public:
     constexpr duration() noexcept = default;
 

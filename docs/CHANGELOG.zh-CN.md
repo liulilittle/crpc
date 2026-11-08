@@ -19,6 +19,27 @@
   `unavailable`。只对不 publish、不提供 PUSH 的 server 使用 `shards_auto()`。
   测试：`test_shard_auto.cpp`。
 
+### 构建：shared 构建与 export gate 重新变绿
+
+- **新增加导出符号、不改布局（MINOR）。** `crpc::time::date_time`、`crpc::time::duration`
+  与 `crpc::time::timestamp` 现在被导出（类级 `CRPC_API`），DLL 因此暴露它们本就
+  out-of-line 的成员（`is_valid`、`validate`、`absolute`、`checked_*`、`from_*`）；
+  `date_time::validate()` 的成员级 `CRPC_API` 被移除，因为类级宏已覆盖同一符号，
+  两者同时出现会被 MSVC 判为 C2487。抽象基类 `crpc::resilience::instance_set`
+  同样被导出，因为导出类 `crpc::cluster::health_instance_set` 继承它
+  （MSVC C4275 / export gate 规则 E）。虚函数槽位、字段、偏移与 `sizeof` 均不变。
+- **仅 shared 构建出现的未使用局部变量。** `tests/test_handshake.cpp` 为五个
+  `delta` 计数器加 `[[maybe_unused]]`：它们只在非 shared
+  （`#if !defined(CRPC_SHARED)`）分支里被读取，shared 构建因此报 C4189 ×5。
+- **空反射类型的 pedantic 修复。** `codec.hpp` 为两个 fold 辅助 lambda `step`
+  加 `[[maybe_unused]]`（空 tuple 会让它们未被使用，触发
+  `-Wunused-but-set-variable`）；`tests/test_codec_protobuf_flatbuffers.cpp`
+  为 `trip_empty` 的注册补一个注释实参，使变参宏 `RTTI_DEFINE_TYPE` 至少收到
+  一个参数（`-Wpedantic`）。
+- 证据：MSVC x64 shared Release、静态 Release 与 Debug 构建均为 0 error / 0 warning；
+  `export_gate` 在有 DLL 与无 DLL 两种形态下均 OK；受影响套件在 shared 与静态
+  构建下均通过。
+
 ### 集群原语：网络注册中心之前的 G19 Phase 0 硬化
 
 - **Tombstone purge（P1/P2/P9）。** `tombstone_grace == 0` 现在表示"立即可清理"

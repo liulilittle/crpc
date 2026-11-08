@@ -1037,15 +1037,17 @@ def main(argv=None):
     # Measured on this tree, "undecorated + non-template + pure virtual" selects
     # 8 types and adding aggregates pushes the count into the hundreds, so the
     # rule would either mis-fire on header-only value types or be unverifiable.
-    # Audit A showed the eight header-only callback interfaces (`codec`,
-    # `instance_set`, `multipart_handler`, `interceptor`, `exporter`,
-    # `stream_transport`, `quorum`, `call_state_base`) need no macro: the library
-    # receives them by reference or pointer, the consumer implements them, so the
-    # consumer never needs the DLL's copy of the base -- link and run both
-    # succeed with and without the macro, and so does deriving from an
-    # undecorated base. Rule E flags exactly the case that matters (a decorated
-    # class deriving from an undecorated *non-template* base) and reports zero on
-    # a clean tree.
+    # Audit A showed the seven header-only callback interfaces (`codec`,
+    # `multipart_handler`, `interceptor`, `exporter`, `stream_transport`,
+    # `quorum`, `call_state_base`) need no macro: the library receives them by
+    # reference or pointer, the consumer implements them, so the consumer never
+    # needs the DLL's copy of the base -- link and run both succeed with and
+    # without the macro, and so does deriving from an undecorated base.
+    # `instance_set` is no longer one of them: `health_instance_set` is an
+    # exported class that derives from it, so it must carry the decorator
+    # (rule E). Rule E flags exactly the case that matters (a decorated class
+    # deriving from an undecorated *non-template* base) and reports zero on a
+    # clean tree.
     #
     # A template base is skipped when the base list is parsed (`'<' not in
     # base`), and that is correct rather than a blind spot. A template base is

@@ -55,6 +55,8 @@ MAJOR.MINOR.PATCH
 
 未发布的 G36 自动分片工作新增 **2 个 MINOR 导出符号** + **2 个头文件 inline `shards_auto()` 重载（不新增导出符号）**、不改布局：导出符号为自由函数 `crpc::rpc::default_shard_count()` 与 `crpc::server::shard_count()`；`crpc::server::builder::shards_auto()`（无参重载与注入核数重载）均为头文件 `inline`，不新增导出。`server::options` 与 `server::builder` 的所有字段、偏移与尺寸不变（x64：`sizeof(options) == 320`、`sizeof(builder) == 400`；x86：`264` / `304`），默认 `options::shards == 1` 与 `builder::shards(0) -> 1` 映射也不变。自动分片仅在 opt-in 时生效（且与 PUSH 互斥），默认行为完全一致，因此这是 MINOR 追加而非 MAJOR。
 
+未发布的构建门禁修复只**增加导出符号、不改布局与 vtable**，属 MINOR 追加：值类型 `crpc::time::date_time`、`crpc::time::duration`、`crpc::time::timestamp` 补上类级 `CRPC_API`，DLL 因此导出它们本就 out-of-line 的成员（`date_time::is_valid`/`validate`、`duration::absolute`/`checked_*` 与 `from_*` 工厂）；`date_time::validate()` 签名不变，只是从成员级装饰改由类级覆盖（两者同时出现会被 MSVC 判为 C2487）。抽象接口 `crpc::resilience::instance_set` 同样补上 `CRPC_API`，因为导出类 `crpc::cluster::health_instance_set` 继承它（规则 E），这正是消除 MSVC C4275 的改动。没有新增或移动虚函数槽位，字段、偏移与 `sizeof` 均不变：只有导出表增长，消费者布局保持一致。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

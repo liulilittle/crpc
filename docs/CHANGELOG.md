@@ -4,6 +4,30 @@
 
 ## Unreleased
 
+### Build: the shared build and the export gate are clean again
+
+- **MINOR (exported symbols only, no layout).** `crpc::time::date_time`,
+  `crpc::time::duration` and `crpc::time::timestamp` are now exported
+  (class-level `CRPC_API`), so the DLL exposes their already-out-of-line members
+  (`is_valid`, `validate`, `absolute`, `checked_*`, `from_*`); the member-level
+  `CRPC_API` on `date_time::validate()` is dropped because the class-level macro
+  covers the same symbol and MSVC rejects both together as C2487. The abstract
+  base `crpc::resilience::instance_set` is exported too, because the exported
+  class `crpc::cluster::health_instance_set` derives from it (MSVC C4275 / export
+  gate rule E). No virtual slot, field, offset or `sizeof` changes.
+- **Shared-only unused locals.** `tests/test_handshake.cpp` marks the five
+  `delta` counters `[[maybe_unused]]`: they are read only in the non-shared
+  (`#if !defined(CRPC_SHARED)`) branch, so the shared build reported C4189 ×5.
+- **Pedantic fixes for empty reflected types.** `codec.hpp` marks the two
+  fold-helper `step` lambdas `[[maybe_unused]]` (an empty tuple leaves them
+  unused, `-Wunused-but-set-variable`), and
+  `tests/test_codec_protobuf_flatbuffers.cpp` registers `trip_empty` with a
+  comment argument so the variadic `RTTI_DEFINE_TYPE` macro receives at least
+  one argument (`-Wpedantic`).
+- Evidence: MSVC x64 shared Release, static Release and Debug builds report
+  0 errors / 0 warnings; `export_gate` is OK with and without the DLL; the
+  affected suites pass on both the shared and static builds.
+
 ### Server: opt-in automatic shard count (G36)
 
 - **New symbols + inline API (MINOR).** `crpc::rpc::default_shard_count(physical_cores)` is

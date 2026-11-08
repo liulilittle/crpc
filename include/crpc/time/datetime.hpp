@@ -53,7 +53,7 @@ enum class weekday : std::uint8_t {
 [[nodiscard]] CRPC_API const char* to_string(weekday value) noexcept;
 [[nodiscard]] CRPC_API const char* to_short_string(weekday value) noexcept;
 
-struct date_time {
+struct CRPC_API date_time {
     int year = 1;
     int month = 1;
     int day = 1;
@@ -69,7 +69,7 @@ struct date_time {
     // The subsecond part is always in [0, 999999999].
     [[nodiscard]] bool is_valid() const noexcept;
     // `invalid_argument` with a message naming the offending field.
-    [[nodiscard]] CRPC_API status validate() const;
+    [[nodiscard]] status validate() const;
 
     [[nodiscard]] static constexpr date_time utc(int y, int mo, int d, int h = 0,
                                                  int mi = 0, int s = 0,
