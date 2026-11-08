@@ -1325,7 +1325,7 @@ status client::start_request(call_slot& slot, u64 service_id, u64 method_id,
                 }
                 return status{rpc_code::resource_exhausted};
             }
-            slot.written = true;
+            slot.written.store(true, std::memory_order_release);
             in_flight_.emplace(slot.stream_id, &slot);
             if (slot.has_deadline) {
                 deadlines_.emplace(slot.deadline, &slot);
@@ -1409,7 +1409,7 @@ void client::cancel_slot(call_slot& slot) noexcept {
                           rpc_error(rpc_code::canceled, "call canceled"),
                           span<const std::byte>());
         if (won) {
-            written = slot.written;
+            written = slot.written.load(std::memory_order_acquire);
             stream_id = slot.stream_id;
             // A cancellation never received a response, so it returns the
             // window bytes without growing the window.
@@ -1676,7 +1676,7 @@ void client::poll() noexcept {
             // Local-only marker: the facade distinguishes this from a
             // server-produced deadline (which must not open the breaker).
             error.metadata.set("crpc.local_timeout", "1");
-            if (victim->written && !victim->idempotent) {
+            if (victim->written.load(std::memory_order_acquire) && !victim->idempotent) {
                 error.metadata.set("unknown_side_effect", "1");
             }
             finish(*victim, call_state::timed_out, rpc_code::deadline_exceeded,

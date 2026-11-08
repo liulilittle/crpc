@@ -328,9 +328,11 @@ public:
     bool one_way = false;
     call_id idem{};
 
-    // True once the request bytes were handed to the writer queue (used to
-    // decide whether a timeout implies an unknown side effect).
-    bool written = false;
+    // True once the request bytes were appended to the write queue (used to
+    // decide whether a timeout implies an unknown side effect). It is published
+    // by the writer path (gate-open / direct send) and read by `poll()` on
+    // another thread, so it is atomic: store with release, load with acquire.
+    std::atomic<bool> written{false};
 
     // --- Terminal result (written by the claim winner only) ---
     rpc_code code = rpc_code::ok;
@@ -364,6 +366,12 @@ public:
     // `stream_id`/`has_deadline`, and an unguarded reset raced with it.
     void (*owner_release)(void* owner, call_slot* slot) noexcept = nullptr;
 };
+
+// A1 self-proof: making `written` atomic must not grow the pooled record. The
+// 512-byte ceiling is asserted in src/abi_check.cpp; this pins the member-type
+// change itself to a byte-for-byte size match.
+static_assert(sizeof(std::atomic<bool>) == sizeof(bool),
+              "call_slot::written must keep the slot size unchanged (A1)");
 
 // Loads the state word with acquire ordering.
 [[nodiscard]] CRPC_API call_state load_state(const call_slot& slot) noexcept;

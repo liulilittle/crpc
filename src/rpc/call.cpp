@@ -101,7 +101,7 @@ void call_slot::reset() noexcept {
     idempotent = false;
     one_way = false;
     idem = call_id{};
-    written = false;
+    written.store(false, std::memory_order_release);
     code = rpc_code::ok;
     error = rpc_error{};
     if (response.capacity() > response_retain_bytes) {

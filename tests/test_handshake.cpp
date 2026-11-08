@@ -35,6 +35,7 @@
 
 #include <crpc/endian.hpp>
 #include <crpc/frame.hpp>
+#include <crpc/frame_compression.hpp>
 #include <crpc/io.hpp>
 #include <crpc/rpc/client.hpp>
 #include <crpc/rpc/dispatcher.hpp>
@@ -923,6 +924,100 @@ CRPC_TEST(handshake_peek_header_contract) {
     CRPC_CHECK(peek_result::header_error ==
                decoder.peek_header(span<const std::byte>(bad.data(), bad.size()), header));
     CRPC_CHECK_FALSE(decoder.failed());
+}
+
+// --- P8a sender-side ratio self-check (D-B1 send side) ---------------------
+
+namespace {
+struct encode_outcome {
+    status code;
+    std::size_t written = 0;
+    compression_algorithm chosen = compression_algorithm::none;
+    compression_fallback_reason reason = compression_fallback_reason::none;
+    std::vector<std::byte> bytes;
+};
+
+encode_outcome encode_with(frame value, compression_algorithm preferred,
+                           const compression_limits& limits) {
+    encode_outcome result;
+    const std::size_t reserve = encoded_frame_size_compressed(value, preferred, limits);
+    result.bytes.resize(reserve);
+    result.code = encode_frame_compressed_ex(span<std::byte>(result.bytes.data(), result.bytes.size()),
+                                             value, preferred, limits, result.written, &result.chosen,
+                                             nullptr, &result.reason);
+    result.bytes.resize(result.written);
+    return result;
+}
+} // namespace
+
+CRPC_TEST(handshake_p8_sender_ratio_self_check) {
+    compression_limits limits;
+    limits.max_compression_ratio = 300;
+    limits.min_payload = 64;
+    limits.max_payload = max_frame_default;
+
+    // Compressible and within the ratio guard: lz4 emits COMPRESSED.
+    {
+        std::vector<std::byte> zeros(1024u * 1024u, std::byte{0});
+        frame value;
+        value.header.type = frame_type::request;
+        value.header.stream_id = 1;
+        value.payload = span<const std::byte>(zeros.data(), zeros.size());
+        const encode_outcome result = encode_with(value, compression_algorithm::lz4, limits);
+        CRPC_CHECK(result.code.ok());
+        CRPC_CHECK_EQ(static_cast<int>(compression_algorithm::lz4),
+                      static_cast<int>(result.chosen));
+        CRPC_CHECK_EQ(static_cast<int>(compression_fallback_reason::none),
+                      static_cast<int>(result.reason));
+        frame_header header{};
+        CRPC_CHECK(decode_frame_header(span<const std::byte>(result.bytes.data(), result.bytes.size()),
+                                       header)
+                       .ok());
+        CRPC_CHECK((header.flags & frame_flag_compressed) != 0);
+    }
+
+    // Incompressible: the encoder never inflates; reason not_smaller.
+    {
+        std::vector<std::byte> body(1024u * 1024u);
+        std::uint32_t lcg = 987654321u;
+        for (std::size_t i = 0; i < body.size(); ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            body[i] = static_cast<std::byte>(static_cast<unsigned>(lcg >> 24) & 0xFFu);
+        }
+        frame value;
+        value.header.type = frame_type::request;
+        value.header.stream_id = 1;
+        value.payload = span<const std::byte>(body.data(), body.size());
+        const encode_outcome result = encode_with(value, compression_algorithm::lz4, limits);
+        CRPC_CHECK(result.code.ok());
+        CRPC_CHECK_EQ(static_cast<int>(compression_algorithm::none),
+                      static_cast<int>(result.chosen));
+        CRPC_CHECK_EQ(static_cast<int>(compression_fallback_reason::not_smaller),
+                      static_cast<int>(result.reason));
+    }
+
+    // Highly compressible but ratio > 300: fall back to plaintext (a regression
+    // of the sender ratio check would emit COMPRESSED and be rejected by the
+    // receiver's identical guard).
+    {
+        std::vector<std::byte> zeros(1024u * 1024u, std::byte{0});
+        frame value;
+        value.header.type = frame_type::request;
+        value.header.stream_id = 1;
+        value.payload = span<const std::byte>(zeros.data(), zeros.size());
+        const encode_outcome result = encode_with(value, compression_algorithm::gzip, limits);
+        CRPC_CHECK(result.code.ok());
+        CRPC_CHECK_EQ(static_cast<int>(compression_algorithm::none),
+                      static_cast<int>(result.chosen));
+        CRPC_CHECK_EQ(static_cast<int>(compression_fallback_reason::ratio_exceeded),
+                      static_cast<int>(result.reason));
+        frame decoded;
+        const status decode_status =
+            decode_frame(span<const std::byte>(result.bytes.data(), result.bytes.size()), decoded);
+        CRPC_CHECK(decode_status.ok());
+        CRPC_CHECK_EQ(zeros.size(), decoded.payload.size());
+        CRPC_CHECK_EQ(0, static_cast<int>(decoded.header.flags & frame_flag_compressed));
+    }
 }
 
 } // namespace

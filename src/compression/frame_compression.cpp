@@ -194,13 +194,18 @@ std::size_t encoded_frame_size_compressed(const frame& value, compression_algori
     return frame_header_size + extension_bytes + std::max(plain, encoded);
 }
 
-status encode_frame_compressed(span<std::byte> out, const frame& value,
-                               compression_algorithm preferred, const compression_limits& limits,
-                               std::size_t& written, compression_algorithm* chosen,
-                               compression_statistics* stats, u32 max_frame) noexcept {
+status encode_frame_compressed_ex(span<std::byte> out, const frame& value,
+                                  compression_algorithm preferred, const compression_limits& limits,
+                                  std::size_t& written, compression_algorithm* chosen,
+                                  compression_statistics* stats,
+                                  compression_fallback_reason* fallback_reason,
+                                  u32 max_frame) noexcept {
     written = 0;
     if (chosen != nullptr) {
         *chosen = compression_algorithm::none;
+    }
+    if (fallback_reason != nullptr) {
+        *fallback_reason = compression_fallback_reason::none;
     }
     if ((value.header.flags & (frame_flag_compressed | frame_flag_algo_mask)) != 0) {
         // Only this function may set those bits; a caller-supplied COMPRESSED
@@ -242,13 +247,30 @@ status encode_frame_compressed(span<std::byte> out, const frame& value,
         return rpc_code::invalid_argument;
     }
 
-    if (value.payload.empty() || !frame_type_carries_compression(value.header.type) ||
-        preferred == compression_algorithm::none) {
+    if (value.payload.empty()) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::empty_payload;
+        }
+        return fall_back();
+    }
+    if (!frame_type_carries_compression(value.header.type)) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::control_frame;
+        }
+        return fall_back();
+    }
+    if (preferred == compression_algorithm::none) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::identity_requested;
+        }
         return fall_back();
     }
     if (value.payload.size() < limits.min_payload) {
         if (stats != nullptr) {
             ++stats->skipped_below_min;
+        }
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::below_min;
         }
         return fall_back();
     }
@@ -274,6 +296,20 @@ status encode_frame_compressed(span<std::byte> out, const frame& value,
     if (wire_size >= value.payload.size()) {
         if (stats != nullptr) {
             ++stats->fallbacks_not_smaller;
+        }
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::not_smaller;
+        }
+        return fall_back();
+    }
+    // Sender-side ratio self-check (P8/D-B1). The receiver applies the same
+    // guard with its local policy, so a frame whose plain/stream ratio exceeds
+    // the negotiated limit must go out as plaintext instead of being rejected by
+    // the peer. The ratio is measured on the codec stream (no 4-byte prefix),
+    // exactly as decode_frame_compressed measures it.
+    if (ratio_exceeded(value.payload.size(), stream_size, limits.max_compression_ratio)) {
+        if (fallback_reason != nullptr) {
+            *fallback_reason = compression_fallback_reason::ratio_exceeded;
         }
         return fall_back();
     }
@@ -323,6 +359,14 @@ status encode_frame_compressed(span<std::byte> out, const frame& value,
         stats->bytes_wire += wire_size;
     }
     return status();
+}
+
+status encode_frame_compressed(span<std::byte> out, const frame& value,
+                               compression_algorithm preferred, const compression_limits& limits,
+                               std::size_t& written, compression_algorithm* chosen,
+                               compression_statistics* stats, u32 max_frame) noexcept {
+    return encode_frame_compressed_ex(out, value, preferred, limits, written, chosen, stats,
+                                      nullptr, max_frame);
 }
 
 status decode_frame_compressed(span<const std::byte> in, frame& value, span<std::byte> payload_out,

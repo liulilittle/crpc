@@ -55,6 +55,15 @@ are unchanged. The new symbols are MINOR additions:
 - `client::set_flow_control(const rpc::flow_control_options&)`
 - `rpc::flow_controller`, `rpc::flow_control_options`, `rpc::flow_state`
 
+The unreleased G08 handshake batch 1 adds exactly one more MINOR symbol and no
+layout change: `rpc::encode_frame_compressed_ex(span<std::byte>, const frame&,
+compression_algorithm, const compression_limits&, std::size_t&,
+compression_algorithm*, compression_statistics*, compression_fallback_reason*,
+u32)`. It is the single counting point that tells a sender-side compression
+fallback apart (`ratio_exceeded` from `not_smaller` from `below_min`); the
+existing `encode_frame_compressed` keeps its signature and delegates to it with a
+null reason. `compression_statistics` is unchanged, so this is a MINOR addition.
+
 `rpc::client` cannot carry a header-side `static_assert(sizeof(client) == N)`:
 it owns standard-library members, so its width is a property of the standard
 library configuration rather than of this library (MSVC Debug and Release

@@ -138,8 +138,31 @@ struct compression_statistics {
     std::uint64_t frames_dropped_unreliable = 0;
 };
 
+// Why a frame was sent uncompressed. `encode_frame_compressed` always chooses
+// the identity encoding when compression is not a strict win; the connection
+// layer needs to tell a "ratio too high" fallback apart from the ordinary
+// "not smaller" one (sealed-plan P8/A3), because only the former feeds
+// negotiation_statistics::ratio_fallbacks. Returned through
+// encode_frame_compressed_ex's optional `fallback_reason` out-parameter, so the
+// existing entry point and compression_statistics keep their layout.
+enum class compression_fallback_reason : std::uint8_t {
+    // The frame was compressed (no fallback), or the reason does not apply.
+    none = 0,
+    // The caller asked for the identity encoding (preferred == none).
+    identity_requested,
+    // The frame type never carries compression (a control frame).
+    control_frame,
+    // The payload was empty.
+    empty_payload,
+    // The payload was below limits.min_payload.
+    below_min,
+    // The encoded payload was not strictly smaller than the plain payload.
+    not_smaller,
+    // The compressed/plain ratio exceeded limits.max_compression_ratio.
+    ratio_exceeded
+};
+
 // Per-frame report filled by frame_decoder::next(frame&, frame_compression_info*).
-//
 // It exists because frame_decoder cannot grow a member without an ABI break
 // (docs/abi.md), yet a connection layer needs to know what came off the wire:
 // which algorithm a compressed frame used, how many bytes it occupied there and
@@ -251,6 +274,19 @@ struct frame_compression_info {
     span<std::byte> out, const frame& value, compression_algorithm preferred,
     const compression_limits& limits, std::size_t& written,
     compression_algorithm* chosen = nullptr, compression_statistics* stats = nullptr,
+    u32 max_frame = max_frame_default) noexcept;
+
+// Extended form of encode_frame_compressed. Identical behaviour, but when
+// `fallback_reason` is non-null it reports why the frame was (or was not) sent
+// uncompressed. This is the single counting point that lets a connection layer
+// distinguish a ratio fallback from the ordinary "not smaller" fallback without
+// growing compression_statistics. Added as a new exported symbol (MINOR); the
+// plain encode_frame_compressed above delegates to it with a null reason.
+[[nodiscard]] CRPC_API status encode_frame_compressed_ex(
+    span<std::byte> out, const frame& value, compression_algorithm preferred,
+    const compression_limits& limits, std::size_t& written,
+    compression_algorithm* chosen, compression_statistics* stats,
+    compression_fallback_reason* fallback_reason,
     u32 max_frame = max_frame_default) noexcept;
 
 // Decodes exactly one frame, decompressing it into `payload_out`.
