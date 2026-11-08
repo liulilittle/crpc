@@ -4,6 +4,18 @@
 
 ## 未发布
 
+### 构建：POSIX exec-status 写入在启用 fortify 的 GCC 下零警告
+
+- **无行为变化。** `src/system/process.cpp` 现在消费两处 `::write` 的返回值
+  （`const ssize_t reported = ::write(...); (void)reported;`），这两处写入把
+  `chdir`/`execve` 失败上报给父进程。Ubuntu g++-13 在 `-O1` 及以上默认启用
+  `_FORTIFY_SOURCE=3`，`write` 因此带 `warn_unused_result`，旧的
+  `(void)::write(...)` 无法通过 Release 的 `-Werror=unused-result` 门禁。写入保留：
+  它是子进程在 `execve` 前失败时通知父进程的唯一通道。新增 POSIX 测试
+  `spawn_reports_bad_working_directory` 与
+  `spawn_reports_missing_absolute_program` 钉住 `not_found` 上报；单独删掉任一处写入
+  会让对应的那条测试变红，两处都删则整套失败。
+
 ### 服务端：opt-in 自动分片数（G36）
 
 - **新增符号 + inline API（MINOR）。** `crpc::rpc::default_shard_count(physical_cores)` 是

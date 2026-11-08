@@ -1083,14 +1083,30 @@ result<std::unique_ptr<process>> process::spawn(const process_options& options) 
         if (!options.working_directory.empty() &&
             ::chdir(options.working_directory.c_str()) != 0) {
             const int saved = errno;
-            (void)::write(exec_pipe[1], &saved, sizeof(saved));
+            // Best-effort error report to parent: the write payload is exactly sizeof(int) <= PIPE_BUF (4096),
+            // so POSIX guarantees an atomic write of all 4 bytes. EINTR does not occur because we do not block
+            // and no signal handler is installed in the child (no sigaction/signal here); EPIPE is practically
+            // impossible since the parent blocks on read(exec_pipe[0]) until this point (and if the parent were
+            // dead, SIGPIPE would kill the child before returning -1). The pipe is the only channel for exec
+            // failures (chdir or execve): deleting the write causes the parent to treat EOF as success and
+            // return a process handle for a child that already exited 127 (see mutation test below).
+            const ssize_t reported = ::write(exec_pipe[1], &saved, sizeof(saved));
+            (void)reported;
             (void)::close(exec_pipe[1]);
             _exit(127);
         }
 
         (void)::execve(resolved.path.c_str(), argv.data(), envp.data());
         const int saved = errno;
-        (void)::write(exec_pipe[1], &saved, sizeof(saved));
+        // Best-effort error report to parent: the write payload is exactly sizeof(int) <= PIPE_BUF (4096),
+        // so POSIX guarantees an atomic write of all 4 bytes. EINTR does not occur because we do not block
+        // and no signal handler is installed in the child (no sigaction/signal here); EPIPE is practically
+        // impossible since the parent blocks on read(exec_pipe[0]) until this point (and if the parent were
+        // dead, SIGPIPE would kill the child before returning -1). The pipe is the only channel for exec
+        // failures (chdir or execve): deleting the write causes the parent to treat EOF as success and
+        // return a process handle for a child that already exited 127 (see mutation test below).
+        const ssize_t reported = ::write(exec_pipe[1], &saved, sizeof(saved));
+        (void)reported;
         (void)::close(exec_pipe[1]);
         _exit(127);
     }

@@ -162,6 +162,39 @@ CRPC_TEST(run_missing_program_is_not_found) {
     }
 }
 
+CRPC_TEST(spawn_reports_bad_working_directory) {
+#if defined(CRPC_OS_WINDOWS)
+    crpc_test::skip("exec-status pipe is POSIX-only");
+#else
+    // The child's chdir() fails before execve(); the errno must travel back
+    // through the exec-status pipe instead of being lost as a clean EOF.
+    process_options options;
+    options.program = "/bin/true";
+    options.working_directory = "/nonexistent-crpc-dir-xyz";
+    crpc::result<process_result> r = process::run(options);
+    CRPC_CHECK_FALSE(r.ok());
+    if (!r.ok()) {
+        CRPC_CHECK(r.code() == crpc::rpc_code::not_found);
+    }
+#endif
+}
+
+CRPC_TEST(spawn_reports_missing_absolute_program) {
+#if defined(CRPC_OS_WINDOWS)
+    crpc_test::skip("exec-status pipe is POSIX-only");
+#else
+    // A program containing '/' bypasses the parent's PATH search, so the
+    // failure happens in execve() and must be reported through the pipe.
+    process_options options;
+    options.program = "/nonexistent-crpc-prog-xyz";
+    crpc::result<process_result> r = process::run(options);
+    CRPC_CHECK_FALSE(r.ok());
+    if (!r.ok()) {
+        CRPC_CHECK(r.code() == crpc::rpc_code::not_found);
+    }
+#endif
+}
+
 CRPC_TEST(spawn_round_trips_stdin_and_stdout) {
     process_options options;
 #if defined(CRPC_OS_WINDOWS)

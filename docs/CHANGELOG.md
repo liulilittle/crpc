@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+### Build: POSIX exec-status writes are warning-free on fortified GCC
+
+- **No behaviour change.** `src/system/process.cpp` now consumes the result of
+  the two `::write` calls that report `chdir`/`execve` failures to the parent
+  (`const ssize_t reported = ::write(...); (void)reported;`). Ubuntu's g++-13
+  enables `_FORTIFY_SOURCE=3` at `-O1` and above, which makes `write` a
+  `warn_unused_result` function, so the old `(void)::write(...)` failed the
+  `-Werror=unused-result` Release gate. The write stays: it is the only channel
+  that tells the parent the child failed before `execve`. New POSIX tests
+  `spawn_reports_bad_working_directory` and
+  `spawn_reports_missing_absolute_program` pin the `not_found` report: deleting
+  a write turns its own case red, and deleting both turns the suite red.
+
 ### Build: the shared build and the export gate are clean again
 
 - **MINOR (exported symbols only, no layout).** `crpc::time::date_time`,
