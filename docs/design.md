@@ -347,6 +347,8 @@ per shard: 1 OS thread
          + 64 handler coroutines with 64 KiB stacks
 threads = n_shards + 1 acceptor (Windows) + blocking pool (default 0)
 ```
+Implementation status: the shard count is applied **opt-in**. The default stays `shards = 1`; `server::builder::shards_auto()` (and `shards_auto(physical_cores)`) size it through `rpc::default_shard_count()`. A multi-shard server cannot publish (`publish` returns `unsupported_configuration`) and cannot serve push-control subscriptions (`unavailable`), so auto sharding and PUSH are mutually exclusive. Per-shard ownership of the IOCP/epoll loop and `SO_REUSEPORT` remain **targets, not implemented**: each network backend still owns its own loop/pump thread.
+
 Coroutines are M:N over threads, but a shard's runtime is pumped by exactly one thread. `coro_rt_pump` refuses a second concurrent pump (`pump_active`, `[READ:third_party/corocc/src\scheduler\rt_driver.c:458]`), and a LOOP runtime has exactly one worker (`[READ:third_party/corocc/src\scheduler\rt.c:804]`). Handler coroutines are long-lived workers, not one per request: this avoids the 256 KiB default stack (`[READ:third_party/corocc/include\corocc\coro.h:38]`) and the 256-entry default-size stack cache (`[READ:third_party/corocc/src\scheduler\rt.h:167]`).
 ### 4.2 Runtime construction
 ```cpp

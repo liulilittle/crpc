@@ -4,6 +4,25 @@
 
 ## Unreleased
 
+### Server: opt-in automatic shard count (G36)
+
+- **New symbols + inline API (MINOR).** `crpc::rpc::default_shard_count(physical_cores)` is
+  a `constexpr` pure policy (`0 -> 1`, otherwise `clamp(cores - 1, 1, 32)`);
+  `crpc::rpc::default_shard_count()` reads
+  `system::physical_processor_count()` and falls back to 1 on detection failure
+  (declared `CRPC_API`). `server::builder::shards_auto()` and
+  `shards_auto(physical_cores)` apply the policy; `server::shard_count()`
+  observes the result. No `server::options` or `server::builder` field, offset
+  or size changes (x64 320/400, x86 264/304).
+- **Default and `shards(0)` unchanged.** `server::options::shards` still
+  defaults to 1 and `builder::shards(0)` still maps to 1, so the default
+  behaviour and ABI are unchanged (MINOR, not MAJOR).
+- **Auto sharding is opt-in and mutually exclusive with PUSH.** With more than
+  one shard, `server::publish` returns
+  `publish_result::code::unsupported_configuration` and push-control
+  subscriptions return `unavailable`. Use `shards_auto()` only for servers that
+  do not publish or serve PUSH. Tests: `test_shard_auto.cpp`.
+
 ### Cluster primitives: G19 Phase 0 hardening before the network registry
 
 - **Tombstone purge (P1/P2/P9).** `tombstone_grace == 0` now means "eligible

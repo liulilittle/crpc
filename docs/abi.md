@@ -154,6 +154,19 @@ Under `strict_fencing`, only a key that has never existed may be created with
 is not fresh and a zero-fence create is rejected with
 `registry.reason=fence_required`.
 
+The unreleased G36 auto-sharding work adds **two MINOR exported symbols** plus
+**two header-inline `shards_auto()` overloads (no exported symbol)**, with no
+layout change: the free function `crpc::rpc::default_shard_count()` and
+`crpc::server::shard_count()` are the two exported symbols;
+`crpc::server::builder::shards_auto()` (both the parameterless and the
+injected-core-count overload) is header-inline and adds no export.
+`server::options` and `server::builder` keep every field, offset and size (x64:
+`sizeof(options) == 320`, `sizeof(builder) == 400`; x86: `264` / `304`), and
+the default `options::shards == 1` and the `builder::shards(0) -> 1` mapping are
+unchanged. Automatic sharding is opt-in only (it is mutually exclusive with
+PUSH), so the default behaviour is identical and this is a MINOR addition, not
+a MAJOR one.
+
 ## 2. What crosses the ABI boundary
 
 Only these may appear in an exported signature:

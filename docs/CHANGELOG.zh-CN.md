@@ -4,6 +4,21 @@
 
 ## 未发布
 
+### 服务端：opt-in 自动分片数（G36）
+
+- **新增符号 + inline API（MINOR）。** `crpc::rpc::default_shard_count(physical_cores)` 是
+  `constexpr` 纯策略（`0 -> 1`，否则 `clamp(cores - 1, 1, 32)`）；
+  `crpc::rpc::default_shard_count()` 读取 `system::physical_processor_count()`，
+  检测失败时回落 1（声明带 `CRPC_API`）。`server::builder::shards_auto()` 与
+  `shards_auto(physical_cores)` 应用该策略；`server::shard_count()` 观测结果。
+  `server::options` 与 `server::builder` 的字段、偏移与尺寸均不变（x64 320/400，x86 264/304）。
+- **默认值与 `shards(0)` 不变。** `server::options::shards` 仍默认为 1，
+  `builder::shards(0)` 仍映射为 1，因此默认行为与 ABI 不变（MINOR 而非 MAJOR）。
+- **自动分片为 opt-in，且与 PUSH 互斥。** 多分片下 `server::publish` 返回
+  `publish_result::code::unsupported_configuration`，push-control 订阅返回
+  `unavailable`。只对不 publish、不提供 PUSH 的 server 使用 `shards_auto()`。
+  测试：`test_shard_auto.cpp`。
+
 ### 集群原语：网络注册中心之前的 G19 Phase 0 硬化
 
 - **Tombstone purge（P1/P2/P9）。** `tombstone_grace == 0` 现在表示"立即可清理"

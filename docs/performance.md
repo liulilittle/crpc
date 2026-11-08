@@ -116,6 +116,8 @@ p99 (159-169 µs) and p999 (237-295 µs) stay flat. A max-only outlier with a fl
 p99/p999 is scheduler/OS noise, not a distribution shift, so it is reported as
 such rather than as a tail regression.
 
+Automatic sharding is therefore **not** the default (G36). The default stays one shard: on a single client, moving from 1 to 2 or 4 shards is flat-to-worse (0.217 / 0.196 / 0.193 M RPC/s, the "multi-shard 1/2/4" table row), while only multi-client threads scale (1/2/4/8 threads = 0.227 / 0.382 / 0.526 / 0.773 M RPC/s below). Multi-shard also disables `publish`/PUSH, so callers opt in with `builder::shards_auto()` only when they know they have concurrent clients and no PUSH.
+
 Bottleneck evidence (measured, not inferred). Per-call costs on MSVC Release:
 `make_shared<call_state<std::string>>` 52 ns, the per-connection
 `std::recursive_mutex` 8 ns, string codec encode plus decode 17 ns. A phase split

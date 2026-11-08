@@ -63,6 +63,52 @@
 
 namespace crpc {
 
+namespace rpc {
+
+// Automatic shard-count policy (G36). Pure and host-independent: given a
+// physical-core count it returns the shard count to run, with the historical
+// lower bound and the design's upper bound applied.
+//
+//   0 -> 1                              (a zero core count, and the size_t
+//                                        0 - 1 wrap it would otherwise hit)
+//   otherwise clamp(cores - 1, 1, 32)   (one core is left for the acceptor /
+//                                        management thread; the cap is the
+//                                        design's `clamp(physical_cores - 1,
+//                                        1, 32)`)
+//
+// `n` cores map to at most `n - 1` shards, so even a many-core host stays at
+// the 32-shard ceiling. This overload does not read the host: it is the
+// deterministic half of the policy, so the boundary table can be asserted on
+// any machine.
+[[nodiscard]] inline constexpr std::size_t default_shard_count(
+    std::size_t physical_cores) noexcept {
+    if (physical_cores == 0) {
+        return 1;
+    }
+    const std::size_t shards = physical_cores - 1;
+    if (shards < 1) {
+        return 1;
+    }
+    return shards > 32 ? 32 : shards;
+}
+
+// Host-reading overload: reads the physical core count with
+// `crpc::system::physical_processor_count()` and applies the pure overload
+// above. A detection failure falls back to 1 (the historical default) rather
+// than throwing or terminating. Declared `CRPC_API` because a free function is
+// not exported by virtue of belonging to `server`; without it a shared build
+// leaves the symbol out of the export table.
+//
+// Auto sharding is opt-in and mutually exclusive with the PUSH path: with more
+// than one shard, `server::publish` returns
+// `publish_result::code::unsupported_configuration` and push-control
+// subscriptions return `unavailable` (see src/server/server.cpp:1288-1290,
+// :2957-2958). Do not call `builder::shards_auto()` when a server must publish
+// or serve PUSH.
+[[nodiscard]] CRPC_API std::size_t default_shard_count();
+
+} // namespace rpc
+
 // Distinguishable result of `server::publish`.
 //
 // The historical return type was a bare `bool`: a caller could not tell an
@@ -310,6 +356,28 @@ public:
         // `handle_request` in src/server/server.cpp for the guarded sites.
         builder& interceptor_chain(obs::interceptor_chain& chain);
         builder& shards(std::size_t count);
+        // Opt-in automatic sharding: sizes the shard count from the host's
+        // physical core count via `rpc::default_shard_count()`. The default
+        // (`options_.shards == 1`) and `shards(0)` (which still means one
+        // shard) are untouched.
+        //
+        // Mutually exclusive with PUSH: a multi-shard server cannot publish
+        // (`publish` -> `unsupported_configuration`) and cannot serve
+        // push-control subscriptions (`unavailable`). Do not combine this with
+        // a server that publishes or subscribes to PUSH.
+        builder& shards_auto() {
+            options_.shards = rpc::default_shard_count();
+            return *this;
+        }
+        // Injected-core-count form of `shards_auto()`: applies the same pure
+        // policy to a caller-supplied physical-core count. Used to keep the
+        // builder wiring deterministic on a 1-core CI box and to let a
+        // container/cgroup deployment size the shards from its own CPU quota
+        // instead of the host-wide core count.
+        builder& shards_auto(std::size_t physical_cores) {
+            options_.shards = rpc::default_shard_count(physical_cores);
+            return *this;
+        }
         builder& handler_workers(std::size_t count);
         builder& handler_stack_bytes(std::size_t bytes);
 
@@ -400,6 +468,11 @@ public:
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] statistics stats() const noexcept;
+
+    // Number of shard runtimes this server was configured with. Always >= 1
+    // (the constructor maps a zero `options.shards` to 1). Exposed so callers
+    // and tests can observe the auto-sharding decision behind `shards_auto()`.
+    [[nodiscard]] std::size_t shard_count() const noexcept;
 
     // Snapshot of the send-path record pool. Cheap (one mutex lock, two atomic
     // reads); safe from any thread. The counters are monotonic until the pool is

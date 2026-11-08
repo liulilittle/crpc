@@ -347,6 +347,8 @@ per shard: 1 OS thread
          + 64 handler coroutines with 64 KiB stacks
 threads = n_shards + 1 acceptor (Windows) + blocking pool (default 0)
 ```
+实现状态：分片数按 **opt-in** 应用。默认仍为 `shards = 1`；`server::builder::shards_auto()`（以及 `shards_auto(physical_cores)`）经 `rpc::default_shard_count()` 设置分片数。多分片 server 不能 `publish`（返回 `unsupported_configuration`），也不能提供 push-control 订阅（返回 `unavailable`），因此自动分片与 PUSH 互斥。per-shard 的 IOCP/epoll 循环所有权与 `SO_REUSEPORT` 仍为**目标、未实现**：每个网络后端仍拥有自己的循环/泵线程。
+
 协程在 M:N 意义上多于线程，但一个分片的 runtime 只由一个线程 pump。`coro_rt_pump` 拒绝第二个并发 pump（`pump_active`，`[READ:third_party/corocc/src\scheduler\rt_driver.c:458]`），LOOP runtime 只有一个 worker（`[READ:third_party/corocc/src\scheduler\rt.c:804]`）。handler 协程是长期存活的工作者，不是每请求一个：这避开 256 KiB 默认栈（`[READ:third_party/corocc/include\corocc\coro.h:38]`）与 256 项默认尺寸栈缓存（`[READ:third_party/corocc/src\scheduler\rt.h:167]`）。
 ### 4.2 runtime 构造
 ```cpp

@@ -175,6 +175,8 @@ per shard:
 
 分片是亲和性与单线程所有权的单位。它的循环轮询 I/O、到期定时器、清空收件箱并泵自己的运行时。属于另一个分片的完成会被投递到那个分片的收件箱；没有线程泵其他分片的运行时。跨线程流量是 MPSC 加一次合并的门铃。
 
+自动分片数策略（`n_shards = clamp(physical_cores - 1, 1, 32)`）已作为 **opt-in** 提供（G36）：`server::builder::shards_auto()` 与 `shards_auto(physical_cores)` 经 `rpc::default_shard_count()` 设置 `options.shards`；默认仍为 `shards = 1`，`shards(0)` 仍映射为 1。`shards_auto()` 与 PUSH 互斥：多分片下 `publish` 返回 `unsupported_configuration`（`src/server/server.cpp:2957-2958`）、push-control 订阅返回 `unavailable`（`:1288-1290`）。per-shard IOCP/SO_REUSEPORT 与无锁收件箱仍为目标/未实现。
+
 **状态：已设计，未实现。** 代码树中没有 `shard` 类型、协程 handler 池或 MPSC 收件箱。`corocc` 作为可选 CMake 依赖被接受，并在设置 `CRPC_COROCC_DIR` 时链接，但没有任何 CRPC 翻译单元调用 `coro_rt_*`。当前实现的执行模型是：每个网络后端拥有一个循环/泵线程；`rpc::client` 不创建线程，必须由驱动其后端的线程调用；`call<T>::get()` 在条件变量上阻塞；请求分发在读者线程上同步执行。
 
 这是一个阶段性的落点，不是另一种架构。单写者规则、“持有锁时不执行 I/O 或用户回调”规则、基于信用的背压已经生效，因此加入分片不会改变契约。定时轮、handler 池和跨分片唤醒路径仍属于**已设计，未实现**。
@@ -383,7 +385,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 | 可观测性 | 部分 | `test_observability.cpp`、`test_aop_wiring.cpp`；服务端调用路径已接线（`before_call`/`after_call`、短路、异常边界、零成本空链；metadata 注入 handler 上下文），客户端终态经 diagnostics 默认链观察，无指标 |
 | 推送 | 已实现 | `test_push.cpp`、`test_push_e2e.cpp`、`test_http_sse.cpp`；PUSH/PUSH_ACK 已接入 `rpc::client` 与服务端 push pump；SSE 与长轮询已接入 `http_server` |
 | 流控 | 已实现 | `test_flow.cpp`、`test_flow_wiring.cpp`、`test_flow_clock_base.cpp`、`test_flow_lane_quota.cpp`；已接入 `rpc::client`（字节窗口、PING/PONG 探针、每 lane 配额、连接级 pacer） |
-| 分片/协程 | 已实现 | `test_server_client.cpp`；`src/runtime/runtime.cpp` 调用 `coro_rt_*`（`coro_rt_driver.h`、`coro_rt_t`、`coro_rt_sem_t`）；对外是 `runtime` 类型的每核一实例，没有名为 `shard` 的公开类型 |
+| 分片/协程 | 已实现 | `test_server_client.cpp`、`test_shard_auto.cpp`；`src/runtime/runtime.cpp` 调用 `coro_rt_*`（`coro_rt_driver.h`、`coro_rt_t`、`coro_rt_sem_t`）；对外是 `runtime` 类型的每核一实例，没有名为 `shard` 的公开类型；自动分片数为 opt-in（`builder::shards_auto`、`rpc::default_shard_count`，默认仍 1）|
 | 压缩 | 已实现 | HTTP gzip/deflate 流式编解码已实现并测试（`test_content_coding.cpp`），且已接入 `http_server`（`test_http_coding.cpp`）；CRPC 帧压缩：none/lz4/gzip/deflate/lz77/zip 已实现并测试（`test_frame_compression.cpp`，61 个用例），zstd 保留且 fail-closed；`COMPRESSED` 帧现在会被解压或拒绝，不再当作明文交付（此前会原样交付） |
 | Redis 客户端 | 已实现（shared 构建已覆盖 Redis 头导出，`CRPC_BUILD_SHARED=ON` 下 `ctest -R 'redis\|abi_docs\|shared_link'` 通过） | `test_redis_*.cpp` 覆盖 RESP2/3、连接池、pipeline、事务、Pub/Sub、Streams、cluster、Sentinel、类型化辅助与 RTTI 绑定；`test_redis_header_conflict.cpp` 钉住 `stream_entry` 与 `redis_stream_entry` 的区分。已测配置为静态构建；shared 构建受支持，API 相同，且其 Redis 头导出已覆盖。 |
 | SSE / 长轮询 | 已实现 | `test_http_sse.cpp`；SSE writer 与长轮询路由已接入 `src/http/server.cpp` |

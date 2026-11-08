@@ -53,6 +53,8 @@ MAJOR.MINOR.PATCH
 
 另有两条纯行为语义属于本节。成功写入在 `write_result::fence` 中返回该键的生效 fence 高水位（不会低于 lease `fence_barrier`，可直接用于同一键的下一次写入）；`stale_fence` 拒绝会在追加的 `registry.fence` 错误元数据键中携带该高水位，`health_bridge` 据此重锚。`strict_fencing` 下只有**从未存在过**的键允许以 `fence=0` 创建；tombstone 高水位或 fence 高水位在 purge 后仍保留的键不属于全新键，零 fence 创建返回 `registry.reason=fence_required`。
 
+未发布的 G36 自动分片工作新增 **2 个 MINOR 导出符号** + **2 个头文件 inline `shards_auto()` 重载（不新增导出符号）**、不改布局：导出符号为自由函数 `crpc::rpc::default_shard_count()` 与 `crpc::server::shard_count()`；`crpc::server::builder::shards_auto()`（无参重载与注入核数重载）均为头文件 `inline`，不新增导出。`server::options` 与 `server::builder` 的所有字段、偏移与尺寸不变（x64：`sizeof(options) == 320`、`sizeof(builder) == 400`；x86：`264` / `304`），默认 `options::shards == 1` 与 `builder::shards(0) -> 1` 映射也不变。自动分片仅在 opt-in 时生效（且与 PUSH 互斥），默认行为完全一致，因此这是 MINOR 追加而非 MAJOR。
+
 ## 2. 允许跨越 ABI 边界的类型
 
 导出签名中只允许出现：

@@ -153,6 +153,15 @@ CRPC_TEST(shared_link_public_surface) {
     std::unique_ptr<crpc::server> srv = sb.build();
     CRPC_CHECK(srv != nullptr);
 
+    // Reference the out-of-line auto-sharding symbols so the shared build must
+    // export them. `rpc::default_shard_count()` is a free function, not a
+    // member of the exported `server` class, so it is exactly the kind of
+    // symbol a hand-written call list would miss.
+    CRPC_CHECK_EQ(std::size_t{1}, srv->shard_count());
+    const std::size_t auto_shards = crpc::rpc::default_shard_count();
+    CRPC_CHECK(auto_shards >= 1);
+    CRPC_CHECK(auto_shards <= 32);
+
     crpc::client::builder cb;
     cb.add_endpoint(crpc::endpoint::inproc("link"), backend);
     cb.pool_size(1);

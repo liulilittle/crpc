@@ -26,7 +26,7 @@
 #include <crpc/resilience/fallback.hpp>
 #include <crpc/rpc/call.hpp>
 #include <crpc/rpc/lane_queue.hpp>
-
+#include <crpc/system/cpu.hpp>
 namespace crpc {
 namespace {
 
@@ -2999,6 +2999,19 @@ const char* to_string(publish_result result) noexcept {
         return "internal_error";
     }
     return "unknown";
+}
+
+std::size_t rpc::default_shard_count() {
+    result<std::uint32_t> physical = system::physical_processor_count();
+    if (!physical.ok()) {
+        return 1;
+    }
+    return rpc::default_shard_count(
+        static_cast<std::size_t>(physical.value()));
+}
+
+std::size_t server::shard_count() const noexcept {
+    return impl_->opt.shards;
 }
 
 } // namespace crpc
