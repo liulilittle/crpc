@@ -1,4 +1,4 @@
-// CRPC -- client channel implementation.
+﻿// CRPC -- client channel implementation.
 #include <crpc/rpc/client.hpp>
 
 #include <atomic>
@@ -91,7 +91,7 @@ struct public_ping_registry {
 };
 
 // Kept out of `rpc::client` on purpose: the class layout is ABI-pinned
-// (docs/abi.md §4), and a probe that does not use flow control must not force
+// (docs/abi.md 搂4), and a probe that does not use flow control must not force
 // a member on every connection. A token is unique per process, so the registry
 // needs no client key.
 public_ping_registry& public_pings() {
@@ -254,27 +254,76 @@ bool client::is_open() const noexcept {
 }
 
 void client::close() noexcept {
-    if (closed_.load(std::memory_order_acquire)) {
-        return;
-    }
-    // Fails every in-flight call first (idempotent; only the first caller wins
-    // the closed transition). This takes no lock the writer path holds, so a
-    // concurrent start_call either publishes before the transition (and is
-    // failed here) or observes closed_ and rejects.
+    // No `closed_` early return: the reader/fatal paths only *retire* the
+    // transport (retire_transport) and keep the owning unique_ptr in place, so
+    // a user close() after an EOF/GOAWAY must still reach close_transport and
+    // close it (the object itself is released by ~client's member destruction).
+    // `fail_all` is already idempotent (closed_.exchange).
+    // Fails every in-flight call first (only the first caller wins the closed
+    // transition). This takes no lock the writer path holds, so a concurrent
+    // start_call either publishes before the transition (and is failed here) or
+    // observes closed_ and rejects.
     (void)fail_all(rpc_code::shutting_down, "client closed");
-    // Move the transport out and close it without holding any lock. A
-    // synchronous in-process close calls the peer's terminal hook, which may
-    // take the server's push lock; holding a client lock there would invert
-    // against the server send path (push lock -> this lock), a potential
-    // deadlock TSan reports. The local owner closes after the unlock.
-    std::unique_ptr<connection> closing;
+    close_transport();
+}
+
+void client::retire_transport() noexcept {
+    // Soft, idempotent close for reader/fatal callback stacks. It must NOT move
+    // or destroy `conn_`: an in-process transport is delivering the very
+    // callback we are running in, so its delivery counter is still elevated and
+    // ~inproc_connection would wait on itself forever. `closed_` is already set
+    // by fail_all, so every write entry point is short-circuited and is_open()
+    // reports false. The owning unique_ptr is released later by ~client on a
+    // user thread.
+    //
+    // Lock discipline: `write_mutex_` is held only for the idempotency probe,
+    // and `conn_->close()` runs after the unlock. The lock-in-close variant is
+    // not safe in general: close_endpoint hands back the peer's pending write
+    // completion (`src/io/inproc.cpp:240`) and completes it outside the transport
+    // mutex (`src/io/inproc.cpp:251-253`); that completion is send_op::complete
+    // -> finish_send -> wake_push_pump, which takes the server push mutex
+    // (`src/server/server.cpp:2149`, `src/server/server.cpp:1132-1140`). Holding
+    // the client write lock there would add the edge Cw -> push_mutex, the
+    // reverse of the send path's push_mutex -> Cw. The drain re-entry guard
+    // (`src/io/inproc.cpp:279-282`) only prevents the self-wait, not this edge,
+    // so the close must be outside the lock.
+    //
+    // `conn_` is never released before ~client (see close_transport), so the raw
+    // pointer stays valid after the unlock; the lock makes the is_open() probe
+    // atomic with close_transport()/the destructor, and connection::close() is
+    // idempotent on every backend (src/io/inproc.cpp:216-218,
+    // src/io/epoll_backend.cpp:782-785, src/io/iocp_backend.cpp:483-486).
+    connection* closing = nullptr;
     {
         std::lock_guard<std::recursive_mutex> lk(write_mutex_);
-        closing = std::move(conn_);
+        if (!conn_ || !conn_->is_open()) {
+            return;
+        }
+        closing = conn_.get();
     }
-    if (closing) {
-        closing->close();
+    closing->close();
+}
+
+void client::close_transport() noexcept {
+    // Called by close()/~client. Same lock discipline as retire_transport:
+    // only the is_open() probe is under `write_mutex_`; connection::close() is
+    // done after the unlock for the Cw -> push_mutex reason documented there.
+    //
+    // The unique_ptr is deliberately NOT moved out: it is released by ~client's
+    // member destruction, after close() and bind_source(nullptr) have drained
+    // every delivery (bind_source waits for in-flight delivery). connection::
+    // close() is idempotent and does not destroy the object, so the fd is still
+    // released immediately while no callback stack can observe a freed
+    // transport.
+    connection* closing = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(write_mutex_);
+        if (!conn_ || !conn_->is_open()) {
+            return;
+        }
+        closing = conn_.get();
     }
+    closing->close();
 }
 
 void client::set_flow_control(const flow_control_options& options) {
@@ -345,67 +394,141 @@ std::size_t client::on_data(span<const std::byte> data) noexcept {
     // reader-lock scope: the synchronous in-process drain re-enters `on_data`
     // from the writer, and a completion taken under the reader lock would invert
     // against the completion/detach path.
+    enum class fatal_kind { none, protocol, resource };
     std::vector<pending_frame> frames;
     frame_decoder::result result = frame_decoder::result::need_more;
+    fatal_kind fatal = fatal_kind::none;
     {
         std::lock_guard<std::recursive_mutex> lk(read_mutex_);
         if (in_process_) {
-            // Re-entered from a synchronous push: the outer loop will drain these
-            // bytes after the current frame is handled. The chunk does not outlive
-            // this call, so it must go through the copying path (which also drains
-            // any external chunk the outer loop still holds).
+            // Re-entered from a synchronous push: an outer drain is still on
+            // this thread's stack (the recursive read lock is held by it). The
+            // chunk does not outlive this call, so a non-fatal chunk goes
+            // through the copying path. A fatal condition must not be reported
+            // here -- closing or completing under the outer drain's lock would
+            // violate the "handle after unlock" contract -- so it is recorded
+            // and the outer drain performs the single protocol_failure().
+            frame_header h{};
+            const peek_result pr = decoder_.peek_header(data, h);
+            if (pr == peek_result::header_error ||
+                (pr == peek_result::header_ready && h.type == frame_type::settings &&
+                 h.payload_len > settings_payload_cap)) {
+                reader_fatal_ = true;
+                decoder_.abort_external();
+                return data.size();
+            }
             decoder_.feed(data);
             return data.size();
         }
         // Parse directly out of the transport's chunk: handle_frame() consumes the
         // payload before next() is called again, so the zero-copy window is this
         // loop. Only a trailing partial frame is copied into the decoder.
-        decoder_.feed_external(data);
-        in_process_ = true;
-        frame value;
-        // A dropped frame consumes its bytes and leaves the decoder usable, so it
-        // is not a terminal outcome: keep parsing the rest of this chunk, matching
-        // server_connection::on_data. Borrowing mode has no payload buffer, so a
-        // compressed frame fails hard instead and frame_dropped is unreachable
-        // here today; the branch is kept so a future payload buffer cannot
-        // silently truncate the chunk.
-        for (;;) {
-            result = decoder_.next(value);
-            if (result == frame_decoder::result::frame_dropped) {
-                continue;
+        //
+        // Before feeding, probe the header that the buffered tail plus this
+        // chunk would form. This is the 4 KiB early check: a SETTINGS header
+        // that declares more than `settings_payload_cap` is rejected here, so
+        // the payload bytes are never appended to the internal buffer.
+        frame_header h{};
+        const peek_result pr = decoder_.peek_header(data, h);
+        if (pr == peek_result::header_error ||
+            (pr == peek_result::header_ready && h.type == frame_type::settings &&
+             h.payload_len > settings_payload_cap)) {
+            decoder_.abort_external();
+            fatal = fatal_kind::protocol;
+        } else {
+            decoder_.feed_external(data);
+            in_process_ = true;
+            frame value;
+            // A dropped frame consumes its bytes and leaves the decoder usable,
+            // so it is not a terminal outcome: keep parsing the rest of this
+            // chunk, matching server_connection::on_data. Borrowing mode has no
+            // payload buffer, so a compressed frame fails hard instead and
+            // frame_dropped is unreachable here today; the branch is kept so a
+            // future payload buffer cannot silently truncate the chunk.
+            for (;;) {
+                if (reader_fatal_) {
+                    // The defensive re-entrant branch above saw a fatal
+                    // condition; abandon this chunk, do not `next()`, do not
+                    // `drain_external()`, and do not handle staged frames.
+                    if (fatal == fatal_kind::none) {
+                        fatal = fatal_kind::protocol;
+                    }
+                    break;
+                }
+                // Per-frame probe before `next()` consumes/stages the frame.
+                // Same predicate as the pre-feed probe, so a small frame that
+                // precedes an oversized SETTINGS frame in one chunk is stopped
+                // before the SETTINGS header's payload is consumed.
+                frame_header ph{};
+                const peek_result lpr = decoder_.peek_header({}, ph);
+                if (lpr == peek_result::header_error ||
+                    (lpr == peek_result::header_ready && ph.type == frame_type::settings &&
+                     ph.payload_len > settings_payload_cap)) {
+                    fatal = fatal_kind::protocol;
+                    break;
+                }
+                result = decoder_.next(value);
+                if (result == frame_decoder::result::frame_dropped) {
+                    continue;
+                }
+                if (result != frame_decoder::result::frame_ready) {
+                    break;
+                }
+                pending_frame copy;
+                copy.header = value.header;
+                copy.ordered = value.ordered;
+                if (!copy.payload.append(value.payload)) {
+                    // Allocation failure while staging the frame is an explicit
+                    // connection failure, never a silent drop: a control frame
+                    // that could not be staged must not disappear.
+                    fatal = fatal_kind::resource;
+                    break;
+                }
+                // `on_data` is `noexcept` (the backend calls it through a virtual
+                // source), so a growth failure here must not reach
+                // `std::terminate`. It is reported as resource_exhausted below.
+                try {
+                    frames.push_back(std::move(copy));
+                } catch (...) {
+                    fatal = fatal_kind::resource;
+                    break;
+                }
             }
-            if (result != frame_decoder::result::frame_ready) {
-                break;
-            }
-            pending_frame copy;
-            copy.header = value.header;
-            copy.ordered = value.ordered;
-            if (!copy.payload.append(value.payload)) {
-                // Allocation failure while staging the frame: drop it and keep
-                // parsing the rest of the chunk rather than losing the stream.
-                continue;
-            }
-            // `on_data` is `noexcept` (the backend calls it through a virtual
-            // source), so a growth failure here must not reach
-            // `std::terminate`. Dropping the staged frame degrades to "this
-            // response is lost"; the caller's deadline reports it.
-            try {
-                frames.push_back(std::move(copy));
-            } catch (...) {
-                continue;
+            in_process_ = false;
+            if (fatal != fatal_kind::none) {
+                decoder_.abort_external();
+            } else {
+                decoder_.drain_external();
             }
         }
-        in_process_ = false;
-        decoder_.drain_external();
     }
-    // Reader lock released. `handle_frame` runs without it, so a completion it
-    // takes cannot wait on a thread that holds `read_mutex_`.
+    // Reader lock released. A fatal chunk is abandoned whole: staged frames are
+    // never handled, and the failure is reported exactly once.
+    if (fatal != fatal_kind::none || reader_fatal_) {
+        if (fatal == fatal_kind::resource) {
+            (void)fail_all(rpc_code::resource_exhausted,
+                           "frame staging allocation failed");
+            retire_transport();
+        } else {
+            protocol_failure();
+        }
+        return data.size();
+    }
+    // `handle_frame` runs without the reader lock, so a completion it takes
+    // cannot wait on a thread that holds `read_mutex_`.
     for (pending_frame& pending : frames) {
         frame value;
         value.header = pending.header;
         value.ordered = pending.ordered;
         value.payload = pending.payload.readable();
         handle_frame(value);
+        // A terminal frame handled above (GOAWAY, or a push that failed the
+        // protocol) sets closed_ and retires the transport. The rest of this
+        // chunk was already staged; stop dispatching it. This matches the
+        // server's "stop dispatch + teardown + close" contract.
+        if (closed_.load(std::memory_order_acquire)) {
+            break;
+        }
     }
     if (result == frame_decoder::result::error) {
         protocol_failure();
@@ -650,18 +773,77 @@ void client::handle_pong(const frame& value) {
     flow_->on_probe_reply(token, duration_ns_since_epoch(now));
 }
 
-void client::handle_goaway(const frame&) {
-    if (closed_.load(std::memory_order_acquire)) {
+namespace {
+
+// GOAWAY payload is exactly `last_stream_id u32 LE + rpc_code u32 LE`. A code
+// outside the rpc_code enum is a protocol violation, not a value to pass
+// through to the caller. The whitelist is explicit on purpose: comparing
+// against the current maximum enum value would silently start rejecting a new,
+// perfectly valid code when the enum grows.
+bool decode_goaway_payload(span<const std::byte> payload, rpc_code& code) noexcept {
+    if (payload.size() != 8) {
+        return false;
+    }
+    // `last_stream_id` is parsed (and deliberately not acted on per stream in
+    // this slice: every in-flight call is failed) so a malformed payload is
+    // detected before the code is read.
+    (void)endian::load_le32(payload.data());
+    const u32 raw = endian::load_le32(payload.data() + 4);
+    switch (raw) {
+    case static_cast<u32>(rpc_code::ok):
+    case static_cast<u32>(rpc_code::canceled):
+    case static_cast<u32>(rpc_code::deadline_exceeded):
+    case static_cast<u32>(rpc_code::unavailable):
+    case static_cast<u32>(rpc_code::connection_refused):
+    case static_cast<u32>(rpc_code::connection_reset):
+    case static_cast<u32>(rpc_code::broken_pipe):
+    case static_cast<u32>(rpc_code::eof):
+    case static_cast<u32>(rpc_code::overload):
+    case static_cast<u32>(rpc_code::not_found):
+    case static_cast<u32>(rpc_code::no_such_method):
+    case static_cast<u32>(rpc_code::invalid_argument):
+    case static_cast<u32>(rpc_code::failed_precondition):
+    case static_cast<u32>(rpc_code::resource_exhausted):
+    case static_cast<u32>(rpc_code::protocol_error):
+    case static_cast<u32>(rpc_code::decode_error):
+    case static_cast<u32>(rpc_code::encode_error):
+    case static_cast<u32>(rpc_code::not_acknowledged):
+    case static_cast<u32>(rpc_code::unknown_side_effect):
+    case static_cast<u32>(rpc_code::internal):
+    case static_cast<u32>(rpc_code::shutting_down):
+    case static_cast<u32>(rpc_code::application):
+    case static_cast<u32>(rpc_code::permission_denied):
+        code = static_cast<rpc_code>(raw);
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+void client::handle_goaway(const frame& value) {
+    rpc_code code = rpc_code::ok;
+    if (!decode_goaway_payload(value.payload, code)) {
+        // Malformed length or unknown code: the peer's shutdown reason cannot
+        // be trusted, so the session is a protocol failure.
+        (void)fail_all(rpc_code::protocol_error, "malformed GOAWAY");
+        retire_transport();
         return;
     }
-    (void)fail_all(rpc_code::shutting_down, "peer sent GOAWAY");
+    if (code == rpc_code::ok) {
+        // `ok` is a graceful shutdown: keep the established `shutting_down`
+        // semantics instead of surfacing the raw `ok` (which means success).
+        (void)fail_all(rpc_code::shutting_down, "peer sent GOAWAY (ok)");
+    } else {
+        (void)fail_all(code, "peer sent GOAWAY");
+    }
+    retire_transport();
 }
 
 void client::protocol_failure() {
-    if (closed_.load(std::memory_order_acquire)) {
-        return;
-    }
     (void)fail_all(rpc_code::protocol_error, "frame decode error");
+    retire_transport();
 }
 
 // --- Writer ------------------------------------------------------------------

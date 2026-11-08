@@ -78,6 +78,12 @@ inline constexpr std::size_t ordered_extension_size = 16;
 inline constexpr u32 max_frame_default = 16u * 1024u * 1024u;
 inline constexpr u32 max_frame_hard_cap = 64u * 1024u * 1024u;
 
+// Protocol cap for a SETTINGS payload. The connection layer rejects a SETTINGS
+// header that declares a larger payload before the payload is copied (see
+// frame_decoder::peek_header). Kept here, next to the frame limits, because both
+// the client and the server use it.
+inline constexpr u32 settings_payload_cap = 4096;
+
 // stream_id bit 31 is reserved and must be zero.
 inline constexpr u32 max_stream_id = 0x7FFFFFFFu;
 
@@ -297,12 +303,24 @@ struct call_envelope {
 
 // --- Incremental decoder -----------------------------------------------------
 
-// Per-frame report for frame_decoder::next(frame&, frame_compression_info*).
-// Declared here, defined in <crpc/frame_compression.hpp>: this header must stay
+// Per-frame report for frame_decoder::next(frame&, frame_compression_info&).
+// Declared and defined in <crpc/frame_compression.hpp>: this header must stay
 // compression-agnostic and never include the compression header, but the
 // decoder's overload needs to name the type. A pointer to an incomplete type is
 // enough for the declaration.
 struct frame_compression_info;
+
+// Result of a read-only header probe (frame_decoder::peek_header).
+enum class peek_result : u8 {
+    // Fewer than 16 header bytes are available across the buffered tail and the
+    // optional next chunk. Nothing was consumed.
+    need_more,
+    // A complete header was decoded into the caller's `frame_header`.
+    header_ready,
+    // The decoder is already in an error state, or the 16 header bytes are not
+    // a valid frame header.
+    header_error
+};
 
 // Streaming frame decoder. Bytes are copied into an internal buffer; a complete
 // frame is only produced by next(). The decoder performs no allocation for a
@@ -419,6 +437,24 @@ public:
     // chunk is active. Must be called before the chunk passed to
     // feed_external() goes out of scope.
     void drain_external() noexcept;
+
+    // Read-only header probe. Builds the next frame's 16-byte header from the
+    // unread tail of the internal buffer (or the active external chunk) plus
+    // the optional prefix of `next_chunk`, and decodes it without consuming or
+    // copying any payload. Used by the connection layer to reject an oversized
+    // SETTINGS frame before feed_external()/feed() can copy it. Nothing is
+    // consumed and neither read_offset_ nor external_offset_ changes. The
+    // probe does not set the decoder's error state; every caller must handle
+    // `header_error` itself.
+    [[nodiscard]] peek_result peek_header(span<const std::byte> next_chunk,
+                                          frame_header& out) noexcept;
+
+    // Drops the unconsumed tail of the active external chunk and clears the
+    // internal buffer (read_offset_ is reset). Only the error state and the
+    // allocated capacity are retained. This is the fatal-close cleanup: it
+    // guarantees that no buffered SETTINGS payload survives the decision to
+    // abort the connection.
+    void abort_external() noexcept;
 
     // Attempts to decode one frame from the buffered bytes.
     //   * need_more   -- the header or payload is incomplete; `out` unchanged;

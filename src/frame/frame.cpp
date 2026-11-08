@@ -4,6 +4,7 @@
 // no bitfields. Multi-byte values go through endian::store_le*/load_le* and the
 // bounds-checked byte_reader/byte_writer.
 #include <algorithm>
+#include <cstring>
 #include <limits>
 
 #if defined(_MSC_VER) && defined(_M_X64)
@@ -664,30 +665,80 @@ void frame_decoder::feed_external(span<const std::byte> data) noexcept {
     if (error_ != rpc_code::ok || data.empty()) {
         return;
     }
-    if (buffer_.size() != read_offset_) {
-        // Bytes are already buffered from an earlier partial frame. Parsing
-        // `data` directly would put those bytes behind the buffered ones in the
-        // stream, so fall back to the copying path and let next() read the
-        // buffer.
-        feed(data);
+    if (buffer_.size() == read_offset_) {
+        // No partial frame buffered: the chunk can be parsed in place.
+        external_ = data;
+        external_offset_ = 0;
+        external_active_ = true;
         return;
     }
-    external_ = data;
-    external_offset_ = 0;
-    external_active_ = true;
+
+    // Bytes are already buffered from an earlier partial frame. Do NOT copy the
+    // whole chunk: that would put a following oversized SETTINGS payload into
+    // the internal buffer before the connection layer's 4 KiB check has seen
+    // its header. Copy only the bytes that complete the earliest buffered
+    // frame, then expose the rest of the chunk through the external window.
+    std::size_t consumed = 0;
+
+    // Step 1: complete the 16-byte header if the buffered tail is shorter.
+    if (buffer_.size() - read_offset_ < frame_header_size) {
+        const std::size_t want = frame_header_size - (buffer_.size() - read_offset_);
+        const std::size_t take = data.size() < want ? data.size() : want;
+        if (!buffer_.append(span<const std::byte>(data.data(), take))) {
+            error_ = rpc_code::resource_exhausted;
+            return;
+        }
+        consumed = take;
+        if (buffer_.size() - read_offset_ < frame_header_size) {
+            // Still no complete header: every available byte was consumed.
+            return;
+        }
+    }
+
+    // Step 2: with the header available, copy exactly the payload bytes that
+    // finish this one frame.
+    frame_header header;
+    const status decoded = decode_frame_header(
+        span<const std::byte>(buffer_.data() + read_offset_, frame_header_size), header,
+        max_frame_);
+    if (!decoded.ok()) {
+        // Leave the invalid header for next() to report as a fatal error. The
+        // rest of the chunk is irrelevant because the connection is closing.
+        return;
+    }
+    const std::size_t extension_bytes =
+        (header.flags & frame_flag_ordered) != 0 ? ordered_extension_size : 0;
+    const std::size_t total =
+        frame_header_size + extension_bytes + static_cast<std::size_t>(header.payload_len);
+    const std::size_t unread = buffer_.size() - read_offset_;
+    const std::size_t need = total > unread ? total - unread : 0;
+    const std::size_t remaining = data.size() - consumed;
+    const std::size_t take = remaining < need ? remaining : need;
+    if (take != 0) {
+        if (!buffer_.append(span<const std::byte>(data.data() + consumed, take))) {
+            error_ = rpc_code::resource_exhausted;
+            return;
+        }
+        consumed += take;
+    }
+    if (consumed < data.size()) {
+        external_ = span<const std::byte>(data.data() + consumed, data.size() - consumed);
+        external_offset_ = 0;
+        external_active_ = true;
+    }
 }
 
 void frame_decoder::drain_external() noexcept {
     if (!external_active_) {
         return;
     }
-    // Invariant: external_active_ implies read_offset_ == 0. feed_external()
-    // only activates an external window when buffer_.size() == read_offset_,
-    // and every path that advances read_offset_ (consume/compact) clears it
-    // once it catches up to buffer_.size(), so the internal buffer is empty and
-    // no prefix is pending. next() consumes external bytes through
-    // external_offset_, never read_offset_, so draining only appends the
-    // external tail and deliberately leaves read_offset_ at 0.
+    // `external_` is always the bytes that follow every buffered (unread) byte:
+    // feed_external() copies the prefix needed to finish the earliest buffered
+    // frame and only then exposes the rest as the external window. Appending the
+    // external tail behind the buffer therefore preserves the stream order, and
+    // read_offset_ deliberately keeps pointing at the first unread buffered
+    // byte. next()/peek_header() read the buffered tail before the external
+    // window for exactly this reason.
     const std::byte* const tail = external_.data() + external_offset_;
     const std::size_t remaining = external_.size() - external_offset_;
     external_ = span<const std::byte>();
@@ -698,6 +749,61 @@ void frame_decoder::drain_external() noexcept {
             error_ = rpc_code::resource_exhausted;
         }
     }
+}
+
+peek_result frame_decoder::peek_header(span<const std::byte> next_chunk,
+                                       frame_header& out) noexcept {
+    if (error_ != rpc_code::ok) {
+        return peek_result::header_error;
+    }
+    std::byte head[frame_header_size];
+    std::size_t have = 0;
+
+    // Sources are consulted in stream order: buffered unread tail, then the
+    // active external window, then the new chunk's prefix. That mirrors exactly
+    // what feed_external()/feed() would present to next().
+    const std::size_t buffered = buffer_.size() - read_offset_;
+    const std::size_t take_buf = buffered < frame_header_size ? buffered : frame_header_size;
+    if (take_buf != 0) {
+        std::memcpy(head, buffer_.data() + read_offset_, take_buf);
+        have = take_buf;
+    }
+    if (have < frame_header_size && external_active_) {
+        const std::size_t available = external_.size() - external_offset_;
+        const std::size_t wanted = frame_header_size - have;
+        const std::size_t take = available < wanted ? available : wanted;
+        if (take != 0) {
+            std::memcpy(head + have, external_.data() + external_offset_, take);
+            have += take;
+        }
+    }
+    if (have < frame_header_size && !next_chunk.empty()) {
+        const std::size_t wanted = frame_header_size - have;
+        const std::size_t take = next_chunk.size() < wanted ? next_chunk.size() : wanted;
+        std::memcpy(head + have, next_chunk.data(), take);
+        have += take;
+    }
+
+    if (have < frame_header_size) {
+        return peek_result::need_more;
+    }
+
+    frame_header parsed;
+    const status decoded =
+        decode_frame_header(span<const std::byte>(head, frame_header_size), parsed, max_frame_);
+    if (!decoded.ok()) {
+        return peek_result::header_error;
+    }
+    out = parsed;
+    return peek_result::header_ready;
+}
+
+void frame_decoder::abort_external() noexcept {
+    external_ = span<const std::byte>();
+    external_offset_ = 0;
+    external_active_ = false;
+    buffer_.clear();
+    read_offset_ = 0;
 }
 
 void frame_decoder::compact() noexcept {
@@ -729,11 +835,18 @@ frame_decoder::result frame_decoder::next(frame& out, frame_compression_info* in
         return result::error;
     }
 
-    // Frames come from the external chunk when one is active (feed_external),
-    // otherwise from the internal buffer. Only the internal path compacts.
+    // Frames come from the buffered unread tail first (feed_external may leave a
+    // complete frame there while exposing the rest of the chunk externally),
+    // then from the external chunk, otherwise from the internal buffer. Only the
+    // internal path compacts.
+    const bool from_buffer = buffer_.size() != read_offset_;
     const std::byte* base;
     std::size_t available;
-    if (external_active_) {
+    if (from_buffer) {
+        compact();
+        base = buffer_.data() + read_offset_;
+        available = buffer_.size() - read_offset_;
+    } else if (external_active_) {
         base = external_.data() + external_offset_;
         available = external_.size() - external_offset_;
     } else {
@@ -782,14 +895,14 @@ frame_decoder::result frame_decoder::next(frame& out, frame_compression_info* in
     // the bytes are gone and the decoder stays usable, which is why error_ is
     // not touched here.
     const auto consume = [&]() noexcept {
-        if (external_active_) {
-            external_offset_ += total;
-        } else {
+        if (from_buffer) {
             read_offset_ += total;
             if (read_offset_ == buffer_.size()) {
                 buffer_.clear();
                 read_offset_ = 0;
             }
+        } else {
+            external_offset_ += total;
         }
     };
 

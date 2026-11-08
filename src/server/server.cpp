@@ -367,10 +367,10 @@ struct server_connection {
         std::size_t on_data(span<const std::byte> data) noexcept override {
             return owner->on_data(data);
         }
-        void on_eof() noexcept override { owner->on_terminal(); }
+        void on_eof() noexcept override { owner->close_after_peer_eof(); }
         void on_error(std::error_code ec) noexcept override {
             (void)ec;
-            owner->on_terminal();
+            owner->close_after_peer_eof();
         }
         server_connection* owner;
     };
@@ -385,6 +385,16 @@ struct server_connection {
     std::atomic<std::uint32_t> in_flight{0};
     std::atomic<bool> closed{false};
     std::weak_ptr<server_connection> self;
+
+    // Protocol-error teardown: after the best-effort GOAWAY(protocol_error) is
+    // queued, the transport must not be closed abortively (io.hpp:243: close
+    // discards undelivered bytes). finish_send closes it once the send queue is
+    // drained; a short shard-timer grace covers transports whose completion
+    // fires on enqueue rather than on peer delivery (in-process). The flag and
+    // the one-shot guard are atomics because the reader thread sets them while
+    // a completion may run on another thread.
+    std::atomic<bool> close_after_flush{false};
+    std::atomic<bool> close_scheduled{false};
 
     // The transport contract allows exactly one outstanding push per connection
     // (a second push while one is in flight is refused with
@@ -462,6 +472,21 @@ struct server_connection {
     server_connection() = default;
     ~server_connection();
     void on_terminal() noexcept;
+    // Terminal transition triggered by the peer closing its side: marks the
+    // connection terminal and releases the transport. Safe from the reader
+    // callback stack (the connection is shared_ptr-owned and close() is
+    // abortive, never destructing).
+    void close_after_peer_eof() noexcept;
+    // Best-effort GOAWAY with an explicit rpc_code before a protocol-error
+    // close. Returns false when the connection is already closed or the send
+    // pool cannot provide a record. A queued frame is delivered by the outer
+    // transport drain; the caller must therefore not close the transport inside
+    // this callback (an abortive close discards undelivered queued bytes).
+    [[nodiscard]] bool send_goaway_frame(rpc_code code) noexcept;
+    // Bounded deferred close for the protocol-error teardown: after the GOAWAY
+    // has been handed to the transport, close it (idempotent). Only the first
+    // caller arms it.
+    void schedule_close_after_flush() noexcept;
 
     std::size_t on_data(span<const std::byte> data) noexcept;
     void submit(frame& request) noexcept;
@@ -494,6 +519,37 @@ void report_send_failure(server_connection* sc, std::error_code ec) noexcept {
     }
 }
 
+void run_close_after_flush(void* ctx) noexcept {
+    auto* sc = static_cast<server_connection*>(ctx);
+    if (sc != nullptr && sc->conn) {
+        sc->conn->close();
+    }
+}
+
+void server_connection::schedule_close_after_flush() noexcept {
+    if (close_scheduled.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    bool armed = false;
+    if (shard != nullptr) {
+        const std::shared_ptr<server_connection> keep = self.lock();
+        if (keep) {
+            // A short grace lets a synchronous in-process drain hand the
+            // GOAWAY to the peer before the transport is closed (in-process
+            // push completion fires on enqueue, see inproc.cpp:591-598). The
+            // bound stays far below the caller's 2 s teardown expectation, and
+            // the timer wheel keeps `keep` alive until the callback returns.
+            constexpr u64 grace_ns = 50ull * 1000ull * 1000ull;
+            armed = shard->arm_timer(this, shard->now_ns() + grace_ns,
+                                     &run_close_after_flush, this,
+                                     std::shared_ptr<void>(keep));
+        }
+    }
+    if (!armed && conn) {
+        conn->close();
+    }
+}
+
 void finish_send(server_connection* sc, io::io_result result) noexcept {
     if (sc == nullptr) {
         return;
@@ -520,6 +576,17 @@ void finish_send(server_connection* sc, io::io_result result) noexcept {
     if (next != nullptr && sc->conn) {
         sc->conn->sink().push(
             span<const std::byte>(next->bytes.data(), next->size), next);
+        return;
+    }
+    if (sc->close_after_flush.load(std::memory_order_acquire)) {
+        bool idle = false;
+        {
+            std::lock_guard<std::mutex> lk(sc->send_mutex);
+            idle = !sc->send_busy && sc->send_queue.empty();
+        }
+        if (idle) {
+            sc->schedule_close_after_flush();
+        }
     }
 }
 
@@ -2188,6 +2255,77 @@ server_connection::~server_connection() {
     }
 }
 
+namespace {
+
+// GOAWAY payload: `last_stream_id u32 LE + rpc_code u32 LE`. A code outside the
+// rpc_code enum is a protocol violation. The whitelist is explicit so a future
+// enum value is not silently rejected by a comparison against today's maximum.
+// Shared by every server state that parses a peer GOAWAY (S1/S2/S4 are the same
+// parse here).
+bool decode_goaway_payload(span<const std::byte> payload, rpc_code& code) noexcept {
+    if (payload.size() != 8) {
+        return false;
+    }
+    (void)endian::load_le32(payload.data());
+    const u32 raw = endian::load_le32(payload.data() + 4);
+    switch (raw) {
+    case static_cast<u32>(rpc_code::ok):
+    case static_cast<u32>(rpc_code::canceled):
+    case static_cast<u32>(rpc_code::deadline_exceeded):
+    case static_cast<u32>(rpc_code::unavailable):
+    case static_cast<u32>(rpc_code::connection_refused):
+    case static_cast<u32>(rpc_code::connection_reset):
+    case static_cast<u32>(rpc_code::broken_pipe):
+    case static_cast<u32>(rpc_code::eof):
+    case static_cast<u32>(rpc_code::overload):
+    case static_cast<u32>(rpc_code::not_found):
+    case static_cast<u32>(rpc_code::no_such_method):
+    case static_cast<u32>(rpc_code::invalid_argument):
+    case static_cast<u32>(rpc_code::failed_precondition):
+    case static_cast<u32>(rpc_code::resource_exhausted):
+    case static_cast<u32>(rpc_code::protocol_error):
+    case static_cast<u32>(rpc_code::decode_error):
+    case static_cast<u32>(rpc_code::encode_error):
+    case static_cast<u32>(rpc_code::not_acknowledged):
+    case static_cast<u32>(rpc_code::unknown_side_effect):
+    case static_cast<u32>(rpc_code::internal):
+    case static_cast<u32>(rpc_code::shutting_down):
+    case static_cast<u32>(rpc_code::application):
+    case static_cast<u32>(rpc_code::permission_denied):
+        code = static_cast<rpc_code>(raw);
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+bool server_connection::send_goaway_frame(rpc_code code) noexcept {
+    if (closed.load(std::memory_order_acquire) || owner == nullptr || !conn) {
+        return false;
+    }
+    const std::shared_ptr<server_connection> keep = self.lock();
+    if (!keep) {
+        return false;
+    }
+    std::byte payload[8];
+    endian::store_le32(payload, 0);
+    endian::store_le32(payload + 4, static_cast<u32>(code));
+    return owner->send_payload(keep, 0, frame_type::goaway,
+                               span<const std::byte>(payload, sizeof(payload)));
+}
+
+void server_connection::close_after_peer_eof() noexcept {
+    on_terminal();
+    if (conn) {
+        // The peer is gone; releasing our endpoint does not lose any data the
+        // peer could still read, and it stops this connection from lingering
+        // after a protocol-error GOAWAY has been acknowledged by the close.
+        conn->close();
+    }
+}
+
 void server_connection::on_terminal() noexcept {
     if (closed.exchange(true, std::memory_order_acq_rel)) {
         return;
@@ -2237,22 +2375,91 @@ std::size_t server_connection::on_data(span<const std::byte> data) noexcept {
         return 0;
     }
     std::lock_guard<std::mutex> lk(decode_mutex);
+
+    const auto fail_closed = [this]() noexcept {
+        // Abandon the rest of the chunk: no drain, no further dispatch. Clear
+        // the external view first so no borrowed payload outlives this call.
+        decoder.abort_external();
+        // Queue GOAWAY(protocol_error) and mark the connection terminal. The
+        // transport's close() is *abortive* (io.hpp: it discards undelivered
+        // queued bytes), so closing here would throw the diagnostic frame away
+        // in a nested in-process drain. The frame is delivered by the outer
+        // drain; the transport is closed when the peer acknowledges by closing
+        // (reader_source::on_eof) or when the server stops.
+        const bool queued = send_goaway_frame(rpc_code::protocol_error);
+        on_terminal();
+        if (!queued) {
+            // Nothing could be queued: fall back to the immediate close so the
+            // session does not linger.
+            if (conn) {
+                conn->close();
+            }
+        } else {
+            // Bound the deferred close to the GOAWAY write. The completion may
+            // already have run (synchronous transports complete on enqueue), so
+            // also arm it here when the send queue is already idle.
+            close_after_flush.store(true, std::memory_order_release);
+            bool idle = false;
+            {
+                std::lock_guard<std::mutex> lk(send_mutex);
+                idle = !send_busy && send_queue.empty();
+            }
+            if (idle) {
+                schedule_close_after_flush();
+            }
+        }
+    };
+
+    // 4 KiB early check: the buffered tail plus this chunk's prefix forms the
+    // next header. An oversized SETTINGS payload is rejected before
+    // feed_external() can copy the chunk into the internal buffer.
+    frame_header h{};
+    const peek_result pr = decoder.peek_header(data, h);
+    if (pr == peek_result::header_error ||
+        (pr == peek_result::header_ready && h.type == frame_type::settings &&
+         h.payload_len > settings_payload_cap)) {
+        fail_closed();
+        return data.size();
+    }
     // Parse directly out of the transport's chunk: submit() copies the payload
     // into the job before the next call, so the zero-copy window is exactly
     // this loop. Only a trailing partial frame is copied into the decoder.
     decoder.feed_external(data);
     for (;;) {
+        // Per-frame probe before next() consumes/stages the frame.
+        frame_header ph{};
+        const peek_result lpr = decoder.peek_header({}, ph);
+        if (lpr == peek_result::header_error ||
+            (lpr == peek_result::header_ready && ph.type == frame_type::settings &&
+             ph.payload_len > settings_payload_cap)) {
+            fail_closed();
+            return data.size();
+        }
         frame value;
         const frame_decoder::result result = decoder.next(value);
         if (result == frame_decoder::result::need_more) {
             break;
         }
         if (result == frame_decoder::result::error) {
+            fail_closed();
+            return data.size();
+        }
+        if (value.header.type == frame_type::goaway) {
+            rpc_code code = rpc_code::ok;
+            if (!decode_goaway_payload(value.payload, code)) {
+                // Malformed length or unknown code: fail closed before any of
+                // the rest of the chunk is dispatched.
+                fail_closed();
+                return data.size();
+            }
+            // Legal peer GOAWAY (including `ok`): stop dispatching the rest of
+            // the chunk, run the existing teardown, and close.
+            decoder.abort_external();
             on_terminal();
             if (conn) {
                 conn->close();
             }
-            break;
+            return data.size();
         }
         if (value.header.type == frame_type::request ||
             value.header.type == frame_type::one_way) {

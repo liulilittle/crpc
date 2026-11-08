@@ -189,6 +189,11 @@ per shard:
 
 服务端连接循环在 `src/server/server.cpp` 中实现。`server::start()` 在 `registry.freeze()` 后构建冻结的每服务 guard 表，再创建分片运行时并启动监听；accept sink 把每条连接包装成 `reader_source`，`on_data` 解码 REQUEST/ONE_WAY 并提交到分片的 handler 池。`server::impl::handle_request` 先校验服务 id，再执行 §14 的服务端准入流水线，调用 `rpc::dispatcher::dispatch`，最后把 RESPONSE 或错误帧放入该连接的有界发送路径。客户端流水线已按端点接线；fallback 原语已实现：服务端在四个执行前拒绝点声明 `crpc-degradable`，但服务端仍从不调用 `fallback_execute`；客户端门面在 `call<Resp>::get()` 中、最后一次尝试被终结之后调用它，因此被服务端标记为可降级的拒绝可以由已安装的 fallback 值应答。证据：`src/server/server.cpp:317-403,905-1168,1362-1408`；`include/crpc/server.hpp:78-217`。
 
+### GOAWAY 关闭时机与资源边界
+
+客户端收到 GOAWAY 时，按对端 code 失败全部在途调用（`ok` 映射为 `shutting_down`；未知 code 或载荷长度不是恰好 8 字节则为 `protocol_error`），并就地软关传输；连接对象只在 `~client` 中、投递栈退出之后释放（`src/rpc/client.cpp:256-297`）。服务端收到畸形对端 GOAWAY 时，排队 best-effort `GOAWAY(protocol_error)`，以 `on_terminal()` 停止派发任何后续帧，并在该帧交给传输之后关闭连接（`src/server/server.cpp:2296-2345`、`finish_send` 在 `src/server/server.cpp:520-555`）。关闭有上界：对“写完成在入队时即回调（进程内）”的传输，用一个短暂的分片定时器宽限，确保 GOAWAY 先交给对端再关闭；`stop()` 或对端 EOF 作为兜底。这一延后是传输契约要求的：`connection::close()` 是 *abortive* 的，会丢弃未投递的排队字节（`include/crpc/io.hpp:243`），因此在 reader 回调内立即关闭会丢掉诊断用 GOAWAY。延后期间连接已经是终态，不再派发任何帧，缓冲有界；传输最终由 close（或 `stop()`）释放。在完成回调栈内析构 `rpc::client` 不受支持，且仍为未验证项（T4）。
+
+
 ## 10. 调用状态机 <a id="s10"></a>
 
 已实现的状态：
@@ -294,7 +299,7 @@ MVC 是路由表加绑定：`CRPC_ROUTE` 与 `CRPC_HTTP_*` 在静态初始化时
 
 `obs::trace_context` 携带 16 字节 trace id、8 字节 span id、8 字节 parent 和 W3C flags；`parse_traceparent`/`format_traceparent` 实现 W3C 头，`baggage` 有序且有界。`obs::deadline` 是相对时间（`after(duration)`），符合跨机传播要求。
 
-`obs::interceptor_chain` 是每个 hook 点一张固定容量的钩子表。空链只花一次可预测分支；钩子在启动期注册并冻结。服务端调用路径现已接线：`server::builder::interceptor_chain` 安装的链由 `handle_request` 在 `before_call`（信封解码后、准入之前；钩子返回 false 或抛出异常时，请求以链的裁决结束）与 `after_call`（dispatch 之后；链在此提前停止则以链的裁决替换响应）各运行一次，拦截器写入的 metadata 经 `rpc::dispatcher::dispatch` 的上下文注入重载进入 handler 可见的 `rpc::call_context`。空链路径的代价仅为每个 hook 点一次 `count(point)` 分支：无锁、无分配、无虚调用、无每请求上下文构造。客户端终态结果经进程级链（`obs::set_default_interceptor_chain`）观察：`diagnostics::on_completion` 在 `response<>::get()` 终结时于 `after_call` 运行它；`before_serialize`/`after_deserialize`/`on_retry`/`on_breaker_event`/`on_connect`/`on_close` 与按尝试触发的客户端 `before_call` 仍为**规格已定、未实现**。服务端另有独立的 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1400-1404`，`on_response` 在 `:1608-1612` 与 `:1918-1922`），它不是可观测性链：两套机制按 `include/crpc/server.hpp` 记录的固定顺序并存（legacy 请求观察者、`before_call`、准入与 dispatch、`after_call`、legacy 响应观察者）。
+`obs::interceptor_chain` 是每个 hook 点一张固定容量的钩子表。空链只花一次可预测分支；钩子在启动期注册并冻结。服务端调用路径现已接线：`server::builder::interceptor_chain` 安装的链由 `handle_request` 在 `before_call`（信封解码后、准入之前；钩子返回 false 或抛出异常时，请求以链的裁决结束）与 `after_call`（dispatch 之后；链在此提前停止则以链的裁决替换响应）各运行一次，拦截器写入的 metadata 经 `rpc::dispatcher::dispatch` 的上下文注入重载进入 handler 可见的 `rpc::call_context`。空链路径的代价仅为每个 hook 点一次 `count(point)` 分支：无锁、无分配、无虚调用、无每请求上下文构造。客户端终态结果经进程级链（`obs::set_default_interceptor_chain`）观察：`diagnostics::on_completion` 在 `response<>::get()` 终结时于 `after_call` 运行它；`before_serialize`/`after_deserialize`/`on_retry`/`on_breaker_event`/`on_connect`/`on_close` 与按尝试触发的客户端 `before_call` 仍为**规格已定、未实现**。服务端另有独立的 `server_interceptor` 钩子包住 `dispatch`（`on_request` 在 `src/server/server.cpp:1467-1471`，`on_response` 在 `:1675-1679` 与 `:1985-1989`），它不是可观测性链：两套机制按 `include/crpc/server.hpp` 记录的固定顺序并存（legacy 请求观察者、`before_call`、准入与 dispatch、`after_call`、legacy 响应观察者）。
 
 **异常契约。** HTTP 与 RPC 路径跨越两种不同的边界，它们的行为并不相同。头内联边界编译进消费方，跟随**消费方**的异常选项；库翻译单元是预编译的，保留**库**的选项。
 

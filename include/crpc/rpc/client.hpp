@@ -695,6 +695,11 @@ public:
     [[nodiscard]] u32 slot_capacity() const noexcept { return pool_.capacity(); }
 
 private:
+    // Test seam for the defensive re-entrant reader branch (P2/M1). It is a
+    // friend rather than a public setter so the production interface does not
+    // grow a state-injection knob; the test defines the access shim.
+    friend struct client_test_access;
+
     class reader_source final : public io::source {
     public:
         explicit reader_source(client& owner) noexcept : owner_(owner) {}
@@ -829,6 +834,18 @@ private:
     // `std::string` parameter at the call site would allocate there.
     bool fail_all(rpc_code code, std::string_view message);
     void protocol_failure();
+    // Releases the transport: under `write_mutex_` it only probes is_open(),
+    // then calls connection::close() after the unlock (a synchronous
+    // in-process close re-enters the peer's completion, which may take the
+    // server push lock; holding Cw there would invert). The unique_ptr is NOT
+    // moved out: it is released by ~client's member destruction, after
+    // close()/bind_source(nullptr) drained every delivery. Only close() (and
+    // therefore ~client) calls this; reader/fatal paths use retire_transport().
+    void close_transport() noexcept;
+    // Idempotent soft close for reader/fatal callback stacks: probes is_open()
+    // under `write_mutex_`, then calls `conn_->close()` outside it, without
+    // moving or destroying the transport. `conn_` is released only by ~client.
+    void retire_transport() noexcept;
     void remove_in_flight(call_slot& slot, bool acknowledged);
     void remove_deadline(call_slot& slot);
     call_id next_call_id();
@@ -878,6 +895,11 @@ private:
     std::error_code write_ec_{};
     std::size_t requested_ = 0;
     bool in_process_ = false;
+    // Set by the defensive re-entrant reader branch when it sees a fatal
+    // condition (malformed header, oversized SETTINGS, allocation failure). The
+    // outer drain checks it after releasing the read lock and performs the
+    // single `protocol_failure()`. Never reset: the connection is closed.
+    bool reader_fatal_ = false;
     u32 stream_seq_ = 0;
     u64 seq_ = 0;
     stream_map in_flight_;
