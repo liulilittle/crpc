@@ -77,10 +77,26 @@ cl::service_instance make_instance(const std::string& service,
     return instance;
 }
 
-cl::write_context make_ctx(const std::string& node, crpc::u64 incarnation = 0) {
+cl::write_context make_ctx(const std::string& node, crpc::u64 incarnation = 0,
+                           crpc::u64 fence = 0) {
     cl::write_context context;
     context.node_id = node;
     context.incarnation = incarnation;
+    context.fence = fence;
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
+    return context;
+}
+
+// The default config is strict: a caller that writes must present a token the
+// authority issued for that exact key.
+cl::write_context make_issued_ctx(cl::registry& reg, const std::string& service,
+                                  const std::string& node,
+                                  crpc::u64 incarnation = 0) {
+    cl::write_context context = make_ctx(node, incarnation);
+    const auto token = reg.next_fence(service, node);
+    if (token.ok()) {
+        context.fence = token.value();
+    }
     return context;
 }
 
@@ -96,37 +112,47 @@ cl::instance_state registry_state(cl::registry& reg, const std::string& service,
     return result.value().instances.front().state;
 }
 
+template <typename T>
+std::string rejection_reason_for(const crpc::result<T>& outcome) {
+    if (outcome.ok()) {
+        return "<accepted>";
+    }
+    const std::string* reason =
+        outcome.error().metadata.find("registry.reason");
+    return reason != nullptr ? *reason : std::string{};
+}
+
 void register_node(cl::registry& reg, const std::string& service,
                    const std::string& node, crpc::u16 port) {
     CRPC_REQUIRE(reg.register_instance(make_instance(service, node, port, 1),
-                                       make_ctx(node, 1))
-                     .ok());
+                                      make_issued_ctx(reg, service, node, 1))
+                      .ok());
 }
 
 // A writer that is not the bridge and uses the legacy registration path. Kept
 // for the negative case: under strict_incarnation the same (key, incarnation)
-// with a different payload is rejected instead of clobbering health.
+// with a different payload is rejected instead of clobbering health. It still
+// presents an authority-issued token, because the conflict under test is the
+// incarnation rule, not the fence.
 crpc::result<cl::write_result> legacy_external_register(
     cl::registry& reg, const std::string& service, const std::string& node,
     crpc::u16 port, cl::instance_state state, crpc::u64 incarnation = 1) {
     cl::service_instance instance = make_instance(service, node, port, incarnation);
     instance.state = state;
-    return reg.register_instance(instance, make_ctx(node, incarnation));
+    return reg.register_instance(instance,
+                                make_issued_ctx(reg, service, node, incarnation));
 }
 
 // A writer that is not the bridge. set_state writes only the state field and
-// carries an explicit fence above the published high-water, which is the legal
-// external-writer contract under the strict default. The bridge must treat it
+// carries a token the registry issued for the key, which is the legal
+// external-writer contract under the default config. The bridge must treat it
 // as an external write (P5: register_instance no longer writes health at all).
 void external_register(cl::registry& reg, const std::string& service,
                        const std::string& node, cl::instance_state state,
                        crpc::u64 incarnation = 1) {
-    cl::write_context context = make_ctx(node, incarnation);
-    const crpc::u64 published = reg.fence();
-    context.fence = published == std::numeric_limits<crpc::u64>::max()
-                        ? published
-                        : published + 1;
-    CRPC_REQUIRE(reg.set_state(service, node, state, context).ok());
+    CRPC_REQUIRE(reg.set_state(service, node, state,
+                               make_issued_ctx(reg, service, node, incarnation))
+                      .ok());
 }
 
 } // namespace
@@ -435,14 +461,23 @@ CRPC_TEST(health_bridge_stale_epoch_cannot_overwrite_takeover) {
     CRPC_CHECK_EQ(crpc::u64{1}, new_bridge.flush());
     CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
 
-    // The old bridge still believes critical. Its flush must be rejected by the
-    // registry fence, must not adopt the newer passing state as its own, and
-    // must stop retrying once it has yielded.
+    // The old bridge still believes critical, but it has yielded: a newer epoch
+    // owns the instance and next_writer_epoch() cannot prove that owner is gone.
+    // So the old bridge never writes again; only a freshly constructed bridge
+    // may take over.
     CRPC_CHECK(old_bridge.report("api", "n1", false));
     CRPC_CHECK_EQ(crpc::u64{0}, old_bridge.flush());
     CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
     CRPC_CHECK_EQ(cl::health_state::critical, old_bridge.state("api", "n1"));
     CRPC_CHECK_EQ(crpc::u64{0}, old_bridge.flush());
+
+    // A brand-new bridge is the supported recovery path: it is constructed after
+    // the takeover and therefore holds a strictly newer epoch.
+    cl::health_bridge third_bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(third_bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, third_bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+    CRPC_CHECK_EQ(cl::health_state::critical, third_bridge.state("api", "n1"));
 }
 
 CRPC_TEST(health_bridge_reanchors_after_same_epoch_fence_bump) {
@@ -456,16 +491,156 @@ CRPC_TEST(health_bridge_reanchors_after_same_epoch_fence_bump) {
     CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
     CRPC_CHECK_EQ(cl::health_state::critical, bridge.state("api", "n1"));
 
-    // Two ordinary re-registrations (not a newer health bridge) advance the
-    // key's fence above the bridge's next token. The bridge must re-anchor and
-    // keep writing instead of yielding its authority to a same-epoch writer.
+    // Two ordinary re-registrations advance the key's fence. The bridge must
+    // re-anchor and keep writing: the authority's next_fence() jumps over every
+    // floor, so a single flush succeeds where a local arithmetic guess would
+    // have needed a failed attempt first.
     external_register(reg, "api", "n1", cl::instance_state::critical);
     external_register(reg, "api", "n1", cl::instance_state::critical);
 
     CRPC_CHECK(bridge.report("api", "n1", true));
-    CRPC_CHECK_EQ(crpc::u64{0}, bridge.flush()); // stale fence: re-anchor
-    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush()); // retry succeeds
+    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
     CRPC_CHECK_EQ(cl::health_state::passing, bridge.state("api", "n1"));
+    CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+}
+
+// --- G19 step1: writer-epoch admission at the bridge boundary ----------------
+
+CRPC_TEST(health_bridge_yielded_stops_writing_after_takeover) {
+    // A newer epoch takes the key; the old bridge must stop writing for good
+    // (next_writer_epoch() cannot prove the taker-over died, so re-acquiring an
+    // epoch would be a fail-open: the stale bridge would win the key back).
+    cl::registry reg;
+    register_node(reg, "api", "n1", 8001);
+
+    manual_clock clock;
+    cl::health_bridge old_bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(old_bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, old_bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+
+    cl::health_bridge new_bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    // The first flush only seeds the record from the catalog; the write needs a
+    // second observation (the same shape the takeover case uses).
+    CRPC_CHECK(new_bridge.report("api", "n1", true));
+    (void)new_bridge.flush();
+    CRPC_CHECK(new_bridge.report("api", "n1", true));
+    CRPC_CHECK_EQ(crpc::u64{1}, new_bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+
+    // The first flush after the takeover is where the old bridge learns it has
+    // been deposed: it observes the new writer's revision, wants to reassert its
+    // own (stale) verdict, asks for a token and is refused with stale_writer,
+    // which sets `yielded`. That one refused attempt legitimately allocates a
+    // sequence number, so it is not part of the "must not move" window.
+    CRPC_CHECK(old_bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{0}, old_bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+
+    // From here on the bridge is yielded. The flush counter alone cannot tell a
+    // yielded bridge from one that keeps trying and keeps being refused: both
+    // return 0 and both leave the catalog at passing. What separates them is
+    // whether the bridge still asks the authority for a fence token, so
+    // `reg.fence()` must not move across a flush of a yielded bridge. Without
+    // this assertion, deleting `record.yielded = true` (variation M38) leaves
+    // every other check green, because the stale epoch still rejects the write
+    // on its own.
+    for (int round = 0; round < 3; ++round) {
+        CRPC_CHECK(old_bridge.report("api", "n1", false));
+        const crpc::u64 fence_before = reg.fence();
+        CRPC_CHECK_EQ(crpc::u64{0}, old_bridge.flush());
+        CRPC_CHECK_EQ(fence_before, reg.fence());
+        CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+        // The bridge keeps its own (stale) verdict; it only stops publishing it.
+        CRPC_CHECK_EQ(cl::health_state::critical, old_bridge.state("api", "n1"));
+    }
+}
+
+CRPC_TEST(health_bridge_recovers_after_takeover_dies) {
+    // The supported recovery path is a freshly constructed bridge, which is
+    // granted a strictly newer epoch and may therefore write immediately.
+    cl::registry reg;
+    register_node(reg, "api", "n1", 8001);
+
+    manual_clock clock;
+    cl::health_bridge old_bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(old_bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, old_bridge.flush());
+
+    cl::health_bridge taker(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(taker.report("api", "n1", true));
+    (void)taker.flush();
+    CRPC_CHECK(taker.report("api", "n1", true));
+    CRPC_CHECK_EQ(crpc::u64{1}, taker.flush());
+    CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+
+    // The taker stops writing (it is "gone"); a brand-new bridge still holds a
+    // strictly newer epoch and takes over immediately. Its first flush does NOT
+    // merely seed here: the catalog is passing while the probe wants critical,
+    // so the bridge writes on that first pass (the seeding clamp only suppresses
+    // a desired state that is *less* severe than the catalog's).
+    cl::health_bridge recovery(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(recovery.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, recovery.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+    CRPC_CHECK_EQ(cl::health_state::critical, recovery.state("api", "n1"));
+
+    // The originally deposed bridge stays deposed: it never writes again.
+    CRPC_CHECK(old_bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{0}, old_bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+}
+
+CRPC_TEST(health_bridge_external_writer_epoch_zero_is_exempt) {
+    // An external writer with writer_epoch == 0 is exempt: it can write a key
+    // that an epoch-tracked bridge already owns, and it never moves the floor.
+    cl::registry reg;
+    register_node(reg, "api", "n1", 8001);
+
+    manual_clock clock;
+    cl::health_bridge bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+
+    // epoch 0: exempt, accepted even though a tracked writer owns the key.
+    external_register(reg, "api", "n1", cl::instance_state::passing);
+    CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
+
+    // The bridge's floor is untouched by that external write: it still owns the
+    // key and its next write is accepted with its original epoch.
+    CRPC_CHECK(bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
+    CRPC_CHECK_EQ(cl::instance_state::critical, registry_state(reg, "api", "n1"));
+}
+
+CRPC_TEST(health_bridge_records_epoch_on_bridge_write) {
+    // A bridge write must leave its epoch recorded: a writer at a strictly lower
+    // epoch is then refused, which is what makes the takeover stick.
+    cl::registry reg;
+    register_node(reg, "api", "n1", 8001);
+
+    manual_clock clock;
+    cl::health_bridge bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(bridge.report("api", "n1", false));
+    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
+
+    // The bridge's epoch is above the registration's (construction allocates
+    // one). A writer below it must be stale; the bridge's own epoch is accepted.
+    // Epoch 1 is a real, non-exempt epoch below the bridge's recorded one, so
+    // it is refused instead of being treated as an external (epoch-0) writer.
+    cl::write_context stale;
+    stale.node_id = "n1";
+    stale.incarnation = 1;   // must match the stored incarnation
+    stale.writer_epoch = 1;
+    stale.fence = reg.next_fence("api", "n1").value();
+    CRPC_CHECK_EQ(std::string("stale_writer"),
+                  rejection_reason_for(reg.set_state(
+                      "api", "n1", cl::instance_state::passing, stale)));
+
+    // The bridge still writes with its own (recorded) epoch.
+    CRPC_CHECK(bridge.report("api", "n1", true));
+    CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
     CRPC_CHECK_EQ(cl::instance_state::passing, registry_state(reg, "api", "n1"));
 }
 
@@ -556,13 +731,10 @@ CRPC_TEST(health_bridge_prunes_tombstones_without_writing) {
     CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
     CRPC_CHECK_EQ(std::size_t{1}, bridge.node_count());
 
-    // The bridge's own flush fenced the key, so the deletion must carry a
-    // fresh epoch like any other external write under the strict default.
-    cl::write_context removal = make_ctx("n1", 1);
-    const crpc::u64 published = reg.fence();
-    removal.fence = published == std::numeric_limits<crpc::u64>::max()
-                        ? published
-                        : published + 1;
+    // The bridge's own flush consumed an issuance, so the deletion must carry a
+    // token the authority issued, like any other external write.
+    cl::write_context removal =
+        make_issued_ctx(reg, "api", "n1", 1);
     CRPC_CHECK(reg.deregister("api", "n1", removal).ok());
 
     // The tombstone is visible only with include_deregistered=true; the bridge

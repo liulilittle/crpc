@@ -121,12 +121,21 @@ MSVC 19.51, x64 Debug, against the previous headers):
   capacity) and gained a second constructor.
 - `cluster::watch_stream` grew from 312 to 320 bytes (cancel-barrier state:
   the dispatching thread id and an in-callback flag).
+- `cluster::write_context` grew from 96 to 104 bytes (x64 Debug; 80 to 88
+  Release): one trailing `u64 writer_epoch`. This is a **second MAJOR break in
+  the same unreleased slice**, accepted deliberately because the field cannot be
+  added any other way: it is the only thing that lets a writer prove it is the
+  current owner of a key rather than merely the holder of a fresh fence token.
+  See the writer-epoch paragraph below for the semantics and for the one
+  default that keeps the guard from failing open.
 
 `cluster::lease_manager` (200 bytes), `cluster::lease` (120),
 `cluster::lease_config` (32), `cluster::health_monitor` (64),
 `cluster::registry_snapshot` (40), `cluster::service_instance` (192),
-`cluster::write_context` (96), `cluster::write_result` (24) and
-`cluster::watch_event` (72) keep their layout. The new symbols are MINOR
+`cluster::write_result` (24) and `cluster::watch_event` (72) keep their layout.
+`cluster::write_context` (104) does not: it took the trailing epoch field
+described above.
+The new symbols are MINOR
 additions: `cluster::registry::fence_barrier(const std::string&, const
 std::string&, u64, const write_context&)`, `cluster::watch_stream::park()`,
 `cluster::watch_stream::cancel()` and
@@ -134,27 +143,105 @@ std::string&, u64, const write_context&)`, `cluster::watch_stream::park()`,
 No enum value, wire field or protocol byte changed; the semantic fixes
 (grace-zero purge, tombstone high-water, bounded caller fencing, expired-lease
 renewal rejection, purge index/remove events, inclusive TTL boundary, watch
-cancel barrier/park/replay) are behaviour changes only. The three new
+cancel barrier/park/replay) are behaviour changes only. The four
 `registry_config` switches are **on by default**:
 `separate_state_writers=true`, `strict_fencing=true`,
-`strict_incarnation=true`. A pre-existing in-process deployment that relied on
-the historical overwrite semantics must set them to `false` explicitly. That
-legacy configuration is unsafe for any deployment with more than one writer:
-registration can clobber a health/lease verdict, an update of an externally
-fenced key can silently drop its fence, and a same-incarnation payload change
-overwrites instead of reporting the conflict.
+`strict_incarnation=true`, `require_issued_fence=true`. A pre-existing
+in-process deployment that relied on the historical overwrite semantics must set
+them to `false` explicitly. That legacy configuration is unsafe for any
+deployment with more than one writer: registration can clobber a health/lease
+verdict, an update of an externally fenced key can silently drop its fence, and
+a same-incarnation payload change overwrites instead of reporting the conflict.
+
+`registry_config::require_issued_fence` changed its default from `false` to
+`true` in this slice. The historical default of `false` was not a working
+configuration: with it off, L-b (issuance attribution) and Z2 (a zero fence is
+never a token) are both inert, so a peer that learnt the key high-water from any
+rejection could write with `high_water+1`, and an unfenced create could occupy a
+key. Turning the switch off is now the only way to get the historical numeric
+contract, and it means opting into both holes. An in-process caller that
+constructs a registry and immediately writes without calling
+`next_fence()`/`fence_barrier()` must either issue a token first (the supported
+shape) or set the switch to `false` and accept that the deployment has no
+issuance attribution. This is a behaviour change, not an ABI one: the field,
+its offset and `sizeof(registry_config)` are unchanged (x64 Debug 104, Release
+96; `sizeof(registry)` 432 / 384).
 
 Two further behaviour-only details belong to this section. A successful write
 reports the key's effective fence high-water in `write_result::fence` (it is
 never below a lease `fence_barrier`, so it can be presented to the next write of
 the same key); a `stale_fence` rejection carries that high-water in the additive
 `registry.fence` error-metadata key, which is how `health_bridge` re-anchors.
-Under `strict_fencing`, only a key that has never existed may be created with
-`fence=0`; a key whose tombstone watermark or fence high-water survived a purge
-is not fresh and a zero-fence create is rejected with
-`registry.reason=fence_required`.
+Under the default `require_issued_fence`, a zero fence is rejected on every
+path, including a create of a key that has never existed (Z2). A key whose
+tombstone watermark or fence high-water survived a purge is likewise not fresh:
+a zero-fence create is rejected with `registry.reason=fence_required`, and an
+unissued token above the high-water is rejected with
+`registry.reason=not_issued`.
 
-The unreleased G36 auto-sharding work adds **two MINOR exported symbols** plus
+**Writer epoch (the second MAJOR break in this slice).** `write_context` gained
+a trailing `u64 writer_epoch`, so the type is 104 bytes on x64 Debug and 88 on
+Release. Every consumer must be rebuilt; a consumer that only ever writes from
+one process and does not care about ownership can leave the field alone, because
+the default is the "unset" sentinel described next.
+
+The field answers a question the fence token cannot: *may this caller write at
+all, or has it been deposed?* A fence token proves the authority issued a
+number; it does not prove the holder is still the owner, because a replacement
+writer can always obtain a larger token. The epoch is the per-key high-water of
+the epochs that have actually committed, and a write whose epoch is below that
+high-water is rejected with `registry.reason=stale_writer` — a verdict the bridge
+treats differently from `stale_fence`: `stale_fence` means "ask for a fresh
+token and try again", while `stale_writer` means "you have been deposed, stop
+writing".
+
+Three values carry distinct meanings, and the default matters:
+
+- `UINT64_MAX` (the default) means *the caller did not set an epoch*. It is
+  rejected with `registry.reason=epoch_required`. The default is deliberately
+  the reject value: defaulting to zero would have silently promoted every
+  forgetful caller to the exempt case below, i.e. the guard would have failed
+  open instead of closed. `cluster::registry::next_writer_epoch()` returns a
+  value that is always strictly greater than every epoch handed out before, and
+  never returns the sentinel.
+- `0` means *an external writer that is not epoch-tracked*. It is accepted and
+  **does not update** the recorded high-water, so an external write can never
+  lower the floor that fences an epoch-tracked writer out.
+- Any other value is an epoch-tracked writer. It is accepted when it is greater
+  than or equal to the key's recorded high-water (an equal epoch is the same
+  writer continuing) and rejected with `stale_writer` when it is lower.
+
+`next_writer_epoch()` is a **monotonic number, not a capability**: it is handed
+to any caller with no identity or liveness check. Because acquiring a larger
+epoch is always possible, "I hold a larger epoch" is not evidence that the
+previous owner is gone. That is why `cluster::health_bridge` treats a
+`stale_writer` rejection as a permanent yield for that bridge instance: only a
+freshly constructed bridge may take the key back.
+
+**The epoch itself is not persisted.** It is allocated from the fence
+allocator's counter, and `restore_from_log` seeds each key's recorded epoch (and
+the global counter) from the fences the log actually records. Epochs a bridge
+consumed without writing — one per construction — are therefore not in the log.
+Measured consequences, by deployment shape:
+
+- Restoring into a **new** registry: a writer that predates the restore has an
+  epoch at or below the recorded fence and is rejected with `stale_writer`; the
+  direction is safe (`DEPOSED_CAN_OVERWRITE=0`).
+- Restoring **in place**, with a log that is not ahead of the registry: refused
+  outright with `registry.reason=stale_log`, so the floor cannot be lowered.
+- Restoring **in place**, with a log that is ahead: accepted, and if the log's
+  fence for a key exceeds a live bridge's epoch, that **legitimate** bridge is
+  rejected with `stale_writer` and — under the permanent-yield rule — stops
+  writing for the rest of its lifetime. A newly constructed bridge is granted an
+  epoch above the new floor and writes normally (`LIVE_BRIDGE_FROZEN_OUT=1`,
+  `fresh_epoch=902` accepted).
+
+So the residual gap is an **availability** one, not a safety one: replaying a
+log under live bridges can freeze a legitimate writer, and it never lets a
+deposed one overwrite. A deployment that replays must reconstruct its bridges;
+cross-process epoch persistence is a step-2 work item.
+
+The G36 auto-sharding work adds **two MINOR exported symbols** plus
 **two header-inline `shards_auto()` overloads (no exported symbol)**, with no
 layout change: the free function `crpc::rpc::default_shard_count()` and
 `crpc::server::shard_count()` are the two exported symbols;

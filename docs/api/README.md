@@ -98,6 +98,7 @@ the authoritative declaration.
 | [`cluster/election.hpp`](../../include/crpc/cluster/election.hpp) | `cluster::election` | Leader election primitives. |
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | Health checkers. |
 | [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`, `cluster::health_instance_set` | Debounced health-to-registry writer and read-only load-balancer view. |
+| [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp) | `cluster::registry_log`, `cluster::file_registry_log`, `cluster::memory_registry_log` | Durable, replayable record log backing the registry's write-ahead log. |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | Index-based watch/subscription over the registry. |
 | [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`, `flow::pacer`, `flow::congestion_window`, `flow::rtt_tracker` | Adaptive flow-control primitives. |
 | [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`, `rpc::flow_control_options`, `rpc::flow_state` | Connection-level flow control: byte window, PING/PONG probes, per-lane quotas, pacer. |
@@ -509,6 +510,7 @@ without registering it here fails the suite.
 - [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp)
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
+- [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)
 
 ### `crpc/flow`

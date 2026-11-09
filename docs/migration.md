@@ -117,3 +117,138 @@ The unreleased diagnostics work is a MAJOR change on top of 2.0.0:
 
 Rebuild every consumer from the same headers and relink. The old and new mangled
 names are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## 6. Unreleased: `registry_config::require_issued_fence` defaults to `true`
+
+This is a **behaviour change, not an ABI break**. The field, its offset and
+`sizeof(registry_config)` are unchanged, so no consumer has to be rebuilt for the
+layout. What changes is that a default-constructed `cluster::registry` now
+enforces issuance attribution (L-b) and the zero-fence rule (Z2).
+
+### What breaks
+
+A caller that constructs a registry and immediately writes without obtaining a
+token from the authority:
+
+```cpp
+cluster::registry reg;                     // default config
+auto r = reg.register_instance(instance, ctx);   // ctx.fence == 0
+// before: accepted   now: failed_precondition / registry.reason=fence_required
+```
+
+A caller that forges its own token from a value it observed:
+
+```cpp
+ctx.fence = reg.fence_floor(service, node).value() + 1;   // not an issuance
+// before: accepted (numeric contract)   now: registry.reason=not_issued
+```
+
+### How to migrate
+
+1. **Preferred: obtain the token from the authority.** Every write of a key
+   should present a token issued for that exact key, principal and lease:
+
+   ```cpp
+   const auto token = reg.next_fence(service, node_id);
+   if (!token.ok()) { /* handle */ }
+   cluster::write_context ctx;
+   ctx.node_id = node_id;
+   ctx.incarnation = incarnation;
+   ctx.fence = token.value();
+   ctx.writer_epoch = 0;  // external writer: epoch tracking not used
+   reg.register_instance(instance, ctx);
+   ```
+
+   `writer_epoch` defaults to `UINT64_MAX`, which is the "caller did not set
+   an epoch" sentinel and is **rejected** with
+   `registry.reason=epoch_required`. Only epoch-tracked writers (a health bridge
+   or an equivalent service-level writer) set it, from
+   `registry::next_writer_epoch()`; an external writer that is not part of that
+   regime must explicitly set `0`, which is the documented exemption and is never
+   recorded as the key's epoch floor.
+
+   `next_fence()` returns `max(global allocation, per-key high-water) + 1`, so
+   one call clears any lease `fence_barrier` as well. A token is spent by the
+   write it authorises: the next mutation of the same key needs a fresh
+   issuance. For a lease, the token the grant published is already bound to the
+   lease id, so pass `lease_id` to `register_instance`/`set_state`/`deregister`.
+
+2. **The bridge does this for you.** `cluster::health_bridge::flush()` asks the
+   registry for a token per key on every write; no caller change is needed.
+
+3. **Only if the caller is genuinely single-writer and in-process**, set the
+   switch off explicitly and record the risk:
+
+   ```cpp
+   cluster::registry_config config;
+   config.require_issued_fence = false;   // L-b and Z2 are now inert
+   cluster::registry reg(config);
+   ```
+
+   With it off, a peer that learnt the key high-water can write with
+   `high_water+1`, and a zero fence can create a key. That is the historical
+   behaviour and it is unsafe with more than one writer.
+
+4. Turning `strict_fencing` off alone is **not** enough to restore the old
+   unfenced shape: `require_issued_fence` owns Z2 independently. A legacy
+   in-process caller that relied on unfenced writes needs both switches off.
+
+### Verification
+
+`tests/test_cluster_phase0.cpp` pins the default directly:
+`default_config_rejects_unissued_token` (a never-issued token is rejected with
+`not_issued`), `default_config_rejects_zero_fence` (`fence_required`),
+`default_config_accepts_issued_token` (a token from `next_fence()` works and is
+spent by the write), and `health_bridge_uses_authority_issued_token` (the bridge
+presents an authority-issued token). `tests/test_registry_fence.cpp` pins the
+semantics of the switch when it is set explicitly.
+
+## 7. Unreleased: `cluster::health_bridge` must be rebuilt after a registry log restore
+
+A `health_bridge` carries a `writer_epoch` obtained from
+`registry::next_writer_epoch()`. The epoch is allocated from the registry's
+global fence allocator, which a log restore only rewinds to the highest fence
+actually **recorded** in the log. Epochs that a bridge consumed without writing
+(one per construction, one per takeover) are not in the log, so after a restore
+the allocator can hand out an epoch lower than one a surviving bridge still
+holds.
+
+**Step 1 rule:** a registry that restores from a log must be followed by
+**reconstructing every `health_bridge`** bound to it. In step 1 the bridge lives
+inside the same process as the registry, so a process restart already rebuilds
+it; this rule only matters if you replay a log into a registry that outlives the
+bridges.
+
+**Step 2:** cross-process epoch persistence is a required work item; see
+`plan.md` step2. Until it lands, do not run bridges across a registry restore.
+
+Residual risk (P-d): there is no runtime check that detects "the allocator
+handed out an epoch below a surviving bridge". Step 1's deployment shape (one
+process for both) is what keeps the rule true.
+
+**Which harm the violation actually causes.** The direction is worth stating
+precisely, because the intuitive guess is the wrong one. Replaying a log into a
+registry that live bridges still point at does **not** let a deposed writer
+overwrite newer state:
+
+- A restore into a *new* registry rejects a pre-restart writer whose epoch is
+  below the log's fence, because the recorded floor is seeded from that fence
+  (measured: rejected with `registry.reason=stale_writer`).
+- An in-place restore is refused outright when the log is not ahead of the
+  registry (`registry.reason=stale_log`), so a log that would *lower* the floor
+  cannot be replayed.
+- When the log *is* ahead, its record for a key carries a fence above every
+  surviving bridge's epoch, so the floor moves **up**, not down.
+
+The harm is therefore **availability, not safety**: the surviving bridge's epoch
+is now below the recorded floor, so it is refused with `stale_writer` and — by
+the permanent-yield rule — stops writing for the rest of its lifetime, even
+though it is the legitimate owner. A freshly constructed bridge is granted an
+epoch above the new floor and writes normally. Measured on the accepted
+in-place path: the live bridge was refused `stale_writer` while a newly
+constructed one succeeded.
+
+So the rule "reconstruct every `health_bridge` after a restore" is about not
+freezing the live writer, not about stopping a stale one. A deployment that
+skips the rule loses write availability on every key whose fence the log
+raised, and does not gain any stale-writer protection problem.

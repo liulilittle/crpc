@@ -152,11 +152,19 @@ private:
         monotonic_clock::time_point remove_at;
     };
 
-    [[nodiscard]] u64 next_fence_locked();
+    [[nodiscard]] u64 next_fence_locked(const std::string& service,
+                                       const std::string& node_id);
     [[nodiscard]] u64 current_incarnation(const std::string& service,
                                           const std::string& node_id) const;
     [[nodiscard]] std::chrono::milliseconds resolve_ttl(
         std::chrono::milliseconds ttl) const;
+    // Lease-attributed write helper: the token a grant issued is bound to the
+    // lease id, so the registry can reject its reuse by another lease (L-b).
+    // `fence` must be a FRESH issuance for this key: a grant publishes a token
+    // and the holder's registration spends it, so the token stored in the entry
+    // is consumed. The authority accepts an outstanding issuance only
+    // (`registry.reason=stale_fence` otherwise), therefore every authority write
+    // re-issues before presenting one.
     [[nodiscard]] result<write_result> apply_state(const entry& current,
                                                    instance_state state, u64 fence);
 

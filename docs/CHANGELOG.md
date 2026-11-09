@@ -4,6 +4,65 @@
 
 ## Unreleased
 
+### MAJOR: `cluster::write_context` gains a trailing `writer_epoch`
+
+- **MAJOR (consumer-visible layout).** `cluster::write_context` grows from 96 to
+  104 bytes on x64 Debug (80 to 88 on Release): one trailing `u64 writer_epoch`.
+  Every consumer must be rebuilt from the matching headers. This is the second
+  MAJOR break in the same unreleased G19 slice, accepted deliberately because the
+  field cannot be added any other way.
+
+  The field answers a question the fence token cannot: whether the caller may
+  write at all, or has been deposed. A fence token proves the authority issued a
+  number; it does not prove the holder is still the owner, because a replacement
+  writer can always obtain a larger token. `writer_epoch` is the per-key
+  high-water of epochs that have actually committed. A write whose epoch is below
+  that high-water is rejected with `registry.reason=stale_writer`, which the
+  health bridge treats as "you have been deposed, stop writing" (unlike
+  `stale_fence`, which means "ask for a fresh token and retry").
+
+  Three values are distinct. `UINT64_MAX` is the default and means "not set": it
+  is rejected with `registry.reason=epoch_required`, so a forgotten assignment
+  fails closed rather than silently becoming an exempt external writer. `0` is
+  the exempt external writer: accepted, and it does not update the recorded
+  high-water. Any other value is an epoch-tracked writer, accepted at or above
+  the recorded high-water and rejected with `stale_writer` below it. New
+  `cluster::registry::next_writer_epoch()` returns a strictly increasing value
+  from the fence allocator's counter; `restore_from_log` seeds the recorded
+  epoch from the log record's fence. `next_writer_epoch()` is a monotonic
+  number, not a capability: it is granted without identity or liveness checks, so
+  `health_bridge` treats a `stale_writer` rejection as a permanent yield for that
+  instance and only a freshly constructed bridge may take over.
+
+  The epoch is **not persisted**, so the residual gap is an availability one, not
+  a safety one. Measured by deployment shape: restoring into a new registry
+  rejects a pre-restart writer (`stale_writer`); an in-place restore whose log is
+  not ahead is refused (`registry.reason=stale_log`), so the floor cannot drop;
+  an in-place restore whose log *is* ahead can freeze a live, legitimate bridge
+  (`stale_writer`, permanent yield) while a newly constructed bridge writes
+  normally. Replaying a log therefore never lets a deposed writer overwrite, but
+  it can stop a legitimate one until the bridge is rebuilt.
+  New cases: `write_context_unset_epoch_is_rejected`,
+  `zero_epoch_is_accepted_and_not_recorded`,
+  `stale_writer_cannot_overwrite_newer_epoch`, `epoch_is_checked_before_fence`,
+  `same_epoch_may_write_again`, `epoch_grant_is_unconditional`,
+  `epoch_floor_survives_restore`, and the bridge-side
+  `health_bridge_yielded_stops_writing_after_takeover` /
+  `health_bridge_recovers_after_takeover_dies`.
+
+### Fix: a public header no longer breaks under `windows.h`
+
+- **No ABI or behaviour change.** `cluster::write_context::writer_epoch`'s
+  default member initialiser is written `(std::numeric_limits<u64>::max)()`.
+  `windows.h` defines a function-like `max` macro unless `NOMINMAX` is set, and a
+  default member initialiser is expanded while the header is parsed, so the
+  unparenthesised form failed to compile for any consumer that included
+  `windows.h` before `crpc/cluster/registry.hpp` (C4003/C2589/C2059). The
+  in-tree build passed `/DNOMINMAX` to every target, which is why this was never
+  seen from inside the project. `tests/test_public_header_include_order.cpp` now
+  undefines `NOMINMAX`, includes `windows.h`, and then all public cluster
+  headers, so the build itself exercises the out-of-tree configuration.
+
 ### Build: POSIX exec-status writes are warning-free on fortified GCC
 
 - **No behaviour change.** `src/system/process.cpp` now consumes the result of
@@ -74,12 +133,17 @@
   `registry.fence_out_of_range`, so one peer can no longer pin the fence domain
   at `UINT64_MAX`. With `strict_fencing` (default **on**), an update of a key
   that has accepted an external epoch must carry a non-zero token
-  (`registry.reason=fence_required`). Only a key that has never existed may be
-  created with `fence=0`: a pre-granted lease can still be followed by its first
-  registration. A key that has a surviving tombstone watermark or fence
-  high-water is **not** fresh — even after `purge_expired_tombstones()` removed
-  the visible row — so a zero-fence create on it is rejected with
-  `registry.reason=fence_required` instead of resetting the epoch.
+  (`registry.reason=fence_required`). `registry_config::require_issued_fence`
+  now defaults to **on** as well, which is what makes Z2 unconditional: a zero
+  fence is rejected on every path, including the first registration of a key
+  that has never existed. An unissued token above the key high-water is
+  rejected with `registry.reason=not_issued`, so knowing the high-water is no
+  longer the same as being allowed to use it (L-b). The historical `false`
+  default is now an explicit opt-out that disables both L-b and Z2; the
+  migration steps are in [migration.md](migration.md). A key that has a
+  surviving tombstone watermark or fence high-water is **not** fresh — even
+  after `purge_expired_tombstones()` removed the visible row — so a zero-fence
+  create on it is rejected instead of resetting the epoch.
   `lease_manager::grant` publishes a fence barrier through the new
   `registry::fence_barrier` before it returns, so a replaced lease cannot write
   with its old fence. A successful write now reports the key's effective fence
@@ -92,7 +156,10 @@
   before the instance exists binds to the first incarnation it observes and is
   applied on expiry, so grant-before-register no longer loses the expiry as a
   stale write. A lease bound to a superseded incarnation is rejected/dropped
-  instead of following the new registration.
+  instead of following the new registration. The sweep now re-issues a token
+  before the critical mark and before the tombstone, because the grant's token
+  was already spent by the holder's registration; presenting the consumed value
+  returned `stale_fence` and the expiry was dropped (`++sweep.rejected`).
 - **Registration (P5/P8/P11/P12).** A registration now requires a non-empty
   endpoint host; a non-empty host with port 0 remains the inproc sentinel.
   `separate_state_writers` (default **on**) keeps the health/lease-owned state

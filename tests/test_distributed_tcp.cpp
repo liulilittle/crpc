@@ -320,17 +320,31 @@ bool register_node(cl::registry& registry, const node& value,
     instance.incarnation = incarnation;
     instance.state = cl::instance_state::passing;
 
+    // The default config is strict: the token must be issued by the authority
+    // for this exact key before the registration can present it.
+    const auto token = registry.next_fence(k_service_name, value.state->id);
+    if (!token.ok()) {
+        return false;
+    }
     cl::write_context context;
     context.node_id = value.state->id;
     context.incarnation = incarnation;
+    context.fence = token.value();
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
     return registry.register_instance(instance, context).ok();
 }
 
 bool set_node_state(cl::registry& registry, const node& value,
                     cl::instance_state state, crpc::u64 incarnation = 1) {
+    const auto token = registry.next_fence(k_service_name, value.state->id);
+    if (!token.ok()) {
+        return false;
+    }
     cl::write_context context;
     context.node_id = value.state->id;
     context.incarnation = incarnation;
+    context.fence = token.value();
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
     return registry.set_state(k_service_name, value.state->id, state, context)
         .ok();
 }
@@ -810,9 +824,15 @@ CRPC_TEST(tcp_discovery_and_route_convergence) {
     nodes[2].stop();
     CRPC_CHECK(wait_for_listener_closed(nodes[2].ep()));
     {
+        // The deregistration is the node's own authority write, so it needs a
+        // token issued for its key.
+        const auto token = registry.next_fence(k_service_name, states[2].id);
+        CRPC_REQUIRE(token.ok());
         cl::write_context context;
         context.node_id = states[2].id;
         context.incarnation = 1;
+        context.fence = token.value();
+        context.writer_epoch = 0;  // external writer: not epoch-tracked
         CRPC_CHECK(registry
                        .deregister(k_service_name, states[2].id, context)
                        .ok());

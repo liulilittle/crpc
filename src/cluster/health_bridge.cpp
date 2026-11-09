@@ -50,6 +50,12 @@ namespace {
     return value == 0xFFFFFFFFu ? value : value + 1;
 }
 
+// True when the registry refusal carries exactly this `registry.reason`.
+[[nodiscard]] bool reason_is(const rpc_error& error, const char* reason) {
+    const std::string* found = error.metadata.find("registry.reason");
+    return found != nullptr && *found == reason;
+}
+
 } // namespace
 
 struct health_bridge::impl {
@@ -61,12 +67,11 @@ struct health_bridge::impl {
         u32 failures = 0;
         // Revision of the catalog instance this bridge last observed or wrote.
         u64 observed_revision = 0;
-        // Next fencing token to request. Zero means "use the bridge epoch".
-        u64 next_fence = 0;
         bool seeded = false;
         // An external writer downgraded the catalog state; rewrite `committed`.
         bool reassert = false;
-        // A newer fencing epoch owns this instance; stop writing.
+        // A newer writer epoch owns this instance; stop writing until a fresh
+        // epoch proves that owner is gone.
         bool yielded = false;
     };
 
@@ -76,8 +81,11 @@ struct health_bridge::impl {
     u32 success_threshold = 2;
     std::size_t max_nodes = 4096;
     monotonic_clock clock = system_monotonic_clock();
-    // Base of this bridge's fencing epoch (see the header contract).
-    u64 fence_base = 1;
+    // Writer epoch granted to this bridge. A newer bridge takes over by holding
+    // a strictly greater epoch; this one stops writing until it can obtain a
+    // fresh, greater epoch from the authority (which is possible once the
+    // taker-over dies, so the yield is recoverable rather than permanent).
+    u64 writer_epoch = 0;
 
     mutable std::mutex mutex;
     std::map<std::pair<std::string, std::string>, record> records;
@@ -236,23 +244,12 @@ endpoint health_instance_set::address_at(std::size_t index) const {
 
 namespace {
 
-// One bridge owns one fencing epoch. The high 32 bits identify the epoch and
-// the low 32 bits are a per-write sequence. The epoch is derived from the
-// registry's last accepted global fence and is strictly greater than any epoch
-// already published, so a bridge constructed after a previous bridge published
-// its first fence can never be overwritten by the old epoch (the registry
-// rejects a lower fence for the key). The registry's own `fence` allocator
-// keeps the low bits strictly increasing across accepted writes.
-[[nodiscard]] u64 next_fence_epoch(u64 observed) noexcept {
-    if (observed == std::numeric_limits<u64>::max()) {
-        return observed;
-    }
-    const u64 epoch = observed >> 32;
-    if (epoch >= 0xFFFFFFFFull) {
-        return observed + 1;
-    }
-    return (epoch + 1) << 32;
-}
+// The bridge owns no fencing arithmetic. Every token it presents is obtained
+// from the registry authority (catalog->next_fence) for the exact key it is
+// about to write, so a token carries the authority's own high-water and the
+// bridge cannot manufacture a fence the authority never granted (L-b). The old
+// `next_fence_epoch`/`impl::fence_base` pair is gone: a self-made
+// high_water+1 was exactly the hole L-b closes.
 
 } // namespace
 
@@ -266,7 +263,8 @@ health_bridge::health_bridge(registry& catalog, std::chrono::milliseconds deboun
     impl_->success_threshold = success_threshold == 0 ? 1 : success_threshold;
     impl_->max_nodes = max_nodes;
     impl_->clock = clock.now != nullptr ? clock : system_monotonic_clock();
-    impl_->fence_base = next_fence_epoch(catalog.fence());
+    const result<u64> epoch = impl_->catalog->next_writer_epoch();
+    impl_->writer_epoch = epoch.ok() ? epoch.value() : 0;
 }
 
 health_bridge::~health_bridge() = default;
@@ -415,13 +413,6 @@ std::size_t health_bridge::flush(monotonic_clock::time_point now) {
             // Equal severity: an identity-only rewrite. Re-anchor above.
         }
 
-        if (record.yielded) {
-            // A newer fencing epoch owns this instance. Keep observing so the
-            // record can be pruned when the catalog drops it, but never write.
-            ++it;
-            continue;
-        }
-
         if (record.desired != record.committed) {
             // A pending, probe-driven transition supersedes a repair write.
             record.reassert = false;
@@ -441,12 +432,29 @@ std::size_t health_bridge::flush(monotonic_clock::time_point now) {
             continue;
         }
 
+        if (record.yielded) {
+            // A newer writer epoch owns this instance. This bridge yielded for
+            // good: only a freshly constructed bridge gets a new epoch, because
+            // next_writer_epoch() cannot prove the taker-over died (it hands out
+            // a strictly greater value to any caller, including this one, so
+            // re-acquiring would let a stale writer win the key back).
+            ++it;
+            continue;
+        }
+
+        // Every write carries a token the registry issued for this exact key.
+        // The bridge never adds one itself: a caller-side high_water+1 is not an
+        // issuance and is rejected with not_issued under the default config.
+        const result<u64> token = impl_->catalog->next_fence(service, node_id);
+        if (!token.ok()) {
+            ++it;
+            continue;
+        }
         write_context context;
         context.node_id = node_id;
         context.incarnation = instance.incarnation;
-        context.fence = record.next_fence > impl_->fence_base
-                            ? record.next_fence
-                            : impl_->fence_base;
+        context.fence = token.value();
+        context.writer_epoch = impl_->writer_epoch;
         std::optional<result<write_result>> written;
         try {
             written.emplace(impl_->catalog->set_state(
@@ -460,54 +468,27 @@ std::size_t health_bridge::flush(monotonic_clock::time_point now) {
             record.desired = target;
             record.desired_since = now;
             record.observed_revision = written->value().index;
-            record.next_fence =
-                written->value().fence == std::numeric_limits<u64>::max()
-                    ? written->value().fence
-                    : written->value().fence + 1;
             record.reassert = false;
             impl_->bump_health();
             ++applied;
+        } else if (written->error().code == rpc_code::failed_precondition &&
+                   reason_is(written->error(), "stale_writer")) {
+            // A newer writer epoch owns this instance. Stop writing until a
+            // fresh epoch proves that owner is gone (see the yield block above).
+            record.yielded = true;
+            ++it;
+            continue;
         } else if (written->error().code == rpc_code::not_found) {
+            // The catalog no longer knows this key: prune the record. erase()
+            // returns the next iterator, so the loop must not advance again.
             it = impl_->records.erase(it);
             continue;
-        } else if (const std::string* reason =
-                       written->error().metadata.find("registry.reason");
-                   reason != nullptr && *reason == "stale_fence") {
-            // F3: the registry reports the key's effective high-water in the
-            // rejection. The global fence can be far below it when a lease
-            // fence_barrier raised the key without moving the global
-            // allocation, so re-anchoring from the global fence alone would
-            // retry a permanently stale token.
-            u64 observed = impl_->catalog->fence();
-            if (const std::string* reported =
-                    written->error().metadata.find("registry.fence");
-                reported != nullptr) {
-                try {
-                    const u64 key_fence = std::stoull(*reported);
-                    if (key_fence > observed) {
-                        observed = key_fence;
-                    }
-                } catch (...) {
-                    // A malformed report falls back to the global fence.
-                }
-            }
-            const u64 epoch_fence = impl_->fence_base >> 32;
-            if ((observed >> 32) > epoch_fence) {
-                // A newer bridge epoch has taken over. Stop writing instead of
-                // fighting it; the record still observes the catalog.
-                record.yielded = true;
-            } else {
-                // Same epoch: an ordinary write advanced the key's fence above
-                // this bridge's sequence. Re-anchor above it and retry on the
-                // next flush.
-                record.next_fence =
-                    observed == std::numeric_limits<u64>::max()
-                        ? observed
-                        : observed + 1;
-            }
         }
-        // Any other failure (stale incarnation, resource bound) stays
-        // pending: the next flush retries with a fresh registry reading.
+        // Any other refusal (stale_fence, not_issued, stale incarnation) leaves
+        // the candidate pending: the next flush reads the key again and asks the
+        // authority for a fresh token, which is the only legal way to re-anchor.
+        // There is no local high-water bookkeeping to update: the authority's
+        // next_fence() already jumps over every floor.
         ++it;
     }
     return applied;

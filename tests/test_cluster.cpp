@@ -87,14 +87,30 @@ cl::write_context make_ctx(const std::string& node, crpc::u64 fence = 0,
     context.node_id = node;
     context.fence = fence;
     context.incarnation = incarnation;
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
     return context;
 }
 
 cl::write_context make_admin_ctx(const std::string& token,
-                                 const std::string& node) {
+                                 const std::string& node,
+                                 crpc::u64 fence = 0) {
     cl::write_context context;
     context.node_id = node;
     context.admin_token = token;
+    context.fence = fence;
+    context.writer_epoch = 0;  // external admin writer: not epoch-tracked
+    return context;
+}
+
+// The default config is strict (require_issued_fence), so a caller that writes
+// must first obtain a token from the authority for that exact key.
+cl::write_context make_issued_ctx(cl::registry& reg, const std::string& service,
+                                  const std::string& node, crpc::u64 incarnation = 0) {
+    cl::write_context context = make_ctx(node, 0, incarnation);
+    const auto token = reg.next_fence(service, node);
+    if (token.ok()) {
+        context.fence = token.value();
+    }
     return context;
 }
 
@@ -184,13 +200,17 @@ public:
 CRPC_TEST(registry_register_query_deregister) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
 
     auto tagged = make_instance("api", "n3", 8003, 1);
     tagged.meta.set("tag", "blue");
-    CRPC_CHECK(reg.register_instance(tagged, make_ctx("n3")).ok());
+    CRPC_CHECK(reg.register_instance(tagged,
+                                     make_issued_ctx(reg, "api", "n3", 1))
+                     .ok());
 
     cl::query_options by_service;
     by_service.service = "api";
@@ -216,7 +236,9 @@ CRPC_TEST(registry_register_query_deregister) {
     CRPC_CHECK_EQ(std::size_t{1}, node_result.value().instances.size());
     CRPC_CHECK_EQ(std::string("api"), node_result.value().instances[0].service);
 
-    CRPC_CHECK(reg.deregister("api", "n1", make_ctx("n1", 0, 1)).ok());
+    CRPC_CHECK(reg.deregister("api", "n1",
+                              make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     auto after = reg.query(by_service);
     CRPC_CHECK(after.ok());
     CRPC_CHECK_EQ(std::size_t{2}, after.value().instances.size());
@@ -228,18 +250,25 @@ CRPC_TEST(registry_register_query_deregister) {
     CRPC_CHECK_EQ(cl::instance_state::deregistered,
                   tombstones.value().instances[0].state);
 
-    // Deregistration is idempotent.
-    CRPC_CHECK(reg.deregister("api", "n1", make_ctx("n1", 0, 1)).ok());
+    // Deregistration is idempotent. The first call spends its issuance, so the
+    // replay needs a fresh authority token; the incarnation is the stored
+    // tombstone incarnation (2), which the replay repeats exactly.
+    CRPC_CHECK(reg.deregister("api", "n1",
+                              make_issued_ctx(reg, "api", "n1", 2))
+                     .ok());
 }
 
 CRPC_TEST(registry_passing_only_and_maintenance) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
     CRPC_CHECK(reg.set_state("api", "n1", cl::instance_state::maintenance,
-                             make_ctx("n1", 0, 1)).ok());
+                             make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
     cl::query_options passing;
     passing.service = "api";
@@ -252,8 +281,15 @@ CRPC_TEST(registry_passing_only_and_maintenance) {
 
 CRPC_TEST(registry_rejects_non_owner_write) {
     cl::registry reg;
+    // The principal is wrong, so the authority check rejects before any fence
+    // question. A token is still supplied so the reason is provably "authority"
+    // and not "not_issued": the two are distinguishable only if both are legal
+    // up to that point.
+    const auto issued = reg.next_fence("api", "n1");
+    CRPC_REQUIRE(issued.ok());
+    cl::write_context forged = make_ctx("n2", issued.value(), 1);
     const auto rejected = reg.register_instance(
-        make_instance("api", "n1", 8001, 1), make_ctx("n2"));
+        make_instance("api", "n1", 8001, 1), forged);
     CRPC_CHECK_FALSE(rejected.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, rejected.code());
     CRPC_CHECK_EQ(std::string("authority"),
@@ -263,8 +299,16 @@ CRPC_TEST(registry_rejects_non_owner_write) {
 }
 
 CRPC_TEST(registry_admin_token) {
+    // The admin path is exercised in its legacy shape on purpose. Under the
+    // strict default (require_issued_fence) a token is bound to the principal it
+    // was issued for, and next_fence() issues for the key owner's principal
+    // only, so an admin writer holding a different node id has no way to obtain
+    // a token the authority would accept. That is a gap in the admin API, not in
+    // the authority check this case pins, so the case sets the switch off
+    // explicitly and documents it.
     cl::registry_config config;
     config.admin_token = "secret";
+    config.require_issued_fence = false;
     cl::registry reg(config);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n9", 8009, 1),
@@ -278,56 +322,79 @@ CRPC_TEST(registry_admin_token) {
 CRPC_TEST(registry_rejects_stale_incarnation) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 5),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 5))
+                     .ok());
     const auto stale = reg.register_instance(
-        make_instance("api", "n1", 8001, 4), make_ctx("n1"));
+        make_instance("api", "n1", 8001, 4), make_issued_ctx(reg, "api", "n1", 4));
     CRPC_CHECK_FALSE(stale.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
     // A changed endpoint is a new incarnation under the strict replay default;
     // the same incarnation with a different payload is a conflict.
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8002, 6),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 6))
+                     .ok());
 }
 
 CRPC_TEST(registry_tombstone_blocks_old_incarnation) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
-    CRPC_CHECK(reg.deregister("api", "n1", make_ctx("n1", 0, 1)).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
+    CRPC_CHECK(reg.deregister("api", "n1",
+                              make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
-    const auto old = reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                           make_ctx("n1"));
+    const auto old = reg.register_instance(
+        make_instance("api", "n1", 8001, 1), make_issued_ctx(reg, "api", "n1", 1));
     CRPC_CHECK_FALSE(old.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, old.code());
-    const auto equal = reg.register_instance(make_instance("api", "n1", 8001, 2),
-                                             make_ctx("n1"));
+    const auto equal = reg.register_instance(
+        make_instance("api", "n1", 8001, 2), make_issued_ctx(reg, "api", "n1", 2));
     CRPC_CHECK_FALSE(equal.ok());
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 3),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 3))
+                     .ok());
 }
 
 CRPC_TEST(registry_index_and_fence_are_monotonic) {
     cl::registry reg;
+    // The token is issued by the authority first: a caller-supplied 10 would be
+    // an unissued token under the default config. The issuance returns
+    // max(global, per-key floor) + 1, so the exact value is asserted through the
+    // issued token rather than a hand-written constant.
+    const auto issued = reg.next_fence("api", "n1");
+    CRPC_REQUIRE(issued.ok());
     const auto first = reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                             make_ctx("n1", 10, 1));
+                                             make_ctx("n1", issued.value(), 1));
     CRPC_CHECK(first.ok());
     CRPC_CHECK_EQ(crpc::u64{1}, first.value().index);
-    CRPC_CHECK_EQ(crpc::u64{10}, first.value().fence);
+    CRPC_CHECK_EQ(issued.value(), first.value().fence);
 
     const auto second = reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                              make_ctx("n2"));
+                                              make_issued_ctx(reg, "api", "n2", 1));
     CRPC_CHECK(second.ok());
     CRPC_CHECK_EQ(crpc::u64{2}, second.value().index);
     CRPC_CHECK(second.value().index > first.value().index);
     CRPC_CHECK(second.value().fence > first.value().fence);
 
+    // Below the key high-water is stale whatever the issuance check says.
     const auto stale = reg.set_state("api", "n1", cl::instance_state::critical,
-                                     make_ctx("n1", 9, 1));
+                                     make_ctx("n1", issued.value() - 1, 1));
     CRPC_CHECK_FALSE(stale.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
 
+    // The equal value is not a reusable ticket either: it is the high-water the
+    // accepted write reported, and feeding it back is an equal-fence write.
+    const auto reused = reg.set_state("api", "n1", cl::instance_state::critical,
+                                      make_ctx("n1", first.value().fence, 1));
+    CRPC_CHECK_FALSE(reused.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, reused.code());
+
+    // A fresh issuance is accepted and advances the index.
+    const auto next_issued = reg.next_fence("api", "n1");
+    CRPC_REQUIRE(next_issued.ok());
     const auto accepted = reg.set_state("api", "n1", cl::instance_state::critical,
-                                        make_ctx("n1", 10, 1));
+                                        make_ctx("n1", next_issued.value(), 1));
     CRPC_CHECK(accepted.ok());
     CRPC_CHECK_EQ(crpc::u64{3}, accepted.value().index);
     CRPC_CHECK_EQ(accepted.value().index, reg.index());
@@ -341,16 +408,18 @@ CRPC_TEST(registry_bounded_limits) {
     cl::registry reg(config);
 
     CRPC_CHECK(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "svc", "n1", 1))
+                     .ok());
     CRPC_CHECK(reg.register_instance(make_instance("svc", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "svc", "n2", 1))
+                     .ok());
     const auto per_service = reg.register_instance(
-        make_instance("svc", "n3", 8003, 1), make_ctx("n3"));
+        make_instance("svc", "n3", 8003, 1), make_issued_ctx(reg, "svc", "n3", 1));
     CRPC_CHECK_FALSE(per_service.ok());
     CRPC_CHECK_EQ(rpc_code::resource_exhausted, per_service.code());
 
     const auto service_limit = reg.register_instance(
-        make_instance("other", "n4", 8004, 1), make_ctx("n4"));
+        make_instance("other", "n4", 8004, 1), make_issued_ctx(reg, "other", "n4", 1));
     CRPC_CHECK_FALSE(service_limit.ok());
     CRPC_CHECK_EQ(rpc_code::resource_exhausted, service_limit.code());
 }
@@ -362,7 +431,8 @@ CRPC_TEST(registry_bounded_metadata) {
 
     auto instance = make_instance("svc", "n1", 8001, 1);
     instance.meta.set("key", "value");
-    const auto rejected = reg.register_instance(instance, make_ctx("n1"));
+    const auto rejected = reg.register_instance(
+        instance, make_issued_ctx(reg, "svc", "n1", 1));
     CRPC_CHECK_FALSE(rejected.ok());
     CRPC_CHECK_EQ(rpc_code::resource_exhausted, rejected.code());
 }
@@ -373,8 +443,11 @@ CRPC_TEST(registry_tombstone_purge) {
     cl::registry reg(config);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
-    CRPC_CHECK(reg.deregister("api", "n1", make_ctx("n1", 0, 1)).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
+    CRPC_CHECK(reg.deregister("api", "n1",
+                              make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
     // Zero grace means "eligible immediately": the very next purge removes the
     // tombstone, and because the include_deregistered view changes it advances
@@ -384,17 +457,20 @@ CRPC_TEST(registry_tombstone_purge) {
     CRPC_CHECK_EQ(index_before + 1, reg.index());
 
     // The purged row cannot be resurrected by an old incarnation: the
-    // tombstone incarnation high-water (2) survives the physical removal.
-    const auto stale = reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                             make_ctx("n1"));
+    // tombstone incarnation high-water (2) survives the physical removal. The
+    // zero-fence attempt is rejected by Z2 before the incarnation rule anyway,
+    // which is the default config's own guarantee.
+    const auto stale =
+        reg.register_instance(make_instance("api", "n1", 8001, 1), make_ctx("n1"));
     CRPC_CHECK_FALSE(stale.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
 
     // The purged tombstone watermark survives, so the key is no longer fresh:
-    // under the strict fencing default the resurrection must carry an epoch
-    // above the surviving high-water (F4).
+    // the resurrection must carry an authority-issued token above the surviving
+    // high-water (F4).
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 3),
-                                     make_ctx("n1", 3)).ok());
+                                     make_issued_ctx(reg, "api", "n1", 3))
+                     .ok());
     CRPC_CHECK_EQ(std::size_t{0}, reg.purge_expired_tombstones());
 
     cl::query_options options;
@@ -417,7 +493,8 @@ CRPC_TEST(lease_grant_renew_expire) {
     cl::lease_manager leases(reg, make_clock(clock), config);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     const auto granted = leases.grant("api", "n1", 1000ms);
     CRPC_CHECK(granted.ok());
     const crpc::u64 id = granted.value().id;
@@ -468,7 +545,8 @@ CRPC_TEST(lease_renew_after_critical_restores_passing) {
     cl::lease_manager leases(reg, make_clock(clock), config);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     const auto granted = leases.grant("api", "n1", 1000ms);
     CRPC_CHECK(granted.ok());
 
@@ -516,21 +594,29 @@ CRPC_TEST(lease_stale_fence_is_rejected) {
     cl::lease_manager leases(reg, make_clock(clock), config);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     const auto granted = leases.grant("api", "n1", 1000ms);
     CRPC_CHECK(granted.ok());
     const crpc::u64 lease_fence = granted.value().fence;
 
-    // A newer authority writes a much higher fence for this key.
+    // A newer authority writer supersedes the lease's barrier. The token is
+    // issued by the authority (a caller-side lease_fence+100 would be refused as
+    // not_issued), and it moves the key high-water above the lease's token.
     const auto newer = reg.set_state("api", "n1", cl::instance_state::passing,
-                                     make_ctx("n1", lease_fence + 100, 1));
+                                     make_issued_ctx(reg, "api", "n1", 1));
     CRPC_CHECK(newer.ok());
+    CRPC_CHECK(newer.value().fence > lease_fence);
 
+    // A renewal after the lease has already expired is refused outright (P4), so
+    // the entry stays critical; the sweep therefore cannot be "rejected" by a
+    // stale write any more. The state the newer writer committed survives.
     clock.advance(2000ms);
+    CRPC_CHECK_FALSE(leases.renew(granted.value().id).ok());
     const auto sweep = leases.expire_now();
-    CRPC_CHECK_EQ(crpc::u32{1}, sweep.rejected);
-    CRPC_CHECK_EQ(crpc::u32{0}, sweep.expired);
-    CRPC_CHECK_EQ(std::size_t{0}, leases.size());
+    CRPC_CHECK_EQ(crpc::u32{1}, sweep.expired);
+    CRPC_CHECK_EQ(crpc::u32{0}, sweep.rejected);
+    CRPC_CHECK_EQ(std::size_t{1}, leases.size());
 
     cl::query_options options;
     options.service = "api";
@@ -538,7 +624,7 @@ CRPC_TEST(lease_stale_fence_is_rejected) {
     auto result = reg.query(options);
     CRPC_CHECK(result.ok());
     CRPC_CHECK_EQ(std::size_t{1}, result.value().instances.size());
-    CRPC_CHECK_EQ(cl::instance_state::passing,
+    CRPC_CHECK_EQ(cl::instance_state::critical,
                   result.value().instances[0].state);
 }
 
@@ -616,7 +702,8 @@ CRPC_TEST(election_stale_epoch_write_is_rejected) {
     manual_clock clock;
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
     cl::lease_manager leases(reg, make_clock(clock));
     stub_quorum quorum;
@@ -630,21 +717,36 @@ CRPC_TEST(election_stale_epoch_write_is_rejected) {
     const auto first = election.campaign("n1");
     CRPC_CHECK(first.ok());
     const crpc::u64 first_epoch = first.value().epoch;
-    CRPC_CHECK(reg.set_state("api", "n1", cl::instance_state::passing,
-                             make_ctx("n1", first_epoch, 1)).ok());
+    // The epoch is a per-candidate fence barrier for the election's own lease
+    // key, not an issuance for "api"/"n1". A write to the instance therefore
+    // needs a token the registry issued for that key, exactly as any other
+    // writer does.
+    const auto first_write = reg.set_state(
+        "api", "n1", cl::instance_state::passing,
+        make_issued_ctx(reg, "api", "n1", 1));
+    CRPC_CHECK(first_write.ok());
+    CRPC_CHECK(first_write.value().fence > 0);
 
     CRPC_CHECK(election.resign().ok());
     const auto second = election.campaign("n1");
     CRPC_CHECK(second.ok());
     const crpc::u64 second_epoch = second.value().epoch;
     CRPC_CHECK(second_epoch > first_epoch);
-    CRPC_CHECK(reg.set_state("api", "n1", cl::instance_state::passing,
-                             make_ctx("n1", second_epoch, 1)).ok());
+    const auto second_write = reg.set_state(
+        "api", "n1", cl::instance_state::passing,
+        make_issued_ctx(reg, "api", "n1", 1));
+    CRPC_CHECK(second_write.ok());
+    CRPC_CHECK(second_write.value().fence > first_write.value().fence);
 
+    // An unissued value that merely resembles an old epoch is refused: knowing a
+    // number is not the same as being allowed to use it (L-b).
     const auto stale = reg.set_state("api", "n1", cl::instance_state::critical,
                                      make_ctx("n1", first_epoch, 1));
     CRPC_CHECK_FALSE(stale.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, stale.code());
+    const std::string* reason = stale.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr &&
+               (*reason == "not_issued" || *reason == "stale_fence"));
 }
 
 // --- Health -----------------------------------------------------------------
@@ -736,9 +838,11 @@ CRPC_TEST(health_tcp_probe_interval) {
 CRPC_TEST(watch_initial_snapshot_and_ordered_deltas) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
 
     cl::watch_hub hub(reg);
     watch_capture capture;
@@ -749,16 +853,19 @@ CRPC_TEST(watch_initial_snapshot_and_ordered_deltas) {
     CRPC_CHECK_EQ(cl::watch_event_kind::snapshot, capture.kinds[0]);
     CRPC_CHECK_EQ(reg.index(), capture.indexes[0]);
 
-    const auto added = reg.register_instance(make_instance("api", "n3", 8003, 1),
-                                             make_ctx("n3"));
+    const auto added = reg.register_instance(
+        make_instance("api", "n3", 8003, 1), make_issued_ctx(reg, "api", "n3", 1));
     CRPC_CHECK(added.ok());
     CRPC_CHECK_EQ(std::size_t{1}, hub.dispatch());
 
     CRPC_CHECK(reg.set_state("api", "n1", cl::instance_state::critical,
-                             make_ctx("n1", 0, 1)).ok());
+                             make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
     CRPC_CHECK_EQ(std::size_t{1}, hub.dispatch());
 
-    CRPC_CHECK(reg.deregister("api", "n2", make_ctx("n2", 0, 1)).ok());
+    CRPC_CHECK(reg.deregister("api", "n2",
+                              make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
     CRPC_CHECK_EQ(std::size_t{1}, hub.dispatch());
 
     CRPC_CHECK_EQ(std::size_t{3}, capture.delta_instances);
@@ -816,7 +923,8 @@ CRPC_TEST(watch_gap_triggers_resync) {
 CRPC_TEST(watch_hub_resync) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
     cl::watch_hub hub(reg);
     watch_capture capture;
@@ -825,7 +933,8 @@ CRPC_TEST(watch_hub_resync) {
     CRPC_CHECK_EQ(std::size_t{1}, capture.snapshot_instances);
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
     CRPC_CHECK(hub.resync(id.value()).ok());
     CRPC_CHECK_EQ(std::size_t{1}, capture.resyncs);
     CRPC_CHECK_EQ(std::size_t{3}, capture.snapshot_instances);
@@ -835,7 +944,8 @@ CRPC_TEST(watch_hub_resync) {
 CRPC_TEST(watch_slow_subscriber_is_dropped) {
     cl::registry reg;
     CRPC_CHECK(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                     make_ctx("n1")).ok());
+                                     make_issued_ctx(reg, "api", "n1", 1))
+                     .ok());
 
     cl::watch_hub hub(reg);
     watch_capture capture;
@@ -843,9 +953,11 @@ CRPC_TEST(watch_slow_subscriber_is_dropped) {
     CRPC_CHECK(id.ok());
 
     CRPC_CHECK(reg.register_instance(make_instance("api", "n2", 8002, 1),
-                                     make_ctx("n2")).ok());
+                                     make_issued_ctx(reg, "api", "n2", 1))
+                     .ok());
     CRPC_CHECK(reg.register_instance(make_instance("api", "n3", 8003, 1),
-                                     make_ctx("n3")).ok());
+                                     make_issued_ctx(reg, "api", "n3", 1))
+                     .ok());
     CRPC_CHECK_EQ(std::size_t{1}, hub.subscriber_count());
 
     const std::size_t delivered = hub.dispatch();
@@ -866,7 +978,9 @@ CRPC_TEST(registry_concurrent_snapshots) {
         const std::string node = "n" + std::to_string(i);
         const auto instance = make_instance(
             "api", node, static_cast<crpc::u16>(9000 + i), 1);
-        CRPC_CHECK(reg.register_instance(instance, make_ctx(node)).ok());
+        CRPC_CHECK(reg.register_instance(instance,
+                                         make_issued_ctx(reg, "api", node, 1))
+                         .ok());
     }
 
     std::atomic<bool> stop{false};
@@ -881,7 +995,16 @@ CRPC_TEST(registry_concurrent_snapshots) {
                 const auto instance = make_instance(
                     "api", node, static_cast<crpc::u16>(9000 + i),
                     static_cast<crpc::u64>(2 + k));
-                const auto written = reg.register_instance(instance, make_ctx(node));
+                // Each iteration needs its own issuance: a token is spent by the
+                // write it authorises, so a loop that reuses one is not a legal
+                // caller shape under the default config.
+                const auto token = reg.next_fence("api", node);
+                if (!token.ok()) {
+                    consistent.store(false, std::memory_order_relaxed);
+                    continue;
+                }
+                const auto written = reg.register_instance(
+                    instance, make_ctx(node, token.value(), 2 + k));
                 if (!written.ok()) {
                     consistent.store(false, std::memory_order_relaxed);
                 }

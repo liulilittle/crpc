@@ -188,17 +188,31 @@ bool register_node(cl::registry& registry, const node& value,
     instance.incarnation = incarnation;
     instance.state = cl::instance_state::passing;
 
+    // The default config is strict: the token must be issued by the authority
+    // for this exact key before the registration can present it.
+    const auto token = registry.next_fence(k_service_name, value.state->id);
+    if (!token.ok()) {
+        return false;
+    }
     cl::write_context context;
     context.node_id = value.state->id;
     context.incarnation = incarnation;
+    context.fence = token.value();
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
     return registry.register_instance(instance, context).ok();
 }
 
 bool set_node_state(cl::registry& registry, const node& value,
                     cl::instance_state state, crpc::u64 incarnation = 1) {
+    const auto token = registry.next_fence(k_service_name, value.state->id);
+    if (!token.ok()) {
+        return false;
+    }
     cl::write_context context;
     context.node_id = value.state->id;
     context.incarnation = incarnation;
+    context.fence = token.value();
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
     return registry.set_state(k_service_name, value.state->id, state, context)
         .ok();
 }
@@ -484,9 +498,15 @@ CRPC_TEST(distributed_discovery_and_route_convergence) {
     // it fail; the refreshed table excludes it and every call succeeds.
     nodes[2].stop();
     {
+        // The deregistration is the node's own authority write, so it needs a
+        // token issued for its key.
+        const auto token = registry.next_fence(k_service_name, states[2].id);
+        CRPC_REQUIRE(token.ok());
         cl::write_context context;
         context.node_id = states[2].id;
         context.incarnation = 1;
+        context.fence = token.value();
+        context.writer_epoch = 0;  // external writer: not epoch-tracked
         CRPC_CHECK(registry
                        .deregister(k_service_name, states[2].id, context)
                        .ok());
@@ -745,6 +765,8 @@ CRPC_TEST(distributed_registry_partition_and_watch_replay) {
 
     // The partitioned node comes back with its old incarnation: the authority
     // rejects the stale write instead of letting it overwrite the newer one.
+    // The token is issued first so the rejection is provably the incarnation
+    // rule and not a missing fence.
     cl::service_instance stale_instance;
     stale_instance.service = k_service_name;
     stale_instance.node_id = states[1].id;
@@ -753,9 +775,13 @@ CRPC_TEST(distributed_registry_partition_and_watch_replay) {
     stale_instance.incarnation = 1;
     stale_instance.state = cl::instance_state::passing;
 
+    const auto stale_token = registry.next_fence(k_service_name, states[1].id);
+    CRPC_REQUIRE(stale_token.ok());
     cl::write_context stale_context;
     stale_context.node_id = states[1].id;
     stale_context.incarnation = 1;
+    stale_context.fence = stale_token.value();
+    stale_context.writer_epoch = 0;  // external writer: not epoch-tracked
     const auto stale =
         registry.register_instance(stale_instance, stale_context);
     CRPC_CHECK_FALSE(stale.ok());
@@ -776,9 +802,13 @@ CRPC_TEST(distributed_registry_partition_and_watch_replay) {
     conflicting.address.port = 0;
     conflicting.incarnation = 3;
     conflicting.state = cl::instance_state::passing;
+    const auto conflict_token = registry.next_fence(k_service_name, states[1].id);
+    CRPC_REQUIRE(conflict_token.ok());
     cl::write_context conflicting_context;
     conflicting_context.node_id = states[1].id;
     conflicting_context.incarnation = 3;
+    conflicting_context.fence = conflict_token.value();
+    conflicting_context.writer_epoch = 0;  // external writer: not epoch-tracked
     const auto conflicting_write =
         registry.register_instance(conflicting, conflicting_context);
     CRPC_CHECK_FALSE(conflicting_write.ok());

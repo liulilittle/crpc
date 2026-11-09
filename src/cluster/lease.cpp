@@ -29,17 +29,34 @@ lease_manager::resolve_ttl(std::chrono::milliseconds ttl) const {
     return ttl.count() > 0 ? ttl : config_.default_ttl;
 }
 
-u64 lease_manager::next_fence_locked() {
-    u64 candidate = catalog_.index();
+u64 lease_manager::next_fence_locked(const std::string& service,
+                                     const std::string& node_id) {
+    const u64 ceiling = std::numeric_limits<u64>::max();
+    // A8: the allocator must clear the per-key high-water in ONE step. A lease
+    // fence_barrier can push one key far above the global counter, and walking
+    // towards it one grant at a time made a barrier of 2^32 cost 2^32 rejected
+    // grants (probe_barrier_livelock / probe_grant_walk). Reading the floor is
+    // the only way to see it without deliberately failing first.
+    const result<u64> floor = catalog_.fence_floor(service, node_id);
+    const u64 key_floor = floor.ok() ? floor.value() : 0;
+
+    u64 base = catalog_.index();
     const u64 registry_fence = catalog_.fence();
-    if (registry_fence > candidate) {
-        candidate = registry_fence;
+    if (registry_fence > base) {
+        base = registry_fence;
     }
-    if (candidate <= last_fence_) {
-        if (last_fence_ == std::numeric_limits<u64>::max()) {
-            return last_fence_;
-        }
-        candidate = last_fence_ + 1;
+    if (last_fence_ > base) {
+        base = last_fence_;
+    }
+    if (base == ceiling) {
+        return ceiling;
+    }
+    u64 candidate = base + 1;
+    // The new token must also exceed the key floor, otherwise the barrier would
+    // republish the very value the previous holder still holds and the two
+    // would be indistinguishable.
+    if (key_floor != ceiling && candidate <= key_floor) {
+        candidate = key_floor + 1;
     }
     last_fence_ = candidate;
     return candidate;
@@ -47,7 +64,7 @@ u64 lease_manager::next_fence_locked() {
 
 u64 lease_manager::next_fence() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return next_fence_locked();
+    return next_fence_locked(std::string{}, std::string{});
 }
 
 u64 lease_manager::current_incarnation(const std::string& service,
@@ -99,23 +116,29 @@ result<lease> lease_manager::grant(const std::string& service,
     next.token.ttl = resolved;
     next.token.incarnation = current_incarnation(service, node_id);
     next.token.expiry = clock_.read() + resolved;
-    next.token.fence = next_fence_locked();
+    next.token.fence = next_fence_locked(service, node_id);
     next.state = phase::active;
     next.remove_at = monotonic_clock::time_point{};
 
     // Fence barrier (P13): publish the new fence for the key before the new
     // holder starts writing, so a replaced lease's old fence is rejected even
     // if the new holder has not written yet. Lock order lease -> registry is
-    // the documented order.
+    // the documented order. The barrier binds the token to this lease id so a
+    // different lease cannot spend it (L-b), and it publishes the token to the
+    // registry's issuance record, which is what makes the first write legal
+    // under require_issued_fence.
     write_context barrier_context;
     barrier_context.node_id = node_id;
     barrier_context.incarnation = next.token.incarnation;
     barrier_context.fence = next.token.fence;
+    barrier_context.writer_epoch = 0;  // lease write: not an epoch-tracked writer
     const result<u64> barrier = catalog_.fence_barrier(
-        service, node_id, next.token.fence, barrier_context);
+        service, node_id, next.token.fence, barrier_context, id);
     if (!barrier.ok()) {
         return barrier.error();
     }
+    // The barrier may raise the effective token above the allocator result.
+    next.token.fence = barrier.value();
 
     if (existing != by_instance_.end()) {
         leases_.erase(existing->second);
@@ -189,7 +212,8 @@ result<lease> lease_manager::renew(u64 lease_id, std::chrono::milliseconds ttl) 
 
     current.token.ttl = resolved;
     current.token.expiry = now + resolved;
-    current.token.fence = next_fence_locked();
+    current.token.fence = next_fence_locked(current.token.service,
+                                            current.token.node_id);
     return current.token;
 }
 
@@ -225,12 +249,34 @@ std::size_t lease_manager::size() const {
 
 result<write_result> lease_manager::apply_state(const entry& current,
                                                 instance_state state, u64 fence) {
+    // Publish the fresh issuance as a barrier for this lease id first. The
+    // registry accepts only an outstanding issuance, and the critical mark /
+    // tombstone below then spend it; without the barrier the write would be
+    // refused as not_issued. This mirrors grant(), which publishes its token
+    // before the holder can spend it.
+    write_context barrier_context;
+    barrier_context.node_id = current.token.node_id;
+    barrier_context.incarnation = current.token.incarnation;
+    barrier_context.fence = fence;
+    barrier_context.writer_epoch = 0;  // lease write: not an epoch-tracked writer
+    const result<u64> barrier = catalog_.fence_barrier(
+        current.token.service, current.token.node_id, fence, barrier_context,
+        current.token.id);
+    if (!barrier.ok()) {
+        return barrier.error();
+    }
     write_context context;
     context.node_id = current.token.node_id;
+    // P7: the entry may have been bound to the incarnation it observed after the
+    // grant, so the write must present that incarnation rather than the value
+    // captured at grant time (which can be 0).
     context.incarnation = current.token.incarnation;
-    context.fence = fence;
+    context.fence = barrier.value();
+    context.writer_epoch = 0;  // lease write: not an epoch-tracked writer
+    // The barrier bound this token to this lease id, so the write must present
+    // the same one (L-b).
     return catalog_.set_state(current.token.service, current.token.node_id, state,
-                              context);
+                              context, current.token.id);
 }
 
 lease_sweep_result lease_manager::expire_now() {
@@ -267,6 +313,14 @@ lease_sweep_result lease_manager::expire_now(monotonic_clock::time_point now) {
                 it = leases_.erase(it);
                 continue;
             }
+            // Re-issue before the write. The token this entry holds was spent by
+            // the holder's registration (or by an earlier expiry write), and the
+            // authority accepts only an outstanding issuance: presenting the
+            // consumed value returns stale_fence. next_fence_locked() advances
+            // both the per-key floor and this manager's own allocator, so the
+            // next grant cannot collide with the token just issued.
+            current.token.fence = next_fence_locked(current.token.service,
+                                                    current.token.node_id);
             const result<write_result> marked =
                 apply_state(current, instance_state::critical, current.token.fence);
             if (!marked.ok()) {
@@ -288,12 +342,34 @@ lease_sweep_result lease_manager::expire_now(monotonic_clock::time_point now) {
         }
 
         if (current.state == phase::critical && now >= current.remove_at) {
+            // The critical write spent the entry's token, so the tombstone needs
+            // its own issuance (same rule as the critical mark above).
+            const u64 removal_fence = next_fence_locked(current.token.service,
+                                                        current.token.node_id);
+            write_context barrier_context;
+            barrier_context.node_id = current.token.node_id;
+            barrier_context.incarnation = current.token.incarnation;
+            barrier_context.fence = removal_fence;
+            barrier_context.writer_epoch = 0;  // lease write: not epoch-tracked
+            const result<u64> barrier = catalog_.fence_barrier(
+                current.token.service, current.token.node_id, removal_fence,
+                barrier_context, current.token.id);
+            if (!barrier.ok()) {
+                if (barrier.code() != rpc_code::not_found) {
+                    ++sweep.rejected;
+                }
+                by_instance_.erase(key{current.token.service, current.token.node_id});
+                it = leases_.erase(it);
+                continue;
+            }
             write_context context;
             context.node_id = current.token.node_id;
             context.incarnation = current.token.incarnation;
-            context.fence = current.token.fence;
+            context.fence = barrier.value();
+            context.writer_epoch = 0;  // lease write: not an epoch-tracked writer
             const result<write_result> removed = catalog_.deregister(
-                current.token.service, current.token.node_id, context);
+                current.token.service, current.token.node_id, context,
+                current.token.id);
             if (removed.ok()) {
                 ++sweep.deregistered;
             } else if (removed.code() != rpc_code::not_found) {

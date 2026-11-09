@@ -4,6 +4,20 @@
 
 ## 未发布
 
+### MAJOR：`cluster::write_context` 尾部新增 `writer_epoch`
+
+- **MAJOR（消费者可见布局）。** `cluster::write_context` 在 x64 Debug 从 96 字节增至 104 字节（Release 从 80 增至 88）：尾部新增一个 `u64 writer_epoch`。所有消费者必须用匹配的头文件重编。这是同一未发布 G19 切片内的第二次 MAJOR 破坏，属于有意接受：该字段没有别的加法。
+
+  这个字段回答 fence 令牌回答不了的问题：调用方到底还有没有写入资格，还是已经被废黜。fence 令牌只证明权威签发过一个号，不证明持有者仍是所有者，因为接替者总能拿到更大的令牌。`writer_epoch` 是「已真正提交过的纪元」的按键高水位。写入者纪元低于该高水位时以 `registry.reason=stale_writer` 拒绝；health bridge 把它当作「你已被废黜，停止写入」，而 `stale_fence` 意味着「重新取一个令牌再试」。
+
+  三个取值互不重叠。`UINT64_MAX` 是默认值，表示「未设置」：以 `registry.reason=epoch_required` 拒绝，因此忘记赋值会 fail-closed，而不会静默变成一个豁免的外部写入者。`0` 是豁免的外部写入者：被接受，且不更新已记录的高水位。其他任何值都是纪元跟踪写入者，大于或等于已记录高水位时接受，低于时以 `stale_writer` 拒绝。新增的 `cluster::registry::next_writer_epoch()` 从 fence 分配器的计数器返回严格递增的值，因此从日志恢复的目录不会发出一个不高于幸存写入者已用值的纪元；`restore_from_log` 用日志记录的 fence 作为已记录纪元的种子。`next_writer_epoch()` 是单调数字而非能力凭据：它不校验身份也不校验存活，所以 `health_bridge` 把 `stale_writer` 拒绝当作该实例的永久让位，只有新建的 bridge 才能把键取回。新增用例：`write_context_unset_epoch_is_rejected`、`zero_epoch_is_accepted_and_not_recorded`、`stale_writer_cannot_overwrite_newer_epoch`、`epoch_is_checked_before_fence`、`same_epoch_may_write_again`、`epoch_grant_is_unconditional`、`epoch_floor_survives_restore`，以及 bridge 侧的 `health_bridge_yielded_stops_writing_after_takeover`、`health_bridge_recovers_after_takeover_dies`。
+
+  纪元**不持久化**，因此残余缺口是**可用性**问题、不是安全性问题。按部署形态实测：恢复到新 registry 会拒绝重启前的写入者（`stale_writer`）；原地恢复且日志不领先时被拒（`registry.reason=stale_log`），下界不会下降；原地恢复且日志领先时，可能冻结一个**存活且合法**的 bridge（`stale_writer` + 永久让位），而新建的 bridge 可正常写入。因此重放日志永远不会让被废黜的写入者覆盖成功，但可能让一个合法写入者停写，直到 bridge 被重建。
+
+### 修复：公开头文件不再被 `windows.h` 破坏
+
+- **无 ABI 或行为变化。** `cluster::write_context::writer_epoch` 的默认成员初始化器写成 `(std::numeric_limits<u64>::max)()`。除非定义 `NOMINMAX`，`windows.h` 会定义一个函数式 `max` 宏，而默认成员初始化器在头文件解析期展开，因此未加括号的写法会让任何先包含 `windows.h`、再包含 `crpc/cluster/registry.hpp` 的消费者编译失败（C4003/C2589/C2059）。树内构建给所有目标都传了 `/DNOMINMAX`，这正是项目内部从未看到该问题的原因。新增的 `tests/test_public_header_include_order.cpp` 会先 `#undef NOMINMAX`、包含 `windows.h`，再包含全部公开 cluster 头文件，使树内构建也真正测到树外配置。
+
 ### 构建：POSIX exec-status 写入在启用 fortify 的 GCC 下零警告
 
 - **无行为变化。** `src/system/process.cpp` 现在消费两处 `::write` 的返回值
@@ -63,8 +77,12 @@
   `registry_config::max_fence_lead`，更大的值以 `registry.fence_out_of_range`
   拒绝，单个 peer 无法再把 fence 域钉死在 `UINT64_MAX`。`strict_fencing`
   （默认**开启**）要求已接受外部 epoch 的键在更新时携带非零 token
-  （`registry.reason=fence_required`）。只有**从未存在过**的键才允许以
-  `fence=0` 创建：先 grant 的 lease 仍可跟随首次注册。保留有 tombstone
+  （`registry.reason=fence_required`）。`registry_config::require_issued_fence`
+  现在同样默认**开启**，这正是 Z2 无条件生效的原因：零 fence 在每条路径上都被
+  拒绝，包括从未存在过的键的首次注册。高水位之上但未经签发的 token 以
+  `registry.reason=not_issued` 拒绝，知道高水位不再等于被允许使用它（L-b）。
+  历史的 `false` 默认现在是一个显式退出开关，会同时关掉 L-b 与 Z2；迁移步骤见
+  [migration.md](migration.md)。保留有 tombstone
   高水位或 fence 高水位的键**不属于全新键**——即使
   `purge_expired_tombstones()` 已物理删除可见行——对它做零 fence 创建会返回
   `registry.reason=fence_required`，而不是重置 epoch。`lease_manager::grant`
@@ -76,7 +94,10 @@
 - **Lease 生命周期（P4/P7）。** 对已过期但尚未 sweep 的 active lease 续租返回
   `deadline_exceeded`，不再复活；实例尚不存在时 grant 的 lease 在首次观察到
   incarnation 时绑定，并在到期时生效，grant 先于 register 不再丢失到期写入；
-  绑定到已被取代 incarnation 的 lease 会被拒绝/丢弃，而不是跟随新注册。
+  绑定到已被取代 incarnation 的 lease 会被拒绝/丢弃，而不是跟随新注册。sweep
+  现在在 critical 标记与 tombstone 之前重新签发 token：grant 的 token 已被持有
+  方的注册花掉，提交已消耗的值会返回 `stale_fence`，到期因此被丢弃
+  （`++sweep.rejected`）。
 - **注册（P5/P8/P11/P12）。** 注册要求非空 endpoint host；非空 host + port 0
   仍是 inproc sentinel。`separate_state_writers`（默认**开启**）在更新时保留
   health/lease 所有的 state，注册不会覆盖健康裁决。`strict_incarnation`

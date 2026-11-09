@@ -48,10 +48,34 @@ MAJOR.MINOR.PATCH
 - `cluster::registry` 从 368 字节增至 432 字节：私有 tombstone incarnation 高水位与已 fencing 键表。消费者自行分配 registry，因此其宽度属于契约。
 - `cluster::watch_hub` 从 144 字节增至 192 字节（有界 replay ring 及其容量），并新增第二个构造函数。
 - `cluster::watch_stream` 从 312 字节增至 320 字节（取消屏障状态：正在派发的线程 id 与回调中标志）。
+- `cluster::write_context` 从 96 字节增至 104 字节（x64 Debug；Release 从 80 增至 88）：尾部新增一个 `u64 writer_epoch`。这是同一未发布切片内的**第二次 MAJOR 破坏**，属于有意接受：该字段没有别的加法，它是写入者证明自己"仍是该 key 的当前所有者"、而不仅仅是"持有一个新签发的 fence 令牌"的唯一手段。语义与那个防止守卫 fail-open 的默认值见下文「写入者纪元」段。
 
-`cluster::lease_manager`（200 字节）、`cluster::lease`（120）、`cluster::lease_config`（32）、`cluster::health_monitor`（64）、`cluster::registry_snapshot`（40）、`cluster::service_instance`（192）、`cluster::write_context`（96）、`cluster::write_result`（24）、`cluster::watch_event`（72）布局不变。新增符号为 MINOR 追加：`cluster::registry::fence_barrier(const std::string&, const std::string&, u64, const write_context&)`、`cluster::watch_stream::park()`、`cluster::watch_stream::cancel()`、`cluster::watch_hub::watch_hub(registry&, std::size_t, std::size_t)`。没有枚举值、wire 字段或协议字节变化；语义修复（grace 为零立即 purge、tombstone 高水位、调用方 fence 有界、过期 lease 拒绝续租、purge 推进 index 并发 remove 事件、TTL 边界包含等号、watch 取消屏障/park/replay）只是行为变化。`registry_config` 的三个新开关**默认开启**：`separate_state_writers=true`、`strict_fencing=true`、`strict_incarnation=true`。依赖历史覆盖语义的既有进程内用法必须显式把它们设为 `false`；该 legacy 配置在任何多写入方部署中都不安全：注册会覆盖 health/lease 裁决，已接受外部 fencing 的键在更新时会静默丢失 fence，同 incarnation 换 payload 会直接覆盖而不是报冲突。
+`cluster::lease_manager`（200 字节）、`cluster::lease`（120）、`cluster::lease_config`（32）、`cluster::health_monitor`（64）、`cluster::registry_snapshot`（40）、`cluster::service_instance`（192）、`cluster::write_result`（24）、`cluster::watch_event`（72）布局不变；`cluster::write_context`（104）不再不变：它接受了上文所述的尾部纪元字段。新增符号为 MINOR 追加：`cluster::registry::fence_barrier(const std::string&, const std::string&, u64, const write_context&)`、`cluster::watch_stream::park()`、`cluster::watch_stream::cancel()`、`cluster::watch_hub::watch_hub(registry&, std::size_t, std::size_t)`。没有枚举值、wire 字段或协议字节变化；语义修复（grace 为零立即 purge、tombstone 高水位、调用方 fence 有界、过期 lease 拒绝续租、purge 推进 index 并发 remove 事件、TTL 边界包含等号、watch 取消屏障/park/replay）只是行为变化。`registry_config` 的四个开关**默认开启**：`separate_state_writers=true`、`strict_fencing=true`、`strict_incarnation=true`、`require_issued_fence=true`。依赖历史覆盖语义的既有进程内用法必须显式把它们设为 `false`；该 legacy 配置在任何多写入方部署中都不安全：注册会覆盖 health/lease 裁决，已接受外部 fencing 的键在更新时会静默丢失 fence，同 incarnation 换 payload 会直接覆盖而不是报冲突。
 
-另有两条纯行为语义属于本节。成功写入在 `write_result::fence` 中返回该键的生效 fence 高水位（不会低于 lease `fence_barrier`，可直接用于同一键的下一次写入）；`stale_fence` 拒绝会在追加的 `registry.fence` 错误元数据键中携带该高水位，`health_bridge` 据此重锚。`strict_fencing` 下只有**从未存在过**的键允许以 `fence=0` 创建；tombstone 高水位或 fence 高水位在 purge 后仍保留的键不属于全新键，零 fence 创建返回 `registry.reason=fence_required`。
+`registry_config::require_issued_fence` 的默认值在本片由 `false` 改为 `true`。历史的 `false` 默认并不是一套可用配置：关闭时 L-b（签发归属）与 Z2（零 fence 永远不是 token）都不生效，任何从拒绝中得知键高水位的 peer 都能用 `high_water+1` 写入，未 fencing 的创建也能占据一个键。把开关关掉现在是得到历史数值契约的唯一途径，意味着同时接受这两个洞。构造 registry 后不调用 `next_fence()`/`fence_barrier()` 就直接写入的进程内调用方，必须先签发 token（受支持的形态），或者把开关设为 `false` 并承认该部署没有签发归属。这是行为变更而非 ABI 变更：字段、偏移与 `sizeof(registry_config)` 均不变（x64 Debug 104、Release 96；`sizeof(registry)` 432 / 384）。
+
+另有两条纯行为语义属于本节。成功写入在 `write_result::fence` 中返回该键的生效 fence 高水位（不会低于 lease `fence_barrier`，可直接用于同一键的下一次写入）；`stale_fence` 拒绝会在追加的 `registry.fence` 错误元数据键中携带该高水位，`health_bridge` 据此重锚。默认的 `require_issued_fence` 下，零 fence 在每条路径上都被拒绝，包括从未存在过的键的创建（Z2）。tombstone 高水位或 fence 高水位在 purge 后仍保留的键同样不属于全新键：零 fence 创建返回 `registry.reason=fence_required`，高水位之上但未签发的 token 返回 `registry.reason=not_issued`。
+
+**写入者纪元（本切片内的第二次 MAJOR 破坏）。** `write_context` 尾部新增 `u64 writer_epoch`，因此该类型在 x64 Debug 为 104 字节、Release 为 88 字节。所有消费者必须重编；只在单一进程内写入、不关心所有权的消费者可以不动这个字段，因为默认值就是下一段描述的「未设置」哨兵。
+
+这个字段回答 fence 令牌回答不了的问题：*这个调用方到底还有没有写入资格，还是已经被废黜？* fence 令牌只证明权威签发过一个号，不证明持有者仍是所有者，因为接替者总能拿到更大的令牌。纪元是「已真正提交过的纪元」的按键高水位，写入者纪元低于该高水位时以 `registry.reason=stale_writer` 拒绝——`health_bridge` 对这一裁决的处理与 `stale_fence` 不同：`stale_fence` 意味着「重新取一个令牌再试」，`stale_writer` 意味着「你已被废黜，停止写入」。
+
+三个取值含义互不重叠，且默认值是关键：
+
+- `UINT64_MAX`（默认值）表示*调用方没有设置纪元*，以 `registry.reason=epoch_required` 拒绝。默认值刻意取「拒绝」这一侧：若默认取零，所有忘记赋值的调用方都会被静默提升为下面那个豁免情形，守卫就会 fail-open 而不是 fail-closed。`cluster::registry::next_writer_epoch()` 返回的值严格大于此前发出的所有纪元，且永不返回该哨兵。
+- `0` 表示*不参与纪元跟踪的外部写入者*。它被接受，并且**不更新**已记录的高水位，因此外部写入永远不能降低那个把纪元跟踪写入者挡在外面的下界。
+- 其他任何值都是纪元跟踪写入者。大于或等于该键已记录高水位时接受（等值表示同一写入者继续写），低于时以 `stale_writer` 拒绝。
+
+`next_writer_epoch()` 是**单调数字，不是能力凭据**：它不校验身份也不校验存活，交给任何调用方。正因为「拿到更大的纪元」永远可能，「我持有更大的纪元」并不能证明前任所有者已死。这就是 `cluster::health_bridge` 把 `stale_writer` 拒绝当作该 bridge 实例的**永久让位**的原因：只有新建的 bridge 才能把键取回。
+
+**纪元本身不持久化。** 它从 fence 分配器的计数器分配，`restore_from_log` 用日志实际记录的 fence 作为每个键已记录纪元与全局计数器的种子，因此 bridge 在构造时消耗、但没有写入日志的纪元不会出现在日志里。按部署形态实测的后果：
+
+- 恢复到**新** registry：早于本次恢复的写入者纪元不高于已记录 fence，被 `stale_writer` 拒绝；方向是安全的（`DEPOSED_CAN_OVERWRITE=0`）。
+- **原地**恢复、且日志不领先于 registry：直接以 `registry.reason=stale_log` 拒绝，下界不可能被降低。
+- **原地**恢复、且日志领先：被接受；若日志中该键的 fence 高于某个存活 bridge 的纪元，那个**合法**的 bridge 会被 `stale_writer` 拒绝，并在永久让位规则下**终生停止写入**。新建的 bridge 会拿到高于新下界的纪元，可正常写入（实测 `LIVE_BRIDGE_FROZEN_OUT=1`、`fresh_epoch=902` 接受）。
+
+所以残余缺口是**可用性**问题，不是安全性问题：在存活 bridge 之下重放日志会冻结一个合法写入者，但永远不会让被废黜的写入者覆盖成功。需要重放日志的部署必须重建其 bridge；跨进程纪元持久化是 step2 的工作项。
+
 
 未发布的 G36 自动分片工作新增 **2 个 MINOR 导出符号** + **2 个头文件 inline `shards_auto()` 重载（不新增导出符号）**、不改布局：导出符号为自由函数 `crpc::rpc::default_shard_count()` 与 `crpc::server::shard_count()`；`crpc::server::builder::shards_auto()`（无参重载与注入核数重载）均为头文件 `inline`，不新增导出。`server::options` 与 `server::builder` 的所有字段、偏移与尺寸不变（x64：`sizeof(options) == 320`、`sizeof(builder) == 400`；x86：`264` / `304`），默认 `options::shards == 1` 与 `builder::shards(0) -> 1` 映射也不变。自动分片仅在 opt-in 时生效（且与 PUSH 互斥），默认行为完全一致，因此这是 MINOR 追加而非 MAJOR。
 

@@ -1,11 +1,16 @@
-// CRPC -- service catalog implementation.
+﻿// CRPC -- service catalog implementation.
 #include <crpc/cluster/registry.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
+
+#include <crpc/cluster/registry_log.hpp>
 
 namespace crpc {
 namespace cluster {
@@ -16,12 +21,28 @@ constexpr const char* reason_stale_incarnation = "stale_incarnation";
 constexpr const char* reason_stale_fence = "stale_fence";
 constexpr const char* reason_fence_required = "fence_required";
 constexpr const char* reason_fence_out_of_range = "fence_out_of_range";
+constexpr const char* reason_not_issued = "not_issued";
+constexpr const char* reason_stale_writer = "stale_writer";
+constexpr const char* reason_epoch_required = "epoch_required";
 constexpr const char* reason_tombstone = "tombstone";
 constexpr const char* reason_conflict = "conflict";
 constexpr const char* reason_not_live = "not_live";
 constexpr const char* reason_limit = "limit";
 constexpr const char* reason_overflow = "index_overflow";
 constexpr const char* reason_invalid = "invalid";
+
+// Deterministic FNV-1a over the node id. std::hash is not used because the
+// resulting principal is part of an issuance record that must compare equal
+// across builds and (from step3 on) across nodes; some standard libraries seed
+// their string hash per process.
+[[nodiscard]] u64 fnv1a(const std::string& value) noexcept {
+    u64 hash = 1469598103934665603ull;
+    for (const char c : value) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
 
 [[nodiscard]] bool is_space(char c) noexcept {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
@@ -109,23 +130,44 @@ u64 registry::published_fence_locked() const noexcept {
     return last_global_fence_;
 }
 
-u64 registry::record_fence_locked(const key& id, u64 requested,
-                                  u64 authority) {
-    u64& key_fence = last_fence_[id];
-    if (requested > key_fence) {
-        key_fence = requested;
+u64 registry::principal_hash(const std::string& node_id) noexcept {
+    return fnv1a(node_id);
+}
+
+bool registry::issuance_matches_locked(const key& id, u64 fence, u64 principal,
+                                       u64 lease_id) const noexcept {
+    const auto found = last_fence_.find(id);
+    if (found == last_fence_.end()) {
+        return false;
     }
-    if (authority > key_fence) {
-        key_fence = authority;
+    const issued_fence& record = found->second;
+    return record.outstanding && record.token == fence &&
+           record.principal_hash == principal && record.lease_id == lease_id;
+}
+
+u64 registry::record_fence_locked(const key& id, u64 requested, u64 authority,
+                                  u64 principal, u64 lease_id) {
+    issued_fence& key_fence = last_fence_[id];
+    if (requested > key_fence.token) {
+        key_fence.token = requested;
+        key_fence.principal_hash = principal;
+        key_fence.lease_id = lease_id;
+    }
+    if (authority > key_fence.token) {
+        key_fence.token = authority;
+        key_fence.principal_hash = principal;
+        key_fence.lease_id = lease_id;
     }
     if (requested != 0) {
         fenced_keys_[id] = true;
     }
+    // The issuance is spent: the next mutation of this key needs a strictly
+    // greater token from the authority, so a token cannot be reused by a second
+    // writer that learnt it.
+    key_fence.outstanding = false;
     // The effective per-key high-water, not the bare authority allocation: a
-    // fence_barrier can hold the key above the global allocator, and a caller
-    // must be able to feed the returned token back without being told it is
-    // stale (F3).
-    return key_fence;
+    // fence_barrier can hold the key above the global allocator.
+    return key_fence.token;
 }
 
 bool registry::identity_equal(const service_instance& a,
@@ -149,15 +191,55 @@ bool registry::identity_equal(const service_instance& a,
     return true;
 }
 
-registry::fence_verdict registry::check_fence(const key& id, u64 fence,
-                                              bool creating) const noexcept {
+registry::fence_verdict registry::check_writer_epoch(const key& id,
+                                                     u64 writer_epoch) const noexcept {
+    // UINT64_MAX is the "caller did not set an epoch" sentinel. Defaulting to
+    // zero instead would silently make a forgetful writer an exempt external
+    // one, i.e. the guard would fail open.
+    if (writer_epoch == std::numeric_limits<u64>::max()) {
+        return fence_verdict::required;
+    }
+    if (writer_epoch == 0) {
+        return fence_verdict::ok;
+    }
+    const auto found = last_fence_.find(id);
+    if (found == last_fence_.end()) {
+        return fence_verdict::ok;
+    }
+    if (writer_epoch < found->second.writer_epoch) {
+        return fence_verdict::stale_writer;
+    }
+    return fence_verdict::ok;
+}
+
+void registry::record_writer_epoch_locked(const key& id, u64 writer_epoch) {
+    if (writer_epoch == 0 || writer_epoch == std::numeric_limits<u64>::max()) {
+        return;
+    }
+    issued_fence& key_fence = last_fence_[id];
+    if (writer_epoch > key_fence.writer_epoch) {
+        key_fence.writer_epoch = writer_epoch;
+    }
+}
+
+registry::fence_verdict registry::check_fence(const key& id, u64 fence, bool creating,
+                                              bool exact_replay, u64 principal,
+                                              u64 lease_id, bool issuing) const noexcept {
     if (fence == 0) {
+        // Z2: under the strict authorization mode a zero fence never
+        // authorises a mutation, not even the first registration of a key with
+        // no history. The historical grant-before-register back door let an
+        // unfenced create occupy a key that a fence_barrier had already raised,
+        // and a squatter could take a key before its owner registered.
+        if (config_.require_issued_fence) {
+            return fence_verdict::required;
+        }
+        // Legacy (default) mode keeps the Phase 0 rule so in-process users that
+        // never configure fencing are unaffected: an update of a key that
+        // accepted an external epoch, or a create behind a surviving tombstone
+        // watermark, requires a token; anything else may be unfenced.
         if (config_.strict_fencing) {
             if (creating) {
-                // A surviving tombstone watermark means the key already had an
-                // incarnation epoch; purge_expired_tombstones() removes the
-                // visible row but keeps the fence history. A zero fence would
-                // reset the epoch, so a purged key is not fresh (F4).
                 if (tombstone_watermark_.find(id) != tombstone_watermark_.end()) {
                     return fence_verdict::required;
                 }
@@ -176,8 +258,8 @@ registry::fence_verdict registry::check_fence(const key& id, u64 fence,
         // global allocation, so the bound must consider it; otherwise repeated
         // grants on one key would drift past the lead and be rejected.
         const auto accepted = last_fence_.find(id);
-        if (accepted != last_fence_.end() && accepted->second > high_water) {
-            high_water = accepted->second;
+        if (accepted != last_fence_.end() && accepted->second.token > high_water) {
+            high_water = accepted->second.token;
         }
         const u64 lead = config_.max_fence_lead;
         const u64 limit = high_water > std::numeric_limits<u64>::max() - lead
@@ -188,10 +270,51 @@ registry::fence_verdict registry::check_fence(const key& id, u64 fence,
         }
     }
     const auto accepted = last_fence_.find(id);
-    if (accepted != last_fence_.end() && fence < accepted->second) {
+    const u64 high_water = accepted != last_fence_.end() ? accepted->second.token : 0;
+    // L-a: below the key high-water is always stale.
+    if (fence < high_water) {
         return fence_verdict::stale;
     }
-    return fence_verdict::ok;
+    if (!config_.require_issued_fence) {
+        // Legacy numeric contract: any in-range token above the high-water is
+        // accepted. Kept for in-process users; a network deployment must set
+        // require_issued_fence.
+        return fence_verdict::ok;
+    }
+    // L-b: with issuance attribution on, the token must be one the authority
+    // issued for this key, principal and lease.
+    if (issuing) {
+        // fence_barrier publishes a token. A strictly greater token always
+        // passes; an equal one rebinds the outstanding issuance to the caller,
+        // which is how a lease grant hands the same barrier value to the new
+        // holder. The barrier itself is authority-checked, so this is the
+        // authority moving the token, not a peer claiming it.
+        if (fence >= high_water) {
+            return fence_verdict::ok;
+        }
+        return fence_verdict::stale;
+    }
+    if (fence == high_water) {
+        // Equal to the key high-water: only an exact replay of an accepted
+        // write, or the first use of an outstanding issuance, may spend it.
+        // A new incarnation that merely observed the high-water is rejected.
+        if (exact_replay || issuance_matches_locked(id, fence, principal, lease_id)) {
+            return fence_verdict::ok;
+        }
+        if (accepted != last_fence_.end() && accepted->second.outstanding) {
+            // The token is live but it was issued to another principal or
+            // another lease: it exists, it is simply not this writer's. Report
+            // that precisely instead of calling it stale, which would suggest
+            // the token has already been spent.
+            return fence_verdict::not_issued;
+        }
+        return fence_verdict::stale;
+    }
+    // Strictly above the high-water: the authority must have issued it.
+    if (issuance_matches_locked(id, fence, principal, lease_id)) {
+        return fence_verdict::ok;
+    }
+    return fence_verdict::not_issued;
 }
 
 bool registry::allocate_fence(u64 requested, u64 next_index,
@@ -206,6 +329,19 @@ bool registry::allocate_fence(u64 requested, u64 next_index,
     if (key_high_water > candidate) {
         candidate = key_high_water;
     }
+    if (requested != 0) {
+        // The caller presented a token the authority issued. The issuance was
+        // itself the global allocation (next_fence() and fence_barrier() both
+        // move last_global_fence_), so committing it must not spend a second
+        // number: an issued token of N has to stay N. Only the global
+        // high-water may move, and never downwards.
+        if (candidate > last_global_fence_) {
+            last_global_fence_ = candidate;
+        }
+        out = candidate;
+        return true;
+    }
+    // An unfenced (legacy) write takes a fresh number from the global counter.
     if (candidate <= last_global_fence_) {
         candidate = last_global_fence_ + 1;
     }
@@ -217,6 +353,12 @@ bool registry::allocate_fence(u64 requested, u64 next_index,
 result<u64> registry::fence_barrier(const std::string& service,
                                     const std::string& node_id, u64 fence,
                                     const write_context& context) {
+    return fence_barrier(service, node_id, fence, context, /*lease_id=*/0);
+}
+
+result<u64> registry::fence_barrier(const std::string& service,
+                                    const std::string& node_id, u64 fence,
+                                    const write_context& context, u64 lease_id) {
     if (service.empty() || node_id.empty() || fence == 0) {
         return reject(rpc_code::invalid_argument,
                       "service, node_id and fence are required", reason_invalid);
@@ -229,7 +371,10 @@ result<u64> registry::fence_barrier(const std::string& service,
 
     const key id{service, node_id};
     std::lock_guard<std::mutex> lock(mutex_);
-    const fence_verdict verdict = check_fence(id, fence, true);
+    const u64 principal = principal_hash(context.node_id);
+    const fence_verdict verdict =
+        check_fence(id, fence, /*creating=*/true, /*exact_replay=*/false, principal,
+                    lease_id, /*issuing=*/true);
     if (verdict == fence_verdict::out_of_range) {
         return reject(rpc_code::failed_precondition,
                       "fencing token is out of range",
@@ -238,12 +383,22 @@ result<u64> registry::fence_barrier(const std::string& service,
     if (verdict == fence_verdict::stale) {
         return reject_stale_fence_locked(id);
     }
-    u64& key_fence = last_fence_[id];
-    if (fence > key_fence) {
-        key_fence = fence;
+    if (verdict == fence_verdict::required) {
+        return reject(rpc_code::failed_precondition,
+                      "a fencing token is required for this key",
+                      reason_fence_required);
+    }
+    issued_fence& key_fence = last_fence_[id];
+    if (fence >= key_fence.token) {
+        key_fence.token = fence;
+        // A barrier publishes the token: the holder that calls it may spend it
+        // once even though it equals the key high-water.
+        key_fence.principal_hash = principal;
+        key_fence.lease_id = lease_id;
+        key_fence.outstanding = true;
     }
     fenced_keys_[id] = true;
-    return key_fence;
+    return key_fence.token;
 }
 
 
@@ -258,7 +413,7 @@ rpc_error registry::reject_stale_fence_locked(const key& id) const {
                              reason_stale_fence);
     const auto accepted = last_fence_.find(id);
     if (accepted != last_fence_.end()) {
-        error.metadata.set("registry.fence", std::to_string(accepted->second));
+        error.metadata.set("registry.fence", std::to_string(accepted->second.token));
     }
     return error;
 }
@@ -346,6 +501,18 @@ void registry::notify(const catalog_event& event) {
 
 result<write_result> registry::register_instance(service_instance instance,
                                                  const write_context& context) {
+    return register_with(std::move(instance), context, /*lease_id=*/0);
+}
+
+result<write_result> registry::register_instance(service_instance instance,
+                                                 const write_context& context,
+                                                 u64 lease_id) {
+    return register_with(std::move(instance), context, lease_id);
+}
+
+result<write_result> registry::register_with(service_instance instance,
+                                             const write_context& context,
+                                             u64 lease_id) {
     if (instance.service.empty() || instance.node_id.empty()) {
         return reject(rpc_code::invalid_argument, "service and node_id are required",
                       reason_invalid);
@@ -436,8 +603,25 @@ result<write_result> registry::register_instance(service_instance instance,
             }
         }
 
+        const u64 principal = principal_hash(context.node_id);
+        // S7: epoch before fence. A stale epoch means the writer has been
+        // replaced and must yield; reporting stale_fence instead would tell it
+        // to re-anchor and keep writing.
+        const fence_verdict epoch_verdict =
+            check_writer_epoch(id, context.writer_epoch);
+        if (epoch_verdict == fence_verdict::required) {
+            return reject(rpc_code::failed_precondition,
+                          "a writer epoch is required for this key",
+                          reason_epoch_required);
+        }
+        if (epoch_verdict == fence_verdict::stale_writer) {
+            return reject(rpc_code::failed_precondition,
+                          "writer epoch is older than the recorded one",
+                          reason_stale_writer);
+        }
         const fence_verdict verdict =
-            check_fence(id, context.fence, existing == instances_.end());
+            check_fence(id, context.fence, existing == instances_.end(), idempotent,
+                        principal, lease_id, /*issuing=*/false);
         if (verdict == fence_verdict::stale) {
             return reject_stale_fence_locked(id);
         }
@@ -450,6 +634,11 @@ result<write_result> registry::register_instance(service_instance instance,
                           "a fencing token is required for this key",
                           reason_fence_required);
         }
+        if (verdict == fence_verdict::not_issued) {
+            return reject(rpc_code::failed_precondition,
+                          "fencing token was not issued for this writer",
+                          reason_not_issued);
+        }
 
         if (idempotent) {
             // Replay of an accepted write: the index and the event stream do
@@ -457,7 +646,7 @@ result<write_result> registry::register_instance(service_instance instance,
             const auto recorded = last_fence_.find(id);
             outcome.index = existing->second.revision;
             outcome.fence = recorded != last_fence_.end()
-                                ? recorded->second
+                                ? recorded->second.token
                                 : existing->second.revision;
             outcome.incarnation = existing->second.incarnation;
             return outcome;
@@ -479,15 +668,16 @@ result<write_result> registry::register_instance(service_instance instance,
         const u64 next_index = index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
-            accepted_fence != last_fence_.end() ? accepted_fence->second : 0;
+            accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
         u64 next_fence = 0;
         if (!allocate_fence(context.fence, next_index, key_high_water,
                             next_fence)) {
             return reject(rpc_code::resource_exhausted, "fence exhausted",
                           reason_overflow);
         }
-        const u64 returned =
-            record_fence_locked(id, context.fence, next_fence);
+        const u64 returned = record_fence_locked(id, context.fence, next_fence,
+                                                 principal, lease_id);
+        record_writer_epoch_locked(id, context.writer_epoch);
         instance.revision = next_index;
 
         auto next = snapshot_with(instance);
@@ -515,6 +705,20 @@ result<write_result> registry::register_instance(service_instance instance,
 result<write_result> registry::deregister(const std::string& service,
                                           const std::string& node_id,
                                           const write_context& context) {
+    return deregister_with(service, node_id, context, /*lease_id=*/0);
+}
+
+result<write_result> registry::deregister(const std::string& service,
+                                          const std::string& node_id,
+                                          const write_context& context,
+                                          u64 lease_id) {
+    return deregister_with(service, node_id, context, lease_id);
+}
+
+result<write_result> registry::deregister_with(const std::string& service,
+                                               const std::string& node_id,
+                                               const write_context& context,
+                                               u64 lease_id) {
     if (service.empty() || node_id.empty()) {
         return reject(rpc_code::invalid_argument, "service and node_id are required",
                       reason_invalid);
@@ -537,7 +741,24 @@ result<write_result> registry::deregister(const std::string& service,
             return reject(rpc_code::failed_precondition,
                           "write authority does not belong to this node", reason_authority);
         }
-        const fence_verdict verdict = check_fence(id, context.fence, false);
+        const u64 principal = principal_hash(context.node_id);
+        // S7: epoch before fence (see register_with).
+        const fence_verdict epoch_verdict =
+            check_writer_epoch(id, context.writer_epoch);
+        if (epoch_verdict == fence_verdict::required) {
+            return reject(rpc_code::failed_precondition,
+                          "a writer epoch is required for this key",
+                          reason_epoch_required);
+        }
+        if (epoch_verdict == fence_verdict::stale_writer) {
+            return reject(rpc_code::failed_precondition,
+                          "writer epoch is older than the recorded one",
+                          reason_stale_writer);
+        }
+        const fence_verdict verdict =
+            check_fence(id, context.fence, /*creating=*/false,
+                        /*exact_replay=*/false, principal, lease_id,
+                        /*issuing=*/false);
         if (verdict == fence_verdict::stale) {
             return reject_stale_fence_locked(id);
         }
@@ -550,11 +771,17 @@ result<write_result> registry::deregister(const std::string& service,
                           "a fencing token is required for this key",
                           reason_fence_required);
         }
+        if (verdict == fence_verdict::not_issued) {
+            return reject(rpc_code::failed_precondition,
+                          "fencing token was not issued for this writer",
+                          reason_not_issued);
+        }
 
         if (stored.state == instance_state::deregistered) {
             const auto fence_it = last_fence_.find(id);
             outcome.index = index_;
-            outcome.fence = fence_it == last_fence_.end() ? index_ : fence_it->second;
+            outcome.fence =
+                fence_it == last_fence_.end() ? index_ : fence_it->second.token;
             outcome.incarnation = stored.incarnation;
             return outcome;
         }
@@ -580,15 +807,16 @@ result<write_result> registry::deregister(const std::string& service,
         const u64 next_index = index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
-            accepted_fence != last_fence_.end() ? accepted_fence->second : 0;
+            accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
         u64 next_fence = 0;
         if (!allocate_fence(context.fence, next_index, key_high_water,
                             next_fence)) {
             return reject(rpc_code::resource_exhausted, "fence exhausted",
                           reason_overflow);
         }
-        const u64 returned =
-            record_fence_locked(id, context.fence, next_fence);
+        const u64 returned = record_fence_locked(id, context.fence, next_fence,
+                                                 principal, lease_id);
+        record_writer_epoch_locked(id, context.writer_epoch);
         updated.revision = next_index;
 
         // Keep the tombstone incarnation high-water even after a later purge
@@ -620,6 +848,22 @@ result<write_result> registry::set_state(const std::string& service,
                                          const std::string& node_id,
                                          instance_state state,
                                          const write_context& context) {
+    return set_state_with(service, node_id, state, context, /*lease_id=*/0);
+}
+
+result<write_result> registry::set_state(const std::string& service,
+                                         const std::string& node_id,
+                                         instance_state state,
+                                         const write_context& context,
+                                         u64 lease_id) {
+    return set_state_with(service, node_id, state, context, lease_id);
+}
+
+result<write_result> registry::set_state_with(const std::string& service,
+                                              const std::string& node_id,
+                                              instance_state state,
+                                              const write_context& context,
+                                              u64 lease_id) {
     if (service.empty() || node_id.empty()) {
         return reject(rpc_code::invalid_argument, "service and node_id are required",
                       reason_invalid);
@@ -645,7 +889,26 @@ result<write_result> registry::set_state(const std::string& service,
             return reject(rpc_code::failed_precondition,
                           "write authority does not belong to this node", reason_authority);
         }
-        const fence_verdict verdict = check_fence(id, context.fence, false);
+        const u64 principal = principal_hash(context.node_id);
+        // S7: epoch before fence. A stale epoch means the writer has been
+        // replaced and must yield; reporting stale_fence instead would tell it
+        // to re-anchor and keep writing.
+        const fence_verdict epoch_verdict =
+            check_writer_epoch(id, context.writer_epoch);
+        if (epoch_verdict == fence_verdict::required) {
+            return reject(rpc_code::failed_precondition,
+                          "a writer epoch is required for this key",
+                          reason_epoch_required);
+        }
+        if (epoch_verdict == fence_verdict::stale_writer) {
+            return reject(rpc_code::failed_precondition,
+                          "writer epoch is older than the recorded one",
+                          reason_stale_writer);
+        }
+        const fence_verdict verdict =
+            check_fence(id, context.fence, /*creating=*/false,
+                        /*exact_replay=*/false, principal, lease_id,
+                        /*issuing=*/false);
         if (verdict == fence_verdict::stale) {
             return reject_stale_fence_locked(id);
         }
@@ -657,6 +920,11 @@ result<write_result> registry::set_state(const std::string& service,
             return reject(rpc_code::failed_precondition,
                           "a fencing token is required for this key",
                           reason_fence_required);
+        }
+        if (verdict == fence_verdict::not_issued) {
+            return reject(rpc_code::failed_precondition,
+                          "fencing token was not issued for this writer",
+                          reason_not_issued);
         }
         if (stored.state == instance_state::deregistered) {
             return reject(rpc_code::not_found,
@@ -676,15 +944,16 @@ result<write_result> registry::set_state(const std::string& service,
         const u64 next_index = index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
-            accepted_fence != last_fence_.end() ? accepted_fence->second : 0;
+            accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
         u64 next_fence = 0;
         if (!allocate_fence(context.fence, next_index, key_high_water,
                             next_fence)) {
             return reject(rpc_code::resource_exhausted, "fence exhausted",
                           reason_overflow);
         }
-        const u64 returned =
-            record_fence_locked(id, context.fence, next_fence);
+        const u64 returned = record_fence_locked(id, context.fence, next_fence,
+                                                 principal, lease_id);
+        record_writer_epoch_locked(id, context.writer_epoch);
         updated.revision = next_index;
 
         auto next = snapshot_with(updated);
@@ -751,6 +1020,86 @@ u64 registry::index() const noexcept {
 u64 registry::fence() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return published_fence_locked();
+}
+
+result<u64> registry::issue_fence(const std::string& service,
+                                  const std::string& node_id, u64 lease_id) {
+    if (service.empty() || node_id.empty()) {
+        return reject(rpc_code::invalid_argument, "service and node_id are required",
+                      reason_invalid);
+    }
+    const key id{service, node_id};
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (last_global_fence_ == std::numeric_limits<u64>::max()) {
+        return reject(rpc_code::resource_exhausted, "fence exhausted",
+                      reason_overflow);
+    }
+    // max(global, per-key high-water) + 1: the allocator must jump over a
+    // barrier rather than walk towards it one grant at a time, and the new
+    // token must be strictly above the token it replaces so the previous
+    // holder is fenced out immediately.
+    u64 floor = published_fence_locked();
+    const auto accepted = last_fence_.find(id);
+    if (accepted != last_fence_.end() && accepted->second.token > floor) {
+        floor = accepted->second.token;
+    }
+    if (floor == std::numeric_limits<u64>::max()) {
+        return reject(rpc_code::resource_exhausted, "fence exhausted",
+                      reason_overflow);
+    }
+    const u64 token = floor + 1;
+    issued_fence& record = last_fence_[id];
+    record.token = token;
+    // The principal is the issuer's own identity: next_fence() is called by the
+    // authority on behalf of the key owner, and the write must come from the
+    // same node id.
+    record.principal_hash = principal_hash(node_id);
+    record.lease_id = lease_id;
+    record.outstanding = true;
+    if (token > last_global_fence_) {
+        last_global_fence_ = token;
+    }
+    fenced_keys_[id] = true;
+    return token;
+}
+
+result<u64> registry::next_fence(const std::string& service,
+                                 const std::string& node_id) {
+    return issue_fence(service, node_id, /*lease_id=*/0);
+}
+
+result<u64> registry::next_fence(const std::string& service,
+                                 const std::string& node_id, u64 lease_id) {
+    return issue_fence(service, node_id, lease_id);
+}
+
+result<u64> registry::next_writer_epoch() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (last_global_fence_ == std::numeric_limits<u64>::max()) {
+        return reject(rpc_code::resource_exhausted, "fence exhausted",
+                      reason_overflow);
+    }
+    // The epoch shares the fence allocation counter: a bridge epoch is a
+    // reservation in the same number space, so a restored catalog can never hand
+    // out an epoch at or below one a surviving writer already used. The
+    // reservation is deliberately not a fence issuance (it touches no key), so
+    // it cannot spend or rebind any token.
+    return ++last_global_fence_;
+}
+
+result<u64> registry::fence_floor(const std::string& service,
+                                  const std::string& node_id) const {
+    if (service.empty() || node_id.empty()) {
+        return reject(rpc_code::invalid_argument, "service and node_id are required",
+                      reason_invalid);
+    }
+    const key id{service, node_id};
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto accepted = last_fence_.find(id);
+    // The per-key high-water, deliberately not the global allocation: a lease
+    // barrier can hold one key far above the global counter, and the whole
+    // point of the floor is to let an allocator see that.
+    return accepted != last_fence_.end() ? accepted->second.token : 0;
 }
 
 result<u64> registry::add_sink(catalog_sink sink, void* context) {
@@ -843,6 +1192,348 @@ std::size_t registry::purge_expired_tombstones() {
         notify(event);
     }
     return expired.size();
+}
+
+// --- restore_from_log --------------------------------------------------------
+//
+// A friend free function (see registry.hpp): it needs the private catalog and
+// fence state to rebuild them atomically, and keeping it out of the class
+// avoids adding a log handle member, which would grow `registry` by 8 bytes
+// (a second MAJOR layout change).
+
+namespace {
+
+// The payload codec: version(u8) | state(u8) | service | node_id | host
+// (each length-prefixed u32) | port(u16) | weight(u32) | incarnation(u64) |
+// meta_count(u32) then per entry key/value (length-prefixed u32). The first
+// 16 bytes carry the record's fence and incarnation; the rest is the instance
+// body. Every read is bounds-checked, so a truncated payload is an error
+// rather than a partially parsed instance.
+constexpr std::uint8_t kRestoreVersion = 1;
+constexpr std::size_t kRestoreHeader = 16;
+
+class payload_reader {
+public:
+    payload_reader(const std::vector<std::byte>& bytes, std::size_t offset)
+        : bytes_(bytes), pos_(offset) {}
+
+    bool u8(std::uint8_t& out) {
+        if (pos_ + 1 > bytes_.size()) {
+            return false;
+        }
+        out = std::to_integer<std::uint8_t>(bytes_[pos_]);
+        pos_ += 1;
+        return true;
+    }
+    bool u16(std::uint16_t& out) {
+        if (pos_ + 2 > bytes_.size()) {
+            return false;
+        }
+        out = static_cast<std::uint16_t>(
+            std::to_integer<unsigned>(bytes_[pos_]) |
+            (static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes_[pos_ + 1]))
+             << 8));
+        pos_ += 2;
+        return true;
+    }
+    bool u32(std::uint32_t& out) {
+        if (pos_ + 4 > bytes_.size()) {
+            return false;
+        }
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) {
+            v |= static_cast<std::uint32_t>(
+                     std::to_integer<unsigned>(bytes_[pos_ + i]))
+                 << (8 * i);
+        }
+        out = v;
+        pos_ += 4;
+        return true;
+    }
+    bool u64(std::uint64_t& out) {
+        if (pos_ + 8 > bytes_.size()) {
+            return false;
+        }
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) {
+            v |= static_cast<std::uint64_t>(
+                     std::to_integer<unsigned>(bytes_[pos_ + i]))
+                 << (8 * i);
+        }
+        out = v;
+        pos_ += 8;
+        return true;
+    }
+    bool str(std::string& out) {
+        std::uint32_t len = 0;
+        if (!u32(len) || len > bytes_.size() - pos_) {
+            return false;
+        }
+        out.assign(reinterpret_cast<const char*>(bytes_.data()) + pos_, len);
+        pos_ += len;
+        return true;
+    }
+    [[nodiscard]] bool at_end() const { return pos_ == bytes_.size(); }
+
+private:
+    const std::vector<std::byte>& bytes_;
+    std::size_t pos_;
+};
+
+bool decode_restore_payload(const std::vector<std::byte>& payload,
+                            u64& fence, u64& incarnation,
+                            service_instance& out) {
+    if (payload.size() < kRestoreHeader) {
+        return false;
+    }
+    fence = 0;
+    incarnation = 0;
+    for (int i = 0; i < 8; ++i) {
+        fence |= static_cast<u64>(
+                     std::to_integer<unsigned>(payload[static_cast<std::size_t>(i)]))
+                 << (8 * i);
+        incarnation |= static_cast<u64>(
+                           std::to_integer<unsigned>(
+                               payload[8 + static_cast<std::size_t>(i)]))
+                       << (8 * i);
+    }
+    payload_reader r(payload, kRestoreHeader);
+    std::uint8_t version = 0;
+    std::uint8_t state = 0;
+    if (!r.u8(version) || version != kRestoreVersion) {
+        return false;
+    }
+    if (!r.u8(state) ||
+        state > static_cast<std::uint8_t>(instance_state::deregistered)) {
+        return false;
+    }
+    out.state = static_cast<instance_state>(state);
+    if (!r.str(out.service) || !r.str(out.node_id) || !r.str(out.address.host)) {
+        return false;
+    }
+    if (!r.u16(out.address.port) || !r.u32(out.weight) || !r.u64(out.incarnation)) {
+        return false;
+    }
+    std::uint32_t meta_count = 0;
+    if (!r.u32(meta_count) || meta_count > 100000u) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < meta_count; ++i) {
+        std::string key;
+        std::string value;
+        if (!r.str(key) || !r.str(value)) {
+            return false;
+        }
+        out.meta.set(std::move(key), std::move(value));
+    }
+    return r.at_end();
+}
+
+// One folded, validated entry. The catalog key is private to `registry`, so
+// the fold uses a plain pair; the apply step constructs the private key.
+struct folded_record {
+    u64 index = 0;
+    u64 fence = 0;
+    u64 incarnation = 0;
+    service_instance instance;
+};
+
+} // namespace
+
+result<std::size_t> restore_from_log(registry& target, const registry_log& log) {
+    const auto reject = [](rpc_code code, const std::string& message,
+                           const char* reason) {
+        rpc_error error(code, message);
+        error.metadata.set("registry.reason", reason);
+        return error;
+    };
+
+    // R8: replay()'s own error is propagated verbatim; nothing is applied.
+    const auto replayed = log.replay(0);
+    if (!replayed.ok()) {
+        return replayed.error();
+    }
+    const std::vector<log_record>& stream = replayed.value();
+
+    // Fold last-wins by index. replay() returns vector<log_record> and the
+    // backend is replaceable, so duplicates are a legal input (7.1.6b).
+    // A std::map keeps the output ordered by index, which is the apply order.
+    std::map<u64, folded_record> folded;
+    for (const auto& record : stream) {
+        folded_record decoded;
+        if (!decode_restore_payload(record.payload, decoded.fence,
+                                    decoded.incarnation, decoded.instance)) {
+            return reject(rpc_code::invalid_argument,
+                          "restore: record payload is not decodable",
+                          reason_invalid);
+        }
+        decoded.index = record.index;
+        // Last-wins: a later record at the same index replaces the earlier one.
+        folded[record.index] = std::move(decoded);
+    }
+
+    // G5: an empty stream is a successful no-op.
+    if (folded.empty()) {
+        return std::size_t{0};
+    }
+
+    // G1: the folded sequence must be 1, 2, 3, ... with no hole. Checking the
+    // folded sequence (not the raw stream) is what makes a duplicate index
+    // legal: 1,2,2 folds to 1,2, which is dense.
+    u64 expected = 1;
+    for (const auto& entry : folded) {
+        if (entry.first != expected) {
+            return reject(rpc_code::invalid_argument,
+                          "restore: index gap (expected " +
+                              std::to_string(expected) + ", got " +
+                              std::to_string(entry.first) + ")",
+                          reason_invalid);
+        }
+        ++expected;
+    }
+
+    const u64 stream_max_index = folded.rbegin()->first;
+    const u64 stream_max_fence = [&]() {
+        u64 max_fence = 0;
+        for (const auto& entry : folded) {
+            if (entry.second.fence > max_fence) {
+                max_fence = entry.second.fence;
+            }
+        }
+        return max_fence;
+    }();
+    // R5 is per key, not global: a log that only ever mentions key A must not
+    // be rejected because key B (which the log never mentions) has a higher
+    // water-mark on the target. Fold the stream a second time by key, keeping
+    // the maximum fence for each key (the log is append-only and the folded
+    // order is by ascending index, so the last record of a key is its newest).
+    std::map<registry::key, u64, registry::key_less> fence_by_key;
+    for (const auto& entry : folded) {
+        const registry::key id{entry.second.instance.service,
+                               entry.second.instance.node_id};
+        u64& high = fence_by_key[id];
+        if (entry.second.fence > high) {
+            high = entry.second.fence;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(target.mutex_);
+
+    // G3: never roll a newer catalog back to an older log.
+    if (stream_max_index <= target.index_) {
+        return reject(rpc_code::failed_precondition,
+                      "restore: log is not ahead of the registry",
+                      "stale_log");
+    }
+    // R5: a fence regression on any key the log touches would let an old
+    // holder of that key write again. A key the log does not mention has no
+    // regression to check, so the global water-mark is deliberately not
+    // compared here.
+    for (const auto& entry : fence_by_key) {
+        const auto it = target.last_fence_.find(entry.first);
+        if (it != target.last_fence_.end() && entry.second < it->second.token) {
+            return reject(rpc_code::failed_precondition,
+                          "restore: log fence is below the registry water-mark",
+                          "fence_regression");
+        }
+    }
+
+    // R4: one (service, node_id, incarnation) names one write. The stream is
+    // validated before anything is applied, so a conflict leaves the registry
+    // untouched.
+    struct identity {
+        std::string service;
+        std::string node_id;
+        u64 incarnation = 0;
+
+        bool operator<(const identity& other) const {
+            if (service != other.service) {
+                return service < other.service;
+            }
+            if (node_id != other.node_id) {
+                return node_id < other.node_id;
+            }
+            return incarnation < other.incarnation;
+        }
+    };
+    std::map<identity, const folded_record*> seen;
+    for (const auto& entry : folded) {
+        const folded_record& record = entry.second;
+        const identity id{record.instance.service, record.instance.node_id,
+                          record.incarnation};
+        const auto existing = seen.find(id);
+        if (existing != seen.end()) {
+            const folded_record& other = *existing->second;
+            const bool same = other.instance.address == record.instance.address &&
+                              other.instance.weight == record.instance.weight &&
+                              other.instance.state == record.instance.state &&
+                              other.instance.meta.size() ==
+                                  record.instance.meta.size();
+            const bool meta_same = [&]() {
+                if (other.instance.meta.size() != record.instance.meta.size()) {
+                    return false;
+                }
+                for (const auto& item : other.instance.meta) {
+                    const std::string* value = record.instance.meta.find(item.first);
+                    if (value == nullptr || *value != item.second) {
+                        return false;
+                    }
+                }
+                return true;
+            }();
+            if (!same || !meta_same) {
+                return reject(rpc_code::failed_precondition,
+                              "restore: conflicting replay for one incarnation",
+                              reason_conflict);
+            }
+            continue;
+        }
+        seen.emplace(id, &record);
+    }
+
+    // Apply. The stream is dense from 1, so the target's index moves to the
+    // folded maximum, and the fence water-mark moves to the stream maximum.
+    // The tombstones and incarnation high-water are rebuilt from the same
+    // records so a later purge/registration cannot resurrect an old row.
+    auto next = std::make_shared<registry_snapshot>();
+    next->instances.reserve(folded.size());
+    for (const auto& entry : folded) {
+        const folded_record& record = entry.second;
+        service_instance instance = record.instance;
+        // The payload header already carries the incarnation; the body's copy is
+        // an independent encoding of the same field, so the header wins.
+        instance.revision = record.index;
+        instance.incarnation = record.incarnation;
+        next->instances.push_back(instance);
+        const registry::key id{instance.service, instance.node_id};
+        target.instances_[id] = instance;
+        target.last_fence_[id] = registry::issued_fence{
+            record.fence, registry::principal_hash(instance.node_id), 0, false,
+            // The epoch and the fence share one allocation counter
+            // (next_writer_epoch() is ++last_global_fence_), so the highest fence
+            // this key accepted in the log is also the lower bound of any epoch
+            // that may write it. Zero would let a pre-restart writer overwrite
+            // the restored data; UINT64_MAX would starve the key forever.
+            /*writer_epoch=*/record.fence};
+        if (instance.state == instance_state::deregistered) {
+            u64& watermark = target.tombstone_watermark_[id];
+            if (instance.incarnation > watermark) {
+                watermark = instance.incarnation;
+            }
+        }
+        if (record.fence != 0) {
+            target.fenced_keys_[id] = true;
+        }
+    }
+    next->index = stream_max_index;
+    target.index_ = stream_max_index;
+    if (stream_max_fence > target.last_global_fence_) {
+        target.last_global_fence_ = stream_max_fence;
+    }
+    std::shared_ptr<const registry_snapshot> published(std::move(next));
+    target.snapshot_.store(published, std::memory_order_release);
+
+    return folded.size();
 }
 
 } // namespace cluster

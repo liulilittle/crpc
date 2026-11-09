@@ -70,6 +70,20 @@ cl::write_context make_ctx(const std::string& node, u64 fence = 0,
     context.node_id = node;
     context.fence = fence;
     context.incarnation = incarnation;
+    context.writer_epoch = 0;  // external writer: not epoch-tracked
+    return context;
+}
+
+// The default config is strict (require_issued_fence), so a caller that writes
+// must first obtain a token from the authority. This helper is the canonical
+// shape: issue, then present.
+cl::write_context make_issued_ctx(cl::registry& reg, const std::string& service,
+                                  const std::string& node, u64 incarnation = 0) {
+    cl::write_context context = make_ctx(node, 0, incarnation);
+    const auto token = reg.next_fence(service, node);
+    if (token.ok()) {
+        context.fence = token.value();
+    }
     return context;
 }
 
@@ -157,10 +171,13 @@ CRPC_TEST(phase0_p1_grace_zero_purges_immediately) {
     config.tombstone_grace = 0;
     cl::registry reg(config);
 
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
-    CRPC_REQUIRE(reg.deregister("svc", "n1", make_ctx("n1", 0, 1)).ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "n1"))
+                      .ok());
+    CRPC_REQUIRE(reg.deregister("svc", "n1",
+                                make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
 
     CRPC_CHECK_EQ(std::size_t{1}, reg.purge_expired_tombstones());
 
@@ -178,32 +195,40 @@ CRPC_TEST(phase0_p2_purge_keeps_tombstone_high_water) {
     config.tombstone_grace = 0;
     cl::registry reg(config);
 
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "a", 8001, 1),
-                                       make_ctx("a"))
-                     .ok());
-    CRPC_REQUIRE(reg.deregister("svc", "a", make_ctx("a", 0, 1)).ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "a", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "a"))
+                      .ok());
+    CRPC_REQUIRE(reg.deregister("svc", "a",
+                                make_issued_ctx(reg, "svc", "a", 1))
+                      .ok());
     CRPC_REQUIRE(reg.purge_expired_tombstones() == 1);
 
     // The visible row is gone, but the tombstone watermark (incarnation 2)
-    // must still reject every incarnation that is not strictly greater.
-    const auto old_incarnation =
-        reg.register_instance(make_instance("svc", "a", 8001, 1), make_ctx("a"));
+    // must still reject every incarnation that is not strictly greater. Both of
+    // these carry a token the authority issued; the rejection is the
+    // incarnation rule, not a missing fence.
+    const auto old_incarnation = reg.register_instance(
+        make_instance("svc", "a", 8001, 1),
+        make_issued_ctx(reg, "svc", "a"));
     CRPC_CHECK_FALSE(old_incarnation.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, old_incarnation.code());
     CRPC_CHECK_EQ(std::string("tombstone"), rejection_reason(old_incarnation));
 
-    const auto equal_incarnation =
-        reg.register_instance(make_instance("svc", "a", 8001, 2), make_ctx("a"));
+    const auto equal_incarnation = reg.register_instance(
+        make_instance("svc", "a", 8001, 2),
+        make_issued_ctx(reg, "svc", "a", 2));
     CRPC_CHECK_FALSE(equal_incarnation.ok());
     CRPC_CHECK_EQ(std::string("tombstone"),
                   rejection_reason(equal_incarnation));
 
     // The visible row is purged but the tombstone watermark survives, so the
-    // key is not fresh: the resurrection carries an epoch above the surviving
-    // high-water (F4).
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "a", 8001, 3),
-                                     make_ctx("a", 3))
-                   .ok());
+    // key is not fresh: the resurrection carries a token above the surviving
+    // high-water (F4), which is what make_issued_ctx obtains.
+    CRPC_CHECK(reg.register_instance(
+                                  make_instance("svc", "a", 8001, 3),
+                                  make_issued_ctx(reg, "svc", "a", 3))
+                    .ok());
 }
 
 // --- P3: a caller fence cannot exhaust the authority fence -------------------
@@ -221,22 +246,25 @@ CRPC_TEST(phase0_p3_caller_fence_cannot_exhaust_authority) {
                   rejection_reason(hostile));
 
     // The rejected leap must not poison later writes.
-    const auto b = reg.register_instance(make_instance("svc", "b", 2, 1),
-                                         make_ctx("b"));
+    const auto b = reg.register_instance(
+        make_instance("svc", "b", 2, 1), make_issued_ctx(reg, "svc", "b"));
     CRPC_CHECK(b.ok());
-    const auto c = reg.register_instance(make_instance("svc", "c", 3, 1),
-                                         make_ctx("c"));
+    const auto c = reg.register_instance(
+        make_instance("svc", "c", 3, 1), make_issued_ctx(reg, "svc", "c"));
     CRPC_CHECK(c.ok());
     CRPC_CHECK(b.ok() && c.ok() && c.value().fence < huge);
 
     // A bounded caller epoch is still honoured and the returned fence stays
-    // globally strictly increasing.
-    const auto epoch = reg.register_instance(make_instance("svc", "d", 4, 1),
-                                             make_ctx("d", 7));
+    // globally strictly increasing. The epoch is issued by the authority first
+    // so the write itself is legal under require_issued_fence.
+    const auto epoch_token = reg.next_fence("svc", "d");
+    CRPC_REQUIRE(epoch_token.ok());
+    const auto epoch = reg.register_instance(
+        make_instance("svc", "d", 4, 1), make_ctx("d", epoch_token.value()));
     CRPC_REQUIRE(epoch.ok());
-    CRPC_CHECK_EQ(u64{7}, epoch.value().fence);
-    const auto after = reg.register_instance(make_instance("svc", "e", 5, 1),
-                                             make_ctx("e"));
+    CRPC_CHECK_EQ(epoch_token.value(), epoch.value().fence);
+    const auto after = reg.register_instance(
+        make_instance("svc", "e", 5, 1), make_issued_ctx(reg, "svc", "e"));
     CRPC_REQUIRE(after.ok());
     CRPC_CHECK(after.value().fence > epoch.value().fence);
 }
@@ -246,9 +274,10 @@ CRPC_TEST(phase0_p3_caller_fence_cannot_exhaust_authority) {
 CRPC_TEST(phase0_p4_expired_renew_is_rejected) {
     manual_clock clock;
     cl::registry reg;
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "n1"))
+                      .ok());
     cl::lease_manager leases(reg, make_clock(clock));
 
     const auto granted = leases.grant("svc", "n1", 1000ms);
@@ -270,26 +299,31 @@ CRPC_TEST(phase0_p5_register_keeps_health_state) {
     config.strict_incarnation = true;
     cl::registry reg(config);
 
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     CRPC_REQUIRE(reg.set_state("svc", "n1", cl::instance_state::critical,
-                               make_ctx("n1", 0, 1))
-                     .ok());
+                               make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     CRPC_CHECK_EQ(cl::instance_state::critical, state_of(reg, "svc", "n1"));
 
     // A new incarnation re-registers with a different endpoint. The health
     // verdict belongs to the health/lease writer and must survive.
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "n1", 8002, 2),
-                                     make_ctx("n1"))
-                   .ok());
+    CRPC_CHECK(reg.register_instance(
+                                  make_instance("svc", "n1", 8002, 2),
+                                  make_issued_ctx(reg, "svc", "n1", 2))
+                    .ok());
     CRPC_CHECK_EQ(cl::instance_state::critical, state_of(reg, "svc", "n1"));
 
-    // An identical replay is a no-op and also keeps the state.
+    // An identical replay is a no-op and also keeps the state. It repeats the
+    // exact token of the accepted write, which is the only equal-fence write the
+    // strict contract admits.
     const u64 index_before = reg.index();
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "n1", 8002, 2),
-                                     make_ctx("n1"))
-                   .ok());
+    CRPC_CHECK(reg.register_instance(
+                                  make_instance("svc", "n1", 8002, 2),
+                                  make_ctx("n1", reg.fence_floor("svc", "n1").value(), 2))
+                    .ok());
     CRPC_CHECK_EQ(index_before, reg.index());
     CRPC_CHECK_EQ(cl::instance_state::critical, state_of(reg, "svc", "n1"));
 }
@@ -301,29 +335,40 @@ CRPC_TEST(phase0_p6_unfenced_write_after_fenced_epoch_rejected) {
     config.strict_fencing = true;
     cl::registry reg(config);
 
-    // The first create is never fenced.
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
-    // An external epoch (a lease/election token) fences the key.
+    // The first create carries an authority-issued token.
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
+    // An external epoch (a lease/election token) fences the key. The token is
+    // issued by the authority first: the case under test is the fence rule, not
+    // the issuance check.
+    const auto epoch_token = reg.next_fence("svc", "n1");
+    CRPC_REQUIRE(epoch_token.ok());
     CRPC_REQUIRE(reg.set_state("svc", "n1", cl::instance_state::critical,
-                               make_ctx("n1", 100, 1))
-                     .ok());
+                               make_ctx("n1", epoch_token.value(), 1))
+                      .ok());
 
+    // A zero fence is rejected even though this key is not fresh: the default
+    // require_issued_fence makes Z2 unconditional.
     const auto unfenced = reg.register_instance(
         make_instance("svc", "n1", 8002, 2), make_ctx("n1", 0));
     CRPC_CHECK_FALSE(unfenced.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, unfenced.code());
     CRPC_CHECK_EQ(std::string("fence_required"), rejection_reason(unfenced));
 
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "n1", 8002, 2),
-                                     make_ctx("n1", 100))
-                   .ok());
+    // The legal shape is a fresh authority token, not the observed value 100.
+    CRPC_CHECK(reg.register_instance(
+                                  make_instance("svc", "n1", 8002, 2),
+                                  make_issued_ctx(reg, "svc", "n1", 2))
+                    .ok());
 
-    // The default mode keeps the historical unfenced behaviour for in-process
-    // users that never configured fencing.
+    // Turning strict_fencing off is not enough to restore the historical
+    // unfenced behaviour any more: require_issued_fence owns Z2 independently,
+    // so the legacy in-process shape needs both switches off.
     cl::registry_config compat_config;
     compat_config.strict_fencing = false;
+    compat_config.require_issued_fence = false;
     cl::registry compat(compat_config);
     CRPC_REQUIRE(compat.register_instance(make_instance("svc", "n1", 8001, 1),
                                           make_ctx("n1"))
@@ -347,8 +392,12 @@ CRPC_TEST(phase0_p7_grant_before_register_expiry_applies) {
 
     const auto granted = leases.grant("svc", "n1", 1000ms);
     CRPC_REQUIRE(granted.ok());
+    // The lease grant publishes a barrier for the key, so the registration must
+    // present the token that grant issued - the zero-fence create path is gone
+    // (Z2). The token is bound to the lease id, so it is passed through.
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
+                                       make_ctx("n1", granted.value().fence, 1),
+                                       granted.value().id)
                      .ok());
 
     clock.advance(1000ms);
@@ -377,13 +426,13 @@ CRPC_TEST(phase0_p8_endpoint_validation) {
 
     const auto empty_host_port0 =
         reg.register_instance(make_instance("svc", "n1", 0, 1, ""),
-                              make_ctx("n1"));
+                              make_issued_ctx(reg, "svc", "n1"));
     CRPC_CHECK_FALSE(empty_host_port0.ok());
     CRPC_CHECK_EQ(rpc_code::invalid_argument, empty_host_port0.code());
 
     const auto empty_host_network =
         reg.register_instance(make_instance("svc", "n2", 8001, 1, ""),
-                              make_ctx("n2"));
+                              make_issued_ctx(reg, "svc", "n2"));
     CRPC_CHECK_FALSE(empty_host_network.ok());
     CRPC_CHECK_EQ(rpc_code::invalid_argument, empty_host_network.code());
 
@@ -391,10 +440,11 @@ CRPC_TEST(phase0_p8_endpoint_validation) {
     // in-process distributed tests; it must not be rejected blindly.
     CRPC_CHECK(reg.register_instance(
                    make_instance("svc", "n3", 0, 1, "dist-inproc-node"),
-                   make_ctx("n3"))
+                   make_issued_ctx(reg, "svc", "n3"))
                    .ok());
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "n4", 8001, 1),
-                                     make_ctx("n4"))
+    CRPC_CHECK(reg.register_instance(
+                   make_instance("svc", "n4", 8001, 1),
+                   make_issued_ctx(reg, "svc", "n4"))
                    .ok());
 }
 
@@ -408,12 +458,14 @@ CRPC_TEST(phase0_p9_purge_bumps_index_and_emits_remove) {
     CRPC_REQUIRE(reg.add_sink(&capture_catalog_event, &events).ok());
 
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "a", 8001, 1),
-                                       make_ctx("a"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "a", 1))
+                      .ok());
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "b", 8002, 1),
-                                       make_ctx("b"))
-                     .ok());
-    CRPC_REQUIRE(reg.deregister("svc", "a", make_ctx("a", 0, 1)).ok());
+                                       make_issued_ctx(reg, "svc", "b", 1))
+                      .ok());
+    CRPC_REQUIRE(reg.deregister("svc", "a",
+                                make_issued_ctx(reg, "svc", "a", 1))
+                      .ok());
 
     const u64 before = reg.index();
     events.indexes.clear();
@@ -454,16 +506,22 @@ CRPC_TEST(phase0_p11_identical_register_is_idempotent) {
     cl::registry_config config;
     config.strict_incarnation = true;
     cl::registry reg(config);
+    const auto create_token = reg.next_fence("svc", "n1");
+    CRPC_REQUIRE(create_token.ok());
     const auto first = reg.register_instance(
-        make_instance("svc", "n1", 7001, 3), make_ctx("n1"));
+        make_instance("svc", "n1", 7001, 3),
+        make_ctx("n1", create_token.value(), 3));
     CRPC_REQUIRE(first.ok());
     CRPC_CHECK_EQ(u64{1}, reg.index());
 
     catalog_capture events;
     CRPC_REQUIRE(reg.add_sink(&capture_catalog_event, &events).ok());
 
+    // Byte-identical replay: the same token as well as the same payload. That is
+    // the one equal-fence write the strict contract admits.
     const auto retry = reg.register_instance(
-        make_instance("svc", "n1", 7001, 3), make_ctx("n1"));
+        make_instance("svc", "n1", 7001, 3),
+        make_ctx("n1", create_token.value(), 3));
     CRPC_CHECK(retry.ok());
     CRPC_CHECK_EQ(u64{1}, reg.index());
     CRPC_CHECK_EQ(first.value().index, retry.value().index);
@@ -478,34 +536,38 @@ CRPC_TEST(phase0_p12_conflicting_payload_rejected) {
     config.strict_incarnation = true;
     cl::registry reg(config);
 
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 3),
-                                       make_ctx("n1"))
-                     .ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 3),
+                                   make_issued_ctx(reg, "svc", "n1", 3))
+                      .ok());
     const u64 before = reg.index();
 
     const auto conflict = reg.register_instance(
-        make_instance("svc", "n1", 8002, 3), make_ctx("n1"));
+        make_instance("svc", "n1", 8002, 3), make_issued_ctx(reg, "svc", "n1", 3));
     CRPC_CHECK_FALSE(conflict.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, conflict.code());
     CRPC_CHECK_EQ(std::string("conflict"), rejection_reason(conflict));
     CRPC_CHECK_EQ(before, reg.index());
 
-    CRPC_CHECK(reg.register_instance(make_instance("svc", "n1", 8001, 3),
-                                     make_ctx("n1"))
-                   .ok());
+    CRPC_CHECK(reg.register_instance(
+                                  make_instance("svc", "n1", 8001, 3),
+                                  make_ctx("n1", reg.fence_floor("svc", "n1").value(), 3))
+                    .ok());
     CRPC_CHECK_EQ(before, reg.index());
 
-    // The default mode keeps the historical overwrite so existing in-process
-    // users that bump only the endpoint are not broken.
+    // Turning strict_incarnation off is not enough on its own: the legacy
+    // in-process shape also needs require_issued_fence off, because a zero fence
+    // is refused independently (Z2).
     cl::registry_config compat_config;
     compat_config.strict_incarnation = false;
+    compat_config.require_issued_fence = false;
     cl::registry compat(compat_config);
     CRPC_REQUIRE(compat.register_instance(make_instance("svc", "n1", 8001, 3),
                                           make_ctx("n1"))
                      .ok());
     CRPC_CHECK(compat.register_instance(make_instance("svc", "n1", 8002, 3),
                                         make_ctx("n1"))
-                   .ok());
+                    .ok());
     cl::query_options options;
     options.service = "svc";
     const auto rows = compat.query(options);
@@ -519,9 +581,10 @@ CRPC_TEST(phase0_p12_conflicting_payload_rejected) {
 CRPC_TEST(phase0_p13_grant_fences_old_holder) {
     manual_clock clock;
     cl::registry reg;
-    CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("svc", "n1", 8001, 1),
+                                   make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     cl::lease_manager leases(reg, make_clock(clock));
 
     const auto old_lease = leases.grant("svc", "n1", 1000ms);
@@ -532,14 +595,15 @@ CRPC_TEST(phase0_p13_grant_fences_old_holder) {
 
     const auto old_write = reg.register_instance(
         make_instance("svc", "n1", 9001, 2),
-        make_ctx("n1", old_lease.value().fence, 2));
+        make_ctx("n1", old_lease.value().fence, 2), old_lease.value().id);
     CRPC_CHECK_FALSE(old_write.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, old_write.code());
     CRPC_CHECK_EQ(std::string("stale_fence"), rejection_reason(old_write));
 
     CRPC_CHECK(reg.register_instance(
                    make_instance("svc", "n1", 9001, 2),
-                   make_ctx("n1", new_lease.value().fence, 2))
+                   make_ctx("n1", new_lease.value().fence, 2),
+                   new_lease.value().id)
                    .ok());
 }
 
@@ -557,11 +621,11 @@ CRPC_TEST(phase0_w1_cancel_is_a_delivery_barrier) {
     capture.id = id.value();
 
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n2", 8002, 1),
-                                       make_ctx("n2"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n2", 1))
+                      .ok());
 
     (void)hub.dispatch();
     CRPC_CHECK_EQ(1, capture.deltas);
@@ -575,8 +639,8 @@ CRPC_TEST(phase0_w1_cancel_is_a_delivery_barrier) {
 CRPC_TEST(phase0_w2_watch_at_current_parks) {
     cl::registry reg;
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     cl::watch_hub hub(reg);
     watch_capture capture;
 
@@ -587,8 +651,8 @@ CRPC_TEST(phase0_w2_watch_at_current_parks) {
     CRPC_CHECK_EQ(0, capture.callbacks);
 
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n2", 8002, 1),
-                                       make_ctx("n2"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n2", 1))
+                      .ok());
     CRPC_CHECK_EQ(std::size_t{1}, hub.dispatch());
     CRPC_CHECK_EQ(1, capture.deltas);
     CRPC_CHECK_EQ(0, capture.snapshots);
@@ -605,11 +669,11 @@ CRPC_TEST(phase0_w3_incremental_replay) {
     CRPC_REQUIRE(id.ok());
 
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n2", 8002, 1),
-                                       make_ctx("n2"))
-                     .ok());
+                                       make_issued_ctx(reg, "svc", "n2", 1))
+                      .ok());
     CRPC_REQUIRE(hub.dispatch() == 2);
     CRPC_REQUIRE(hub.cancel(id.value()).ok());
 
@@ -648,30 +712,51 @@ CRPC_TEST(phase0_w4_apply_resync_does_not_roll_back) {
 // --- F3: a successful write reports the key's effective high-water ----------
 
 CRPC_TEST(phase0_f3_write_result_covers_key_high_water) {
-    cl::registry reg;
+    // The strict authorization mode is what makes "a returned token is a
+    // high-water, not a reusable ticket" observable; under the legacy numeric
+    // contract an equal fence is still accepted.
+    cl::registry_config config;
+    config.require_issued_fence = true;
+    cl::registry reg(config);
 
     // A lease barrier can raise the key high-water before the first
-    // registration; the create itself stays unfenced (grant-before-register).
+    // registration. The create must present a token the authority issued: the
+    // barrier published 5, and next_fence() allocates above it (F3 new
+    // contract - a returned token is a high-water, not a reusable ticket).
     CRPC_REQUIRE(reg.fence_barrier("svc", "n1", 5, make_ctx("n1")).ok());
+    const auto issued = reg.next_fence("svc", "n1");
+    CRPC_REQUIRE(issued.ok());
+    CRPC_CHECK(issued.value() > 5);
 
-    const auto created = reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                               make_ctx("n1"));
+    const auto created = reg.register_instance(
+        make_instance("svc", "n1", 8001, 1), make_ctx("n1", issued.value(), 1));
     CRPC_REQUIRE(created.ok());
     CRPC_CHECK(created.value().fence >= 5);
+    CRPC_CHECK(created.value().fence >= issued.value());
 
     // write_result::fence stays globally strictly increasing even though the
     // barrier raised a key above the global allocation.
-    const auto other = reg.register_instance(make_instance("svc", "n2", 8002, 1),
-                                             make_ctx("n2"));
+    const auto other_issued = reg.next_fence("svc", "n2");
+    CRPC_REQUIRE(other_issued.ok());
+    const auto other = reg.register_instance(
+        make_instance("svc", "n2", 8002, 1), make_ctx("n2", other_issued.value(), 1));
     CRPC_REQUIRE(other.ok());
     CRPC_CHECK(other.value().fence > created.value().fence);
 
-    // The returned token is directly usable: a follower write with it must not
-    // be rejected as stale.
+    // The next mutation needs a fresh issuance, not the returned high-water:
+    // feeding created.value().fence back is an equal-fence write and is stale.
+    const auto reused = reg.set_state("svc", "n1", cl::instance_state::critical,
+                                      make_ctx("n1", created.value().fence, 1));
+    CRPC_CHECK_FALSE(reused.ok());
+    CRPC_CHECK_EQ(std::string("stale_fence"), rejection_reason(reused));
+
+    const auto next_issued = reg.next_fence("svc", "n1");
+    CRPC_REQUIRE(next_issued.ok());
+    CRPC_CHECK(next_issued.value() > created.value().fence);
     const auto next = reg.set_state("svc", "n1", cl::instance_state::critical,
-                                    make_ctx("n1", created.value().fence, 1));
+                                    make_ctx("n1", next_issued.value(), 1));
     CRPC_CHECK(next.ok());
-    CRPC_CHECK(next.value().fence >= created.value().fence);
+    CRPC_CHECK(next.value().fence >= next_issued.value());
 }
 
 // --- F3: the health bridge re-anchors above the key high-water ---------------
@@ -680,8 +765,8 @@ CRPC_TEST(phase0_f3_health_bridge_reanchors_above_key_high_water) {
     manual_clock clock;
     cl::registry reg;
     CRPC_REQUIRE(reg.register_instance(make_instance("api", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
+                                       make_issued_ctx(reg, "api", "n1", 1))
+                      .ok());
 
     cl::health_bridge bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
     CRPC_CHECK(bridge.report("api", "n1", false));
@@ -694,11 +779,10 @@ CRPC_TEST(phase0_f3_health_bridge_reanchors_above_key_high_water) {
         CRPC_REQUIRE(leases.grant("api", "n1", 1000ms).ok());
     }
 
-    // The bridge's next token is now below the key high-water. Re-anchoring
-    // from the global fence would retry the same stale token forever; the
-    // rejection reports the key high-water so the next flush succeeds.
+    // The bridge's next token must be obtained from the authority, which jumps
+    // over every floor, so a single flush re-anchors and succeeds: there is no
+    // local arithmetic to be wrong about.
     CRPC_CHECK(bridge.report("api", "n1", true));
-    CRPC_CHECK_EQ(crpc::u64{0}, bridge.flush());
     CRPC_CHECK_EQ(crpc::u64{1}, bridge.flush());
     CRPC_CHECK_EQ(cl::instance_state::passing, state_of(reg, "api", "n1"));
     CRPC_CHECK_EQ(cl::health_state::passing, bridge.state("api", "n1"));
@@ -712,23 +796,116 @@ CRPC_TEST(phase0_f4_purged_key_requires_fence) {
     cl::registry reg(config);
 
     CRPC_REQUIRE(reg.register_instance(make_instance("svc", "n1", 8001, 1),
-                                       make_ctx("n1"))
-                     .ok());
-    CRPC_REQUIRE(reg.deregister("svc", "n1", make_ctx("n1", 0, 1)).ok());
+                                       make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
+    CRPC_REQUIRE(reg.deregister("svc", "n1",
+                                make_issued_ctx(reg, "svc", "n1", 1))
+                      .ok());
     CRPC_REQUIRE(reg.purge_expired_tombstones() == 1);
 
     // The fence epoch survives the purge, so a zero-fence create would reset
-    // it. Strict fencing rejects the resurrection.
+    // it. The default require_issued_fence rejects the resurrection outright.
     const auto unfenced =
         reg.register_instance(make_instance("svc", "n1", 8001, 3), make_ctx("n1"));
     CRPC_CHECK_FALSE(unfenced.ok());
     CRPC_CHECK_EQ(rpc_code::failed_precondition, unfenced.code());
     CRPC_CHECK_EQ(std::string("fence_required"), rejection_reason(unfenced));
 
-    // An explicit epoch above the surviving high-water is accepted.
-    const auto fenced = reg.register_instance(make_instance("svc", "n1", 8001, 3),
-                                              make_ctx("n1", 3));
+    // An authority-issued token above the surviving high-water is accepted.
+    const auto fenced = reg.register_instance(
+        make_instance("svc", "n1", 8001, 3),
+        make_issued_ctx(reg, "svc", "n1", 3));
     CRPC_CHECK(fenced.ok());
+}
+
+// --- S-B3: require_issued_fence is on by default -----------------------------
+//
+// The three G19 Phase 0 switches (separate_state_writers, strict_fencing,
+// strict_incarnation) are on by default; this slice makes the fourth one,
+// require_issued_fence, the same. These cases pin the *default-constructed*
+// registry: no config is passed, so whatever the struct's default member
+// initialisers say is the behaviour under test. They are red while the default
+// is false and green once it is true, which is the point.
+
+CRPC_TEST(default_config_rejects_unissued_token) {
+    // Default construction, deliberately no registry_config: the point is the
+    // shipped default, not an explicit switch.
+    cl::registry reg;
+
+    // A token the authority never issued for this key. Under the strict mode it
+    // must be rejected with the exact reason "not_issued"; under the legacy
+    // numeric contract an in-range token above the high-water is accepted, so
+    // this case fails while the default is off.
+    const auto forged = reg.register_instance(
+        make_instance("svc", "n1", 8001, 1), make_ctx("n1", 4242, 1));
+    CRPC_CHECK_FALSE(forged.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, forged.code());
+    CRPC_CHECK_EQ(std::string("not_issued"), rejection_reason(forged));
+}
+
+CRPC_TEST(default_config_rejects_zero_fence) {
+    // Default construction: Z2 (a zero fence is never a token) must hold even
+    // for a completely fresh key with no history at all.
+    cl::registry reg;
+
+    const auto zero = reg.register_instance(
+        make_instance("svc", "n1", 8001, 1), make_ctx("n1"));
+    CRPC_CHECK_FALSE(zero.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, zero.code());
+    CRPC_CHECK_EQ(std::string("fence_required"), rejection_reason(zero));
+}
+
+CRPC_TEST(default_config_accepts_issued_token) {
+    // The default is not "reject everything": a token the authority issued for
+    // this key, principal and lease is accepted, and the write is visible.
+    cl::registry reg;
+
+    const auto issued = reg.next_fence("svc", "n1");
+    CRPC_REQUIRE(issued.ok());
+    const auto created = reg.register_instance(
+        make_instance("svc", "n1", 8001, 1), make_ctx("n1", issued.value(), 1));
+    CRPC_REQUIRE(created.ok());
+    CRPC_CHECK_EQ(cl::instance_state::passing, state_of(reg, "svc", "n1"));
+
+    // The issuance is spent, so the same token cannot authorise a second,
+    // different payload: the default mode really does attribute issuance.
+    const auto reused = reg.register_instance(
+        make_instance("svc", "n1", 8002, 2), make_ctx("n1", issued.value(), 2));
+    CRPC_CHECK_FALSE(reused.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, reused.code());
+    CRPC_CHECK(rejection_reason(reused) == std::string("stale_fence") ||
+               rejection_reason(reused) == std::string("not_issued"));
+}
+
+CRPC_TEST(health_bridge_uses_authority_issued_token) {
+    // The bridge's write path must present a token the registry issued, never a
+    // locally manufactured high_water+1. The observable: a successful bridge
+    // flush returns 1, and the token it used is gone from the authority, so a
+    // second writer that forges "the value the bridge must have used" is
+    // rejected as not_issued.
+    cl::registry reg;
+    const auto create_token = reg.next_fence("api", "n1");
+    CRPC_REQUIRE(create_token.ok());
+    CRPC_REQUIRE(reg.register_instance(
+                                   make_instance("api", "n1", 8001, 1),
+                                   make_ctx("n1", create_token.value(), 1))
+                      .ok());
+
+    manual_clock clock;
+    cl::health_bridge bridge(reg, 0ms, 1, 1, 16, make_clock(clock));
+    CRPC_CHECK(bridge.report("api", "n1", false));
+    CRPC_REQUIRE(bridge.flush() == 1);
+    CRPC_CHECK_EQ(cl::instance_state::critical, state_of(reg, "api", "n1"));
+
+    // The bridge consumed an issuance of its own; whatever value it presented,
+    // a caller-side +1 above the current high-water is not an issuance.
+    const u64 floor = reg.fence_floor("api", "n1").value();
+    const auto forged = reg.set_state("api", "n1", cl::instance_state::passing,
+                                      make_ctx("n1", floor + 1, 1));
+    CRPC_CHECK_FALSE(forged.ok());
+    CRPC_CHECK_EQ(rpc_code::failed_precondition, forged.code());
+    CRPC_CHECK_EQ(std::string("not_issued"), rejection_reason(forged));
+    CRPC_CHECK_EQ(cl::instance_state::critical, state_of(reg, "api", "n1"));
 }
 
 CRPC_TEST_MAIN()

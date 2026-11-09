@@ -35,13 +35,33 @@
 //     the bridge keeps its committed state and repairs the catalog with its
 //     own write. Recovery therefore only happens through a debounced,
 //     half-open, fenced write of this bridge.
-//   * Fencing: one bridge owns one fencing epoch. The epoch is taken from the
-//     registry's last accepted global fence and is strictly newer than any
-//     epoch already published, so a bridge constructed after an older bridge
-//     has written can take over. Every `set_state` carries a monotonically
-//     increasing fence; if the registry rejects it as stale, a newer epoch
-//     owns the instance and this bridge yields (it keeps observing but stops
-//     writing) instead of overwriting the newer state.
+//   * Fencing: every write carries a token the registry authority issued for
+//     that exact key (`registry::next_fence(service, node_id)`). The bridge
+//     manufactures no fence of its own, so a token it presents is one the
+//     authority granted (L-b); the authority's allocation is strictly above the
+//     key's high-water and above every lease barrier, so a replaced or stale
+//     writer cannot be re-anchored by a local arithmetic guess. A refused token
+//     leaves the candidate pending: the next flush asks for a fresh issuance.
+//   * Writer epoch: a bridge owns one `writer_epoch` taken from
+//     `registry::next_writer_epoch()` at construction. Every write carries it,
+//     and a write whose epoch is below the key's recorded epoch is rejected with
+//     `registry.reason=stale_writer`; the bridge then yields: it keeps observing
+//     but stops writing for the rest of its lifetime.
+//
+//     The yield is permanent on purpose. `next_writer_epoch()` is a monotonic
+//     counter, not a capability: it is granted to any caller with no identity or
+//     liveness check, so "I obtained a larger epoch" does not prove the previous
+//     owner is gone. A bridge that re-acquired an epoch after being refused would
+//     therefore win the key back on its next probe and the guard would be a
+//     no-op. The supported recovery path is to construct a new health_bridge,
+//     which is granted a strictly newer epoch and may write immediately.
+//
+//     LIFETIME: the epoch is process-local and is NOT persisted. A registry
+//     restored from a log rewinds its allocator to the highest fence the log
+//     records, which can be below an epoch a surviving bridge holds. Step 1
+//     keeps bridges and their registry in one process, so a restart rebuilds
+//     both; a registry replayed under live bridges is a step-2 scenario and
+//     requires the cross-process epoch persistence listed in plan.md.
 //   * The node set is bounded by `max_nodes`. `report()` returns false at the
 //     bound or when the record cannot be allocated.
 //
@@ -138,8 +158,11 @@ public:
 
     // The single writer. Applies every transition whose debounce window has
     // elapsed and repairs external downgrades. Returns the number of registry
-    // writes that were accepted. A write rejected as stale means a newer
-    // fencing epoch owns the instance; that record yields and stops writing.
+    // writes that were accepted. A write the registry refuses with stale_fence,
+    // not_issued or a stale incarnation leaves the candidate pending, and the
+    // next flush obtains a fresh authority token and retries. A write refused
+    // with stale_writer does not: that bridge has been deposed and stops writing
+    // for the rest of its lifetime (see the writer-epoch note above).
     [[nodiscard]] std::size_t flush();
     [[nodiscard]] std::size_t flush(monotonic_clock::time_point now);
 
