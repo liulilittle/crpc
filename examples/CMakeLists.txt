@@ -20,7 +20,8 @@
 # by the same glob rather than by its own target.
 file(GLOB CRPC_EXAMPLE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/quickstart*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/deploy_*.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/deploy_*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/registryd.cpp")
 
 foreach(source ${CRPC_EXAMPLE_SOURCES})
     get_filename_component(file_name "${source}" NAME_WE)

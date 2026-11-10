@@ -99,6 +99,11 @@ the authoritative declaration.
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | Health checkers. |
 | [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`, `cluster::health_instance_set` | Debounced health-to-registry writer and read-only load-balancer view. |
 | [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp) | `cluster::registry_log`, `cluster::file_registry_log`, `cluster::memory_registry_log` | Durable, replayable record log backing the registry's write-ahead log. |
+| [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp) | `cluster::acl_rule`, `cluster::acl_token_hash` | Static bearer-token authorisation table for the registry service (not authentication; see the header's trust boundary). |
+| [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp) | `cluster::fence_request`, `cluster::fence_authority_fn`, `cluster::fence_authority` | The fence-allocation seam: step2 supplies the local registry allocator, step3 a leader-committed one, with no service change. |
+| [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp) | `cluster::registry_service_id`, `cluster::registry_tag`, request/response DTOs | The versioned tag DTO wire contract for the registry service, with fail-closed decoding. |
+| [`cluster/registry_service.hpp`](../../include/crpc/cluster/registry_service.hpp) | `cluster::registry_service`, `cluster::epoch_store`, `cluster::registry_service_config` | The registry service: ACL injection, epoch store, single-instance lease, six handlers. |
+| [`cluster/registry_client.hpp`](../../include/crpc/cluster/registry_client.hpp) | `cluster::registry_client`, `cluster::registry_anchor` | Per-thread dual-anchor client with the three-layer retry. |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | Index-based watch/subscription over the registry. |
 | [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`, `flow::pacer`, `flow::congestion_window`, `flow::rtt_tracker` | Adaptive flow-control primitives. |
 | [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`, `rpc::flow_control_options`, `rpc::flow_state` | Connection-level flow control: byte window, PING/PONG probes, per-lane quotas, pacer. |
@@ -527,3 +532,36 @@ without registering it here fails the suite.
 - [Distributed testing and benchmarks](../distributed-testing.md) — multi-node tests and benchmark commands.
 - [ABI policy](../abi.md) — layout and export rules.
 - [Build and test](../building.md) — CMake options and the one-click scripts.
+
+
+### Registry wire tags (step2)
+
+The registry service frame is `u16 dto_version`, `u32 total_len`, then zero or more
+`tag { u8 id, u32 len, u8[len] value }`. Tags 1-13 were fixed by the step2 design;
+14-17 were added when the design's own requirements (a client idempotency key, a
+token issue time) turned out to have no reserved tag. Tag 14 carries the response
+body's `index` -- it is NOT `query`'s optional `node_id`, which reuses tag 4.
+
+| Tag | Name | Direction | Meaning |
+|---|---|---|---|
+| 1 | `registry_tag_token` | request | The bearer token (plaintext; see the trust boundary above). |
+| 2 | `registry_tag_dto_version` | request | Must equal `registry_dto_version` (1). |
+| 3 | `registry_tag_service` | request | Service name, or empty for a catalog-wide query. |
+| 4 | `registry_tag_node_id` | request | Node id; also carries `query`'s optional filter. |
+| 5 | `registry_tag_host` | request | Endpoint host. |
+| 6 | `registry_tag_port` | request | Endpoint port. |
+| 7 | `registry_tag_incarnation` | request | Expected incarnation. |
+| 8 | `registry_tag_fence` | request | Fencing token from `next_fence`. |
+| 9 | `registry_tag_writer_epoch` | request | The client's epoch claim; the service replaces it with its own issuance. |
+| 10 | `registry_tag_weight` | request | Instance weight. |
+| 11 | `registry_tag_state` | request | `instance_state` value. |
+| 12 | `registry_tag_meta` | request | Length-prefixed metadata map. |
+| 13 | `registry_tag_passing_only` | request | Query filter: only passing instances. |
+| 14 | `registry_tag_index` | both | Response body `index`; request-side client anchor index. |
+| 15 | `registry_tag_client_request_id` | request | The client's idempotency key; a retry of one logical write reuses it. |
+| 16 | `registry_tag_token_issued_at` | request | Token issue time, `system_clock` milliseconds. |
+| 17 | `registry_tag_token_nonce` | request | Reserved nonce; not interpreted by the service in step2. |
+
+An unknown tag id, a repeated tag id, a tag length past the end of the frame, a
+`total_len` that disagrees with the body and an unsupported `dto_version` are all
+refused, each with its own `registry.reason`.

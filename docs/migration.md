@@ -252,3 +252,72 @@ So the rule "reconstruct every `health_bridge` after a restore" is about not
 freezing the live writer, not about stopping a stale one. A deployment that
 skips the rule loses write availability on every key whose fence the log
 raised, and does not gain any stale-writer protection problem.
+
+
+## 8. Unreleased: registry service (step2) operational requirements
+
+### 8.1 The ACL is a bearer-token authorisation layer, not authentication
+
+A holder of a valid token can act as the principal that token was issued to.
+There is no transport security: the RPC layer carries no peer identity
+(`call_envelope`, `call_context` and `frame` have no identity field) and there is
+no TLS. A token observed on the wire can be replayed until it expires.
+Deployments that need authenticated peers must terminate TLS in front of the
+service or run it on a trusted network. The token travels in the DTO body, never
+in `metadata`, because the client's `metadata` does not reach the server.
+The principal is injected by the service from the matched ACL rule; a client's
+own claim is never trusted.
+
+### 8.2 The token time window depends on clock synchronisation
+
+A token carries its issue time (`registry_tag_token_issued_at`) and the service
+rejects one whose absolute difference from the service's clock exceeds
+`registry_token_window` (30 s). The comparison uses `system_clock` (Unix epoch)
+because the window is cross-process and `steady_clock` has a per-process epoch.
+A token with no issue time is rejected (fail closed).
+
+This is a **time limit, not replay prevention**: a token observed inside the
+window can still be replayed. It also **depends on the client and the service
+agreeing on the wall clock (NTP)**; a client whose clock is ahead or behind by
+more than the window is denied. Clock synchronisation is `UNVERIFIED`.
+
+### 8.3 Epochs are issued by the service, not chosen by the client
+
+`writer_epoch` is allocated from the service's epoch store, never taken from the
+client's claim. The store is a separate file written atomically **before** the
+number is returned; a persist failure refuses the write with
+`registry.reason=epoch_not_persisted`. At startup the counter is seeded with
+`max(persisted, registry.fence())`, with `fence()` read after the restore. A
+client that presents `writer_epoch = 0` is refused with `epoch_required`.
+
+### 8.4 Only one service per state directory
+
+A service holds a single-instance lease over its `state_dir`: an in-process
+registry plus a named kernel mutex (a Windows mutex is re-entrant for its owning
+thread, so the kernel object alone cannot stop a second instance in the same
+process). `WAIT_ABANDONED` is accepted -- refusing it would make a crashed
+deployment permanently unrestartable -- and taking over does **not** reimplement
+the torn-tail truncate: `file_registry_log::open()` already scans the file,
+adopts the intact prefix and truncates a torn tail, and a corrupt record makes it
+fail. A log behind the restored catalog is refused with `stale_log`.
+
+### 8.5 The idempotency map has a capacity boundary
+
+The service caches the last successful write per `client_request_id` in a map
+bounded by `max_idempotency_entries` (default 4096) and `idempotency_ttl`
+(default 300000 ms). Entries are evicted by TTL first and then oldest-first, one
+at a time; the map is never cleared wholesale, which would drop every request's
+protection at once.
+
+**A request outside the map has no protection.** A replay of an evicted request
+takes the normal path and may be rejected as a stale incarnation or a stale
+anchor. Size the deployment so that `max_idempotency_entries` multiplied by
+`idempotency_ttl` is at least the client's maximum retry window. Only successful
+writes are cached; a failed first attempt stays retryable.
+
+### 8.6 `permission_denied` does not round-trip
+
+The response codec fails closed on codes above `application` (21), so a client
+observes `internal` with the original code in the `crpc.raw_code` metadata entry.
+The service still emits `permission_denied` (22) per the reason table; a client
+that must distinguish an ACL denial reads `crpc.raw_code`.

@@ -4,6 +4,25 @@
 
 ## 未发布
 
+### 注册中心服务（G19 step2）
+
+- **MINOR（新增符号，无布局变化）** 新增 `cluster::registry_service` 与 `cluster::registry_client`；`registry` / `write_context` / `registry_config` / `registry_log` 及其函数保持全部字段、偏移与大小。新增头文件：`cluster/registry_acl.hpp`、`cluster/fence_authority.hpp`、`cluster/registry_wire.hpp`、`cluster/registry_service.hpp`、`cluster/registry_client.hpp`。新增可执行程序：`examples/registryd.cpp`。
+
+- **线路契约。** 版本化 tag 帧（`u16 dto_version` + `u32 total_len` + 若干 `tag{id,u32 len,value}`），`service_id = ~u64{1}`，方法号 1-6（register/deregister/set_state/query/next_fence/ping）。解码 fail-closed：`total_len` 不匹配、缺少必需 tag、未知 tag id、tag 长度越过帧尾、重复 tag、不支持的版本，各自有独立的 `registry.reason`。tag 14-17 是 step2 新增（1-17 完整表见 `docs/api/README.md`）：14 携带响应体的 `index`，15 是客户端幂等键，16 是 token 签发时间，17 是保留的 nonce。
+
+- **ACL 是 bearer-token 授权层，不是身份认证层。** 持有合法 token 的一方以其被签发的 principal 身份行事。没有传输层安全：RPC 层不携带对端身份，也没有 TLS，因此线路上被观察到的 token 可在时间窗内重放。token 经 DTO body 传输，绝不放进 `metadata`。principal 由服务端从命中的规则注入，客户端的声明永不被信任。30 秒时间窗（`registry_token_window`）把重放限制在该窗口内，这是**限时**而非防重放。需要认证对端的部署必须在服务前终结 TLS，或运行在可信网络。
+
+- **`writer_epoch` 由服务端签发，不是客户端自报。** 客户端的声明值从不被使用：两个客户端可以报同一个数字，而这正是 epoch 文件要防的冲突。epoch 存储是独立文件，**先落盘再发号**；落盘失败则拒绝写入（`registry.reason=epoch_not_persisted`）。启动时计数器以 `max(persisted, registry.fence())` 播种，`fence()` 在 restore 之后取。
+
+- **单实例租约。** 进程内 `std::set` + 跨进程命名互斥体（Windows 互斥体对持有线程可重入，单靠它拦不住同进程第二个实例）。接受 `WAIT_ABANDONED`：拒绝它会让崩溃的部署永久无法重启。接管**不重复实现**撕裂尾部截断——`file_registry_log::open()` 已扫描文件、采纳完整前缀并截断撕裂尾部，损坏记录直接使其失败。
+
+- **双锚点 `(authority_epoch, index)`。** 客户端每线程一个 anchor（共享 anchor 会让一个线程的提交使另一个线程的在途观测失效）。观测过期以 `registry.reason=stale_anchor` 应答，并在 `rpc_error::metadata` 中携带权威当前 index；客户端据此重锚并重试一次。
+
+- **三段式重试。** 传输层 `rpc::dedup`；服务层按 `client_request_id` 的有界映射（TTL `idempotency_ttl` + 容量 `max_idempotency_entries`，逐个淘汰最旧，**绝不整表清空**）；客户端双锚点。只缓存成功写入，失败的首次尝试仍可重试。容量与 TTL 共同限定保护范围：被淘汰请求的重放会走正常路径，并可能被判为过期 incarnation。部署须使 `max_idempotency_entries` × TTL ≥ 客户端最大重试窗口。
+
+- **已知限制。** `rpc_code::permission_denied`（22）无法往返：响应编码器对高于 `application`（21）的码 fail-closed 为 `internal`，原始码在 `crpc.raw_code`。token 时间窗依赖客户端与服务端时钟同步（NTP），未同步会被拒。两者均见 `docs/migration.md` §8。
+
+
 ### MAJOR：`cluster::write_context` 尾部新增 `writer_epoch`
 
 - **MAJOR（消费者可见布局）。** `cluster::write_context` 在 x64 Debug 从 96 字节增至 104 字节（Release 从 80 增至 88）：尾部新增一个 `u64 writer_epoch`。所有消费者必须用匹配的头文件重编。这是同一未发布 G19 切片内的第二次 MAJOR 破坏，属于有意接受：该字段没有别的加法。

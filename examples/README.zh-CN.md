@@ -274,6 +274,20 @@ soak: requests=2000 failures=0 connect_failures=0 worst_connect_ms=0 handles 93 
 Windows 上用 `crpc::iocp_backend`，Linux 上用 `crpc::io::epoll_backend`，
 两端都用 `crpc::endpoint::tcp("127.0.0.1", port)`。线上格式与调用/推送 API 不变。
 
+## 注册中心服务进程
+
+`registryd.cpp` 是 G19 step2 的可执行程序：一个跑在 loopback TCP 上的真实
+`cluster::registry_service`，带 ACL、epoch 持久化与单实例租约。它是薄 main——
+配置、信号、启动、停止，全部行为都在库内：
+
+```powershell
+.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>]
+```
+
+该 token 是 **bearer token**，不是身份认证凭据：持有合法 token 的一方即以其被签发
+的 principal 身份行事，而 RPC 层不携带对端身份、也没有 TLS。完整信任边界见
+`include/crpc/cluster/registry_acl.hpp`。
+
 ## 下一步
 
 - [docs/tutorial.md](../docs/tutorial.zh-CN.md) 会一步一步构建同一个程序。

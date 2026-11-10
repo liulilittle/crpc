@@ -507,6 +507,11 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
+- [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp)
+- [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp)
+- [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp)
+- [`cluster/registry_service.hpp`](../../include/crpc/cluster/registry_service.hpp)
+- [`cluster/registry_client.hpp`](../../include/crpc/cluster/registry_client.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)
 
 ### `crpc/flow`
@@ -523,3 +528,34 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [分布式测试与基准](../distributed-testing.zh-CN.md) —— 多节点测试与基准命令。
 - [ABI 策略](../abi.zh-CN.md) —— 布局与导出规则。
 - [构建与测试](../building.zh-CN.md) —— CMake 选项与一键脚本。
+
+
+### 注册中心线路 tag（step2）
+
+注册中心服务帧为 `u16 dto_version`、`u32 total_len`，其后是零个或多个
+`tag { u8 id, u32 len, u8[len] value }`。tag 1-13 由 step2 设计固定；14-17 是因
+设计自身的要求（客户端幂等键、token 签发时间）在原有 tag 中没有预留位置而新增的。
+tag 14 携带响应体的 `index`——它**不是** `query` 的可选 `node_id`，后者复用 tag 4。
+
+| Tag | 名称 | 方向 | 语义 |
+|---|---|---|---|
+| 1 | `registry_tag_token` | 请求 | bearer token（明文；信任边界见上文） |
+| 2 | `registry_tag_dto_version` | 请求 | 必须等于 `registry_dto_version`（1） |
+| 3 | `registry_tag_service` | 请求 | 服务名；全目录查询时为空 |
+| 4 | `registry_tag_node_id` | 请求 | 节点 id；也承载 `query` 的可选过滤条件 |
+| 5 | `registry_tag_host` | 请求 | endpoint host |
+| 6 | `registry_tag_port` | 请求 | endpoint port |
+| 7 | `registry_tag_incarnation` | 请求 | 期望的 incarnation |
+| 8 | `registry_tag_fence` | 请求 | 来自 `next_fence` 的 fencing token |
+| 9 | `registry_tag_writer_epoch` | 请求 | 客户端的 epoch 声明；服务端用自己的签发值替换它 |
+| 10 | `registry_tag_weight` | 请求 | 实例权重 |
+| 11 | `registry_tag_state` | 请求 | `instance_state` 值 |
+| 12 | `registry_tag_meta` | 请求 | 长度前缀的 metadata 映射 |
+| 13 | `registry_tag_passing_only` | 请求 | 查询过滤：仅 passing 实例 |
+| 14 | `registry_tag_index` | 双向 | 响应体 `index`；请求侧的客户端 anchor index |
+| 15 | `registry_tag_client_request_id` | 请求 | 客户端幂等键；同一逻辑写入的重试复用该值 |
+| 16 | `registry_tag_token_issued_at` | 请求 | token 签发时间，`system_clock` 毫秒 |
+| 17 | `registry_tag_token_nonce` | 请求 | 保留 nonce；step2 的服务端不解释它 |
+
+未知 tag id、重复 tag id、tag 长度越过帧尾、`total_len` 与 body 不一致、以及不支持
+的 `dto_version`，全部被拒绝，且各自有独立的 `registry.reason`。

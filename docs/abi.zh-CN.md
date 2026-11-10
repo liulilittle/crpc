@@ -234,6 +234,21 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::call_envelope`
 - `::crpc::cluster::prevote_result`
 - `::crpc::cluster::vote_result`
+- `::crpc::cluster::registry_anchor`
+- `::crpc::cluster::registry_deregister_request`
+- `::crpc::cluster::registry_next_fence_request`
+- `::crpc::cluster::registry_ping_request`
+- `::crpc::cluster::registry_query_request`
+- `::crpc::cluster::registry_query_response`
+- `::crpc::cluster::registry_register_request`
+- `::crpc::cluster::registry_set_state_request`
+- `::crpc::cluster::registry_tag`
+- `::crpc::cluster::registry_write_response`
+- `::crpc::cluster::service_instance`
+
+`::crpc::cluster::registry_query_row` 故意不在清单里：它嵌套在
+`::crpc::cluster::registry_query_response` 内部，本身从不出现在按值传递的导出签名
+中，因此它的布局变化不单独登记——那些变化通过父记录的序列化体现。
 - `::crpc::compression_limits`
 - `::crpc::compression_statistics`
 - `::crpc::crypto::uuid`

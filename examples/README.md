@@ -251,7 +251,23 @@ curl -sS http://127.0.0.1:19555/echo/curl-real
 A `curl` that gets `HTTP/1.1 200` and the expected body is evidence no
 in-process test can give: the bytes on the wire are correct HTTP, not something
 only this library can parse.
-### Sustained load
+
+## Registry service daemon
+
+`registryd.cpp` is the G19 step2 executable: a real `cluster::registry_service`
+on loopback TCP, with the ACL, the epoch store and the single-instance lease.
+It is a thin main -- configuration, signals, start, stop; all behaviour lives in
+the library:
+
+```powershell
+.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>]
+```
+
+The token is a **bearer token**, not an authentication credential: a holder of a
+valid token acts as the principal it was issued to, and the RPC layer carries no
+peer identity and no TLS. See `include/crpc/cluster/registry_acl.hpp` for the
+full trust boundary.
+
 
 A single round trip proves the wire works. It says nothing about whether the
 process survives ten thousand of them. `soak <port> <count>` runs that:

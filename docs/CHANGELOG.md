@@ -4,6 +4,73 @@
 
 ## Unreleased
 
+### Cluster: the network registry service (G19 step2)
+
+- **MINOR (new symbols, no layout change).** `cluster::registry_service` and
+  `cluster::registry_client` are added; `registry`, `write_context`,
+  `registry_config`, `registry_log` and their functions keep every field, offset
+  and size. New headers: `cluster/registry_acl.hpp`, `cluster/fence_authority.hpp`,
+  `cluster/registry_wire.hpp`, `cluster/registry_service.hpp`,
+  `cluster/registry_client.hpp`. New executable: `examples/registryd.cpp`.
+
+- **Wire contract.** A versioned tag frame (`u16 dto_version`, `u32 total_len`,
+  then `tag{id,u32 len,value}`), `service_id = ~u64{1}`, method ids 1-6
+  (register/deregister/set_state/query/next_fence/ping). Decoding is fail-closed:
+  a `total_len` mismatch, a missing required tag, an unknown tag id, a tag length
+  past the end of the frame, a repeated tag id and an unsupported version are all
+  refused, each with its own `registry.reason`. Tags 14-17 are new in step2 (see
+  `docs/api/README.md` for the table): 14 carries the response `index`, 15 the
+  client's idempotency key, 16 the token's issue time, 17 a reserved nonce.
+
+- **ACL is a bearer-token authorisation layer, not authentication.** A holder of
+  a valid token acts as the principal it was issued to. There is no transport
+  security: the RPC layer carries no peer identity and there is no TLS, so a
+  token observed on the wire can be replayed inside the time window. The token
+  travels in the DTO body, never in `metadata`. The principal is injected by the
+  service from the matched rule; a client claim is never trusted. A time window
+  of 30 s (`registry_token_window`) limits replay to that window, and it is a
+  *limit*, not replay prevention. Deployments that need authenticated peers must
+  terminate TLS in front of the service or run it on a trusted network.
+
+- **`writer_epoch` is issued by the service, not chosen by the client.** The
+  client's claim is never used: two clients can present the same number, which is
+  exactly the collision the epoch file exists to prevent. The epoch store is a
+  separate file written atomically **before** the number is returned; a persist
+  failure refuses the write (`registry.reason=epoch_not_persisted`). At startup
+  the counter is seeded with `max(persisted, registry.fence())`, with `fence()`
+  read after the restore.
+
+- **Single-instance lease.** A named kernel mutex plus an in-process registry
+  (a Windows mutex is re-entrant for its owning thread, so the kernel object alone
+  cannot stop a second instance in the same process). `WAIT_ABANDONED` is
+  accepted: refusing it would make a crashed deployment permanently
+  unrestartable. Taking over does NOT reimplement the torn-tail truncate --
+  `file_registry_log::open()` already scans the file, adopts the intact prefix
+  and truncates a torn tail, and a corrupt record makes it fail.
+
+- **Dual anchor `(authority_epoch, index)`.** The client keeps one anchor per
+  thread (a shared anchor lets one thread's commit invalidate another's
+  in-flight observation). A stale observation is answered with
+  `registry.reason=stale_anchor` and the authority's current index in
+  `rpc_error::metadata`, and the client re-anchors and retries once.
+
+- **Three-layer retry.** Transport: `rpc::dedup` on an idempotent call. Service:
+  a bounded map from `client_request_id` to the last successful write, evicted by
+  TTL and then oldest-first -- never cleared wholesale, which would drop every
+  request's protection at once. Client: the dual anchor. Only successful writes
+  are cached; a failed first attempt stays retryable. The map's capacity
+  (`max_idempotency_entries`, default 4096) and TTL (`idempotency_ttl`, default
+  300000 ms) bound the protection: a replay of an evicted request takes the
+  normal path and may be rejected as a stale incarnation. Size the capacity so
+  that `max_idempotency_entries` x TTL >= the client's maximum retry window.
+
+- **Known limits.** `rpc_code::permission_denied` (22) does not round-trip: the
+  response codec fails closed on codes above `application` (21), so a client
+  observes `internal` with the original code in `crpc.raw_code`. The service
+  still emits 22 per the reason table. The token window depends on client/service
+  clock synchronisation (NTP); an unsynchronised client is denied. Both are
+  documented in `docs/migration.md` §8.
+
 ### MAJOR: `cluster::write_context` gains a trailing `writer_epoch`
 
 - **MAJOR (consumer-visible layout).** `cluster::write_context` grows from 96 to

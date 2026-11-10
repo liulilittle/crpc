@@ -81,3 +81,61 @@
 - `failure_origin` 从 `client_detail` 迁入 `crpc`，重命名了两个导出符号（`breaker_record_for`、`result_origin`）。`client_detail::failure_origin` 别名保持源码兼容，但链接到旧符号的消费方必须重新链接。
 
 每个消费方必须用同一份头文件重建并重新链接。旧/新 mangled 名见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)。
+
+
+> 注：§6、§7 尚未翻译，见英文版 `migration.md`。
+
+## 8. 未发布：注册中心服务（step2）运维要求
+
+### 8.1 ACL 是 bearer-token 授权层，不是身份认证层
+
+持有合法 token 的一方以其被签发的 principal 身份行事。没有传输层安全：RPC 层
+不携带对端身份（`call_envelope`、`call_context`、`frame` 均无身份字段），也没有
+TLS。线路上被观察到的 token 在过期前可被重放。需要认证对端的部署必须在服务前
+终结 TLS，或运行在可信网络。token 经 DTO body 传输，绝不放进 `metadata`——客户端
+的 `metadata` 根本到不了服务端。principal 由服务端从命中的 ACL 规则注入，客户端
+自身的声明永不被信任。
+
+### 8.2 token 时间窗依赖时钟同步
+
+token 携带自己的签发时间（`registry_tag_token_issued_at`），服务端拒绝与服务端
+时钟之差绝对值超过 `registry_token_window`（30 秒）的 token。比较使用
+`system_clock`（Unix epoch），因为该窗口是跨进程的，而 `steady_clock` 的 epoch
+是每个进程独立的。未携带签发时间的 token 被拒绝（fail closed）。
+
+这是**限时，不是防重放**：窗口内被观察到的 token 仍可重放。它还**依赖客户端与
+服务端 wall clock 一致（NTP）**；时钟偏差超过窗口的客户端会被拒绝。时钟同步性
+为 `UNVERIFIED`。
+
+### 8.3 epoch 由服务端签发，不是客户端自选
+
+`writer_epoch` 从服务端的 epoch 存储分配，绝不采用客户端的声明值。该存储是独立
+文件，**先落盘再发号**；落盘失败以 `registry.reason=epoch_not_persisted` 拒绝
+写入。启动时计数器以 `max(persisted, registry.fence())` 播种，`fence()` 在
+restore 之后读取。客户端传 `writer_epoch = 0` 会被 `epoch_required` 拒绝。
+
+### 8.4 每个 state 目录只能有一个服务实例
+
+服务对其 `state_dir` 持有单实例租约：进程内注册表 + 跨进程命名互斥体（Windows
+互斥体对持有线程可重入，单靠内核对象拦不住同进程的第二个实例）。接受
+`WAIT_ABANDONED`——拒绝它会让崩溃的部署永久无法重启——接管**不重复实现**撕裂
+尾部截断：`file_registry_log::open()` 已扫描文件、采纳完整前缀并截断撕裂尾部，
+损坏记录直接使其失败。日志落后于已恢复目录时以 `stale_log` 拒绝。
+
+### 8.5 幂等映射有容量边界
+
+服务端按 `client_request_id` 缓存最后一次成功写入，映射受
+`max_idempotency_entries`（默认 4096）与 `idempotency_ttl`（默认 300000 毫秒）
+约束。先按 TTL 逐条淘汰，再逐个淘汰最旧的一条；**绝不整表清空**，那会一次性
+丢掉所有请求的保护。
+
+**映射之外的请求没有保护。** 被淘汰请求的重放会走正常路径，并可能被判为过期
+incarnation 或过期 anchor。部署须使 `max_idempotency_entries` 乘以
+`idempotency_ttl` 不小于客户端的最大重试窗口。只缓存成功写入；失败的首次尝试
+仍可重试。
+
+### 8.6 `permission_denied` 无法往返
+
+响应编码器对高于 `application`（21）的码 fail-closed 为 `internal`，原始码在
+`crpc.raw_code` 元数据项里。服务端仍按 reason 表发 `permission_denied`（22）；
+需要区分 ACL 拒绝的客户端应读 `crpc.raw_code`。
