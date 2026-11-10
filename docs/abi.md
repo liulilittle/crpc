@@ -527,6 +527,8 @@ is guarded.
 - `::crpc::cluster::registry_write_response`
 - `::crpc::cluster::anchor_store`
 - `::crpc::cluster::service_instance`
+- `::crpc::cluster::raft_persistent_state`
+- `::crpc::cluster::raft_state_store`
 
 `::crpc::cluster::registry_query_row` is deliberately absent from the list: it is
 nested inside `::crpc::cluster::registry_query_response` and never appears by

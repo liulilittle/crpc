@@ -246,6 +246,8 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::cluster::registry_write_response`
 - `::crpc::cluster::anchor_store`
 - `::crpc::cluster::service_instance`
+- `::crpc::cluster::raft_persistent_state`
+- `::crpc::cluster::raft_state_store`
 
 `::crpc::cluster::registry_query_row` 故意不在清单里：它嵌套在
 `::crpc::cluster::registry_query_response` 内部，本身从不出现在按值传递的导出签名

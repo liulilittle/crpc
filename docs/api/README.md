@@ -99,6 +99,7 @@ the authoritative declaration.
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | Health checkers. |
 | [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`, `cluster::health_instance_set` | Debounced health-to-registry writer and read-only load-balancer view. |
 | [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp) | `cluster::registry_log`, `cluster::file_registry_log`, `cluster::memory_registry_log` | Durable, replayable record log backing the registry's write-ahead log. |
+| [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp) | `cluster::raft_persistent_state`, `cluster::raft_state_store` | The two Raft fields that must survive a restart (term and vote), written atomically and read fail-closed. |
 | [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp) | `cluster::acl_rule`, `cluster::acl_token_hash` | Static bearer-token authorisation table for the registry service (not authentication; see the header's trust boundary). |
 | [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp) | `cluster::fence_request`, `cluster::fence_authority_fn`, `cluster::fence_authority` | The fence-allocation seam: step2 supplies the local registry allocator, step3 a leader-committed one, with no service change. |
 | [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp) | `cluster::registry_service_id`, `cluster::registry_tag`, request/response DTOs | The versioned tag DTO wire contract for the registry service, with fail-closed decoding. |
@@ -516,6 +517,7 @@ without registering it here fails the suite.
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
+- [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)
 
 ### `crpc/flow`

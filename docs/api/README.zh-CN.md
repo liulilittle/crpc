@@ -96,6 +96,7 @@
 | [`cluster/health.hpp`](../../include/crpc/cluster/health.hpp) | `cluster::health_checker` | 健康检查器。 |
 | [`cluster/health_bridge.hpp`](../../include/crpc/cluster/health_bridge.hpp) | `cluster::health_bridge`、`cluster::health_instance_set` | 带去抖的“健康结果→注册表”单写者，以及只读负载均衡视图。 |
 | [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp) | `cluster::registry_log`、`cluster::file_registry_log`、`cluster::memory_registry_log` | 可持久化、可回放的记录日志，作为注册表的写前日志。 |
+| [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp) | `cluster::raft_persistent_state`、`cluster::raft_state_store` | Raft 必须在重启后保留的两个字段（term 与投票），原子写入、失败即拒绝读取。 |
 | [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp) | `cluster::watch_hub` | 基于索引的目录 watch/订阅。 |
 | [`flow/estimator.hpp`](../../include/crpc/flow/estimator.hpp) | `flow::rtt_estimator`、`flow::pacer`、`flow::congestion_window`、`flow::rtt_tracker` | 自适应流控原语。 |
 | [`rpc/flow_control.hpp`](../../include/crpc/rpc/flow_control.hpp) | `rpc::flow_controller`、`rpc::flow_control_options`、`rpc::flow_state` | 连接级流控：字节窗口、PING/PONG 探针、每 lane 配额、pacer。 |
@@ -507,6 +508,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`cluster/lease.hpp`](../../include/crpc/cluster/lease.hpp)
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
+- [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp)
 - [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp)
 - [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp)
 - [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp)
