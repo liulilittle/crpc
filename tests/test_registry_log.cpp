@@ -501,4 +501,243 @@ CRPC_TEST(f1_replay_stream_is_strictly_increasing) {
     CRPC_CHECK_EQ(u64{3}, tail.value()[1].index);
 }
 
+// --- G19 step3 PR-2: truncate_suffix (Raft suffix truncation) ----------------
+//
+// `append` at an index <= last_index already cuts the conflicting suffix
+// (E16). Raft needs the same operation as a first-class step: a follower whose
+// log diverged from the leader's must discard everything from the conflict
+// point *before* the leader's entries arrive, not only when a conflicting
+// record happens to be appended. These cases pin that operation, its
+// durability, its idempotence, and the refusal a backend that cannot truncate
+// must give.
+
+// A backend that does not override the default. The refusal is the point: a
+// silent no-op would let a follower keep a suffix the leader already
+// overwrote.
+class non_truncating_log final : public cl::registry_log {
+public:
+    crpc::result<u64> append(const cl::log_record& record) override {
+        records_.push_back(record);
+        return record.index;
+    }
+    crpc::result<std::vector<cl::log_record>> replay(u64 from_index) const override {
+        std::vector<cl::log_record> out;
+        for (const auto& record : records_) {
+            if (record.index >= from_index) {
+                out.push_back(record);
+            }
+        }
+        return out;
+    }
+    crpc::status sync() override { return crpc::status(); }
+    [[nodiscard]] u64 last_index() const noexcept override {
+        return records_.empty() ? 0 : records_.back().index;
+    }
+
+private:
+    std::vector<cl::log_record> records_;
+};
+
+CRPC_TEST(truncate_suffix_removes_the_tail) {
+    cl::memory_registry_log log;
+    for (u64 index = 1; index <= 5; ++index) {
+        CRPC_REQUIRE(log.append(make_record(index, "v" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log.truncate_suffix(3).ok());
+    CRPC_CHECK_EQ(u64{2}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+    CRPC_CHECK_EQ(u64{1}, replayed.value()[0].index);
+    CRPC_CHECK_EQ(u64{2}, replayed.value()[1].index);
+    CRPC_CHECK_EQ(std::string("v2"), text_of(replayed.value()[1].payload));
+}
+
+CRPC_TEST(truncate_suffix_is_idempotent) {
+    cl::memory_registry_log log;
+    for (u64 index = 1; index <= 4; ++index) {
+        CRPC_REQUIRE(log.append(make_record(index, "v" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log.truncate_suffix(3).ok());
+    CRPC_REQUIRE(log.truncate_suffix(3).ok());
+    CRPC_CHECK_EQ(u64{2}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+}
+
+CRPC_TEST(truncate_suffix_past_the_end_is_a_noop) {
+    cl::memory_registry_log log;
+    for (u64 index = 1; index <= 2; ++index) {
+        CRPC_REQUIRE(log.append(make_record(index, "v" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log.truncate_suffix(10).ok());
+    CRPC_CHECK_EQ(u64{2}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+}
+
+CRPC_TEST(truncate_suffix_at_last_plus_one_is_a_noop) {
+    cl::memory_registry_log log;
+    for (u64 index = 1; index <= 2; ++index) {
+        CRPC_REQUIRE(log.append(make_record(index, "v" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log.truncate_suffix(3).ok());
+    CRPC_CHECK_EQ(u64{2}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+}
+
+CRPC_TEST(truncate_suffix_rejects_index_zero) {
+    cl::memory_registry_log log;
+    CRPC_REQUIRE(log.append(make_record(1, "v1")).ok());
+    const auto st = log.truncate_suffix(0);
+    CRPC_CHECK_FALSE(st.ok());
+    if (!st.ok()) {
+        CRPC_CHECK_EQ(rpc_code::invalid_argument, st.code());
+    }
+    // The refusal must not have removed anything.
+    CRPC_CHECK_EQ(u64{1}, log.last_index());
+}
+
+CRPC_TEST(truncate_suffix_persists_across_reopen) {
+    log_dir dir("crpc-logts-");
+    CRPC_REQUIRE(dir.valid());
+    const std::string path = dir.file("persist.log");
+
+    {
+        auto opened = cl::file_registry_log::open(path);
+        CRPC_REQUIRE(opened.ok());
+        auto log = std::move(opened.value());
+        for (u64 index = 1; index <= 3; ++index) {
+            CRPC_REQUIRE(log->append(make_record(index, "v" + std::to_string(index))).ok());
+        }
+        CRPC_REQUIRE(log->sync().ok());
+        const u64 before = log->durable_size();
+        const auto st = log->truncate_suffix(2);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[diag] truncate reason=%s\n", st.message().c_str());
+        }
+        CRPC_REQUIRE(st.ok());
+        CRPC_CHECK_EQ(u64{1}, log->last_index());
+        // The truncation is durable: the durable boundary moved back with it.
+        CRPC_CHECK(log->durable_size() < before);
+    }
+
+    auto opened = cl::file_registry_log::open(path);
+    CRPC_REQUIRE(opened.ok());
+    auto log = std::move(opened.value());
+    const auto replayed = log->replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{1});
+    CRPC_CHECK_EQ(u64{1}, replayed.value()[0].index);
+    CRPC_CHECK_EQ(std::string("v1"), text_of(replayed.value()[0].payload));
+    CRPC_CHECK_EQ(u64{1}, log->last_index());
+}
+
+// The truncation must be on the device, not merely recorded in the object's own
+// counters. This case is the two-sided assertion the power-loss model exists
+// for: after a successful truncate the boundary holds, and after a *failed*
+// flush the boundary must not move. An implementation that only updates
+// `durable_size_` (and never flushes) passes the first half and fails here.
+CRPC_TEST(truncate_suffix_flushes_and_a_failed_flush_moves_nothing) {
+    log_dir dir("crpc-logts-");
+    CRPC_REQUIRE(dir.valid());
+    const std::string path = dir.file("flush.log");
+
+    auto opened = cl::file_registry_log::open(path);
+    CRPC_REQUIRE(opened.ok());
+    auto log = std::move(opened.value());
+    for (u64 index = 1; index <= 3; ++index) {
+        CRPC_REQUIRE(log->append(make_record(index, "v" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log->sync().ok());
+    const u64 flushes_before = log->flush_count();
+
+    CRPC_REQUIRE(log->truncate_suffix(2).ok());
+    // A real flush happened: the counter moved, not just the boundary field.
+    CRPC_CHECK(log->flush_count() > flushes_before);
+    // And the boundary survives the power-loss model: dropping the unsynced
+    // tail must not bring the truncated record back.
+    log->drop_unsynced_tail();
+    CRPC_CHECK_EQ(u64{1}, log->last_index());
+    const auto replayed = log->replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{1});
+    CRPC_CHECK_EQ(u64{1}, replayed.value()[0].index);
+
+    // The failure side: a flush that fails must leave the truncation unapplied
+    // on the device, which is the property a no-sync implementation violates.
+    const u64 boundary = log->durable_size();
+    const u64 flushes = log->flush_count();
+    log->inject_flush_failure();
+    const status failed = log->sync();
+    CRPC_CHECK_FALSE(failed.ok());
+    CRPC_CHECK_EQ(boundary, log->durable_size());
+    CRPC_CHECK_EQ(flushes, log->flush_count());
+}
+
+CRPC_TEST(truncate_suffix_then_append_continues_from_the_new_tail) {
+    cl::memory_registry_log log;
+    for (u64 index = 1; index <= 3; ++index) {
+        CRPC_REQUIRE(log.append(make_record(index, "old-" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log.truncate_suffix(2).ok());
+    CRPC_REQUIRE(log.append(make_record(2, "new-two")).ok());
+    CRPC_CHECK_EQ(u64{2}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+    CRPC_CHECK_EQ(u64{1}, replayed.value()[0].index);
+    CRPC_CHECK_EQ(u64{2}, replayed.value()[1].index);
+    CRPC_CHECK_EQ(std::string("new-two"), text_of(replayed.value()[1].payload));
+}
+
+// The file backend must survive the same append-after-truncate shape, because
+// its index space lives in `spans_` and a stale span list would let a later
+// append at the old index silently cut a record that was never removed.
+CRPC_TEST(truncate_suffix_then_append_on_the_file_backend) {
+    log_dir dir("crpc-logts-");
+    CRPC_REQUIRE(dir.valid());
+    const std::string path = dir.file("append-after.log");
+
+    auto opened = cl::file_registry_log::open(path);
+    CRPC_REQUIRE(opened.ok());
+    auto log = std::move(opened.value());
+    for (u64 index = 1; index <= 3; ++index) {
+        CRPC_REQUIRE(log->append(make_record(index, "old-" + std::to_string(index))).ok());
+    }
+    CRPC_REQUIRE(log->truncate_suffix(2).ok());
+    CRPC_REQUIRE(log->append(make_record(2, "new-two")).ok());
+    CRPC_CHECK_EQ(u64{2}, log->last_index());
+
+    const auto replayed = log->replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{2});
+    CRPC_CHECK_EQ(u64{1}, replayed.value()[0].index);
+    CRPC_CHECK_EQ(std::string("old-1"), text_of(replayed.value()[0].payload));
+    CRPC_CHECK_EQ(u64{2}, replayed.value()[1].index);
+    CRPC_CHECK_EQ(std::string("new-two"), text_of(replayed.value()[1].payload));
+}
+
+CRPC_TEST(a_backend_that_does_not_override_truncate_refuses) {
+    non_truncating_log log;
+    CRPC_REQUIRE(log.append(make_record(1, "v1")).ok());
+    const auto st = log.truncate_suffix(1);
+    CRPC_CHECK_FALSE(st.ok());
+    if (!st.ok()) {
+        // `rpc_code` has no `unimplemented` (design.md:1779/O1 ruled it out), so
+        // the capability gap is `failed_precondition`. The exact code matters
+        // less than "not ok": a silent success is the defect.
+        CRPC_CHECK_EQ(rpc_code::failed_precondition, st.code());
+    }
+    // A refusal must not be a silent success: the record is still there.
+    CRPC_CHECK_EQ(u64{1}, log.last_index());
+    const auto replayed = log.replay(0);
+    CRPC_REQUIRE(replayed.ok());
+    CRPC_REQUIRE(replayed.value().size() == std::size_t{1});
+}
+
 CRPC_TEST_MAIN()

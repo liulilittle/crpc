@@ -530,8 +530,80 @@ void file_registry_log::drop_unsynced_tail() {
     intact_size_ = target;
 }
 
-// --- memory_registry_log -----------------------------------------------------
+// --- truncate_suffix (base default) ------------------------------------------
+//
+// The default refuses rather than silently doing nothing. A no-op truncation is
+// exactly the failure the Raft rule prevents: the follower would keep a suffix
+// the leader has already overwritten and could acknowledge entries it does not
+// hold. Refusing makes the limitation visible to the caller.
+status registry_log::truncate_suffix(u64 from_index) {
+    (void)from_index;
+    // `unimplemented` is deliberately absent from `rpc_code`: design.md:1779
+    // (O1) records that adding it was ruled out, so the capability gap is
+    // expressed with the closest existing code. `failed_precondition` says the
+    // operation is not available on this backend rather than that the caller
+    // did something wrong, and `unavailable` would wrongly suggest a retry
+    // could help.
+    return status(rpc_code::failed_precondition,
+                  "registry_log: this backend cannot truncate");
+}
 
+// --- truncate_suffix (file backend) ------------------------------------------
+status file_registry_log::truncate_suffix(u64 from_index) {
+    if (from_index == 0) {
+        return status(rpc_code::invalid_argument,
+                      "registry_log: truncate index must not be zero");
+    }
+    if (handle_ == nullptr) {
+        return status(rpc_code::failed_precondition, "registry_log: closed");
+    }
+
+    // `spans_` is rebuilt by replay(), not by append(). A caller that opens a
+    // log and truncates without replaying first would otherwise see an empty
+    // span list and be told "nothing to do" while records remain on disk.
+    // Replaying also re-validates every frame's CRC, so a corrupt log is
+    // reported here rather than truncated around.
+    const auto replayed = replay(0);
+    if (!replayed.ok()) {
+        return replayed.error();
+    }
+
+    // Idempotent: at or past the end there is no suffix to remove.
+    if (from_index > last_index_) {
+        return status();
+    }
+
+    // First span whose index is >= from_index; everything from there on goes.
+    std::size_t cut = 0;
+    while (cut < spans_.size() && spans_[cut].index < from_index) {
+        ++cut;
+    }
+    if (cut == spans_.size()) {
+        // Defensive: last_index_ said the record exists but the span list does
+        // not carry it. Nothing to cut, and reporting success would hide the
+        // inconsistency.
+        return status();
+    }
+
+    const u64 base = spans_[cut].offset;
+    const status trimmed = truncate_to(base);
+    if (!trimmed.ok()) {
+        return trimmed;
+    }
+    spans_.resize(cut);
+    if (durable_size_ > base) {
+        durable_size_ = base;
+    }
+    last_index_ = spans_.empty() ? 0 : spans_.back().index;
+    bytes_on_disk_ = base;
+    intact_size_ = base;
+
+    // Raft requires the truncation to be durable: a follower that truncated in
+    // memory only would replay the stale suffix after a restart.
+    return sync();
+}
+
+// --- memory_registry_log -----------------------------------------------------
 result<u64> memory_registry_log::append(const log_record& record) {
     if (record.index == 0) {
         return rpc_error(rpc_code::invalid_argument,
@@ -548,6 +620,18 @@ result<u64> memory_registry_log::append(const log_record& record) {
     }
     records_.push_back(record);
     return record.index;
+}
+
+status memory_registry_log::truncate_suffix(u64 from_index) {
+    if (from_index == 0) {
+        return status(rpc_code::invalid_argument,
+                      "registry_log: truncate index must not be zero");
+    }
+    // Idempotent: a from_index past the end pops nothing.
+    while (!records_.empty() && records_.back().index >= from_index) {
+        records_.pop_back();
+    }
+    return status();
 }
 
 result<std::vector<log_record>> memory_registry_log::replay(u64 from_index) const {

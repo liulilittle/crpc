@@ -104,6 +104,23 @@ public:
 
     // Index of the last record, or 0 when the log is empty.
     [[nodiscard]] virtual u64 last_index() const noexcept = 0;
+
+    // Removes every record with index >= `from_index`. This is the Raft
+    // "truncate the conflicting suffix" operation: a follower whose log has
+    // diverged from the leader's discards everything from the conflict point
+    // before appending the leader's entries.
+    //
+    // The default refuses. A backend that cannot truncate says so rather than
+    // silently doing nothing, because a silent no-op here is exactly the bug
+    // the Raft rule prevents: the follower would keep a suffix the leader has
+    // already overwritten and acknowledge entries it does not hold. The two
+    // shipped backends override this; an implementation outside this library
+    // that does not need truncation inherits the refusal and keeps compiling,
+    // which is why the member is virtual with a body rather than pure.
+    //
+    // Idempotent: truncating at or past the end is a no-op. `from_index == 0`
+    // is `invalid_argument`, because 0 is not a valid record index.
+    [[nodiscard]] virtual status truncate_suffix(u64 from_index);
 };
 
 // File-backed log. Owns its file handle for the whole lifetime and appends with
@@ -122,6 +139,7 @@ public:
 
     result<u64> append(const log_record& record) override;
     result<std::vector<log_record>> replay(u64 from_index) const override;
+    status truncate_suffix(u64 from_index) override;
     status sync() override;
     [[nodiscard]] u64 last_index() const noexcept override { return last_index_; }
 
@@ -192,6 +210,7 @@ class CRPC_API memory_registry_log final : public registry_log {
 public:
     result<u64> append(const log_record& record) override;
     result<std::vector<log_record>> replay(u64 from_index) const override;
+    status truncate_suffix(u64 from_index) override;
     status sync() override { return status(); }
     [[nodiscard]] u64 last_index() const noexcept override {
         return records_.empty() ? 0 : records_.back().index;
