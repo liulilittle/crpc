@@ -13,8 +13,11 @@
 //   D3  the registry index is the folded maximum, not the record count.
 //   D4  duplicate indexes do not double-apply: the catalog has one row per
 //       (service, node_id) and the folded record count is the dense count.
-//   D5  a true gap (1 then 3) is rejected with a message naming the gap, and
-//       the registry is left completely untouched.
+//   D5  a truncated tail (registry events 1 then 3 with no record at 2) is
+//       rejected, and the registry is left completely untouched. G19 step3
+//       PR-1 narrowed this to "strictly increasing" because the consensus
+//       layer's own kinds may legally occupy the missing index, so a gap is
+//       only a corruption when nothing at all carries the index.
 //
 // Fail-closed requirements (R1-R9 as narrowed by B-verify-sb2-criteria):
 //   R1  a torn tail is the prefix replay() returns; it is accepted as-is.
@@ -209,6 +212,44 @@ bool decode_payload(const std::vector<std::byte>& bytes,
     }
     return r.at_end();
 }
+
+// A log that carries the consensus layer's kinds alongside registry events.
+class mixed_log final : public cl::registry_log {
+public:
+    crpc::result<u64> append(const cl::log_record& record) override {
+        records_.push_back(record);
+        return record.index;
+    }
+    crpc::result<std::vector<cl::log_record>> replay(u64 from_index) const override {
+        std::vector<cl::log_record> out;
+        for (const auto& record : records_) {
+            if (record.index >= from_index) {
+                out.push_back(record);
+            }
+        }
+        return out;
+    }
+    crpc::status sync() override { return crpc::status(); }
+    [[nodiscard]] u64 last_index() const noexcept override {
+        return records_.empty() ? 0 : records_.back().index;
+    }
+
+    // The consensus layer writes a record with no registry-event codec; the
+    // payload shape is opaque to the catalog and deliberately not decodable.
+    void append_consensus(cl::log_record_kind kind, u64 index, u64 term,
+                          const std::vector<std::byte>& payload) {
+        cl::log_record record;
+        record.kind = kind;
+        record.term = term;
+        record.index = index;
+        record.payload = payload;
+        records_.push_back(std::move(record));
+    }
+
+private:
+    std::vector<cl::log_record> records_;
+};
+
 
 // --- Stream building ---------------------------------------------------------
 
@@ -465,6 +506,34 @@ CRPC_TEST(restore_rejects_true_gap_after_fold) {
     }
     // R9: the failed restore must not zero the index.
     CRPC_CHECK_EQ(u64{0}, reg.index());
+}
+
+// --- G19 step3 PR-1: a gap is only legal when a consensus record fills it ----
+//
+// The same shape as the case above (registry events at 1 and 3), but index 2
+// exists and belongs to the consensus layer. The full index sequence is dense
+// (1,2,3), so the restore must succeed: the missing index is accounted for, not
+// lost. This is the case that separates "check the full sequence" (correct)
+// from "check only the registry-event subsequence" (would reject a legal log)
+// and from "check nothing" (would accept the truncation above).
+CRPC_TEST(restore_accepts_a_raft_record_filling_the_gap) {
+    cl::registry reg(legacy_config());
+    mixed_log log;
+    CRPC_REQUIRE(log.append(make_record(1, 1, 1,
+                                        make_instance("svc", "n1", 8001, 1))).ok());
+    log.append_consensus(cl::log_record_kind::raft_term, 2, 3,
+                         {std::byte{0x07}});
+    CRPC_REQUIRE(log.append(make_record(3, 3, 1,
+                                        make_instance("svc", "n3", 8003, 1))).ok());
+
+    const auto st = cl::restore_from_log(reg, log);
+    if (!st.ok()) {
+        std::fprintf(stderr, "[diag] gap-filled reason=%s msg=%s\n",
+                     rejection_reason(st).c_str(), st.error().message.c_str());
+    }
+    CRPC_CHECK(st.ok());
+    CRPC_CHECK_EQ(std::size_t{2}, query_all(reg).size());
+    CRPC_CHECK_EQ(u64{3}, reg.index());
 }
 
 // --- G3: a stale log (stream behind the target) is rejected -----------------
@@ -908,6 +977,159 @@ CRPC_TEST(epoch_floor_survives_restore) {
     newer.fence = reg.next_fence("svc", "n2").value();
     newer.writer_epoch = reg.next_writer_epoch().value();
     CRPC_CHECK(reg.set_state("svc", "n2", cl::instance_state::critical, newer).ok());
+}
+
+// --- G19 step3 PR-1: the consensus layer's records live in the same log -----
+//
+// `registry_log.hpp:64-73` designs four record kinds (registry_event, raft_term,
+// raft_vote, raft_snapshot, raft_entry) and says the consensus layer persists
+// its own kinds in the same log "so that a node has one durability boundary
+// instead of two". `restore_from_log` therefore reads only `registry_event`
+// records: the raft records carry no catalog mutation, and their payloads are
+// not in the registry event codec, so treating them as events is a hard failure
+// (S-1). These cases pin both halves of that contract -- the skip and the fact
+// that the skip is by kind, not a blanket "ignore decode errors".
+
+// T1: a stream of registry events interleaved with every raft kind restores
+// successfully, and only the registry events reach the catalog.
+CRPC_TEST(restore_skips_non_registry_kinds) {
+    cl::registry reg(legacy_config());
+    mixed_log log;
+    // index 1: a legal registry event.
+    CRPC_REQUIRE(log.append(make_record(1, 1, 1,
+                                        make_instance("svc", "n1", 8001, 1))).ok());
+    // index 2: a raft term record (opaque payload).
+    log.append_consensus(cl::log_record_kind::raft_term, 2, 7,
+                         {std::byte{0x01}, std::byte{0x02}, std::byte{0x03}});
+    // index 3: a raft vote record.
+    log.append_consensus(cl::log_record_kind::raft_vote, 3, 7,
+                         {std::byte{0xAA}, std::byte{0xBB}});
+    // index 4: a legal registry event.
+    CRPC_REQUIRE(log.append(make_record(4, 4, 1,
+                                        make_instance("svc", "n2", 8002, 1))).ok());
+    // index 5: a raft snapshot record.
+    log.append_consensus(cl::log_record_kind::raft_snapshot, 5, 9,
+                         {std::byte{0x00}, std::byte{0xFF}, std::byte{0x10}});
+    // index 6: a raft entry record.
+    log.append_consensus(cl::log_record_kind::raft_entry, 6, 9,
+                         {std::byte{0xDE}, std::byte{0xAD}});
+
+    const auto st = cl::restore_from_log(reg, log);
+    if (!st.ok()) {
+        std::fprintf(stderr, "[diag] T1 reason=%s msg=%s\n",
+                     rejection_reason(st).c_str(), st.error().message.c_str());
+    }
+    CRPC_CHECK(st.ok());
+    // Only the two registry events are applied.
+    cl::service_instance probe1;
+    cl::service_instance probe2;
+    CRPC_CHECK(find_instance(reg, "svc", "n1", probe1));
+    CRPC_CHECK(find_instance(reg, "svc", "n2", probe2));
+    CRPC_CHECK_EQ(std::size_t{2}, query_all(reg).size());
+    // The catalog index is the log's high-water (6), not the count of applied
+    // registry events (2): the raft records still occupy index space, so a
+    // later append must land after them rather than overwrite one.
+    CRPC_CHECK_EQ(u64{6}, reg.index());
+}
+
+// T2: the skip is by kind. A record that *claims* to be a registry event but
+// carries an undecodable payload must still be rejected -- otherwise "skip the
+// raft records" would have become "skip every record that fails to decode",
+// which is a fail-open hole: a corrupted event would be silently dropped.
+CRPC_TEST(restore_still_rejects_a_malformed_registry_event) {
+    cl::registry reg(legacy_config());
+    mixed_log log;
+    // A registry_event whose payload is not the event codec. The body's version
+    // byte is 0x63 (not kVersion=1), so the decoder rejects it; the header is a
+    // well-formed fence/incarnation pair so only the version gate can fire.
+    std::vector<std::byte> garbage(32, std::byte{0x00});
+    garbage[16] = std::byte{0x63};  // version
+    garbage[17] = std::byte{0x00};  // state = passing
+    log.append_consensus(cl::log_record_kind::registry_event, 1, 0, garbage);
+
+    const auto st = cl::restore_from_log(reg, log);
+    if (st.ok()) {
+        std::fprintf(stderr, "[diag] T2 accepted a malformed registry_event\n");
+    }
+    CRPC_CHECK_FALSE(st.ok());
+    if (!st.ok()) {
+        // Precise reason: the decode rule, not a gap, a fence or a conflict.
+        CRPC_CHECK_EQ(rpc_code::invalid_argument, st.code());
+        CRPC_CHECK_EQ(std::string("invalid"), rejection_reason(st));
+    }
+    // R9: the failed restore must not zero or move the index.
+    CRPC_CHECK_EQ(u64{0}, reg.index());
+}
+
+
+// T4: the log's high-water index is the last record of ANY kind. If a trailing
+// raft record set the index, a restore that used the folded maximum would leave
+// the registry behind the log, and the next append would land on the raft
+// record's index and truncate it -- silent data loss in the durability boundary.
+CRPC_TEST(restore_keeps_the_log_high_water_past_a_trailing_raft_record) {
+    cl::registry reg(legacy_config());
+    mixed_log log;
+    CRPC_REQUIRE(log.append(make_record(1, 1, 1,
+                                        make_instance("svc", "n1", 8001, 1))).ok());
+    // The trailing record is a raft entry: the registry-event subsequence ends
+    // at index 1, but the log's high-water is 2.
+    log.append_consensus(cl::log_record_kind::raft_entry, 2, 5,
+                         {std::byte{0x42}, std::byte{0x43}});
+
+    const auto st = cl::restore_from_log(reg, log);
+    if (!st.ok()) {
+        std::fprintf(stderr, "[diag] T4 reason=%s msg=%s\n",
+                     rejection_reason(st).c_str(), st.error().message.c_str());
+    }
+    CRPC_REQUIRE(st.ok());
+    // The catalog index must be the log high-water (2), not the folded
+    // registry-event maximum (1).
+    CRPC_CHECK_EQ(u64{2}, reg.index());
+
+    // The consequence that matters: a later registry append at index 3 must be
+    // accepted, and it must not be reported as a conflict overwrite of the
+    // raft record (which would be the outcome if index_ had stayed at 1).
+    const auto next = reg.next_fence("svc", "n2");
+    CRPC_REQUIRE(next.ok());
+    const auto written = reg.register_instance(
+        make_instance("svc", "n2", 8002, 1), make_ctx("n2", next.value(), 1));
+    if (!written.ok()) {
+        std::fprintf(stderr, "[diag] T4 append reason=%s\n",
+                     rejection_reason(written).c_str());
+    }
+    CRPC_REQUIRE(written.ok());
+    CRPC_CHECK_EQ(u64{3}, written.value().index);
+    // Both rows are present: the append neither overwrote nor displaced n1.
+    cl::service_instance probe1;
+    cl::service_instance probe2;
+    CRPC_CHECK(find_instance(reg, "svc", "n1", probe1));
+    CRPC_CHECK(find_instance(reg, "svc", "n2", probe2));
+}
+
+// T5: a raft-only stream is not an error, and the registry-event subsequence is
+// dense from its own first record. Here the log holds exactly one registry
+// event at index 3 (the two records before it are the consensus layer's). G1
+// must accept a single-event subsequence regardless of where it starts, because
+// the log's index space is shared.
+CRPC_TEST(restore_accepts_a_single_registry_event_after_leading_raft_records) {
+    cl::registry reg(legacy_config());
+    mixed_log log;
+    log.append_consensus(cl::log_record_kind::raft_term, 1, 1,
+                         {std::byte{0x01}});
+    log.append_consensus(cl::log_record_kind::raft_vote, 2, 2,
+                         {std::byte{0x02}, std::byte{0x03}});
+    CRPC_REQUIRE(log.append(make_record(3, 3, 1,
+                                        make_instance("svc", "n1", 8001, 1))).ok());
+
+    const auto st = cl::restore_from_log(reg, log);
+    if (!st.ok()) {
+        std::fprintf(stderr, "[diag] T5 reason=%s msg=%s\n",
+                     rejection_reason(st).c_str(), st.error().message.c_str());
+    }
+    CRPC_CHECK(st.ok());
+    CRPC_CHECK_EQ(std::size_t{1}, query_all(reg).size());
+    // The catalog index is the log high-water (3), not the folded count (1).
+    CRPC_CHECK_EQ(u64{3}, reg.index());
 }
 
 CRPC_TEST_MAIN()

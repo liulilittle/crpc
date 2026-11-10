@@ -618,12 +618,15 @@ private:
 // as it was (R9: the index is never zeroed on failure).
 //
 //   R1  a torn tail is the prefix replay() returns; that prefix is accepted.
-//   G1  the folded index sequence must start at 1 and be strictly +1: a hole
-//       would make a lost record indistinguishable from a legitimate jump
+//   G1  the log's index space must be dense across ALL record kinds: 1, 2, 3,
+//       ... with no hole. The consensus layer interleaves its own record kinds
+//       in the same log (registry_log.hpp:64-73), so a gap in the
+//       registry-event subsequence is the expected shape; a gap in the full
+//       sequence means records were lost, which is corruption
 //       (invalid_argument, message names the gap).
-//   G3  the stream's maximum index must exceed target.index(): restoring an
-//       older log over a newer catalog is a rollback, not a recovery
-//       (failed_precondition).
+//   G3  the log's maximum index (of any kind) must exceed target.index():
+//       restoring an older log over a newer catalog is a rollback, not a
+//       recovery (failed_precondition).
 //   R4  one (service, node_id, incarnation) names one write; a second,
 //       different payload for the same incarnation is a conflict.
 //   R5  the restored fence water-mark must not go below the target's

@@ -1355,11 +1355,47 @@ result<std::size_t> restore_from_log(registry& target, const registry_log& log) 
     }
     const std::vector<log_record>& stream = replayed.value();
 
-    // Fold last-wins by index. replay() returns vector<log_record> and the
-    // backend is replaceable, so duplicates are a legal input (7.1.6b).
-    // A std::map keeps the output ordered by index, which is the apply order.
+    // G1: the log's index space must be dense across ALL record kinds. The
+    // consensus layer interleaves its own record kinds in the same log
+    // (registry_log.hpp:64-73), so a gap in the *registry-event* subsequence is
+    // the expected shape; a gap in the *full* sequence means records were lost,
+    // which is corruption. Checking the full sequence is what keeps the step1
+    // guarantee (a torn or truncated tail is rejected) while letting raft
+    // records occupy the indices between registry events.
+    //
+    // The stream is folded by index first, last-wins, because replay() returns
+    // the raw sequence and `registry_log` is a replaceable interface: a backend
+    // may hand back a duplicate index (7.1.6b), and 1,2,2 is dense after folding.
+    std::map<u64, log_record_kind> index_kinds;
+    for (const auto& record : stream) {
+        index_kinds[record.index] = record.kind;
+    }
+    u64 expected = 1;
+    for (const auto& entry : index_kinds) {
+        if (entry.first != expected) {
+            return reject(rpc_code::invalid_argument,
+                          "restore: index gap (expected " +
+                              std::to_string(expected) + ", got " +
+                              std::to_string(entry.first) + ")",
+                          reason_invalid);
+        }
+        ++expected;
+    }
+
+    // Fold last-wins by index. A std::map keeps the output ordered by index,
+    // which is the apply order.
     std::map<u64, folded_record> folded;
     for (const auto& record : stream) {
+        // Only registry_event carries a catalog mutation. The other kinds
+        // (raft_term/raft_vote/raft_snapshot/raft_entry) are consumed by the
+        // consensus layer, not by the catalog restore, and their payloads are
+        // not in the registry event codec. Skipping them by kind -- not by
+        // "failed to decode" -- is what keeps a corrupted event visible: a
+        // registry_event whose payload is undecodable still falls through to
+        // the decode below and is rejected.
+        if (record.kind != log_record_kind::registry_event) {
+            continue;
+        }
         folded_record decoded;
         if (!decode_restore_payload(record.payload, decoded.fence,
                                     decoded.incarnation, decoded.instance)) {
@@ -1372,27 +1408,30 @@ result<std::size_t> restore_from_log(registry& target, const registry_log& log) 
         folded[record.index] = std::move(decoded);
     }
 
-    // G5: an empty stream is a successful no-op.
+    // The log's high-water index is the last index of ANY kind, taken from the
+    // full fold above: a trailing raft record occupies index space the catalog
+    // does not apply but must still account for, or the next append would land
+    // on top of it and truncate it.
+    const u64 stream_max_index = index_kinds.empty() ? 0 : index_kinds.rbegin()->first;
+
+    // G5: an empty stream is a successful no-op. A stream with no registry
+    // event is too: there is no catalog mutation to apply, and the index still
+    // advances to the log high-water so a later append cannot overwrite the
+    // consensus records.
     if (folded.empty()) {
+        if (stream_max_index == 0) {
+            return std::size_t{0};
+        }
+        std::lock_guard<std::mutex> lock(target.mutex_);
+        if (stream_max_index <= target.index_) {
+            return reject(rpc_code::failed_precondition,
+                          "restore: log is not ahead of the registry",
+                          "stale_log");
+        }
+        target.index_ = stream_max_index;
         return std::size_t{0};
     }
 
-    // G1: the folded sequence must be 1, 2, 3, ... with no hole. Checking the
-    // folded sequence (not the raw stream) is what makes a duplicate index
-    // legal: 1,2,2 folds to 1,2, which is dense.
-    u64 expected = 1;
-    for (const auto& entry : folded) {
-        if (entry.first != expected) {
-            return reject(rpc_code::invalid_argument,
-                          "restore: index gap (expected " +
-                              std::to_string(expected) + ", got " +
-                              std::to_string(entry.first) + ")",
-                          reason_invalid);
-        }
-        ++expected;
-    }
-
-    const u64 stream_max_index = folded.rbegin()->first;
     const u64 stream_max_fence = [&]() {
         u64 max_fence = 0;
         for (const auto& entry : folded) {
@@ -1407,6 +1446,11 @@ result<std::size_t> restore_from_log(registry& target, const registry_log& log) 
     // water-mark on the target. Fold the stream a second time by key, keeping
     // the maximum fence for each key (the log is append-only and the folded
     // order is by ascending index, so the last record of a key is its newest).
+    //
+    // `stream_max_fence` is deliberately folded over registry events only, while
+    // `stream_max_index` (above) is the high-water of every kind: a raft record
+    // occupies an index but carries no fence, so it can raise the index without
+    // touching the fence water-mark.
     std::map<registry::key, u64, registry::key_less> fence_by_key;
     for (const auto& entry : folded) {
         const registry::key id{entry.second.instance.service,
@@ -1491,10 +1535,11 @@ result<std::size_t> restore_from_log(registry& target, const registry_log& log) 
         seen.emplace(id, &record);
     }
 
-    // Apply. The stream is dense from 1, so the target's index moves to the
-    // folded maximum, and the fence water-mark moves to the stream maximum.
-    // The tombstones and incarnation high-water are rebuilt from the same
-    // records so a later purge/registration cannot resurrect an old row.
+    // Apply. The target's index moves to the log's high-water of every kind
+    // (`stream_max_index`), and the fence water-mark moves to the registry
+    // events' maximum. The tombstones and incarnation high-water are rebuilt
+    // from the same records so a later purge/registration cannot resurrect an
+    // old row.
     auto next = std::make_shared<registry_snapshot>();
     next->instances.reserve(folded.size());
     for (const auto& entry : folded) {
