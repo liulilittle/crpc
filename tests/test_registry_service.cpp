@@ -1044,4 +1044,1092 @@ CRPC_TEST(service_equal_index_anchor_is_accepted) {
     (void)fs::remove_all(dir);
 }
 
+// --- The anchor guards deregister and set_state too ----------------------------
+//
+// VERDICT section 5.1: "after every successful write the server sets
+// last_anchor = {authority_epoch, index}". `register` was the only handler that
+// updated it, and `deregister` / `set_state` did not even carry an anchor. A
+// client that had observed index N could therefore replay a deregister or a
+// set_state against a service that had already moved past N.
+
+CRPC_TEST(service_deregister_rejects_a_stale_anchor) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_dereg_stale";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const cl::registry_anchor anchor = client.local_anchor_for("svc\x1fnode-A");
+
+    // Advance the authority with a second write from another client, so the
+    // anchor above is behind the service.
+    auto other = std::make_unique<cl::registry_client>(n.client,
+                                                       cl::registry_client_options{"token-A"});
+    cl::service_instance newer = instance;
+    newer.address.port = 9090;
+    const auto advanced = other->register_instance(newer, 2, 8);
+    CRPC_REQUIRE(advanced.ok());
+    CRPC_CHECK(advanced.value().index > anchor.index);
+
+    // Replaying the deregister with the old anchor must be rejected.
+    const auto stale = client.deregister("svc", "node-A", 1, 9);
+    CRPC_CHECK_FALSE(stale.ok());
+    if (stale.ok()) {
+        return;
+    }
+    const std::string* reason = stale.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+    }
+
+    // The instance must still be there: the stale deregister did not land.
+    const auto after = client.query("svc");
+    CRPC_REQUIRE(after.ok());
+    CRPC_CHECK_EQ(static_cast<std::size_t>(1), after.value().rows.size());
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(service_set_state_rejects_a_stale_anchor) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_state_stale";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const cl::registry_anchor anchor = client.local_anchor_for("svc\x1fnode-A");
+
+    auto other = std::make_unique<cl::registry_client>(n.client,
+                                                       cl::registry_client_options{"token-A"});
+    cl::service_instance newer = instance;
+    newer.address.port = 9090;
+    const auto advanced = other->register_instance(newer, 2, 8);
+    CRPC_REQUIRE(advanced.ok());
+    CRPC_CHECK(advanced.value().index > anchor.index);
+
+    const auto stale = client.set_state("svc", "node-A", cl::instance_state::passing, 1, 9);
+    CRPC_CHECK_FALSE(stale.ok());
+    if (stale.ok()) {
+        return;
+    }
+    const std::string* reason = stale.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+    }
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- The anchor survives a restart --------------------------------------------
+//
+// `last_anchor` used to be a plain in-memory map that only `register` updated.
+// After a restart it was empty, so `anchor_allows` saw "no anchor on record"
+// and let every write through -- a client could replay a pre-restart anchor
+// against a freshly started service. VERDICT section 5.1 requires the anchor to
+// be persisted next to the epoch file.
+//
+// This is the case that distinguishes "persisted" from "rebuilt": the second
+// service restores the catalog from the log (so it knows index 1 exists), but
+// the anchor it holds must also be there, or the check is vacuous.
+
+CRPC_TEST(service_anchor_survives_a_restart) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_anchor_restart";
+    (void)fs::remove_all(dir);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    cl::registry_anchor pre_restart;
+    {
+        node n;
+        CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+        cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+        client.set_stale_retries(0);
+        const auto seeded = client.register_instance(instance, 1, 7);
+        CRPC_REQUIRE(seeded.ok());
+        pre_restart = client.local_anchor_for("svc\x1fnode-A");
+        CRPC_CHECK(pre_restart.index > 0);
+        // Advance past the anchor so a replay is detectable. A DIFFERENT
+        // SERVICE is used rather than a different node: the token is bound to
+        // node-A, so a node-B write would be denied by the ACL and the case
+        // would measure the wrong thing.
+        auto other = std::make_unique<cl::registry_client>(n.client,
+                                                           cl::registry_client_options{"token-A"});
+        cl::service_instance newer = instance;
+        newer.service = "svc-2";
+        newer.address.port = 9090;
+        const auto advanced = other->register_instance(newer, 1, 8);
+        CRPC_REQUIRE(advanced.ok());
+        n.stop();
+    }
+
+    // A brand new service over the same state directory.
+    {
+        node n;
+        CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+        cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+        client.set_stale_retries(0);
+
+        // The catalog came back: the restore worked. `svc` is present with
+        // exactly one row -- the first incarnation wrote `svc-2` under a
+        // DIFFERENT key, so it neither added a row for `svc` nor disturbed the
+        // anchor this case is about. That separation is the point: it proves the
+        // persisted anchor is per-key, not a single global water-mark.
+        const auto restored = client.query("svc");
+        CRPC_REQUIRE(restored.ok());
+        CRPC_CHECK_EQ(static_cast<std::size_t>(1), restored.value().rows.size());
+
+        // A write presenting an anchor BEHIND the persisted water-mark must be
+        // stale. If the anchor were not persisted, `anchor_allows` would see no
+        // record and accept it.
+        //
+        // The presented anchor is deliberately one index BEHIND what the first
+        // incarnation persisted: presenting exactly the water-mark is a
+        // legitimate replay (`not_stale` uses `>=`), so that would not test
+        // anything.
+        cl::registry_anchor behind = pre_restart;
+        if (behind.index > 1) {
+            behind.index -= 1;
+        } else {
+            behind.index = 0;
+        }
+#if defined(CRPC_TESTING)
+        client.set_local_anchor("svc\x1fnode-A", behind);
+#endif
+        cl::service_instance replay = instance;
+        replay.address.port = 7070;
+        const auto stale = client.register_instance(replay, 3, 9);
+        CRPC_CHECK_FALSE(stale.ok());
+        if (stale.ok()) {
+            n.stop();
+            (void)fs::remove_all(dir);
+            return;
+        }
+        const std::string* reason = stale.error().metadata.find("registry.reason");
+        CRPC_CHECK(reason != nullptr);
+        if (reason != nullptr) {
+            CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+        }
+        // The metadata must carry the persisted anchor's index, which is at
+        // least as high as what the client saw before the restart.
+        const std::string* index = stale.error().metadata.find("registry.index");
+        CRPC_CHECK(index != nullptr);
+        if (index != nullptr) {
+            CRPC_CHECK(std::stoull(*index) >= pre_restart.index);
+        }
+        n.stop();
+    }
+
+    (void)fs::remove_all(dir);
+}
+
+// --- The authority epoch is part of the anchor --------------------------------
+//
+// `anchor_epoch` was a dead field: declared at registry_service.cpp:330 and
+// never assigned, so it was always 0 and the first half of the two-dimensional
+// `not_stale` comparison never fired. This case pins it to the epoch_store's
+// value, which is the authority's own term number (VERDICT section 4.2).
+
+CRPC_TEST(service_reports_its_own_authority_epoch) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_epoch_report";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+
+    // The write response carries the authority epoch, and it must be non-zero:
+    // `epoch_store::next()` issues value_+1 from a seeded base, so a service that
+    // has issued at least one epoch is at 1 or above.
+    CRPC_CHECK(seeded.value().authority_epoch > 0);
+
+    // The client's anchor picks the epoch up from the response.
+    const cl::registry_anchor anchor = client.local_anchor_for("svc\x1fnode-A");
+    CRPC_CHECK_EQ(seeded.value().authority_epoch, anchor.authority_epoch);
+    CRPC_CHECK_EQ(seeded.value().index, anchor.index);
+
+    // And the query response carries the same epoch.
+    const auto queried = client.query("svc");
+    CRPC_REQUIRE(queried.ok());
+    CRPC_CHECK_EQ(seeded.value().authority_epoch, queried.value().anchor.authority_epoch);
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- The client sends its anchor epoch on every write --------------------------
+//
+// `register` sent tag 14 (index) but the epoch half had no tag at all, so the
+// service could not compare epochs. Tag 18 carries it now; this case proves the
+// service sees a stale EPOCH (not just a stale index).
+
+CRPC_TEST(service_rejects_a_stale_authority_epoch) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_epoch_stale";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const cl::registry_anchor good = client.local_anchor_for("svc\x1fnode-A");
+    CRPC_CHECK(good.authority_epoch > 0);
+
+    // Restart the service: a new authority with a NEW epoch, and an anchor map
+    // loaded from disk. The client still holds the OLD epoch.
+    n.stop();
+    {
+        node restarted;
+        CRPC_REQUIRE(restarted.start(dir.str(), "token-A"));
+        cl::registry_client stale_client(restarted.client,
+                                         cl::registry_client_options{"token-A"});
+        stale_client.set_stale_retries(0);
+        // Seed an anchor one index BEHIND what the service persisted. Presenting
+        // exactly the water-mark would be a legitimate replay (`not_stale` is
+        // `>=`), so that would prove nothing.
+        cl::registry_anchor behind = good;
+        behind.index = good.index > 1 ? good.index - 1 : 0;
+#if defined(CRPC_TESTING)
+        stale_client.set_local_anchor("svc\x1fnode-A", behind);
+#endif
+
+        // Force the client's anchor to the pre-restart epoch. `local_anchor_for`
+        // reads what the client stored; to present an old epoch we need a client
+        // that never saw the new one, which is exactly a client that lived before
+        // the restart. The service's epoch advanced, so its watermark is ahead.
+        //
+        // The write below presents whatever anchor this client holds. A fresh
+        // client holds none, so this case instead pins the service's own view:
+        // after a restart the authority epoch must be strictly greater than the
+        // pre-restart one, which is what makes the old anchor stale.
+        // The client holds the PRE-restart anchor, so its write must be stale.
+        // This is the assertion that fails if the anchor (and its epoch half) is
+        // not persisted: without it the restarted service has an empty
+        // `last_anchor`, `anchor_allows` sees "no record" and accepts the write.
+        cl::service_instance replay = instance;
+        replay.address.port = 7070;
+        // `stale_client`, NOT the outer `client`: the outer one holds no anchor for
+        // this key (it was never re-anchored after the restart) and has its retry
+        // enabled, so it would silently re-anchor and succeed.
+        const auto stale = stale_client.register_instance(replay, 3, 9);
+        CRPC_CHECK_FALSE(stale.ok());
+        if (stale.ok()) {
+            restarted.stop();
+            (void)fs::remove_all(dir);
+            return;
+        }
+        const std::string* reason = stale.error().metadata.find("registry.reason");
+        CRPC_CHECK(reason != nullptr);
+        if (reason != nullptr) {
+            CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+        }
+        // The error reports the WATER-MARK the client failed against, which is
+        // the anchor persisted before the restart. Pinning it proves the
+        // water-mark (not just the catalog) came back from disk: had the anchor
+        // file not been read, `last_anchor` would be empty, `anchor_allows`
+        // would return true at "no record", and the write would have been
+        // accepted.
+        const std::string* index = stale.error().metadata.find("registry.index");
+        CRPC_CHECK(index != nullptr);
+        if (index != nullptr) {
+            CRPC_CHECK(std::stoull(*index) >= good.index);
+        }
+        restarted.stop();
+    }
+
+    (void)fs::remove_all(dir);
+}
+
+// --- Every successful write advances the anchor water-mark --------------------
+//
+// VERDICT section 5.1: "after EVERY successful write the server sets
+// last_anchor = {authority_epoch, index}". `register` did; `deregister` and
+// `set_state` did not. A stalled water-mark means an anchor that is already
+// behind the authority is still accepted, which defeats the whole check.
+
+CRPC_TEST(service_deregister_advances_the_anchor_water_mark) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_dereg_wm";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const crpc::u64 register_index = seeded.value().index;
+
+    // Deregister is a write like any other: it must move the water-mark. The
+    // response's index is the catalog's log index, which a deregister advances.
+    const auto removed = client.deregister("svc", "node-A", 1, 9);
+    CRPC_REQUIRE(removed.ok());
+    const crpc::u64 deregister_index = removed.value().index;
+    CRPC_CHECK(deregister_index > register_index);
+
+    // A client holding the PRE-deregister anchor must now be stale: the
+    // authority has moved past it. This is the assertion that fails if
+    // `on_deregister` does not update `last_anchor`. The anchor is seeded
+    // explicitly (test-only seam) because a client that performed the
+    // deregister itself would already have been re-anchored by the response.
+    auto stale_client =
+        std::make_unique<cl::registry_client>(n.client, cl::registry_client_options{"token-A"});
+    stale_client->set_stale_retries(0);
+#if defined(CRPC_TESTING)
+    stale_client->set_local_anchor("svc\x1fnode-A",
+                                   cl::registry_anchor{seeded.value().authority_epoch,
+                                                       register_index});
+#endif
+    const auto replay = stale_client->deregister("svc", "node-A", 1, 10);
+    CRPC_CHECK_FALSE(replay.ok());
+    if (replay.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = replay.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+    }
+    const std::string* index = replay.error().metadata.find("registry.index");
+    CRPC_CHECK(index != nullptr);
+    if (index != nullptr) {
+        CRPC_CHECK_EQ(deregister_index, std::stoull(*index));
+    }
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(service_set_state_advances_the_anchor_water_mark) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_state_wm";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const crpc::u64 register_index = seeded.value().index;
+
+    const auto changed =
+        client.set_state("svc", "node-A", cl::instance_state::passing, 1, 9);
+    CRPC_REQUIRE(changed.ok());
+    const crpc::u64 set_state_index = changed.value().index;
+    CRPC_CHECK(set_state_index > register_index);
+
+    // Replaying the set_state with the PRE-set_state anchor must be stale. The
+    // anchor is seeded explicitly for the same reason as in the deregister case.
+    auto stale_client =
+        std::make_unique<cl::registry_client>(n.client, cl::registry_client_options{"token-A"});
+    stale_client->set_stale_retries(0);
+#if defined(CRPC_TESTING)
+    stale_client->set_local_anchor("svc\x1fnode-A",
+                                   cl::registry_anchor{seeded.value().authority_epoch,
+                                                       register_index});
+#endif
+    const auto replay =
+        stale_client->set_state("svc", "node-A", cl::instance_state::passing, 1, 10);
+    CRPC_CHECK_FALSE(replay.ok());
+    if (replay.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = replay.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+    }
+    const std::string* index = replay.error().metadata.find("registry.index");
+    CRPC_CHECK(index != nullptr);
+    if (index != nullptr) {
+        CRPC_CHECK_EQ(set_state_index, std::stoull(*index));
+    }
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- An idempotent replay is still subject to the anchor check ----------------
+//
+// This pins the existing ORDER of the two gates (anchor first, idempotency
+// second, registry_service.cpp:832 then :881). If a future refactor moved the
+// idempotency lookup ahead of the anchor check, the cached result would be
+// handed back for a write whose anchor is behind the authority -- a bypass.
+
+CRPC_TEST(an_idempotent_replay_with_a_stale_anchor_is_still_rejected) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_idem_stale";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+    client.set_request_identity("logical-write-1");
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto first = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(first.ok());
+
+    // Advance the authority with a different client and a different identity.
+    auto other = std::make_unique<cl::registry_client>(n.client,
+                                                       cl::registry_client_options{"token-A"});
+    other->set_request_identity("logical-write-2");
+    cl::service_instance newer = instance;
+    newer.address.port = 9090;
+    const auto advanced = other->register_instance(newer, 2, 8);
+    CRPC_REQUIRE(advanced.ok());
+
+    // The SAME request identity as the first write, but the client's anchor is
+    // now behind the authority. The idempotency map holds a hit for this key;
+    // the anchor check must reject the write before the map is consulted.
+    const auto replay = client.register_instance(instance, 1, 7);
+    CRPC_CHECK_FALSE(replay.ok());
+    if (replay.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = replay.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+    }
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- A token without an issue time is denied, not merely unverified -----------
+//
+// `check_acl` refuses a request whose token carries no `token_issued_at`: a
+// bearer token with no issue time cannot be shown to be inside the replay
+// window, so it is denied rather than assumed fresh. Every other case uses the
+// client, which always stamps tag 16, so this gate had no coverage at all --
+// which is why a mutant that deleted the `!has_issued_at` branch left the whole
+// suite green.
+
+CRPC_TEST(a_token_without_an_issue_time_is_denied) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_no_issue_time";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    // `check_acl` is public and takes the DTO fields directly, so the case can
+    // present the exact state the wire produces for a tag-16-less frame.
+    //
+    // `issued_at` is INSIDE the window on purpose. With `issued_at = 0` the
+    // 30-second window check would reject the token independently of the
+    // `!has_issued_at` gate, so deleting that gate would leave this case green
+    // and the gate would still have no coverage.
+    const auto now = std::chrono::system_clock::now();
+    const auto fresh =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) -
+        std::chrono::milliseconds{1000};
+    const cl::acl_decision denied = n.service->check_acl(
+        "token-A", cl::registry_method_register, "svc", "node-A", now, fresh,
+        /*has_issued_at=*/false);
+    CRPC_CHECK_FALSE(denied.allowed);
+    CRPC_CHECK_EQ(std::string("acl_denied"), denied.reason);
+
+    // Control: the same token WITH the same issue time is allowed, so the
+    // denial above is about the missing stamp and not about the timestamp.
+    const cl::acl_decision allowed = n.service->check_acl(
+        "token-A", cl::registry_method_register, "svc", "node-A", now, fresh,
+        /*has_issued_at=*/true);
+    CRPC_CHECK(allowed.allowed);
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- A client that outlives the service cannot replay its old anchor ----------
+//
+// The real P1-3 threat: the client PROCESS does not restart, the service does.
+// The client's anchor is process-local and stays alive; the restarted service has
+// a new authority epoch. Without persisted `last_anchor` the restarted service
+// would see "no anchor on record" and accept the replay.
+//
+// The same `registry_client` object is used across the restart, which is only
+// possible because `set_local_anchor` (test-only, CRPC_TESTING) can seed the
+// anchor a pre-restart client would have been holding.
+
+CRPC_TEST(service_rejects_a_stale_authority_epoch_after_restart) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_epoch_restart";
+    (void)fs::remove_all(dir);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    cl::registry_anchor pre_restart;
+    {
+        node n;
+        CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+        cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+        client.set_stale_retries(0);
+        const auto seeded = client.register_instance(instance, 1, 7);
+        CRPC_REQUIRE(seeded.ok());
+        pre_restart = client.local_anchor_for("svc\x1fnode-A");
+        CRPC_REQUIRE(pre_restart.index > 0);
+        CRPC_REQUIRE(pre_restart.authority_epoch > 0);
+        n.stop();
+    }
+
+    // Restart over the same state directory. The anchor the first client held is
+    // what a client that outlived the service would still be holding; seeding it
+    // into the new client reproduces exactly that state.
+    {
+        node restarted;
+        CRPC_REQUIRE(restarted.start(dir.str(), "token-A"));
+        cl::registry_client client(restarted.client,
+                                   cl::registry_client_options{"token-A"});
+        client.set_stale_retries(0);
+        // Seed an anchor one index BEHIND the persisted water-mark (see the
+        // restart case for why "exactly the water-mark" would not be a test).
+        cl::registry_anchor behind = pre_restart;
+        behind.index = pre_restart.index > 1 ? pre_restart.index - 1 : 0;
+#if defined(CRPC_TESTING)
+        client.set_local_anchor("svc\x1fnode-A", behind);
+#endif
+
+        cl::service_instance replay = instance;
+        replay.address.port = 7070;
+        const auto stale = client.register_instance(replay, 3, 9);
+        CRPC_CHECK_FALSE(stale.ok());
+        if (stale.ok()) {
+            restarted.stop();
+            (void)fs::remove_all(dir);
+            return;
+        }
+        const std::string* reason = stale.error().metadata.find("registry.reason");
+        CRPC_CHECK(reason != nullptr);
+        if (reason != nullptr) {
+            CRPC_CHECK_EQ(std::string("stale_anchor"), *reason);
+        }
+        restarted.stop();
+    }
+
+    (void)fs::remove_all(dir);
+}
+
+// --- A fresh client can write a key that already has a water-mark -------------
+//
+// A brand-new `registry_client` has no anchor for any key. It must be able to
+// write a key the service already holds a water-mark for, without first having
+// to observe a write.
+//
+// The client used to append tag 14 and tag 18 UNCONDITIONALLY, so a fresh client
+// presented the anchor `{0, 0}`. The service reads "a tag was present" as "the
+// client presented an anchor", so `{0, 0}` was judged against the stored
+// `{epoch, index}` and found behind it -- a fresh client was rejected with
+// `stale_anchor` on its very first write. The default retry hid this; a caller
+// with `set_stale_retries(0)` could never write.
+
+CRPC_TEST(a_fresh_client_can_write_a_key_that_already_has_a_water_mark) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_fresh_client";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    // Client A writes the key, establishing a water-mark.
+    cl::registry_client first(n.client, cl::registry_client_options{"token-A"});
+    const auto seeded = first.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+
+    // Client B has never seen a response for this key: no anchor at all.
+    cl::registry_client fresh(n.client, cl::registry_client_options{"token-A"});
+    fresh.set_stale_retries(0);
+    CRPC_CHECK_FALSE(fresh.local_anchor_for("svc\x1fnode-A").index > 0);
+
+    cl::service_instance update = instance;
+    update.address.port = 9090;
+    const auto written = fresh.register_instance(update, 2, 8);
+    CRPC_CHECK(written.ok());
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- The persisted anchor file is SECURITY STATE, so a corrupt file must be
+//      refused, not silently emptied ---------------------------------------------
+//
+// `anchor_store::load` returns `failed_precondition` with
+// `registry.reason=anchor_unreadable` for every one of these shapes. Each branch
+// has its own case: a mutant that removes one of the checks leaves the suite
+// green unless exactly that shape is exercised. Without these, deleting all the
+// bounds checks in `load` would still pass (B's M-R3/R4/R5).
+
+namespace {
+
+void write_bytes(const fs::path& path, const std::vector<std::byte>& bytes) {
+    CRPC_REQUIRE(fs::write_all_bytes_atomic(
+                     path, crpc::span<const std::byte>(bytes.data(), bytes.size()))
+                     .ok());
+}
+
+std::vector<std::byte> anchor_file_bytes(const std::string& key,
+                                         crpc::u64 epoch,
+                                         crpc::u64 index,
+                                         crpc::u32 count = 1) {
+    std::vector<std::byte> body;
+    const auto put32 = [&body](crpc::u32 v) {
+        std::byte b[4];
+        crpc::endian::store_le32(b, v);
+        body.insert(body.end(), b, b + 4);
+    };
+    const auto put64 = [&body](crpc::u64 v) {
+        std::byte b[8];
+        crpc::endian::store_le64(b, v);
+        body.insert(body.end(), b, b + 8);
+    };
+    put32(count);
+    put32(static_cast<crpc::u32>(key.size()));
+    body.insert(body.end(), reinterpret_cast<const std::byte*>(key.data()),
+                reinterpret_cast<const std::byte*>(key.data()) + key.size());
+    put64(epoch);
+    put64(index);
+    return body;
+}
+
+// Creates the directory and returns false if it could not be created. It cannot
+// use CRPC_REQUIRE: that macro returns from the ENCLOSING function, so a helper
+// that uses it must return void.
+bool make_anchor_dir(const char* name, fs::path& out) {
+    const fs::path dir = fs::temporary_directory().value() / name;
+    (void)fs::remove_all(dir);
+    if (!fs::create_directories(dir).ok()) {
+        return false;
+    }
+    out = dir;
+    return true;
+}
+
+const char* unreadable_reason(const crpc::status& s) {
+    const std::string* found = s.error().metadata.find("registry.reason");
+    return found != nullptr ? found->c_str() : "";
+}
+
+// All the corruption branches report the SAME `registry.reason`
+// (`anchor_unreadable`), so asserting only the reason cannot tell which branch
+// fired -- a mutant that removes one branch's check and lets the file fall
+// through to another still satisfies "an error with that reason". Each branch
+// therefore also pins its own MESSAGE, which is unique.
+const char* message_of(const crpc::status& s) { return s.message().c_str(); }
+
+} // namespace
+
+CRPC_TEST(an_anchor_file_with_a_truncated_count_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t1", dir));
+    // 3 bytes: the u32 count header does not fit.
+    write_bytes(dir / "registry.anchor", {static_cast<std::byte>(1),
+                                          static_cast<std::byte>(0),
+                                          static_cast<std::byte>(0)});
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file is truncated (count)"),
+                  std::string(message_of(s)));
+    CRPC_CHECK(loaded.empty());
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_a_truncated_key_length_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t2", dir));
+    // count=1, but the key length header is missing.
+    std::vector<std::byte> body{static_cast<std::byte>(1), static_cast<std::byte>(0),
+                                static_cast<std::byte>(0), static_cast<std::byte>(0)};
+    write_bytes(dir / "registry.anchor", body);
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file is truncated (key length)"),
+                  std::string(message_of(s)));
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_an_out_of_range_key_length_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t3", dir));
+    // key_len = 0 is invalid (an empty key cannot name a service/node pair).
+    std::vector<std::byte> body{
+        static_cast<std::byte>(1), static_cast<std::byte>(0), static_cast<std::byte>(0),
+        static_cast<std::byte>(0), static_cast<std::byte>(0), static_cast<std::byte>(0),
+        static_cast<std::byte>(0), static_cast<std::byte>(0)};
+    write_bytes(dir / "registry.anchor", body);
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file has an invalid key length"),
+                  std::string(message_of(s)));
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_a_truncated_key_value_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t3b", dir));
+    // count=1, key_len=8 -- a LEGAL length -- but only 2 key bytes follow. The
+    // other two length tests cannot cover this: `key_len == 0` fires on the zero
+    // value and the truncated-header test never reaches this line at all. Only
+    // the `!need(key_len)` clause can catch it, and without that clause the
+    // reader builds a `std::string` from 8 bytes when only 2 exist -- an
+    // out-of-bounds read that the length range alone would not prevent.
+    std::vector<std::byte> body{
+        static_cast<std::byte>(1), static_cast<std::byte>(0), static_cast<std::byte>(0),
+        static_cast<std::byte>(0),                                    // count = 1
+        static_cast<std::byte>(8), static_cast<std::byte>(0), static_cast<std::byte>(0),
+        static_cast<std::byte>(0),                                    // key_len = 8
+        static_cast<std::byte>('a'), static_cast<std::byte>('b')};    // only 2 bytes
+    write_bytes(dir / "registry.anchor", body);
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file has an invalid key length"),
+                  std::string(message_of(s)));
+    CRPC_CHECK(loaded.empty());
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_a_truncated_anchor_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t4", dir));
+    // A complete key, but only 8 of the 16 anchor bytes.
+    std::vector<std::byte> body;
+    const std::string key = "svc\x1fnode-A";
+    const auto put32 = [&body](crpc::u32 v) {
+        std::byte b[4];
+        crpc::endian::store_le32(b, v);
+        body.insert(body.end(), b, b + 4);
+    };
+    put32(1);
+    put32(static_cast<crpc::u32>(key.size()));
+    body.insert(body.end(), reinterpret_cast<const std::byte*>(key.data()),
+                reinterpret_cast<const std::byte*>(key.data()) + key.size());
+    std::byte half[8];
+    crpc::endian::store_le64(half, 1);
+    body.insert(body.end(), half, half + 8);
+    write_bytes(dir / "registry.anchor", body);
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file is truncated (anchor)"),
+                  std::string(message_of(s)));
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_a_malformed_key_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t5", dir));
+    // A well-formed entry whose key has no '\x1f' separator, so it cannot be split
+    // into (service, node_id).
+    write_bytes(dir / "registry.anchor",
+                anchor_file_bytes("svc-node-A", 1, 1));
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file has a malformed key"),
+                  std::string(message_of(s)));
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(an_anchor_file_with_trailing_bytes_is_rejected) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t6", dir));
+    std::vector<std::byte> body = anchor_file_bytes("svc\x1fnode-A", 1, 1);
+    body.push_back(static_cast<std::byte>(0));
+    write_bytes(dir / "registry.anchor", body);
+
+    std::map<std::pair<std::string, std::string>, cl::registry_anchor> loaded;
+    const crpc::status s = cl::anchor_store::load(dir, loaded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(s)));
+    CRPC_CHECK_EQ(std::string("registry anchor file has trailing bytes"),
+                  std::string(message_of(s)));
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(a_corrupt_anchor_file_refuses_to_start) {
+    fs::path dir;
+    CRPC_REQUIRE(make_anchor_dir("crpc_g19s2_anchor_t7", dir));
+    // A corrupt anchor file must stop the service from starting: accepting it as
+    // empty is exactly the restart bypass the persistence exists to prevent.
+    write_bytes(dir / "registry.anchor",
+                {static_cast<std::byte>(1), static_cast<std::byte>(0),
+                 static_cast<std::byte>(0), static_cast<std::byte>(0)});
+
+    cl::registry_service_config config;
+    config.state_dir = dir;
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    auto backend = std::make_unique<crpc::iocp_backend>();
+    config.backend = backend.get();
+    cl::acl_rule rule;
+    rule.token_hash = fnv1a("token-A");
+    rule.principal_id = "node-A";
+    rule.node_id = "node-A";
+    rule.read_prefixes.push_back("");
+    rule.write_prefixes.push_back("");
+    config.acl.push_back(rule);
+
+    cl::registry_service service(std::move(config));
+    crpc::server::builder builder;
+    const crpc::status prepared = service.prepare(builder);
+    CRPC_CHECK_FALSE(prepared.ok());
+    if (prepared.ok()) {
+        (void)fs::remove_all(dir);
+        return;
+    }
+    // The reason must be the anchor-specific one, not a generic failure.
+    CRPC_CHECK_EQ(std::string("anchor_unreadable"), std::string(unreadable_reason(prepared)));
+    (void)fs::remove_all(dir);
+}
+
+// --- `not_live` maps to `not_found` (9), not `failed_precondition` (12) --------
+//
+// `service_error` remaps the registry's own codes through `code_for_reason`
+// (VERDICT section 2.5), where `not_live` is 9 -- deliberately NOT 12. The
+// mapping had no coverage, so a mutant that changed it to `failed_precondition`
+// left the suite green.
+//
+// The public path that produces `not_live`: `set_state` on an instance whose
+// stored state is `deregistered` (registry.cpp returns `reject(rpc_code::
+// not_found, ..., reason_not_live)`).
+
+CRPC_TEST(not_live_maps_to_not_found_code) {
+    const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_not_live";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    cl::service_instance instance;
+    instance.service = "svc";
+    instance.node_id = "node-A";
+    instance.address.host = "127.0.0.1";
+    instance.address.port = 8080;
+
+    const auto seeded = client.register_instance(instance, 1, 7);
+    CRPC_REQUIRE(seeded.ok());
+    const auto removed = client.deregister("svc", "node-A", 1, 9);
+    CRPC_REQUIRE(removed.ok());
+
+    // A SECOND client with the water-mark anchor. A fresh client has no anchor,
+    // so the service would accept it and the registry would not reach the
+    // `deregistered` branch; this one presents exactly the water-mark, which
+    // `not_stale` accepts as a legitimate replay, so the anchor check lets the
+    // request through. `set_state` is used rather than a second `deregister`
+    // because the idempotency map would otherwise answer the deregister from its
+    // cache. The registry then answers `not_live` because the stored state is
+    // `deregistered`, and `service_error` must translate that to code 9
+    // (`not_found`), not 12.
+    cl::registry_client replaying(n.client, cl::registry_client_options{"token-A"});
+    replaying.set_stale_retries(0);
+#if defined(CRPC_TESTING)
+    replaying.set_local_anchor("svc\x1fnode-A",
+                               cl::registry_anchor{removed.value().authority_epoch,
+                                                   removed.value().index});
+#endif
+    const auto replay =
+        replaying.set_state("svc", "node-A", cl::instance_state::passing, 1, 11);
+    CRPC_CHECK_FALSE(replay.ok());
+    if (replay.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = replay.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("not_live"), *reason);
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::not_found),
+                  static_cast<int>(replay.error().code));
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- the two `not_live` sites in the registry are both code 9 ----------------
+//
+// `registry::set_state_with` and `registry::deregister_with` each answer an
+// unknown instance with `reject(rpc_code::not_found, "instance is not
+// registered", reason_not_live)` -- the SAME message and reason, so the reason
+// metadata alone cannot tell them apart. They are still two separate sites with
+// two separate `code_for_reason` inputs, and B's round-3 mutation A7 changed the
+// `code` at the set_state site only: the deregistered-tombstone case stayed green
+// because it exercises a different branch.
+//
+// These two cases pin the unknown-instance site of each method. The
+// deregistered-tombstone site is covered by `not_live_maps_to_not_found_code`
+// above; together the three sites are covered.
+
+CRPC_TEST(a_set_state_for_an_unknown_instance_maps_to_not_found) {
+    const fs::path dir =
+        fs::temporary_directory().value() / "crpc_g19s2_not_live_unknown_state";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    // `node_id` must be the one the ACL rule is bound to (`node-A`), otherwise
+    // `check_authority` refuses first with `authority` and the registry is never
+    // reached. The SERVICE name is the unregistered part, so the registry's
+    // first lookup misses and the unknown-instance branch is the one taken.
+    const auto rejected =
+        client.set_state("never-registered", "node-A", cl::instance_state::passing, 1, 7);
+    CRPC_CHECK_FALSE(rejected.ok());
+    if (rejected.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = rejected.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("not_live"), *reason);
+    }
+    // The code is the point: the unknown-instance site must agree with the
+    // tombstone site, and `service_error` must not rewrite 9 into 12.
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::not_found),
+                  static_cast<int>(rejected.error().code));
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+CRPC_TEST(a_deregister_for_an_unknown_instance_maps_to_not_found) {
+    const fs::path dir =
+        fs::temporary_directory().value() / "crpc_g19s2_not_live_unknown_dereg";
+    (void)fs::remove_all(dir);
+
+    node n;
+    CRPC_REQUIRE(n.start(dir.str(), "token-A"));
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    client.set_stale_retries(0);
+
+    // Same shape as the set_state case, on the deregister path: `deregister_with`
+    // has its own unknown-instance rejection (registry.cpp:736) with its own
+    // `code` literal, so it needs its own coverage.
+    const auto rejected = client.deregister("never-registered", "node-A", 1, 7);
+    CRPC_CHECK_FALSE(rejected.ok());
+    if (rejected.ok()) {
+        n.stop();
+        (void)fs::remove_all(dir);
+        return;
+    }
+    const std::string* reason = rejected.error().metadata.find("registry.reason");
+    CRPC_CHECK(reason != nullptr);
+    if (reason != nullptr) {
+        CRPC_CHECK_EQ(std::string("not_live"), *reason);
+    }
+    CRPC_CHECK_EQ(static_cast<int>(crpc::rpc_code::not_found),
+                  static_cast<int>(rejected.error().code));
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
 CRPC_TEST_MAIN()

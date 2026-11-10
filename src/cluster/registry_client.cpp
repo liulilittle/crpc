@@ -221,18 +221,22 @@ void registry_client::set_token_issued_at(std::chrono::milliseconds issued_at) n
     impl_->options.token_issued_at = issued_at;
 }
 
-registry_anchor registry_client::local_anchor() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto found = impl_->anchors.find(anchor_slot(""));
-    return found != impl_->anchors.end() ? found->second : registry_anchor{};
-}
-
 registry_anchor registry_client::local_anchor_for(const std::string& key) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto found = impl_->anchors.find(anchor_slot(key));
     return found != impl_->anchors.end() ? found->second : registry_anchor{};
 }
 
+#if defined(CRPC_TESTING)
+// Compiled only in a Debug build of the library (CMakeLists.txt defines
+// CRPC_TESTING for `crpc` under `$<$<CONFIG:Debug>:...>`), and declared only when
+// the same macro is set, so a Release library exports nothing. See the header.
+void registry_client::set_local_anchor(const std::string& key,
+                                       const registry_anchor& anchor) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->anchors[anchor_slot(key)] = anchor;
+}
+#endif
 namespace {
 
 // Extracts `registry.index` from an error's metadata.
@@ -248,6 +252,22 @@ namespace {
         return 0;
     }
     return value;
+}
+
+// Extracts `registry.authority_epoch` from an error's metadata. Absent (an older
+// service, or a failure that is not an anchor rejection) means "do not change the
+// epoch", which the caller treats as 0 -- a client that has never observed an
+// epoch has none to preserve.
+[[nodiscard]] u64 error_authority_epoch(const rpc_error& error) {
+    const std::string* found = error.metadata.find("registry.authority_epoch");
+    if (found == nullptr) {
+        return 0;
+    }
+    try {
+        return std::stoull(*found);
+    } catch (...) {
+        return 0;
+    }
 }
 
 } // namespace
@@ -280,10 +300,12 @@ result<registry_write_response> registry_client::register_instance(
 
     // 2. Build the request. The client anchor travels in `client_request_id`
     //    metadata so the service layer can recognise an exact replay.
-    const registry_anchor anchor = [&] {
+    const std::optional<registry_anchor> anchor = [&] {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         const auto found = impl_->anchors.find(anchor_slot(key));
-        return found != impl_->anchors.end() ? found->second : registry_anchor{};
+        return found != impl_->anchors.end()
+                   ? std::optional<registry_anchor>{found->second}
+                   : std::nullopt;
     }();
 
     std::vector<std::byte> tags;
@@ -300,16 +322,32 @@ result<registry_write_response> registry_client::register_instance(
     // payload and the incarnation, so a retry of the same write carries the
     // same id and the service's idempotency map recognises it (the fence is
     // re-allocated on every call and cannot serve as the key).
+    //
+    // The METHOD is part of the key. Without it, a register and a deregister of
+    // the same (service, node, incarnation) would collide on one key: the
+    // deregister would be answered from the register's cached response and the
+    // catalog would never be touched.
     if (!impl_->request_identity.empty()) {
         append_str_tag(tags, registry_tag_client_request_id, impl_->request_identity);
     } else {
         append_str_tag(tags, registry_tag_client_request_id,
-                       request_key(instance.service, instance.node_id, incarnation));
+                       request_key(instance.service, instance.node_id, incarnation) +
+                           std::string("\x1f", 1) + "register");
     }
-    // The client's anchor rides in the reserved index tag: 0 means "no anchor".
-    // In step2 the authority epoch is constant, so the index alone carries the
-    // dictionary order; step3 adds the epoch without changing this tag.
-    append_u64_tag(tags, registry_tag_index, anchor.index);
+    // The client's anchor rides in tag 14 (index) and tag 18 (authority epoch).
+    // BOTH halves are needed: the index alone cannot distinguish "behind the
+    // authority" from "a different authority entirely", which is exactly what a
+    // restarted service produces.
+    //
+    // A pair is sent ONLY when the client actually holds one. A fresh client has
+    // never seen a response, so it has no anchor; sending `{0, 0}` would tell the
+    // service "here is my anchor, and it is behind yours", and the write would be
+    // rejected as stale on the client's very first call. "No anchor" must be
+    // expressed by the ABSENCE of the tags, not by an all-zero anchor.
+    if (anchor.has_value()) {
+        append_u64_tag(tags, registry_tag_index, anchor->index);
+        append_u64_tag(tags, registry_tag_client_authority_epoch, anchor->authority_epoch);
+    }
     append_u32_tag(tags, registry_tag_weight, instance.weight);
     append_u8_tag(tags, registry_tag_state, static_cast<u8>(instance.state));
     if (!instance.meta.empty()) {
@@ -346,7 +384,14 @@ result<registry_write_response> registry_client::register_instance(
             // (with its metadata), never rebuilt -- rebuilding would drop
             // `registry.reason` and `registry.index`, which is exactly what
             // the caller needs in order to re-anchor.
-            const registry_anchor observed{0, error_index(error)};
+            // Re-anchor BOTH halves. The error carries `registry.index` and, since
+            // the authority epoch became a real value, `registry.authority_epoch`
+            // (set in registry_service.cpp). Taking only the index would store an
+            // epoch of 0, and an epoch of 0 is behind every real epoch, so the
+            // very next write from this client would be stale again -- the retry
+            // would loop until the budget ran out instead of succeeding.
+            const registry_anchor observed{error_authority_epoch(error),
+                                            error_index(error)};
             {
                 std::lock_guard<std::mutex> lock(impl_->mutex);
                 impl_->anchors[anchor_slot(key)] = observed;
@@ -401,6 +446,28 @@ result<registry_write_response> registry_client::deregister(
     append_u64_tag(tags, registry_tag_incarnation, incarnation);
     append_u64_tag(tags, registry_tag_fence, fence.value());
     append_u64_tag(tags, registry_tag_writer_epoch, writer_epoch);
+    // The same logical-write identity and the same anchor as `register`: a
+    // deregister is a write like any other, so it is subject to the anchor
+    // check and its retry is recognisable. The method is part of the key so a
+    // register and a deregister of the same key do not collide.
+    if (!impl_->request_identity.empty()) {
+        append_str_tag(tags, registry_tag_client_request_id, impl_->request_identity);
+    } else {
+        append_str_tag(tags, registry_tag_client_request_id,
+                       request_key(service, node_id, incarnation) + std::string("\x1f", 1) + "deregister");
+    }
+    const std::optional<registry_anchor> anchor = [&] {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto found =
+            impl_->anchors.find(anchor_slot(service + '\x1f' + node_id));
+        return found != impl_->anchors.end()
+                   ? std::optional<registry_anchor>{found->second}
+                   : std::nullopt;
+    }();
+    if (anchor.has_value()) {
+        append_u64_tag(tags, registry_tag_index, anchor->index);
+        append_u64_tag(tags, registry_tag_client_authority_epoch, anchor->authority_epoch);
+    }
 
     std::vector<std::byte> body;
     const status framed = build_frame(tags, body);
@@ -449,6 +516,26 @@ result<registry_write_response> registry_client::set_state(
     append_u64_tag(tags, registry_tag_fence, fence.value());
     append_u64_tag(tags, registry_tag_writer_epoch, writer_epoch);
     append_u8_tag(tags, registry_tag_state, static_cast<u8>(state));
+    // Same identity and anchor as `register` / `deregister`. The method is part
+    // of the key for the same reason as above.
+    if (!impl_->request_identity.empty()) {
+        append_str_tag(tags, registry_tag_client_request_id, impl_->request_identity);
+    } else {
+        append_str_tag(tags, registry_tag_client_request_id,
+                       request_key(service, node_id, incarnation) + std::string("\x1f", 1) + "set_state");
+    }
+    const std::optional<registry_anchor> anchor = [&] {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto found =
+            impl_->anchors.find(anchor_slot(service + '\x1f' + node_id));
+        return found != impl_->anchors.end()
+                   ? std::optional<registry_anchor>{found->second}
+                   : std::nullopt;
+    }();
+    if (anchor.has_value()) {
+        append_u64_tag(tags, registry_tag_index, anchor->index);
+        append_u64_tag(tags, registry_tag_client_authority_epoch, anchor->authority_epoch);
+    }
 
     std::vector<std::byte> body;
     const status framed = build_frame(tags, body);

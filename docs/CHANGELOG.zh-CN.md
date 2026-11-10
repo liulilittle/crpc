@@ -8,7 +8,7 @@
 
 - **MINOR（新增符号，无布局变化）** 新增 `cluster::registry_service` 与 `cluster::registry_client`；`registry` / `write_context` / `registry_config` / `registry_log` 及其函数保持全部字段、偏移与大小。新增头文件：`cluster/registry_acl.hpp`、`cluster/fence_authority.hpp`、`cluster/registry_wire.hpp`、`cluster/registry_service.hpp`、`cluster/registry_client.hpp`。新增可执行程序：`examples/registryd.cpp`。
 
-- **线路契约。** 版本化 tag 帧（`u16 dto_version` + `u32 total_len` + 若干 `tag{id,u32 len,value}`），`service_id = ~u64{1}`，方法号 1-6（register/deregister/set_state/query/next_fence/ping）。解码 fail-closed：`total_len` 不匹配、缺少必需 tag、未知 tag id、tag 长度越过帧尾、重复 tag、不支持的版本，各自有独立的 `registry.reason`。tag 14-17 是 step2 新增（1-17 完整表见 `docs/api/README.md`）：14 携带响应体的 `index`，15 是客户端幂等键，16 是 token 签发时间，17 是保留的 nonce。
+- **线路契约。** 版本化 tag 帧（`u16 dto_version` + `u32 total_len` + 若干 `tag{id,u32 len,value}`），`service_id = ~u64{1}`，方法号 1-6（register/deregister/set_state/query/next_fence/ping）。解码 fail-closed：`total_len` 不匹配、缺少必需 tag、未知 tag id、tag 长度越过帧尾、重复 tag、不支持的版本，各自有独立的 `registry.reason`。tag 14-17 是 step2 新增（1-17 完整表见 `docs/api/README.md`）：14 携带响应体的 `index`，15 是客户端幂等键，16 是 token 签发时间，17 是保留的 nonce。tag 18、19 同为新增：18（`client_authority_epoch`）是二维 anchor 的请求侧一半，19（`authority_epoch`）是响应侧一半。在此之前 anchor 的 epoch 一维没有专属 tag，`not_stale` 退化成一维 index 比较；响应侧则按编码器不同把 epoch 放进 tag 9（`writer_epoch`）或 tag 7（`incarnation`），同一个 tag id 因此有三种含义。
 
 - **ACL 是 bearer-token 授权层，不是身份认证层。** 持有合法 token 的一方以其被签发的 principal 身份行事。没有传输层安全：RPC 层不携带对端身份，也没有 TLS，因此线路上被观察到的 token 可在时间窗内重放。token 经 DTO body 传输，绝不放进 `metadata`。principal 由服务端从命中的规则注入，客户端的声明永不被信任。30 秒时间窗（`registry_token_window`）把重放限制在该窗口内，这是**限时**而非防重放。需要认证对端的部署必须在服务前终结 TLS，或运行在可信网络。
 

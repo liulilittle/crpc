@@ -75,6 +75,15 @@ foreach(source ${CRPC_TEST_SOURCES})
 
     add_executable(${target} ${sources})
     target_link_libraries(${target} PRIVATE crpc_core)
+    # `CRPC_TESTING` is defined for TEST TARGETS ONLY. It unlocks test-only
+    # seams in public headers (e.g. `registry_client::set_local_anchor`), which
+    # let a case construct a state that is unreachable through the published API
+    # -- a client that keeps its anchor while the service it talks to restarts.
+    # The library and the examples must NEVER define it: a seam compiled into the
+    # shipped library would widen the API surface and could be reached by a
+    # caller. Defining it here, on the test executable, keeps it out of the
+    # library's translation units (the header's `#if defined` is evaluated per TU).
+    target_compile_definitions(${target} PRIVATE CRPC_TESTING)
     if(WIN32)
         # `tests/ephemeral_ports.hpp` reads the system TCP table so a
         # connection-churning case can tell "this machine ran out of

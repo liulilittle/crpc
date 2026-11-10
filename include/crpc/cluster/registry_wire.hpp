@@ -12,8 +12,12 @@
 //       tag*                  // repeats until total_len bytes consumed
 //
 //   tag :=
-//       u8   tag_id            // 0..registry_tag_max_known (15); anything
-//                              // else -> unknown_tag
+//       u8   tag_id            // must be one of the ids in the tag table
+//                              // below (an explicit whitelist, NOT a range:
+//                              // tag 2 is retired and 0 is invalid, so an
+//                              // id <= registry_tag_max_known test would
+//                              // wrongly accept gaps); anything else ->
+//                              // unknown_tag
 //       u32  len               // MUST NOT exceed the bytes remaining   <-- layer 2
 //       u8[len] value
 //
@@ -79,11 +83,11 @@ inline constexpr u64 registry_method_ping       = 6;
 
 // --- Tag ids -----------------------------------------------------------------
 //
-// The ids are the field table of VERDICT section 2.3. Tag 2 (`dto_version`)
-// is part of the frame header on the wire but is decoded through the same tag
-// walk so a required-field check can name it uniformly.
+// The ids are the field table of VERDICT section 2.3. The DTO version is NOT a
+// tag: it lives in the fixed frame header (the u16 at offset 0) and is checked
+// there, so it needs no tag id. An earlier `registry_tag_dto_version = 2`
+// constant existed for it and was never used.
 inline constexpr u8 registry_tag_token        = 1;
-inline constexpr u8 registry_tag_dto_version  = 2;
 inline constexpr u8 registry_tag_service      = 3;
 inline constexpr u8 registry_tag_node_id      = 4;
 inline constexpr u8 registry_tag_host         = 5;
@@ -100,8 +104,30 @@ inline constexpr u8 registry_tag_client_request_id = 15;
 inline constexpr u8 registry_tag_token_issued_at = 16;
 inline constexpr u8 registry_tag_token_nonce     = 17;
 
-// Largest tag id this version understands. Anything above it is `dto_unknown_tag`.
-inline constexpr u8 registry_tag_max_known    = 17;
+// The largest id in the tag table. NOT the decode test: the decoder uses an
+// explicit whitelist (`is_known_tag` in registry_wire.cpp) because the id space
+// has gaps -- tag 2 is retired. This constant survives for tests that need an
+// out-of-range id.
+inline constexpr u8 registry_tag_max_known    = 19;
+
+// --- Direction-specific tags 18 / 19 -----------------------------------------
+//
+// The anchor is two-dimensional: `(authority_epoch, index)` (VERDICT section
+// 5.1). For a long time the epoch half had NO tag of its own: the request
+// carried only the index, so `authority_epoch` was always 0 and the
+// dictionary-order comparison degenerated to a one-dimensional one.
+//
+// The response side had the opposite problem: `authority_epoch` rode in tag 9
+// (`writer_epoch`) in the write response, and in tag 7 (`incarnation`) in the
+// anchor/query responses. One numeric id therefore meant three different things
+// depending on which encoder produced it, with nothing on the wire to say which.
+//
+// Tag 18 is the request half (the client's last observed authority epoch) and
+// tag 19 is the response half (the service's own authority epoch). Tag 1
+// (`index`) is shared by both directions because its meaning -- "a log index" --
+// is the same in each; that is reuse, not a collision.
+inline constexpr u8 registry_tag_client_authority_epoch = 18;
+inline constexpr u8 registry_tag_authority_epoch         = 19;
 
 // The replay window for a bearer token (VERDICT section 1.3, option (ii)).
 // A token whose issue time is outside `|now - issued_at| <= window` is denied.
@@ -339,9 +365,12 @@ struct registry_tag {
 [[nodiscard]] CRPC_API rpc_error registry_failure(rpc_code code, const char* message,
                                                   const char* reason);
 
-inline constexpr const char* registry_reason_invalid = "invalid";
 inline constexpr const char* registry_reason_acl_denied = "acl_denied";
 inline constexpr const char* registry_reason_stale_anchor = "stale_anchor";
+// The persisted `last_anchor` file exists but cannot be parsed. This is a
+// startup failure, never a silent empty map.
+inline constexpr const char* registry_reason_anchor_unreadable =
+    "anchor_unreadable";
 inline constexpr const char* registry_reason_epoch_required = "epoch_required";
 inline constexpr const char* registry_reason_epoch_not_persisted =
     "epoch_not_persisted";

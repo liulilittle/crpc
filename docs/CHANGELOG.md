@@ -18,9 +18,15 @@
   (register/deregister/set_state/query/next_fence/ping). Decoding is fail-closed:
   a `total_len` mismatch, a missing required tag, an unknown tag id, a tag length
   past the end of the frame, a repeated tag id and an unsupported version are all
-  refused, each with its own `registry.reason`. Tags 14-17 are new in step2 (see
-  `docs/api/README.md` for the table): 14 carries the response `index`, 15 the
-  client's idempotency key, 16 the token's issue time, 17 a reserved nonce.
+   refused, each with its own `registry.reason`. Tags 14-17 are new in step2 (see
+   `docs/api/README.md` for the table): 14 carries the response `index`, 15 the
+   client's idempotency key, 16 the token's issue time, 17 a reserved nonce.
+   Tags 18 and 19 are also new: 18 (`client_authority_epoch`) is the request-side
+   half of the two-dimensional anchor and 19 (`authority_epoch`) is the
+   response-side half. Before them the anchor's epoch half had no tag at all and
+   `not_stale` degenerated to a one-dimensional index comparison; the response
+   side carried the epoch in tag 9 (`writer_epoch`) or tag 7 (`incarnation`),
+   depending on the encoder, so one tag id meant three different things.
 
 - **ACL is a bearer-token authorisation layer, not authentication.** A holder of
   a valid token acts as the principal it was issued to. There is no transport

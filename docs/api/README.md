@@ -545,7 +545,7 @@ body's `index` -- it is NOT `query`'s optional `node_id`, which reuses tag 4.
 | Tag | Name | Direction | Meaning |
 |---|---|---|---|
 | 1 | `registry_tag_token` | request | The bearer token (plaintext; see the trust boundary above). |
-| 2 | `registry_tag_dto_version` | request | Must equal `registry_dto_version` (1). |
+| ~~2~~ | ~~`registry_tag_dto_version`~~ | — | **Retired.** The DTO version is a field of the fixed frame header, not a tag. A frame carrying tag 2 is rejected as `dto_unknown_tag`. |
 | 3 | `registry_tag_service` | request | Service name, or empty for a catalog-wide query. |
 | 4 | `registry_tag_node_id` | request | Node id; also carries `query`'s optional filter. |
 | 5 | `registry_tag_host` | request | Endpoint host. |
@@ -561,6 +561,8 @@ body's `index` -- it is NOT `query`'s optional `node_id`, which reuses tag 4.
 | 15 | `registry_tag_client_request_id` | request | The client's idempotency key; a retry of one logical write reuses it. |
 | 16 | `registry_tag_token_issued_at` | request | Token issue time, `system_clock` milliseconds. |
 | 17 | `registry_tag_token_nonce` | request | Reserved nonce; not interpreted by the service in step2. |
+| 18 | `registry_tag_client_authority_epoch` | request | The client's last observed authority epoch: the first half of its two-dimensional anchor. |
+| 19 | `registry_tag_authority_epoch` | response | The service's own authority epoch. Never carried in tag 9 (`writer_epoch`) or tag 7 (`incarnation`), which mean something else. |
 
 An unknown tag id, a repeated tag id, a tag length past the end of the frame, a
 `total_len` that disagrees with the body and an unsupported `dto_version` are all

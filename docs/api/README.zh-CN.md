@@ -540,7 +540,7 @@ tag 14 携带响应体的 `index`——它**不是** `query` 的可选 `node_id`
 | Tag | 名称 | 方向 | 语义 |
 |---|---|---|---|
 | 1 | `registry_tag_token` | 请求 | bearer token（明文；信任边界见上文） |
-| 2 | `registry_tag_dto_version` | 请求 | 必须等于 `registry_dto_version`（1） |
+| ~~2~~ | ~~`registry_tag_dto_version`~~ | — | **已废弃。** DTO 版本是固定帧头的字段，不是 tag。携带 tag 2 的帧按 `dto_unknown_tag` 拒绝。 |
 | 3 | `registry_tag_service` | 请求 | 服务名；全目录查询时为空 |
 | 4 | `registry_tag_node_id` | 请求 | 节点 id；也承载 `query` 的可选过滤条件 |
 | 5 | `registry_tag_host` | 请求 | endpoint host |
@@ -556,6 +556,8 @@ tag 14 携带响应体的 `index`——它**不是** `query` 的可选 `node_id`
 | 15 | `registry_tag_client_request_id` | 请求 | 客户端幂等键；同一逻辑写入的重试复用该值 |
 | 16 | `registry_tag_token_issued_at` | 请求 | token 签发时间，`system_clock` 毫秒 |
 | 17 | `registry_tag_token_nonce` | 请求 | 保留 nonce；step2 的服务端不解释它 |
+| 18 | `registry_tag_client_authority_epoch` | 请求 | 客户端上次观察到的权威 epoch，即二维 anchor 的第一维 |
+| 19 | `registry_tag_authority_epoch` | 响应 | 服务端自身的权威 epoch。不再放在 tag 9（`writer_epoch`）或 tag 7（`incarnation`）里，两者含义不同 |
 
 未知 tag id、重复 tag id、tag 长度越过帧尾、`total_len` 与 body 不一致、以及不支持
 的 `dto_version`，全部被拒绝，且各自有独立的 `registry.reason`。

@@ -305,6 +305,25 @@ CRPC_TEST(query_frame_decodes_optional_filters) {
     CRPC_CHECK(decoded.passing_only);
 }
 
+// --- Tag 2 is retired, and a retired id must not be accepted ------------------
+//
+// The DTO version lives in the fixed frame header, not in a tag. Tag 2 used to be
+// `registry_tag_dto_version` and was removed, leaving a gap in the numeric range.
+// An interval test (`id > registry_tag_max_known`) would keep accepting tag 2
+// forever, so the check is an explicit whitelist of the ids this service defines.
+
+CRPC_TEST(a_frame_with_the_retired_tag_2_is_rejected) {
+    std::vector<std::byte> tags;
+    std::vector<std::byte> value;
+    put_u64(value, 1);
+    put_tag(tags, 2, value);
+
+    std::vector<cl::registry_tag> decoded;
+    const crpc::status s = cl::decode_registry_tags(bytes_of(frame_with(tags)), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_unknown_tag"), reason_of(s));
+}
+
 // --- Encoders round-trip -----------------------------------------------------
 
 CRPC_TEST(write_response_round_trip) {
@@ -401,6 +420,311 @@ CRPC_TEST(not_stale_compares_epoch_before_index) {
 
     const cl::registry_anchor older_epoch{0, 999};
     CRPC_CHECK_FALSE(cl::not_stale(anchor, older_epoch));
+}
+
+// --- The response decoders are fail-closed too --------------------------------
+//
+// `decode_write_response` and `decode_query_response` used to walk the tag list
+// and silently accept whatever was present, so a response missing `index` or
+// `fence` decoded "successfully" into a zeroed struct. The client then stored
+// `{0, 0}` as its anchor, which is a valid-looking anchor pointing at nothing --
+// a later write would be rejected as stale forever, with no way to recover. A
+// response the service never produced is malformed input, not an empty result.
+
+CRPC_TEST(write_response_rejects_an_empty_body) {
+    const std::vector<std::byte> empty;
+    cl::registry_write_response decoded;
+    const crpc::status s =
+        cl::decode_write_response(crpc::span<const std::byte>(empty.data(), empty.size()),
+                                  decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    // An empty body cannot even carry the 6-byte frame prefix.
+    CRPC_CHECK_EQ(std::string("dto_length_mismatch"), reason_of(s));
+}
+
+CRPC_TEST(write_response_rejects_a_prefix_only_body) {
+    // 6 bytes: version + total_len, and no tags at all. This is the shape a
+    // truncated or wrong-endpoint response would have.
+    std::vector<std::byte> body;
+    put_u16(body, 1);
+    put_u32(body, 0);
+
+    cl::registry_write_response decoded;
+    const crpc::status s = cl::decode_write_response(bytes_of(body), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_missing_required"), reason_of(s));
+}
+
+CRPC_TEST(write_response_rejects_a_missing_index_tag) {
+    // fence + incarnation + authority_epoch are present; `index` is not.
+    std::vector<std::byte> tags;
+    put_u64_tag(tags, cl::registry_tag_fence, 7);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 3);
+    put_u64_tag(tags, cl::registry_tag_authority_epoch, 9);
+
+    cl::registry_write_response decoded;
+    const crpc::status s =
+        cl::decode_write_response(bytes_of(frame_with(tags)), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_missing_required"), reason_of(s));
+}
+
+CRPC_TEST(write_response_rejects_a_missing_fence_tag) {
+    std::vector<std::byte> tags;
+    put_u64_tag(tags, cl::registry_tag_index, 42);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 3);
+    put_u64_tag(tags, cl::registry_tag_authority_epoch, 9);
+
+    cl::registry_write_response decoded;
+    const crpc::status s =
+        cl::decode_write_response(bytes_of(frame_with(tags)), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_missing_required"), reason_of(s));
+}
+
+CRPC_TEST(write_response_rejects_a_missing_authority_epoch_tag) {
+    // The tag that carries the authority epoch is tag 19. Before it existed the
+    // value rode in tag 9 (writer_epoch), which is a different concept, so this
+    // case also pins the tag identity: a tag-9-only response must NOT satisfy
+    // the authority_epoch requirement.
+    std::vector<std::byte> tags;
+    put_u64_tag(tags, cl::registry_tag_index, 42);
+    put_u64_tag(tags, cl::registry_tag_fence, 7);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 3);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 9);
+
+    cl::registry_write_response decoded;
+    const crpc::status s =
+        cl::decode_write_response(bytes_of(frame_with(tags)), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_missing_required"), reason_of(s));
+}
+
+CRPC_TEST(query_response_rejects_a_missing_authority_epoch_tag) {
+    // Only the index is present. `encode_anchor_response` writes both.
+    std::vector<std::byte> tags;
+    put_u64_tag(tags, cl::registry_tag_index, 42);
+
+    cl::registry_query_response decoded;
+    const crpc::status s =
+        cl::decode_query_response(bytes_of(frame_with(tags)), decoded);
+    CRPC_CHECK_FALSE(s.ok());
+    CRPC_CHECK_EQ(std::string("dto_missing_required"), reason_of(s));
+}
+
+// --- tag 19 carries the authority epoch, and round-trips ----------------------
+//
+// This is the regression test for the semantic collision: `encode_write_response`
+// used to put `authority_epoch` in tag 9 (`writer_epoch`), and
+// `encode_anchor_response`/`encode_query_response` used tag 7 (`incarnation`).
+// The same numeric tag id therefore meant three different things depending on
+// which encoder produced it. Tag 19 is dedicated to the authority epoch.
+
+CRPC_TEST(authority_epoch_round_trips_through_tag_19) {
+    cl::registry_write_response value;
+    value.index = 42;
+    value.fence = 7;
+    value.incarnation = 3;
+    value.authority_epoch = 9;
+
+    crpc::buffer out;
+    const crpc::status encoded = cl::encode_write_response(value, out);
+    CRPC_REQUIRE(encoded.ok());
+
+    // The frame must contain tag 19, and must NOT carry the authority epoch in
+    // tag 9 any more.
+    std::vector<cl::registry_tag> tags;
+    const crpc::status walked =
+        cl::decode_registry_tags(bytes_of(out.readable()), tags);
+    CRPC_REQUIRE(walked.ok());
+    bool has_tag_19 = false;
+    bool has_tag_9 = false;
+    for (const auto& tag : tags) {
+        if (tag.id == cl::registry_tag_authority_epoch) {
+            has_tag_19 = true;
+        }
+        if (tag.id == cl::registry_tag_writer_epoch) {
+            has_tag_9 = true;
+        }
+    }
+    CRPC_CHECK(has_tag_19);
+    CRPC_CHECK_FALSE(has_tag_9);
+
+    cl::registry_write_response decoded;
+    const crpc::status s =
+        cl::decode_write_response(bytes_of(out.readable()), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK_EQ(crpc::u64{9}, decoded.authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{42}, decoded.index);
+    CRPC_CHECK_EQ(crpc::u64{7}, decoded.fence);
+    CRPC_CHECK_EQ(crpc::u64{3}, decoded.incarnation);
+}
+
+CRPC_TEST(anchor_response_round_trips_through_tag_19) {
+    const cl::registry_anchor value{9, 42};
+
+    crpc::buffer out;
+    const crpc::status encoded = cl::encode_anchor_response(value, out);
+    CRPC_REQUIRE(encoded.ok());
+
+    std::vector<cl::registry_tag> tags;
+    const crpc::status walked =
+        cl::decode_registry_tags(bytes_of(out.readable()), tags);
+    CRPC_REQUIRE(walked.ok());
+    bool has_tag_19 = false;
+    for (const auto& tag : tags) {
+        if (tag.id == cl::registry_tag_authority_epoch) {
+            has_tag_19 = true;
+        }
+    }
+    CRPC_CHECK(has_tag_19);
+
+    cl::registry_query_response decoded;
+    const crpc::status s =
+        cl::decode_query_response(bytes_of(out.readable()), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK_EQ(crpc::u64{9}, decoded.anchor.authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{42}, decoded.anchor.index);
+}
+
+// --- tag 18 carries the client's anchor epoch ---------------------------------
+//
+// `read_optional_identity` reads the client's anchor from the request. Before
+// tag 18 existed the request had no way to carry the epoch half of the anchor,
+// so `registry_anchor::authority_epoch` was always 0 on the request path and the
+// two-dimensional `not_stale` degenerated to a one-dimensional comparison.
+
+CRPC_TEST(register_frame_decodes_the_client_anchor_epoch) {
+    std::vector<std::byte> tags;
+    put_str_tag(tags, cl::registry_tag_token, "tok");
+    put_str_tag(tags, cl::registry_tag_service, "svc");
+    put_str_tag(tags, cl::registry_tag_node_id, "node-a");
+    put_str_tag(tags, cl::registry_tag_host, "127.0.0.1");
+    std::vector<std::byte> port;
+    put_u16(port, 8080);
+    put_tag(tags, cl::registry_tag_port, port);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 1);
+    put_u64_tag(tags, cl::registry_tag_fence, 1);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 7);
+    put_u64_tag(tags, cl::registry_tag_index, 12);
+    put_u64_tag(tags, cl::registry_tag_client_authority_epoch, 9);
+
+    cl::registry_register_request decoded;
+    const crpc::status s = cl::decode_register_request(bytes_of(frame_with(tags)), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{12}, decoded.client_index);
+    CRPC_CHECK_EQ(crpc::u64{9}, decoded.client_authority_epoch);
+}
+
+CRPC_TEST(deregister_frame_decodes_the_client_anchor_epoch) {
+    std::vector<std::byte> tags;
+    put_str_tag(tags, cl::registry_tag_token, "tok");
+    put_str_tag(tags, cl::registry_tag_service, "svc");
+    put_str_tag(tags, cl::registry_tag_node_id, "node-a");
+    put_u64_tag(tags, cl::registry_tag_incarnation, 1);
+    put_u64_tag(tags, cl::registry_tag_fence, 1);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 7);
+    put_u64_tag(tags, cl::registry_tag_index, 12);
+    put_u64_tag(tags, cl::registry_tag_client_authority_epoch, 9);
+
+    cl::registry_deregister_request decoded;
+    const crpc::status s = cl::decode_deregister_request(bytes_of(frame_with(tags)), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{12}, decoded.client_index);
+    CRPC_CHECK_EQ(crpc::u64{9}, decoded.client_authority_epoch);
+}
+
+CRPC_TEST(set_state_frame_decodes_the_client_anchor_epoch) {
+    std::vector<std::byte> tags;
+    put_str_tag(tags, cl::registry_tag_token, "tok");
+    put_str_tag(tags, cl::registry_tag_service, "svc");
+    put_str_tag(tags, cl::registry_tag_node_id, "node-a");
+    put_u64_tag(tags, cl::registry_tag_incarnation, 1);
+    put_u64_tag(tags, cl::registry_tag_fence, 1);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 7);
+    std::vector<std::byte> state;
+    put_u8(state, 2);
+    put_tag(tags, cl::registry_tag_state, state);
+    put_u64_tag(tags, cl::registry_tag_index, 12);
+    put_u64_tag(tags, cl::registry_tag_client_authority_epoch, 9);
+
+    cl::registry_set_state_request decoded;
+    const crpc::status s = cl::decode_set_state_request(bytes_of(frame_with(tags)), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{12}, decoded.client_index);
+    CRPC_CHECK_EQ(crpc::u64{9}, decoded.client_authority_epoch);
+}
+
+CRPC_TEST(client_anchor_epoch_absent_is_zero_and_not_an_anchor) {
+    // No tag 14 and no tag 18: `has_client_anchor` must stay false so the
+    // service treats the write as having no anchor at all, rather than as an
+    // anchor of {0, 0} (which would be "ahead of" nothing and always stale).
+    const std::vector<std::byte> body = valid_register_frame("tok", "svc", "node-a");
+    cl::registry_register_request decoded;
+    const crpc::status s = cl::decode_register_request(bytes_of(body), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK_FALSE(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{0}, decoded.client_authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{0}, decoded.client_index);
+}
+
+// `has_client_anchor` must mean "the client sent an anchor", not "the index it
+// sent is non-zero". The catalog's index starts at 1 (registry.cpp: `next_index
+// = index_ + 1`), so a zero index never legitimately occurs -- but if a client
+// ever DID send {epoch, 0} explicitly, deciding "no anchor" from `index != 0`
+// would silently skip the anchor check and let the write through. The presence
+// of the tags is what carries the meaning.
+
+CRPC_TEST(an_explicit_zero_index_anchor_is_distinguishable) {
+    // Tag 14 present with value 0, and tag 18 present with a non-zero epoch.
+    std::vector<std::byte> tags;
+    put_str_tag(tags, cl::registry_tag_token, "tok");
+    put_str_tag(tags, cl::registry_tag_service, "svc");
+    put_str_tag(tags, cl::registry_tag_node_id, "node-a");
+    put_str_tag(tags, cl::registry_tag_host, "127.0.0.1");
+    std::vector<std::byte> port;
+    put_u16(port, 8080);
+    put_tag(tags, cl::registry_tag_port, port);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 1);
+    put_u64_tag(tags, cl::registry_tag_fence, 1);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 7);
+    put_u64_tag(tags, cl::registry_tag_index, 0);
+    put_u64_tag(tags, cl::registry_tag_client_authority_epoch, 5);
+
+    cl::registry_register_request decoded;
+    const crpc::status s = cl::decode_register_request(bytes_of(frame_with(tags)), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{0}, decoded.client_index);
+    CRPC_CHECK_EQ(crpc::u64{5}, decoded.client_authority_epoch);
+}
+
+CRPC_TEST(an_epoch_without_an_index_is_still_an_anchor) {
+    // Tag 18 alone must also count as an anchor: the epoch half is the half
+    // that survives a restart, so treating "no tag 14" as "no anchor" would
+    // make a restarted service unable to be pinned by epoch.
+    std::vector<std::byte> tags;
+    put_str_tag(tags, cl::registry_tag_token, "tok");
+    put_str_tag(tags, cl::registry_tag_service, "svc");
+    put_str_tag(tags, cl::registry_tag_node_id, "node-a");
+    put_str_tag(tags, cl::registry_tag_host, "127.0.0.1");
+    std::vector<std::byte> port;
+    put_u16(port, 8080);
+    put_tag(tags, cl::registry_tag_port, port);
+    put_u64_tag(tags, cl::registry_tag_incarnation, 1);
+    put_u64_tag(tags, cl::registry_tag_fence, 1);
+    put_u64_tag(tags, cl::registry_tag_writer_epoch, 7);
+    put_u64_tag(tags, cl::registry_tag_client_authority_epoch, 5);
+
+    cl::registry_register_request decoded;
+    const crpc::status s = cl::decode_register_request(bytes_of(frame_with(tags)), decoded);
+    CRPC_REQUIRE(s.ok());
+    CRPC_CHECK(decoded.has_client_anchor);
+    CRPC_CHECK_EQ(crpc::u64{5}, decoded.client_authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{0}, decoded.client_index);
 }
 
 CRPC_TEST_MAIN()

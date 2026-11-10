@@ -241,6 +241,18 @@ if(CRPC_SANITIZER_OPTIONS)
     target_link_options(crpc PUBLIC ${CRPC_SANITIZER_OPTIONS})
 endif()
 
+# CRPC_TESTING is defined for the LIBRARY only in a Debug build, so the test-only
+# seam (`registry_client::set_local_anchor`) is compiled into `crpc.lib` when the
+# test suite is built (tests/CMakeLists.txt defines it for test executables too,
+# so their calls link). A Release build defines it nowhere, so the symbol is
+# absent from the shipped library and cannot be reached by a caller -- the header
+# declaration is inside `#if defined(CRPC_TESTING)`.
+#
+# Debug-only is deliberate: the seam is for tests, and a production build must
+# not carry it. The generator expression keeps the two configurations distinct
+# without a second target.
+target_compile_definitions(crpc PRIVATE $<$<CONFIG:Debug>:CRPC_TESTING>)
+
 # Sources are discovered by pattern so that independent subsystems can be added
 # without editing this file. CONFIGURE_DEPENDS re-globs on reconfigure.
 file(GLOB_RECURSE CRPC_CORE_SOURCES CONFIGURE_DEPENDS

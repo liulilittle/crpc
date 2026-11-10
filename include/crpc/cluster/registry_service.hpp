@@ -98,6 +98,32 @@ struct idempotency_record {
     std::chrono::steady_clock::time_point recorded_at{};
 };
 
+// The persisted `last_anchor` water-mark (VERDICT section 5.1: "persisted next
+// to the epoch file"). Without it a restart starts with an empty map, and an
+// empty map means "no anchor on record", which `anchor_allows` treats as
+// permission -- so a client could replay a pre-restart anchor at a freshly
+// started service.
+//
+// This is SECURITY STATE, so a file that exists but cannot be parsed is a
+// startup failure, never a silent empty map: clearing it is exactly the bypass
+// it exists to prevent.
+class CRPC_API anchor_store {
+public:
+    [[nodiscard]] static fs::path file_path(const fs::path& state_dir);
+
+    // An absent file is a clean "nothing persisted". A truncated file, a bad
+    // key length or trailing bytes are all `failed_precondition` with
+    // `registry_reason_anchor_unreadable`.
+    [[nodiscard]] static status load(
+        const fs::path& state_dir,
+        std::map<std::pair<std::string, std::string>, registry_anchor>& out);
+
+    // Atomic write, so a crash mid-write cannot leave a half-written map.
+    [[nodiscard]] static status save(
+        const fs::path& state_dir,
+        const std::map<std::pair<std::string, std::string>, registry_anchor>& value);
+};
+
 class CRPC_API registry_service {
 public:
     explicit registry_service(registry_service_config config = registry_service_config{});

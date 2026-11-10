@@ -525,6 +525,7 @@ is guarded.
 - `::crpc::cluster::registry_set_state_request`
 - `::crpc::cluster::registry_tag`
 - `::crpc::cluster::registry_write_response`
+- `::crpc::cluster::anchor_store`
 - `::crpc::cluster::service_instance`
 
 `::crpc::cluster::registry_query_row` is deliberately absent from the list: it is

@@ -152,6 +152,36 @@ void append_tag(std::vector<std::byte>& out, u8 id, const std::vector<std::byte>
                                                   : status{rpc_code::encode_error};
 }
 
+// Every tag id this service defines. A frame carrying any other id is
+// `dto_unknown_tag`, including ids below `registry_tag_max_known`: the numeric
+// range has gaps (tag 2 was retired, see the header's tag table) and a range test
+// would accept them.
+[[nodiscard]] bool is_known_tag(u8 id) {
+    switch (id) {
+    case registry_tag_token:
+    case registry_tag_service:
+    case registry_tag_node_id:
+    case registry_tag_host:
+    case registry_tag_port:
+    case registry_tag_incarnation:
+    case registry_tag_fence:
+    case registry_tag_writer_epoch:
+    case registry_tag_weight:
+    case registry_tag_state:
+    case registry_tag_meta:
+    case registry_tag_passing_only:
+    case registry_tag_index:
+    case registry_tag_client_request_id:
+    case registry_tag_token_issued_at:
+    case registry_tag_token_nonce:
+    case registry_tag_client_authority_epoch:
+    case registry_tag_authority_epoch:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 rpc_error registry_failure(rpc_code code, const char* message, const char* reason) {
@@ -204,7 +234,13 @@ status decode_registry_tags(span<const std::byte> body, std::vector<registry_tag
         }
         // Rule 3: an unknown tag id is rejected, never skipped. A future
         // version's field must not be silently dropped by this service.
-        if (id == 0 || id > registry_tag_max_known) {
+        //
+        // The test is an explicit WHITELIST, not `id > registry_tag_max_known`.
+        // An interval test silently accepts every id in a gap: tag 2 was retired
+        // (the DTO version lives in the frame header, not in a tag) and an
+        // interval test would keep accepting it as a meaningful id forever. A
+        // whitelist makes every accepted id one this service actually defines.
+        if (!is_known_tag(id)) {
             return status{registry_failure(rpc_code::decode_error,
                                            "unknown registry tag id",
                                            registry_reason_dto_unknown_tag)};
@@ -378,9 +414,20 @@ namespace {
 // Reads the optional identity fields every write request may carry: the
 // client's idempotency key (tag 15) and its anchor index (tag 14). Shared by
 // the three write decoders so the fail-closed rules are applied identically.
+// Reads the client's anchor from the request: the idempotency key (tag 15), the
+// index half (tag 14) and the epoch half (tag 18).
+//
+// `has_anchor` means "the client sent an anchor", NOT "the index it sent is
+// non-zero". Deciding it from `index != 0` would silently skip the anchor check
+// for a client that explicitly presents {epoch, 0}: the write would be treated
+// as having no anchor and let through. The presence of either tag is what
+// carries the meaning, so both are tracked separately.
 [[nodiscard]] status read_optional_identity(std::vector<registry_tag>& tags,
                                             std::string& request_id, u64& index,
+                                            u64& authority_epoch,
                                             bool& has_anchor) {
+    bool saw_index = false;
+    bool saw_epoch = false;
     for (registry_tag& tag : tags) {
         switch (tag.id) {
         case registry_tag_client_request_id:
@@ -392,12 +439,19 @@ namespace {
             if (const status s = read_u64(tag, index); !s.ok()) {
                 return s;
             }
-            has_anchor = index != 0;
+            saw_index = true;
+            break;
+        case registry_tag_client_authority_epoch:
+            if (const status s = read_u64(tag, authority_epoch); !s.ok()) {
+                return s;
+            }
+            saw_epoch = true;
             break;
         default:
             break;
         }
     }
+    has_anchor = saw_index || saw_epoch;
     return status{};
 }
 
@@ -506,6 +560,7 @@ status decode_register_request(span<const std::byte> body,
     }
     const status identity = read_optional_identity(tags, out.client_request_id,
                                                    out.client_index,
+                                                   out.client_authority_epoch,
                                                    out.has_client_anchor);
     if (!identity.ok()) {
         return identity;
@@ -577,6 +632,7 @@ status decode_deregister_request(span<const std::byte> body,
     }
     const status identity = read_optional_identity(tags, out.client_request_id,
                                                    out.client_index,
+                                                   out.client_authority_epoch,
                                                    out.has_client_anchor);
     if (!identity.ok()) {
         return identity;
@@ -657,6 +713,7 @@ status decode_set_state_request(span<const std::byte> body,
     }
     const status identity = read_optional_identity(tags, out.client_request_id,
                                                    out.client_index,
+                                                   out.client_authority_epoch,
                                                    out.has_client_anchor);
     if (!identity.ok()) {
         return identity;
@@ -776,12 +833,17 @@ status decode_ping_request(span<const std::byte> body, registry_ping_request& ou
                              out.token_nonce);
 }
 
+// The authority epoch travels in tag 19, never in tag 9 (`writer_epoch`) or tag 7
+// (`incarnation`). Those two ids already mean something else in the request
+// direction, and reusing them on the response side made one numeric id carry
+// three different meanings depending on the encoder.
+
 status encode_write_response(const registry_write_response& value, buffer& out) {
     std::vector<std::byte> tags;
     append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
     append_tag(tags, registry_tag_fence, scalar_tag_value_u64(value.fence));
     append_tag(tags, registry_tag_incarnation, scalar_tag_value_u64(value.incarnation));
-    append_tag(tags, registry_tag_writer_epoch,
+    append_tag(tags, registry_tag_authority_epoch,
                scalar_tag_value_u64(value.authority_epoch));
 
     out.clear();
@@ -790,9 +852,9 @@ status encode_write_response(const registry_write_response& value, buffer& out) 
 
 status encode_anchor_response(const registry_anchor& value, buffer& out) {
     std::vector<std::byte> tags;
-    append_tag(tags, registry_tag_incarnation,
+    append_tag(tags, registry_tag_authority_epoch,
                scalar_tag_value_u64(value.authority_epoch));
-    append_tag(tags, registry_tag_fence, scalar_tag_value_u64(value.index));
+    append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
 
     out.clear();
     return finish_frame(tags, out);
@@ -927,20 +989,34 @@ status encode_query_response(const registry_query_response& value, buffer& out) 
     }
 
     std::vector<std::byte> tags;
-    append_tag(tags, registry_tag_incarnation,
+    append_tag(tags, registry_tag_authority_epoch,
                scalar_tag_value_u64(value.anchor.authority_epoch));
-    append_tag(tags, registry_tag_fence, scalar_tag_value_u64(value.anchor.index));
+    append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.anchor.index));
     append_tag(tags, registry_tag_meta, body);
 
     out.clear();
     return finish_frame(tags, out);
 }
 
+// The response decoders are fail-closed for the same reason the request decoders
+// are: a response the service never produced (a truncated frame, a wrong
+// endpoint, a bug) used to decode "successfully" into a zeroed struct, and the
+// client then stored `{0, 0}` as its anchor -- a valid-looking anchor pointing at
+// nothing, which makes every later write look stale with no way to recover.
+// The required set mirrors exactly what the matching encoder writes.
+
 status decode_write_response(span<const std::byte> in, registry_write_response& out) {
+    static const u8 kRequired[] = {registry_tag_index, registry_tag_fence,
+                                   registry_tag_incarnation,
+                                   registry_tag_authority_epoch};
     std::vector<registry_tag> tags;
     const status walked = decode_registry_tags(in, tags);
     if (!walked.ok()) {
         return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
     }
     for (const registry_tag& tag : tags) {
         if (tag.value.size() != sizeof(u64)) {
@@ -957,7 +1033,7 @@ status decode_write_response(span<const std::byte> in, registry_write_response& 
         case registry_tag_incarnation:
             out.incarnation = value;
             break;
-        case registry_tag_writer_epoch:
+        case registry_tag_authority_epoch:
             out.authority_epoch = value;
             break;
         default:
@@ -968,15 +1044,23 @@ status decode_write_response(span<const std::byte> in, registry_write_response& 
 }
 
 status decode_query_response(span<const std::byte> in, registry_query_response& out) {
+// Mirrors `encode_query_response`: the anchor's epoch (tag 19) and index
+// (tag 14, `registry_tag_index`) are both always written, so both are required
+// here.
+    static const u8 kRequired[] = {registry_tag_authority_epoch, registry_tag_index};
     std::vector<registry_tag> tags;
     const status walked = decode_registry_tags(in, tags);
     if (!walked.ok()) {
         return walked;
     }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
     for (const registry_tag& tag : tags) {
-        if (tag.id == registry_tag_incarnation && tag.value.size() == sizeof(u64)) {
+        if (tag.id == registry_tag_authority_epoch && tag.value.size() == sizeof(u64)) {
             out.anchor.authority_epoch = endian::load_le64(tag.value.data());
-        } else if (tag.id == registry_tag_fence && tag.value.size() == sizeof(u64)) {
+        } else if (tag.id == registry_tag_index && tag.value.size() == sizeof(u64)) {
             out.anchor.index = endian::load_le64(tag.value.data());
         } else if (tag.id == registry_tag_meta) {
             tag_value_reader reader(tag.value);

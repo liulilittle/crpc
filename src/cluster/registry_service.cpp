@@ -290,6 +290,121 @@ status epoch_store::persist(u64 value) const {
         path_, span<const std::byte>(bytes, sizeof(bytes)));
 }
 
+// --- anchor persistence -------------------------------------------------------
+//
+// VERDICT section 5.1: the service's `last_anchor` is persisted "next to the
+// epoch file". Without this, a restart left the map empty, `anchor_allows` saw
+// "no anchor on record" and let every write through -- a client could replay a
+// pre-restart anchor against a freshly started service.
+//
+// The file is SECURITY STATE, so a corrupt file must fail the startup rather
+// than be treated as empty: silently clearing it is exactly the bypass this
+// persistence exists to prevent.
+
+fs::path anchor_store::file_path(const fs::path& state_dir) {
+    return state_dir / "registry.anchor";
+}
+
+// Layout: u32 count, then count entries of
+//   u32 key_len | key bytes | u64 authority_epoch | u64 index
+// where `key` is "<service>\x1f<node_id>" -- the same string form the client
+// uses for its per-key anchor slot, so both sides spell a key identically.
+//
+// KNOWN LIMITATION (U1): the layout has no version field, so a same-length
+// change would be misparsed rather than refused. If the layout ever changes,
+// bump the filename in file_path() (e.g. `registry.anchor2`) instead of adding
+// a version byte -- a new name is fail-closed and needs no reader migration.
+status anchor_store::load(const fs::path& state_dir,
+                          std::map<std::pair<std::string, std::string>, registry_anchor>& out) {
+    out.clear();
+    const fs::path path = file_path(state_dir);
+    const auto bytes = fs::read_all_bytes(path);
+    if (!bytes.ok()) {
+        // An absent file is a clean "nothing persisted yet"; anything else is
+        // an error the caller must see.
+        if (bytes.error().code == rpc_code::not_found) {
+            return status{};
+        }
+        return bytes.error();
+    }
+    const auto& data = bytes.value();
+    std::size_t pos = 0;
+    const auto need = [&](std::size_t n) { return pos + n <= data.size(); };
+    if (!need(sizeof(u32))) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry anchor file is truncated (count)",
+                                       registry_reason_anchor_unreadable)};
+    }
+    const u32 count = endian::load_le32(data.data() + pos);
+    pos += sizeof(u32);
+    for (u32 i = 0; i < count; ++i) {
+        if (!need(sizeof(u32))) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry anchor file is truncated (key length)",
+                                           registry_reason_anchor_unreadable)};
+        }
+        const u32 key_len = endian::load_le32(data.data() + pos);
+        pos += sizeof(u32);
+        if (key_len == 0 || key_len > 1024 || !need(key_len)) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry anchor file has an invalid key length",
+                                           registry_reason_anchor_unreadable)};
+        }
+        std::string key(reinterpret_cast<const char*>(data.data() + pos), key_len);
+        pos += key_len;
+        if (!need(sizeof(u64) * 2)) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry anchor file is truncated (anchor)",
+                                           registry_reason_anchor_unreadable)};
+        }
+        registry_anchor anchor;
+        anchor.authority_epoch = endian::load_le64(data.data() + pos);
+        pos += sizeof(u64);
+        anchor.index = endian::load_le64(data.data() + pos);
+        pos += sizeof(u64);
+        const std::size_t sep = key.find('\x1f');
+        if (sep == std::string::npos) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry anchor file has a malformed key",
+                                           registry_reason_anchor_unreadable)};
+        }
+        out[std::make_pair(key.substr(0, sep), key.substr(sep + 1))] = anchor;
+    }
+    if (pos != data.size()) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry anchor file has trailing bytes",
+                                       registry_reason_anchor_unreadable)};
+    }
+    return status{};
+}
+
+status anchor_store::save(
+    const fs::path& state_dir,
+    const std::map<std::pair<std::string, std::string>, registry_anchor>& value) {
+    std::vector<std::byte> body;
+    const auto put_u32 = [&body](u32 v) {
+        std::byte bytes[sizeof(u32)];
+        endian::store_le32(bytes, v);
+        body.insert(body.end(), bytes, bytes + sizeof(bytes));
+    };
+    const auto put_u64 = [&body](u64 v) {
+        std::byte bytes[sizeof(u64)];
+        endian::store_le64(bytes, v);
+        body.insert(body.end(), bytes, bytes + sizeof(bytes));
+    };
+    put_u32(static_cast<u32>(value.size()));
+    for (const auto& entry : value) {
+        const std::string key = entry.first.first + '\x1f' + entry.first.second;
+        put_u32(static_cast<u32>(key.size()));
+        body.insert(body.end(), reinterpret_cast<const std::byte*>(key.data()),
+                    reinterpret_cast<const std::byte*>(key.data()) + key.size());
+        put_u64(entry.second.authority_epoch);
+        put_u64(entry.second.index);
+    }
+    return fs::write_all_bytes_atomic(file_path(state_dir),
+                                      span<const std::byte>(body.data(), body.size()));
+}
+
 // --- registry_service ---------------------------------------------------------
 
 namespace {
@@ -329,9 +444,9 @@ struct registry_service::impl {
     std::map<std::string, idempotency_record> idempotency;
     u64 anchor_epoch = 0;
 
-    // The registry's catalog is the authority; this is the log's durable tail
-    // so a restart can tell whether the file grew behind our back.
-    u64 last_log_index = 0;
+    // The registry's catalog is the authority; the log's durable tail is read
+    // during prepare() to tell whether the file grew behind our back. It is not
+    // cached in a member: the only reader was the prepare-time check below.
 };
 
 registry_service::registry_service(registry_service_config config)
@@ -386,9 +501,10 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
     // time is missing or outside `registry_token_window` is denied. This is a
     // time LIMIT, not replay prevention: a token observed inside the window
     // can still be replayed. The window is compared against the service's
-    // steady clock, so the client must stamp with the same clock family; the
-    // resulting dependency on clock synchronisation is documented in
-    // docs/migration.md and is UNVERIFIED.
+    // SYSTEM clock (Unix epoch) -- the same clock family the client stamps
+    // with -- so the comparison is cross-process. The resulting dependency on
+    // clock synchronisation is documented in docs/migration.md and is
+    // UNVERIFIED.
     if (!has_issued_at) {
         decision.reason = registry_reason_acl_denied;
         return decision;
@@ -415,7 +531,11 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
     if (is_write) {
         bool prefix_ok = false;
         for (const std::string& prefix : matched->write_prefixes) {
-            if (prefix.empty() || service == prefix ||
+            // A blank prefix means "every service". It needs no special case:
+            // `compare(0, 0, prefix)` returns 0 for any `service`, so the
+            // substring test already covers the empty prefix. (An explicit
+            // `prefix.empty() ||` was here and was redundant.)
+            if (service == prefix ||
                 (service.size() >= prefix.size() &&
                  service.compare(0, prefix.size(), prefix) == 0)) {
                 prefix_ok = true;
@@ -440,8 +560,9 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
     if (method == registry_method_query) {
         bool prefix_ok = false;
         for (const std::string& prefix : matched->read_prefixes) {
-            if (prefix.empty() ||
-                service == prefix ||
+            // Same as the write side: an empty prefix is already covered by the
+            // substring test, so it needs no special case.
+            if (service == prefix ||
                 (service.size() >= prefix.size() &&
                  service.compare(0, prefix.size(), prefix) == 0)) {
                 prefix_ok = true;
@@ -500,7 +621,6 @@ status registry_service::prepare(server::builder& builder) {
                                        "registry log is behind the restored catalog",
                                        "stale_log")};
     }
-    impl_->last_log_index = log_last;
 
     // 2c. The torn-tail truncate is NOT duplicated here: `file_registry_log::
     //     open()` already scans the file, adopts the intact prefix and
@@ -524,6 +644,16 @@ status registry_service::prepare(server::builder& builder) {
     }
     impl_->epochs.bind(impl_->config.state_dir);
     impl_->epochs.seed(persisted.value(), impl_->catalog.fence());
+
+    // 4b. Load the persisted anchor water-mark. This must happen after the
+    //     restore (so `last_anchor` reflects the same catalog the restore
+    //     produced) and it is fail-closed: a corrupt file refuses to start
+    //     rather than silently clearing the anchor map.
+    const status anchors = anchor_store::load(impl_->config.state_dir,
+                                              impl_->last_anchor);
+    if (!anchors.ok()) {
+        return anchors;
+    }
 
     // 5. The fence authority is the local registry allocator (step2). step3
     //    replaces this function pointer and the service does not change.
@@ -627,8 +757,10 @@ namespace {
     return status{};
 }
 
-// Maps a registry reason to its rpc_code. The table is VERDICT section 2.5;
-// `not_live` is 9 (not_found), everything else on this list is 12.
+// Maps a registry reason to its rpc_code, per VERDICT section 2.5. Two entries
+// are NOT `failed_precondition`: `not_live` is 9 (`not_found`, deliberately not
+// 12) and `limit` / `index_overflow` are 13 (`resource_exhausted`). Everything
+// else on the section-2.5 table is 12.
 [[nodiscard]] rpc_code code_for_reason(const std::string& reason) {
     if (reason == "not_live") {
         return rpc_code::not_found;
@@ -643,9 +775,19 @@ namespace {
 }
 
 // Wraps a registry error for the wire, setting `registry.index` so a client can
-// re-anchor. `code` overrides the registry's code only for the ACL layer.
+// re-anchor. The error's `rpc_code` is REMAPPED through `code_for_reason`
+// (VERDICT section 2.5), because the registry's own codes are a different
+// enumeration: `not_live` is 9 (`not_found`), not 12, and `limit` /
+// `index_overflow` are 13 (`resource_exhausted`). Returning the registry's code
+// unchanged would hand the caller a number the section-2.5 table does not define.
 [[nodiscard]] rpc_error service_error(const rpc_error& error, u64 index) {
     rpc_error out = error;
+    if (!error.metadata.empty()) {
+        if (const std::string* reason = error.metadata.find("registry.reason");
+            reason != nullptr && !reason->empty()) {
+            out.code = code_for_reason(*reason);
+        }
+    }
     out.metadata.set("registry.index", std::to_string(index));
     return out;
 }
@@ -901,8 +1043,25 @@ status registry_service::on_register(void* self, const call_envelope& /*envelope
     // The water-mark moves only after the mutation is durable. A crash between
     // the registry commit and this update leaves the water-mark behind, which
     // makes the next writer re-anchor rather than silently overtake.
+    //
+    // The epoch half is the service's OWN epoch (`epoch_store::value()`), not a
+    // constant: it is the authority's term number, so a restarted service has a
+    // higher one and every anchor a pre-restart client still holds becomes
+    // stale. It was previously left at the initialised 0, which made the first
+    // half of the two-dimensional comparison dead and reduced `not_stale` to a
+    // one-dimensional index comparison.
+    owner->impl_->anchor_epoch = owner->impl_->epochs.value();
     owner->impl_->last_anchor[key] =
         registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+    // Persist the water-mark BEFORE the response can be observed: a crash after
+    // the write but before this leaves the anchor behind, so a replayed write
+    // would be accepted. Same order as `epoch_store::persist` (write, then
+    // return).
+    const status anchored = anchor_store::save(owner->impl_->config.state_dir,
+                                               owner->impl_->last_anchor);
+    if (!anchored.ok()) {
+        return anchored;
+    }
 
     registry_write_response out;
     out.index = written.value().index;
@@ -997,6 +1156,17 @@ status registry_service::on_deregister(void* self, const call_envelope& /*envelo
     out.index = written.value().index;
     out.fence = written.value().fence;
     out.incarnation = written.value().incarnation;
+    // Advance the water-mark exactly as `on_register` does: a deregister is a
+    // write, and a stalled water-mark would keep an already-superseded anchor
+    // acceptable forever.
+    owner->impl_->anchor_epoch = owner->impl_->epochs.value();
+    owner->impl_->last_anchor[key] =
+        registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+    const status anchored = anchor_store::save(owner->impl_->config.state_dir,
+                                               owner->impl_->last_anchor);
+    if (!anchored.ok()) {
+        return anchored;
+    }
     out.authority_epoch = owner->impl_->anchor_epoch;
     record_idempotent(owner->impl_->idempotency, idem_key, out,
                       owner->impl_->config.max_idempotency_entries,
@@ -1089,6 +1259,15 @@ status registry_service::on_set_state(void* self, const call_envelope& /*envelop
     out.index = written.value().index;
     out.fence = written.value().fence;
     out.incarnation = written.value().incarnation;
+    // Advance the water-mark exactly as `on_register` / `on_deregister` do.
+    owner->impl_->anchor_epoch = owner->impl_->epochs.value();
+    owner->impl_->last_anchor[key] =
+        registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+    const status anchored = anchor_store::save(owner->impl_->config.state_dir,
+                                               owner->impl_->last_anchor);
+    if (!anchored.ok()) {
+        return anchored;
+    }
     out.authority_epoch = owner->impl_->anchor_epoch;
     record_idempotent(owner->impl_->idempotency, idem_key, out,
                       owner->impl_->config.max_idempotency_entries,

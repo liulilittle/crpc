@@ -244,6 +244,7 @@ x64 上**断言该文件中列出的记录的绝对 `sizeof` 与关键 `offsetof
 - `::crpc::cluster::registry_set_state_request`
 - `::crpc::cluster::registry_tag`
 - `::crpc::cluster::registry_write_response`
+- `::crpc::cluster::anchor_store`
 - `::crpc::cluster::service_instance`
 
 `::crpc::cluster::registry_query_row` 故意不在清单里：它嵌套在

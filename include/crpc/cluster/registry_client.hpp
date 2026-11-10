@@ -125,12 +125,34 @@ public:
                                          const std::string& node_id);
     [[nodiscard]] result<registry_anchor> ping();
 
-    // The calling thread's anchor, as last observed. Exposed for tests.
-    [[nodiscard]] registry_anchor local_anchor() const;
-
     // The calling thread's anchor for one key. Exposed for tests so a case can
     // assert that two threads observe two independent anchors.
     [[nodiscard]] registry_anchor local_anchor_for(const std::string& key) const;
+
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
+#if defined(CRPC_TESTING)
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
+    // Seeds the calling thread's anchor for ONE key. The real scenario this
+    // enables is "the client process did NOT restart but the service it talks to
+    // did": the client's anchor is process-local state that outlives the service,
+    // and a restarted service has a new authority epoch. Without this seam that
+    // state is unreachable through the published API, because a fresh client
+    // starts with no anchor.
+    //
+    // The key must be the same string the client itself uses
+    // (`service + '\x1f' + node_id`); it is the slot the write path looks in.
+    // Seeding a different slot would be a no-op and the write would look
+    // anchor-less -- which is exactly the fresh-client case, not the
+    // outlived-the-service case.
+    //
+    // Guarded by CRPC_TESTING, which `tests/CMakeLists.txt` defines for test
+    // executables and `CMakeLists.txt` defines for the library in Debug only. A
+    // Release library therefore has neither the declaration nor the definition:
+    // the symbol cannot be named or linked against by a production caller.
+    void set_local_anchor(const std::string& key, const registry_anchor& anchor);
+#endif
 
 private:
     struct impl;
