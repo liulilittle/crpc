@@ -321,3 +321,66 @@ The response codec fails closed on codes above `application` (21), so a client
 observes `internal` with the original code in the `crpc.raw_code` metadata entry.
 The service still emits `permission_denied` (22) per the reason table; a client
 that must distinguish an ACL denial reads `crpc.raw_code`.
+
+## 9. Unreleased: the KV data plane is a replicated state machine
+
+Before this change a KV write was applied to an in-memory `kv_store` and an
+EMPTY raft entry was proposed. On one node that looked correct; with peers, every
+follower stored an index carrying no command and never learned the value, so a
+multi-node cluster diverged on the first KV write.
+
+### What breaks
+
+- `registry_service_config::raft` is now load-bearing for KV. A service given a
+  non-null `raft` commits KV writes and ACL changes through it and applies the
+  committed log; a service given a null `raft` still applies writes directly, but
+  **nothing is logged and a restart loses every KV value and every runtime ACL
+  change**. `registryd` therefore always builds a single-node `raft_node` over
+  `<state-dir>/raft.log`.
+- ACL rules are no longer read from `config.acl` on every check. `config.acl` is
+  the seed; the live table is `acl_rules`, mutated only by committed
+  `acl_upsert` / `acl_remove` commands. `set_acl_rule` / `remove_acl_rule` are
+  the only supported way to change it at runtime, and both return only after the
+  change is committed.
+- `registry_service::prepare` now replays the committed log before the handlers
+  are registered. A log that cannot be applied is a startup failure, not a
+  partial start.
+
+### How to migrate
+
+1. Give every service that owns a KV store a `raft_node`. A single-node cluster
+   is valid: the node is its own quorum and `raft_node::start` adopts its last
+   log index as committed.
+2. Put the raft log on a different file from the catalog log
+   (`registry_service` opens `<state-dir>/registry.log` for catalog events).
+   Sharing one file is not supported: the two layers number their records
+   independently.
+3. If you were relying on `config.acl` alone, it still works as a seed. To change
+   a rule after start, call `set_acl_rule` / `remove_acl_rule`; editing
+   `config.acl` on a running service has no effect.
+
+### Verification
+
+`tests/test_raft_apply.cpp` drives a three-node cluster and asserts that every
+node's `kv_store` and every node's `acl_rules` hold the same value after one
+write through the leader. `tests/test_registryd_composition.cpp` kills a whole
+daemon and rebuilds it over the same state directory, then reads the value back.
+
+## 10. Unreleased: `registryd` serves the Consul HTTP API
+
+`--http-port <n>` adds a Consul-compatible HTTP facade next to the native binary
+channel. Both reach the same handlers through `registry_service::dispatch`, so
+the ACL check, the anchor water-mark and the log append cannot diverge.
+
+### Operational notes
+
+- The facade needs its own `backend_factory`. Two listeners on one
+  `iocp_backend` fail with "listener could not bind endpoint" even on distinct
+  ports, so `registryd` creates a second backend for the HTTP channel.
+- A Consul registration's `ID` becomes the registry instance's node id, and the
+  registry's authority check requires it to equal the ACL principal. Register
+  with the same identity your token was issued to, or the write is refused with
+  409 and "write authority does not belong to this node".
+- The ACL rule shipped by `registryd` leaves `node_id` empty ("any node"). A
+  rule bound to one node id would deny every KV write with 403, because the KV
+  handlers pass an empty node id to `check_acl`.

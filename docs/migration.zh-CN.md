@@ -139,3 +139,56 @@ incarnation 或过期 anchor。部署须使 `max_idempotency_entries` 乘以
 响应编码器对高于 `application`（21）的码 fail-closed 为 `internal`，原始码在
 `crpc.raw_code` 元数据项里。服务端仍按 reason 表发 `permission_denied`（22）；
 需要区分 ACL 拒绝的客户端应读 `crpc.raw_code`。
+
+## 9. 未发布：KV 数据面是复制状态机
+
+此前 KV 写入只改内存中的 `kv_store`，并向 Raft 提交一个**空**条目。单节点上
+看不出问题；多节点时，每个 follower 存下一个不携带任何命令的索引，永远学不到
+该值，因此第一次 KV 写就会让多节点集群发散。
+
+### 破坏点
+
+- `registry_service_config::raft` 对 KV 现在是必需项。给了非空 `raft` 的服务会把
+  KV 写入与 ACL 变更经它提交并应用已提交日志；给了空 `raft` 的服务仍直接应用，
+  但**不会记录任何日志，重启后丢失全部 KV 值与运行期 ACL 变更**。`registryd`
+  因此总是构建 `<state-dir>/raft.log` 上的单节点 `raft_node`。
+- ACL 规则不再每次检查都读 `config.acl`。`config.acl` 是种子；活动表是
+  `acl_rules`，只由已提交的 `acl_upsert` / `acl_remove` 命令变更。
+  `set_acl_rule` / `remove_acl_rule` 是运行期修改的唯一支持方式，二者都在变更
+  提交后才返回。
+- `registry_service::prepare` 现在在注册 handler 之前回放已提交日志。无法应用的
+  日志是启动失败，不是部分启动。
+
+### 迁移方法
+
+1. 给每个拥有 KV store 的服务配一个 `raft_node`。单节点集群是合法的：节点即
+   自己的 quorum，`raft_node::start` 会把最后日志索引采纳为已提交。
+2. raft 日志必须与 catalog 日志分文件（`registry_service` 在
+   `<state-dir>/registry.log` 记 catalog 事件）。共用一个文件不受支持：两层各自
+   独立编号。
+3. 若原本只依赖 `config.acl`，它仍可作为种子使用。启动后修改规则必须调用
+   `set_acl_rule` / `remove_acl_rule`；在运行中的服务上改 `config.acl` 无效。
+
+### 验证
+
+`tests/test_raft_apply.cpp` 驱动三节点集群，断言经 leader 写入一次后每个节点的
+`kv_store` 与 `acl_rules` 都相同。`tests/test_registryd_composition.cpp` 杀掉整个
+daemon 并在同一状态目录上重建，然后读回该值。
+
+## 10. 未发布：`registryd` 提供 Consul HTTP API
+
+`--http-port <n>` 在原生二进制通道之外增加 Consul 兼容的 HTTP 门面。两者都经
+`registry_service::dispatch` 到达同一批 handler，因此 ACL 检查、anchor 水位与
+日志追加不可能漂移。
+
+### 运维注意
+
+- 该门面需要自己的 `backend_factory`。同一个 `iocp_backend` 上两个 listener 会
+  以 "listener could not bind endpoint" 失败（端口不同也一样），因此 `registryd`
+  为 HTTP 通道单独创建第二个 backend。
+- Consul 注册的 `ID` 会成为注册实例的 node id，而注册中心的权限检查要求它与
+  ACL principal 相等。请用 token 签发给的身份注册，否则写入被拒（409 与
+  "write authority does not belong to this node"）。
+- `registryd` 自带的 ACL 规则把 `node_id` 留空（"任意节点"）。绑定到某个 node id
+  的规则会让每次 KV 写都以 403 被拒，因为 KV handler 传给 `check_acl` 的是空
+  node id。
