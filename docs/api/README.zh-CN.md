@@ -515,6 +515,7 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp)
 - [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp)
 - [`cluster/kv_store.hpp`](../../include/crpc/cluster/kv_store.hpp)
+- [`cluster/consul_http.hpp`](../../include/crpc/cluster/consul_http.hpp)
 - [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp)
 - [`cluster/registry_service.hpp`](../../include/crpc/cluster/registry_service.hpp)
 - [`cluster/registry_client.hpp`](../../include/crpc/cluster/registry_client.hpp)

@@ -587,7 +587,16 @@ registry_anchor registry_service::anchor() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     registry_anchor out;
     out.authority_epoch = impl_->anchor_epoch;
-    out.index = impl_->catalog.index();
+    // The index a caller observes must cover every mutation this service has
+    // accepted, not just catalog rows: a KV write does not touch the catalog
+    // but does advance the store's high-water mark, and a watcher parked on the
+    // catalog-only index would never see it move. The larger of the two is the
+    // honest answer.
+    u64 index = impl_->catalog.index();
+    if (impl_->config.kv != nullptr) {
+        index = std::max(index, impl_->config.kv->highest_index());
+    }
+    out.index = index;
     return out;
 }
 
@@ -1420,6 +1429,55 @@ status registry_service::on_ping(void* self, const call_envelope& /*envelope*/,
     return encode_anchor_response(anchor, response);
 }
 
+// --- Method dispatch (step4 PR-8) --------------------------------------------
+//
+// The HTTP facade reaches the handlers through this table instead of calling
+// them directly. One table, one function-pointer type: the compiler checks each
+// entry against the handler signature, so a handler whose shape changes cannot
+// be wired in silently.
+
+namespace {
+
+struct dispatch_entry {
+    u64 method_id;
+    status (*handler)(void* self, const call_envelope& envelope,
+                      span<const std::byte> body, buffer& response,
+                      rpc::call_context& ctx);
+};
+
+constexpr dispatch_entry kDispatchTable[] = {
+    {registry_method_register, &registry_service::on_register},
+    {registry_method_deregister, &registry_service::on_deregister},
+    {registry_method_set_state, &registry_service::on_set_state},
+    {registry_method_query, &registry_service::on_query},
+    {registry_method_next_fence, &registry_service::on_next_fence},
+    {registry_method_ping, &registry_service::on_ping},
+    {registry_method_kv_get, &registry_service::on_kv_get},
+    {registry_method_kv_put, &registry_service::on_kv_put},
+    {registry_method_kv_cas, &registry_service::on_kv_cas},
+    {registry_method_kv_delete, &registry_service::on_kv_delete},
+};
+
+} // namespace
+
+status registry_service::dispatch(u64 method_id, span<const std::byte> body,
+                                  buffer& response) {
+    for (const dispatch_entry& entry : kDispatchTable) {
+        if (entry.method_id != method_id) {
+            continue;
+        }
+        call_envelope envelope;
+        envelope.service_id = registry_service_id;
+        envelope.method_id = method_id;
+        envelope.body = body;
+        rpc::call_context context;
+        return entry.handler(this, envelope, body, response, context);
+    }
+    return status{registry_failure(rpc_code::no_such_method,
+                                   "registry: no handler for that method",
+                                   "no_such_method")};
+}
+
 // --- KV handlers (step4 PR-7) -----------------------------------------------
 
 status registry_service::on_kv_get(void* self, const call_envelope& /*envelope*/,
@@ -1450,7 +1508,8 @@ status registry_service::on_kv_get(void* self, const call_envelope& /*envelope*/
     if (!entry.ok()) {
         if (entry.code() == rpc_code::not_found) {
             kv_get_response out;
-            out.index = owner->impl_->catalog.index();
+            out.index = std::max(owner->impl_->catalog.index(),
+                                 owner->impl_->config.kv->highest_index());
             out.found = false;
             return encode_kv_get_response(out, response);
         }
@@ -1459,7 +1518,8 @@ status registry_service::on_kv_get(void* self, const call_envelope& /*envelope*/
                                        registry_reason_acl_denied)};
     }
     kv_get_response out;
-    out.index = owner->impl_->catalog.index();
+    out.index = std::max(owner->impl_->catalog.index(),
+                         owner->impl_->config.kv->highest_index());
     out.found = true;
     out.value = entry.value().value;
     out.create_index = entry.value().create_index;
@@ -1492,8 +1552,16 @@ status registry_service::on_kv_put(void* self, const call_envelope& /*envelope*/
     }
     std::lock_guard<std::mutex> lock(owner->impl_->mutex);
     // Resolve the write index: through Raft when a node is configured, else the
-    // next catalog index (single-authority mode).
-    u64 index = owner->impl_->catalog.index() + 1;
+    // next free index (single-authority mode).
+    //
+    // The index must be monotonic across BOTH the catalog and the KV table.
+    // `catalog.index() + 1` alone is NOT enough: a KV write does not advance
+    // the catalog, so two consecutive puts would both receive the same index
+    // and a `cas=N` taken after the first would still match after the second.
+    // The high-water mark of the store is part of the same counter.
+    u64 index = std::max(owner->impl_->catalog.index(),
+                         owner->impl_->config.kv->highest_index()) +
+                1;
     if (owner->impl_->config.raft != nullptr) {
         const result<u64> proposed =
             owner->impl_->config.raft->propose(span<const std::byte>{});
@@ -1558,8 +1626,11 @@ status registry_service::on_kv_cas(void* self, const call_envelope& /*envelope*/
     }
     std::lock_guard<std::mutex> lock(owner->impl_->mutex);
     // Resolve the write index: through Raft when a node is configured, else the
-    // next catalog index (single-authority mode).
-    u64 index = owner->impl_->catalog.index() + 1;
+    // next free index (single-authority mode). Same monotonicity rule as
+    // `on_kv_put`: the KV high-water mark is part of the shared counter.
+    u64 index = std::max(owner->impl_->catalog.index(),
+                         owner->impl_->config.kv->highest_index()) +
+                1;
     if (owner->impl_->config.raft != nullptr) {
         const result<u64> proposed =
             owner->impl_->config.raft->propose(span<const std::byte>{});
@@ -1623,8 +1694,11 @@ status registry_service::on_kv_delete(void* self, const call_envelope& /*envelop
     }
     std::lock_guard<std::mutex> lock(owner->impl_->mutex);
     // Resolve the write index: through Raft when a node is configured, else the
-    // next catalog index (single-authority mode).
-    u64 index = owner->impl_->catalog.index() + 1;
+    // next free index (single-authority mode). Same monotonicity rule as
+    // `on_kv_put`: the KV high-water mark is part of the shared counter.
+    u64 index = std::max(owner->impl_->catalog.index(),
+                         owner->impl_->config.kv->highest_index()) +
+                1;
     if (owner->impl_->config.raft != nullptr) {
         const result<u64> proposed =
             owner->impl_->config.raft->propose(span<const std::byte>{});

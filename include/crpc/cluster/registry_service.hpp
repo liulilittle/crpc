@@ -179,6 +179,24 @@ public:
     // The current authority anchor. Exposed for tests.
     [[nodiscard]] registry_anchor anchor() const;
 
+    // Runs one method against the service exactly as the wire handlers do.
+    //
+    // This is the seam the HTTP facade uses. It takes the SAME encoded DTO body
+    // the binary channel would carry and runs the SAME handler, so the ACL
+    // check, the epoch issue, the anchor water-mark, the catalog log append and
+    // the idempotency map cannot drift between the two channels: there is one
+    // implementation, reached two ways.
+    //
+    // `body` must be a complete registry DTO frame (the 6-byte prefix plus
+    // tags), exactly what `registry_client` puts on the wire. On success
+    // `response` holds the encoded response frame. A malformed body is the
+    // handler's own decode error, never a special case here.
+    //
+    // `method_id` selects the handler; an id with no handler is
+    // `rpc_code::no_such_method` rather than a silent success.
+    [[nodiscard]] status dispatch(u64 method_id, span<const std::byte> body,
+                                  buffer& response);
+
 private:
     // The six RPC handlers. They match `rpc::method_handler` exactly.
     static status on_register(void* self, const call_envelope& envelope,
