@@ -543,4 +543,107 @@ CRPC_TEST(a_kv_put_through_the_http_facade_reaches_every_node) {
     }
 }
 
+// --- A restart replays the committed log -------------------------------------
+
+CRPC_TEST(a_restart_replays_the_committed_log) {
+    // The KV table is in memory and the ACL table is mutated only by applied
+    // commands, so a restart with no replay would come up empty while the log
+    // still holds the commands. On a single node nothing in the log can be
+    // uncommitted (there was never another node to form a minority), so a
+    // restart must recover everything.
+    auto raft_dir_holder = fs::temp_dir::create(fs::path(), "crpc-raftapply-rlog");
+    auto svc_dir_holder = fs::temp_dir::create(fs::path(), "crpc-raftapply-rsvc");
+    CRPC_REQUIRE(raft_dir_holder.ok());
+    CRPC_REQUIRE(svc_dir_holder.ok());
+    const fs::path raft_state_dir = raft_dir_holder.value().native();
+    const fs::path svc_dir = svc_dir_holder.value().native();
+    const fs::path svc_dir_boot2 = svc_dir / "boot2";
+    const fs::path log_path = raft_state_dir / "raft.log";
+
+    cl::acl_rule rule = writer_rule("token-A");
+
+    // --- first boot: write a rule and a KV value, then shut down -------------
+    {
+        auto opened = cl::file_registry_log::open(log_path.str());
+        CRPC_REQUIRE(opened.ok());
+        auto log = std::move(opened).value();
+        manual_clock clock;
+        cl::raft_config config;
+        config.node_id = "A";
+        config.election_timeout_min = 40ms;
+        config.election_timeout_max = 60ms;
+        cl::raft_node raft(config, *log, raft_state_dir, make_clock(clock));
+        CRPC_REQUIRE(raft.start().ok());
+        for (int i = 0; i < 20 && raft.role() != cl::raft_role::leader; ++i) {
+            clock.advance(20ms);
+            raft.tick();
+        }
+        CRPC_REQUIRE(raft.role() == cl::raft_role::leader);
+
+        cl::kv_store store;
+        cl::registry_service_config service_config;
+        service_config.state_dir = svc_dir;
+        service_config.listen = crpc::endpoint{};
+        service_config.kv = &store;
+        service_config.raft = &raft;
+        cl::registry_service service(std::move(service_config));
+        crpc::server::builder builder;
+        CRPC_REQUIRE(service.prepare(builder).ok());
+
+        CRPC_REQUIRE(service.set_acl_rule(rule).ok());
+        cl::raft_command put;
+        put.kind = cl::raft_command_kind::kv_put;
+        put.key = "before-restart";
+        put.value = {std::byte{'x'}, std::byte{'y'}};
+        std::vector<std::byte> payload;
+        CRPC_REQUIRE(cl::encode_raft_command(put, payload).ok());
+        const auto proposed = raft.propose(
+            crpc::span<const std::byte>(payload.data(), payload.size()));
+        CRPC_REQUIRE(proposed.ok());
+        CRPC_REQUIRE(raft
+                         .wait_for_commit(proposed.value(),
+                                          std::chrono::steady_clock::now() + 5s)
+                         .ok());
+        CRPC_REQUIRE(service.apply_committed().ok());
+        CRPC_REQUIRE(store.get("before-restart").ok());
+        CRPC_REQUIRE(service.acl_rules().size() == 1);
+        (void)log->sync();
+    }
+
+    // --- second boot: same log, fresh stores --------------------------------
+    {
+        auto opened = cl::file_registry_log::open(log_path.str());
+        CRPC_REQUIRE(opened.ok());
+        auto log = std::move(opened).value();
+        manual_clock clock;
+        cl::raft_config config;
+        config.node_id = "A";
+        config.election_timeout_min = 40ms;
+        config.election_timeout_max = 60ms;
+        cl::raft_node raft(config, *log, raft_state_dir, make_clock(clock));
+        CRPC_REQUIRE(raft.start().ok());
+        // A single node is its own quorum: `start` adopts the log's last index as
+        // committed, which is what makes the replay below reach the entries.
+        CRPC_CHECK(raft.commit_index() == raft.last_log_index());
+        CRPC_CHECK(raft.commit_index() > 0);
+
+        cl::kv_store store;
+        cl::registry_service_config service_config;
+        service_config.state_dir = svc_dir_boot2;
+        service_config.listen = crpc::endpoint{};
+        service_config.kv = &store;
+        service_config.raft = &raft;
+        // No static seed: the ONLY way this rule appears is the replay.
+        cl::registry_service service(std::move(service_config));
+        crpc::server::builder builder;
+        CRPC_REQUIRE(service.prepare(builder).ok());
+
+        const auto entry = store.get("before-restart");
+        CRPC_REQUIRE(entry.ok());
+        CRPC_CHECK_EQ(std::size_t{2}, entry.value().value.size());
+        CRPC_REQUIRE(service.acl_rules().size() == 1);
+        CRPC_CHECK(service.acl_rules()[0].token_hash == rule.token_hash);
+    }
+}
+
 CRPC_TEST_MAIN()

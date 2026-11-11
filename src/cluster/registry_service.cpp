@@ -876,6 +876,17 @@ status registry_service::prepare(server::builder& builder) {
     impl_->config.authority.fn = &allocate_local;
     impl_->config.authority.context = &impl_->catalog;
 
+    // 5b. Replay the replicated state machine. The KV table lives in memory and
+    //     the ACL table is mutated only by committed commands, so without this
+    //     a restart would come up with an empty KV store and the static seed
+    //     ACL -- every rule added at runtime would be silently lost while the
+    //     commands that added them are still in the log. The cursor starts at
+    //     zero, so the replay is the same code path a follower uses.
+    const status replayed = apply_committed();
+    if (!replayed.ok()) {
+        return replayed;
+    }
+
     // 6. Register the six handlers and the listener.
     builder.add_service(registry_service_id, "registry");
     builder.add_raw_method(registry_service_id, registry_method_register, "register",

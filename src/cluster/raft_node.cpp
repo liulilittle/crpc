@@ -76,6 +76,18 @@ status raft_node::start() {
         peer.next_index = last + 1;
         peer.match_index = 0;
     }
+    // A single-node cluster is its own quorum, so nothing on disk can be
+    // uncommitted: there was never another node to withhold a majority. Adopting
+    // the log's last index here is what lets a restarted single node serve reads
+    // and apply its log without waiting for a leader that does not exist.
+    //
+    // A multi-node node deliberately keeps commit_index at zero. Its own log may
+    // hold entries a quorum never accepted, and committing them locally is the
+    // exact mistake Raft 5.4.2 forbids; it learns the real value from the
+    // leader's next AppendEntries.
+    if (can_win_alone()) {
+        commit_index_ = last;
+    }
     last_heartbeat_ = clock_.read();
     election_deadline_ = last_heartbeat_ +
                          std::chrono::milliseconds(random_election_timeout());
