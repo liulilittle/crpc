@@ -176,6 +176,12 @@ void append_tag(std::vector<std::byte>& out, u8 id, const std::vector<std::byte>
     case registry_tag_token_nonce:
     case registry_tag_client_authority_epoch:
     case registry_tag_authority_epoch:
+    case registry_tag_key:
+    case registry_tag_value:
+    case registry_tag_cas:
+    case registry_tag_found:
+    case registry_tag_create_index:
+    case registry_tag_modify_index:
         return true;
     default:
         return false;
@@ -833,6 +839,117 @@ status decode_ping_request(span<const std::byte> body, registry_ping_request& ou
                              out.token_nonce);
 }
 
+status decode_kv_get_request(span<const std::byte> body,
+                             kv_get_request& out) {
+    static const u8 kRequired[] = {registry_tag_token, registry_tag_key};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(body, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    const registry_tag* token = nullptr;
+    const registry_tag* key = nullptr;
+    if (const status found = find_required(tags, registry_tag_token, &token);
+        !found.ok()) {
+        return found;
+    }
+    if (const status found = find_required(tags, registry_tag_key, &key);
+        !found.ok()) {
+        return found;
+    }
+    if (const status s = read_string(*token, out.token); !s.ok()) {
+        return s;
+    }
+    if (const status s = read_string(*key, out.key); !s.ok()) {
+        return s;
+    }
+    return read_token_window(tags, out.token_issued_at, out.has_token_issued_at,
+                             out.token_nonce);
+}
+
+status decode_kv_put_request(span<const std::byte> body,
+                             kv_put_request& out) {
+    static const u8 kRequired[] = {registry_tag_token, registry_tag_key,
+                                   registry_tag_value};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(body, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    const registry_tag* token = nullptr;
+    const registry_tag* key = nullptr;
+    const registry_tag* value = nullptr;
+    if (const status found = find_required(tags, registry_tag_token, &token);
+        !found.ok()) {
+        return found;
+    }
+    if (const status found = find_required(tags, registry_tag_key, &key);
+        !found.ok()) {
+        return found;
+    }
+    if (const status found = find_required(tags, registry_tag_value, &value);
+        !found.ok()) {
+        return found;
+    }
+    if (const status s = read_string(*token, out.token); !s.ok()) {
+        return s;
+    }
+    if (const status s = read_string(*key, out.key); !s.ok()) {
+        return s;
+    }
+    out.value.assign(value->value.begin(), value->value.end());
+    for (const registry_tag& tag : tags) {
+        if (tag.id == registry_tag_cas) {
+            if (const status s = read_u64(tag, out.cas); !s.ok()) {
+                return s;
+            }
+            out.has_cas = true;
+        }
+    }
+    return read_token_window(tags, out.token_issued_at, out.has_token_issued_at,
+                             out.token_nonce);
+}
+
+status decode_kv_delete_request(span<const std::byte> body,
+                                kv_delete_request& out) {
+    static const u8 kRequired[] = {registry_tag_token, registry_tag_key};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(body, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    const registry_tag* token = nullptr;
+    const registry_tag* key = nullptr;
+    if (const status found = find_required(tags, registry_tag_token, &token);
+        !found.ok()) {
+        return found;
+    }
+    if (const status found = find_required(tags, registry_tag_key, &key);
+        !found.ok()) {
+        return found;
+    }
+    if (const status s = read_string(*token, out.token); !s.ok()) {
+        return s;
+    }
+    if (const status s = read_string(*key, out.key); !s.ok()) {
+        return s;
+    }
+    return read_token_window(tags, out.token_issued_at, out.has_token_issued_at,
+                             out.token_nonce);
+}
+
 // The authority epoch travels in tag 19, never in tag 9 (`writer_epoch`) or tag 7
 // (`incarnation`). Those two ids already mean something else in the request
 // direction, and reusing them on the response side made one numeric id carry
@@ -856,6 +973,38 @@ status encode_anchor_response(const registry_anchor& value, buffer& out) {
                scalar_tag_value_u64(value.authority_epoch));
     append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
 
+    out.clear();
+    return finish_frame(tags, out);
+}
+
+status encode_kv_get_response(const kv_get_response& value, buffer& out) {
+    std::vector<std::byte> tags;
+    append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
+    append_tag(tags, registry_tag_found,
+               scalar_tag_value_u64(value.found ? 1 : 0));
+    append_tag(tags, registry_tag_create_index,
+               scalar_tag_value_u64(value.create_index));
+    append_tag(tags, registry_tag_modify_index,
+               scalar_tag_value_u64(value.modify_index));
+    append_tag(tags, registry_tag_value, value.value);
+    out.clear();
+    return finish_frame(tags, out);
+}
+
+status encode_kv_put_response(const kv_put_response& value, buffer& out) {
+    std::vector<std::byte> tags;
+    append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
+    append_tag(tags, registry_tag_modify_index,
+               scalar_tag_value_u64(value.modify_index));
+    out.clear();
+    return finish_frame(tags, out);
+}
+
+status encode_kv_delete_response(const kv_delete_response& value, buffer& out) {
+    std::vector<std::byte> tags;
+    append_tag(tags, registry_tag_index, scalar_tag_value_u64(value.index));
+    append_tag(tags, registry_tag_found,
+               scalar_tag_value_u64(value.deleted ? 1 : 0));
     out.clear();
     return finish_frame(tags, out);
 }
@@ -1089,6 +1238,135 @@ status decode_query_response(span<const std::byte> in, registry_query_response& 
                 decoded_row.revision = fence;
                 out.rows.push_back(std::move(decoded_row));
             }
+        }
+    }
+    return status{};
+}
+
+status decode_kv_get_response(span<const std::byte> in, kv_get_response& out) {
+    static const u8 kRequired[] = {registry_tag_index, registry_tag_found,
+                                   registry_tag_create_index,
+                                   registry_tag_modify_index, registry_tag_value};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(in, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    for (const registry_tag& tag : tags) {
+        switch (tag.id) {
+        case registry_tag_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.index = endian::load_le64(tag.value.data());
+            break;
+        case registry_tag_found:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv found field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.found = endian::load_le64(tag.value.data()) != 0;
+            break;
+        case registry_tag_create_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv create_index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.create_index = endian::load_le64(tag.value.data());
+            break;
+        case registry_tag_modify_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv modify_index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.modify_index = endian::load_le64(tag.value.data());
+            break;
+        case registry_tag_value:
+            out.value.assign(tag.value.begin(), tag.value.end());
+            break;
+        default:
+            break;
+        }
+    }
+    return status{};
+}
+
+status decode_kv_put_response(span<const std::byte> in, kv_put_response& out) {
+    static const u8 kRequired[] = {registry_tag_index, registry_tag_modify_index};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(in, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    for (const registry_tag& tag : tags) {
+        switch (tag.id) {
+        case registry_tag_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.index = endian::load_le64(tag.value.data());
+            break;
+        case registry_tag_modify_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv modify_index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.modify_index = endian::load_le64(tag.value.data());
+            break;
+        default:
+            break;
+        }
+    }
+    return status{};
+}
+
+status decode_kv_delete_response(span<const std::byte> in, kv_delete_response& out) {
+    static const u8 kRequired[] = {registry_tag_index, registry_tag_found};
+    std::vector<registry_tag> tags;
+    const status walked = decode_registry_tags(in, tags);
+    if (!walked.ok()) {
+        return walked;
+    }
+    const status required = require_tags(tags, kRequired, std::size(kRequired));
+    if (!required.ok()) {
+        return required;
+    }
+    for (const registry_tag& tag : tags) {
+        switch (tag.id) {
+        case registry_tag_index:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv index field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.index = endian::load_le64(tag.value.data());
+            break;
+        case registry_tag_found:
+            if (tag.value.size() != sizeof(u64)) {
+                return status{registry_failure(rpc_code::decode_error,
+                                               "kv found field has the wrong width",
+                                               registry_reason_dto_truncated_field)};
+            }
+            out.deleted = endian::load_le64(tag.value.data()) != 0;
+            break;
+        default:
+            break;
         }
     }
     return status{};

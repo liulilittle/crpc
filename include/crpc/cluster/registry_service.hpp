@@ -40,13 +40,16 @@
 #include <crpc/span.hpp>
 
 #include <crpc/cluster/fence_authority.hpp>
-#include <crpc/cluster/registry.hpp>
+#include <crpc/cluster/kv_store.hpp>
 #include <crpc/cluster/registry_acl.hpp>
 #include <crpc/cluster/registry_log.hpp>
+#include <crpc/cluster/registry.hpp>
 #include <crpc/cluster/registry_wire.hpp>
 
 namespace crpc {
 namespace cluster {
+
+class raft_node;
 
 // The result of an ACL check. A rule is returned by value (a copy) so the
 // caller cannot hold a reference into the table while another thread mutates
@@ -82,6 +85,12 @@ struct registry_service_config {
     // The fence authority. Step2 uses the local registry allocator; step3
     // replaces it with a leader-committed one and the service does not change.
     fence_authority authority{};
+    // The KV store. May be null; when null every KV method returns
+    // `failed_precondition` (single-authority mode has no KV data plane).
+    kv_store* kv = nullptr;
+    // The Raft node used to commit KV writes. May be null: a null raft means
+    // KV writes apply directly (single-authority mode).
+    raft_node* raft = nullptr;
 };
 
 // A persisted write result for the idempotency layer (VERDICT section 5.3).
@@ -195,6 +204,33 @@ private:
     static status on_ping(void* self, const call_envelope& envelope,
                           span<const std::byte> body, buffer& response,
                           rpc::call_context& ctx);
+    // The four KV handlers (step4 PR-7).
+    static status on_kv_get(void* self, const call_envelope& envelope,
+                            span<const std::byte> body, buffer& response,
+                            rpc::call_context& ctx);
+    static status on_kv_put(void* self, const call_envelope& envelope,
+                            span<const std::byte> body, buffer& response,
+                            rpc::call_context& ctx);
+    static status on_kv_cas(void* self, const call_envelope& envelope,
+                            span<const std::byte> body, buffer& response,
+                            rpc::call_context& ctx);
+    static status on_kv_delete(void* self, const call_envelope& envelope,
+                               span<const std::byte> body, buffer& response,
+                               rpc::call_context& ctx);
+    // The implementation bodies of the KV handlers, wrapped so a throw is
+    // diagnosable instead of silently becoming `internal`.
+    [[nodiscard]] status on_kv_get_impl(registry_service& owner,
+                                        span<const std::byte> body,
+                                        buffer& response);
+    [[nodiscard]] status on_kv_put_impl(registry_service& owner,
+                                        span<const std::byte> body,
+                                        buffer& response);
+    [[nodiscard]] status on_kv_cas_impl(registry_service& owner,
+                                        span<const std::byte> body,
+                                        buffer& response);
+    [[nodiscard]] status on_kv_delete_impl(registry_service& owner,
+                                           span<const std::byte> body,
+                                           buffer& response);
 
     struct impl;
     std::unique_ptr<impl> impl_;

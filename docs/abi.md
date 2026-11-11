@@ -525,6 +525,12 @@ is guarded.
 - `::crpc::cluster::registry_set_state_request`
 - `::crpc::cluster::registry_tag`
 - `::crpc::cluster::registry_write_response`
+- `::crpc::cluster::kv_get_request`
+- `::crpc::cluster::kv_get_response`
+- `::crpc::cluster::kv_put_request`
+- `::crpc::cluster::kv_put_response`
+- `::crpc::cluster::kv_delete_request`
+- `::crpc::cluster::kv_delete_response`
 - `::crpc::cluster::anchor_store`
 - `::crpc::cluster::service_instance`
 - `::crpc::cluster::raft_persistent_state`

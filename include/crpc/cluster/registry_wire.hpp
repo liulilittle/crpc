@@ -80,6 +80,10 @@ inline constexpr u64 registry_method_set_state  = 3;
 inline constexpr u64 registry_method_query      = 4;
 inline constexpr u64 registry_method_next_fence = 5;
 inline constexpr u64 registry_method_ping       = 6;
+inline constexpr u64 registry_method_kv_get     = 7;
+inline constexpr u64 registry_method_kv_put     = 8;
+inline constexpr u64 registry_method_kv_cas     = 9;
+inline constexpr u64 registry_method_kv_delete  = 10;
 
 // --- Tag ids -----------------------------------------------------------------
 //
@@ -104,11 +108,19 @@ inline constexpr u8 registry_tag_client_request_id = 15;
 inline constexpr u8 registry_tag_token_issued_at = 16;
 inline constexpr u8 registry_tag_token_nonce     = 17;
 
+// KV tags (VERDICT section 7.4): request tags 20-22, response tags 23-25.
+inline constexpr u8 registry_tag_key             = 20;
+inline constexpr u8 registry_tag_value           = 21;
+inline constexpr u8 registry_tag_cas             = 22;
+inline constexpr u8 registry_tag_found           = 23;
+inline constexpr u8 registry_tag_create_index    = 24;
+inline constexpr u8 registry_tag_modify_index    = 25;
+
 // The largest id in the tag table. NOT the decode test: the decoder uses an
 // explicit whitelist (`is_known_tag` in registry_wire.cpp) because the id space
 // has gaps -- tag 2 is retired. This constant survives for tests that need an
 // out-of-range id.
-inline constexpr u8 registry_tag_max_known    = 19;
+inline constexpr u8 registry_tag_max_known    = 25;
 
 // --- Direction-specific tags 18 / 19 -----------------------------------------
 //
@@ -239,6 +251,57 @@ struct registry_ping_request {
     bool has_token_issued_at = false;
 };
 
+// --- KV request / response DTOs (VERDICT section 7.4) ------------------------
+//
+// All values travel base64 on the wire; the DTO holds raw bytes and the codec
+// transcodes. Every field is required except the explicitly-optional ones,
+// which follow the same `has_*` flag pattern as the registry DTOs.
+
+struct kv_get_request {
+    std::string token;
+    std::string key;
+    std::chrono::milliseconds token_issued_at{0};
+    std::string token_nonce;
+    bool has_token_issued_at = false;
+};
+
+struct kv_get_response {
+    u64 index = 0;
+    std::vector<std::byte> value;
+    u64 create_index = 0;
+    u64 modify_index = 0;
+    bool found = false;
+};
+
+struct kv_put_request {
+    std::string token;
+    std::string key;
+    std::vector<std::byte> value;
+    u64 cas = 0;
+    bool has_cas = false;
+    std::chrono::milliseconds token_issued_at{0};
+    std::string token_nonce;
+    bool has_token_issued_at = false;
+};
+
+struct kv_put_response {
+    u64 index = 0;
+    u64 modify_index = 0;
+};
+
+struct kv_delete_request {
+    std::string token;
+    std::string key;
+    std::chrono::milliseconds token_issued_at{0};
+    std::string token_nonce;
+    bool has_token_issued_at = false;
+};
+
+struct kv_delete_response {
+    u64 index = 0;
+    bool deleted = false;
+};
+
 struct registry_anchor {
     u64 authority_epoch = 0;
     u64 index = 0;
@@ -319,6 +382,30 @@ struct registry_tag {
 [[nodiscard]] CRPC_API status decode_ping_request(
     span<const std::byte> body, registry_ping_request& out);
 
+// --- KV per-method request decoders (VERDICT section 7.4) ---------------------
+
+[[nodiscard]] CRPC_API status decode_kv_get_request(
+    span<const std::byte> body, kv_get_request& out);
+[[nodiscard]] CRPC_API status decode_kv_put_request(
+    span<const std::byte> body, kv_put_request& out);
+[[nodiscard]] CRPC_API status decode_kv_delete_request(
+    span<const std::byte> body, kv_delete_request& out);
+
+// --- KV response encoders / decoders ------------------------------------------
+
+[[nodiscard]] CRPC_API status encode_kv_get_response(
+    const kv_get_response& value, buffer& out);
+[[nodiscard]] CRPC_API status decode_kv_get_response(
+    span<const std::byte> in, kv_get_response& out);
+[[nodiscard]] CRPC_API status encode_kv_put_response(
+    const kv_put_response& value, buffer& out);
+[[nodiscard]] CRPC_API status decode_kv_put_response(
+    span<const std::byte> in, kv_put_response& out);
+[[nodiscard]] CRPC_API status encode_kv_delete_response(
+    const kv_delete_response& value, buffer& out);
+[[nodiscard]] CRPC_API status decode_kv_delete_response(
+    span<const std::byte> in, kv_delete_response& out);
+
 // --- Encoders ----------------------------------------------------------------
 
 [[nodiscard]] CRPC_API status encode_write_response(
@@ -385,6 +472,8 @@ inline constexpr const char* registry_reason_dto_duplicate_tag =
     "dto_duplicate_tag";
 inline constexpr const char* registry_reason_dto_unsupported_version =
     "dto_unsupported_version";
+inline constexpr const char* registry_reason_cas_conflict = "cas_conflict";
+
 
 } // namespace cluster
 } // namespace crpc

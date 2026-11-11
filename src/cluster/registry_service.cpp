@@ -19,6 +19,8 @@
 
 #include <crpc/cluster/registry_service.hpp>
 
+#include <crpc/cluster/raft_node.hpp>
+
 #include <crpc/endian.hpp>
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
@@ -527,7 +529,10 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
     const bool is_write = method == registry_method_register ||
                           method == registry_method_deregister ||
                           method == registry_method_set_state ||
-                          method == registry_method_next_fence;
+                          method == registry_method_next_fence ||
+                          method == registry_method_kv_put ||
+                          method == registry_method_kv_cas ||
+                          method == registry_method_kv_delete;
     if (is_write) {
         bool prefix_ok = false;
         for (const std::string& prefix : matched->write_prefixes) {
@@ -674,6 +679,14 @@ status registry_service::prepare(server::builder& builder) {
                            &registry_service::on_next_fence, this);
     builder.add_raw_method(registry_service_id, registry_method_ping, "ping",
                            &registry_service::on_ping, this);
+    builder.add_raw_method(registry_service_id, registry_method_kv_get, "kv_get",
+                           &registry_service::on_kv_get, this);
+    builder.add_raw_method(registry_service_id, registry_method_kv_put, "kv_put",
+                           &registry_service::on_kv_put, this);
+    builder.add_raw_method(registry_service_id, registry_method_kv_cas, "kv_cas",
+                           &registry_service::on_kv_cas, this);
+    builder.add_raw_method(registry_service_id, registry_method_kv_delete,
+                           "kv_delete", &registry_service::on_kv_delete, this);
     if (impl_->config.listen.valid()) {        if (impl_->config.backend == nullptr) {
             return status{registry_failure(rpc_code::failed_precondition,
                                            "registry service has a listener but no backend",
@@ -1405,6 +1418,249 @@ status registry_service::on_ping(void* self, const call_envelope& /*envelope*/,
         anchor.index = owner->impl_->catalog.index();
     }
     return encode_anchor_response(anchor, response);
+}
+
+// --- KV handlers (step4 PR-7) -----------------------------------------------
+
+status registry_service::on_kv_get(void* self, const call_envelope& /*envelope*/,
+                                   span<const std::byte> body, buffer& response,
+                                   rpc::call_context&) {
+    auto* owner = static_cast<registry_service*>(self);
+    kv_get_request request;
+    const status decoded = decode_kv_get_request(body, request);
+    if (!decoded.ok()) {
+        return decoded;
+    }
+    const acl_decision acl = owner->check_acl(
+        request.token, registry_method_kv_get, request.key, "",
+        std::chrono::system_clock::now(), request.token_issued_at,
+        request.has_token_issued_at);
+    if (!acl.allowed) {
+        return status{registry_failure(rpc_code::permission_denied,
+                                       "registry: acl_denied",
+                                       registry_reason_acl_denied)};
+    }
+    if (owner->impl_->config.kv == nullptr) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: kv store not configured",
+                                       "kv_unavailable")};
+    }
+    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    const result<kv_entry> entry = owner->impl_->config.kv->get(request.key);
+    if (!entry.ok()) {
+        if (entry.code() == rpc_code::not_found) {
+            kv_get_response out;
+            out.index = owner->impl_->catalog.index();
+            out.found = false;
+            return encode_kv_get_response(out, response);
+        }
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: kv invalid key",
+                                       registry_reason_acl_denied)};
+    }
+    kv_get_response out;
+    out.index = owner->impl_->catalog.index();
+    out.found = true;
+    out.value = entry.value().value;
+    out.create_index = entry.value().create_index;
+    out.modify_index = entry.value().modify_index;
+    return encode_kv_get_response(out, response);
+}
+
+status registry_service::on_kv_put(void* self, const call_envelope& /*envelope*/,
+                                   span<const std::byte> body, buffer& response,
+                                   rpc::call_context&) {
+    auto* owner = static_cast<registry_service*>(self);
+    kv_put_request request;
+    const status decoded = decode_kv_put_request(body, request);
+    if (!decoded.ok()) {
+        return decoded;
+    }
+    const acl_decision acl = owner->check_acl(
+        request.token, registry_method_kv_put, request.key, "",
+        std::chrono::system_clock::now(), request.token_issued_at,
+        request.has_token_issued_at);
+    if (!acl.allowed) {
+        return status{registry_failure(rpc_code::permission_denied,
+                                       "registry: acl_denied",
+                                       registry_reason_acl_denied)};
+    }
+    if (owner->impl_->config.kv == nullptr) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: kv store not configured",
+                                       "kv_unavailable")};
+    }
+    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    // Resolve the write index: through Raft when a node is configured, else the
+    // next catalog index (single-authority mode).
+    u64 index = owner->impl_->catalog.index() + 1;
+    if (owner->impl_->config.raft != nullptr) {
+        const result<u64> proposed =
+            owner->impl_->config.raft->propose(span<const std::byte>{});
+        if (!proposed.ok()) {
+            return status{proposed.error()};
+        }
+        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
+            proposed.value(),
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        if (!committed.ok()) {
+            return status{committed.error()};
+        }
+        index = committed.value();
+    }
+    const kv_write_result written =
+        owner->impl_->config.kv->put(request.key, std::move(request.value),
+                                     index);
+    switch (written.kind) {
+    case kv_result_kind::cas_conflict:
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: cas_conflict",
+                                       registry_reason_cas_conflict)};
+    case kv_result_kind::not_found:
+        return status{registry_failure(rpc_code::not_found,
+                                       "registry: kv key not found",
+                                       registry_reason_acl_denied)};
+    case kv_result_kind::invalid_key:
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: kv invalid key",
+                                       registry_reason_acl_denied)};
+    default:
+        break;
+    }
+    kv_put_response out;
+    out.index = written.index;
+    out.modify_index = written.modify_index;
+    return encode_kv_put_response(out, response);
+}
+
+status registry_service::on_kv_cas(void* self, const call_envelope& /*envelope*/,
+                                   span<const std::byte> body, buffer& response,
+                                   rpc::call_context&) {
+    auto* owner = static_cast<registry_service*>(self);
+    kv_put_request request;
+    const status decoded = decode_kv_put_request(body, request);
+    if (!decoded.ok()) {
+        return decoded;
+    }
+    const acl_decision acl = owner->check_acl(
+        request.token, registry_method_kv_cas, request.key, "",
+        std::chrono::system_clock::now(), request.token_issued_at,
+        request.has_token_issued_at);
+    if (!acl.allowed) {
+        return status{registry_failure(rpc_code::permission_denied,
+                                       "registry: acl_denied",
+                                       registry_reason_acl_denied)};
+    }
+    if (owner->impl_->config.kv == nullptr) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: kv store not configured",
+                                       "kv_unavailable")};
+    }
+    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    // Resolve the write index: through Raft when a node is configured, else the
+    // next catalog index (single-authority mode).
+    u64 index = owner->impl_->catalog.index() + 1;
+    if (owner->impl_->config.raft != nullptr) {
+        const result<u64> proposed =
+            owner->impl_->config.raft->propose(span<const std::byte>{});
+        if (!proposed.ok()) {
+            return status{proposed.error()};
+        }
+        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
+            proposed.value(),
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        if (!committed.ok()) {
+            return status{committed.error()};
+        }
+        index = committed.value();
+    }
+    const kv_write_result written = owner->impl_->config.kv->cas(
+        request.key, std::move(request.value), request.cas, index);
+    switch (written.kind) {
+    case kv_result_kind::cas_conflict:
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: cas_conflict",
+                                       registry_reason_cas_conflict)};
+    case kv_result_kind::not_found:
+        return status{registry_failure(rpc_code::not_found,
+                                       "registry: kv key not found",
+                                       registry_reason_acl_denied)};
+    case kv_result_kind::invalid_key:
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: kv invalid key",
+                                       registry_reason_acl_denied)};
+    default:
+        break;
+    }
+    kv_put_response out;
+    out.index = written.index;
+    out.modify_index = written.modify_index;
+    return encode_kv_put_response(out, response);
+}
+
+status registry_service::on_kv_delete(void* self, const call_envelope& /*envelope*/,
+                                      span<const std::byte> body, buffer& response,
+                                      rpc::call_context&) {
+    auto* owner = static_cast<registry_service*>(self);
+    kv_delete_request request;
+    const status decoded = decode_kv_delete_request(body, request);
+    if (!decoded.ok()) {
+        return decoded;
+    }
+    const acl_decision acl = owner->check_acl(
+        request.token, registry_method_kv_delete, request.key, "",
+        std::chrono::system_clock::now(), request.token_issued_at,
+        request.has_token_issued_at);
+    if (!acl.allowed) {
+        return status{registry_failure(rpc_code::permission_denied,
+                                       "registry: acl_denied",
+                                       registry_reason_acl_denied)};
+    }
+    if (owner->impl_->config.kv == nullptr) {
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: kv store not configured",
+                                       "kv_unavailable")};
+    }
+    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    // Resolve the write index: through Raft when a node is configured, else the
+    // next catalog index (single-authority mode).
+    u64 index = owner->impl_->catalog.index() + 1;
+    if (owner->impl_->config.raft != nullptr) {
+        const result<u64> proposed =
+            owner->impl_->config.raft->propose(span<const std::byte>{});
+        if (!proposed.ok()) {
+            return status{proposed.error()};
+        }
+        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
+            proposed.value(),
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        if (!committed.ok()) {
+            return status{committed.error()};
+        }
+        index = committed.value();
+    }
+    const kv_write_result written =
+        owner->impl_->config.kv->erase(request.key, index);
+    switch (written.kind) {
+    case kv_result_kind::cas_conflict:
+        return status{registry_failure(rpc_code::failed_precondition,
+                                       "registry: cas_conflict",
+                                       registry_reason_cas_conflict)};
+    case kv_result_kind::not_found:
+        return status{registry_failure(rpc_code::not_found,
+                                       "registry: kv key not found",
+                                       registry_reason_acl_denied)};
+    case kv_result_kind::invalid_key:
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: kv invalid key",
+                                       registry_reason_acl_denied)};
+    default:
+        break;
+    }
+    kv_delete_response out;
+    out.index = written.index;
+    out.deleted = true;
+    return encode_kv_delete_response(out, response);
 }
 
 } // namespace cluster
