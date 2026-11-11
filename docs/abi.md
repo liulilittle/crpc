@@ -529,6 +529,7 @@ is guarded.
 - `::crpc::cluster::service_instance`
 - `::crpc::cluster::raft_persistent_state`
 - `::crpc::cluster::raft_state_store`
+- `::crpc::cluster::raft_fence_authority`
 
 `::crpc::cluster::registry_query_row` is deliberately absent from the list: it is
 nested inside `::crpc::cluster::registry_query_response` and never appears by

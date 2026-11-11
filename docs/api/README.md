@@ -101,6 +101,7 @@ the authoritative declaration.
 | [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp) | `cluster::registry_log`, `cluster::file_registry_log`, `cluster::memory_registry_log` | Durable, replayable record log backing the registry's write-ahead log. |
 | [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp) | `cluster::raft_persistent_state`, `cluster::raft_state_store` | The two Raft fields that must survive a restart (term and vote), written atomically and read fail-closed. |
 | [`cluster/raft_node.hpp`](../../include/crpc/cluster/raft_node.hpp) | `cluster::raft_role`, `cluster::raft_config`, `cluster::raft_message`, `cluster::raft_node` | Single-process Raft node: PreVote, vote, log replication, and commit. Messages cross a caller-supplied transport, so tests drive the timing deterministically. |
+| [`cluster/raft_fence_authority.hpp`](../../include/crpc/cluster/raft_fence_authority.hpp) | `cluster::raft_fence_authority` | A `fence_authority` whose allocations commit through Raft: the token comes from the catalog allocator, and it is only returned after a majority has durably accepted the entry. |
 | [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp) | `cluster::acl_rule`, `cluster::acl_token_hash` | Static bearer-token authorisation table for the registry service (not authentication; see the header's trust boundary). |
 | [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp) | `cluster::fence_request`, `cluster::fence_authority_fn`, `cluster::fence_authority` | The fence-allocation seam: step2 supplies the local registry allocator, step3 a leader-committed one, with no service change. |
 | [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp) | `cluster::registry_service_id`, `cluster::registry_tag`, request/response DTOs | The versioned tag DTO wire contract for the registry service, with fail-closed decoding. |
@@ -520,6 +521,7 @@ without registering it here fails the suite.
 - [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
 - [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp)
 - [`cluster/raft_node.hpp`](../../include/crpc/cluster/raft_node.hpp)
+- [`cluster/raft_fence_authority.hpp`](../../include/crpc/cluster/raft_fence_authority.hpp)
 - [`cluster/watch.hpp`](../../include/crpc/cluster/watch.hpp)
 
 ### `crpc/flow`

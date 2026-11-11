@@ -149,10 +149,28 @@ public:
     // which several L2 cases need.
     [[nodiscard]] u64 entry_term(u64 index) const noexcept;
 
+    // Drives `tick()` until `commit_index() >= index` or `deadline` passes.
+    //
+    // `propose` returns as soon as the entry is appended and replicated; it
+    // does NOT wait for a majority, so a leader that has lost contact with its
+    // peers still gets a success from it. A caller that must not acknowledge an
+    // uncommitted write (S4) calls this afterwards.
+    //
+    // Fails with `unavailable` when the deadline passes, and immediately when
+    // this node is no longer the leader: waiting after a leadership loss would
+    // hide the loss from the caller, which is the failure S4 forbids.
+    [[nodiscard]] result<u64> wait_for_commit(
+        u64 index, monotonic_clock::time_point deadline);
+
 private:
     struct peer_state {
         u64 next_index = 0;
         u64 match_index = 0;
+        // When this peer last answered an AppendEntries. CheckQuorum reads it:
+        // a leader that has not heard from a majority within one election
+        // timeout is a leader that cannot commit, and must step down rather
+        // than keep acknowledging writes it can never make durable.
+        monotonic_clock::time_point last_ack{};
     };
 
     [[nodiscard]] status persist_locked() const;
@@ -162,6 +180,10 @@ private:
     void send_to(const std::string& peer, const raft_message& msg);
     void broadcast(const raft_message& msg);
     void advance_commit_locked();
+    // Sends each peer the entries it is missing. Used by `wait_for_commit`,
+    // which cannot rely on the heartbeat interval because the injected clock
+    // does not advance on its own.
+    void pump_replication();
     [[nodiscard]] bool log_ok_for_vote(u64 last_term, u64 last_index) const noexcept;
     [[nodiscard]] u64 quorum_size() const noexcept;
     // A node with no peers is its own quorum, so it must not wait for replies
@@ -181,6 +203,10 @@ private:
     u64 last_applied_ = 0;
     monotonic_clock::time_point last_heartbeat_{};
     monotonic_clock::time_point election_deadline_{};
+    // When this node last became leader. CheckQuorum is suppressed for one
+    // election window after this instant so a single lost heartbeat cannot
+    // depose a leader that was just elected.
+    monotonic_clock::time_point leader_since_{};
     bool voted_this_term_ = false;
     // True once this node has accepted a leader (a valid AppendEntries). A node
     // that has never seen a leader must not refuse PreVotes: its election timer

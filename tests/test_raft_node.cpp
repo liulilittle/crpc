@@ -375,10 +375,19 @@ CRPC_TEST(raft_minority_uncommitted_entries_discarded) {
     }
     net.partition(minority);
 
-    // The minority leader keeps proposing; none of these can commit.
+    // The minority leader keeps proposing; none of these can commit. With
+    // CheckQuorum (S4) the leader may also step down once it notices it cannot
+    // reach a majority, in which case `propose` refuses outright. Both outcomes
+    // are correct: what must never happen is a commit.
     for (int i = 0; i < 2; ++i) {
-        CRPC_REQUIRE(leader_node->raft->propose(
-            span<const std::byte>(reinterpret_cast<const std::byte*>("u"), 1)).ok());
+        const auto proposed = leader_node->raft->propose(
+            span<const std::byte>(reinterpret_cast<const std::byte*>("u"), 1));
+        if (!proposed.ok()) {
+            // A deposed leader refuses the write loudly, which is the S4
+            // behaviour. Stop proposing; the assertions below still hold.
+            CRPC_CHECK_EQ(rpc_code::unavailable, proposed.error().code);
+            break;
+        }
         leader_node->clock.advance(50ms);
         leader_node->raft->tick();
     }

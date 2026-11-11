@@ -174,10 +174,16 @@ void raft_node::become_follower(u64 term, std::string leader) {
 void raft_node::become_leader() {
     role_ = raft_role::leader;
     leader_id_ = config_.node_id;
+    leader_since_ = clock_.read();
     const u64 last = log_.last_index();
     for (auto& peer : peers_) {
         peer.next_index = last + 1;
         peer.match_index = 0;
+        // The epoch, not `now`: CheckQuorum must be able to tell "this peer has
+        // never answered" from "this peer answered a moment ago". Seeding to
+        // `now` would make a leader that has heard from nobody look healthy for
+        // one window, which is the opposite of what the check is for.
+        peer.last_ack = monotonic_clock::time_point{};
     }
 }
 
@@ -221,6 +227,35 @@ void raft_node::tick() {
             beat.leader_commit = commit_index_;
             broadcast(beat);
             last_heartbeat_ = now;
+
+            // CheckQuorum runs AFTER the heartbeat, not before it: the
+            // transport delivers replies synchronously, so a reachable peer
+            // has already refreshed `last_ack` by the time this runs. Checking
+            // first would count the interval that just elapsed as silence and
+            // depose a healthy leader.
+            //
+            // Two guards keep it from firing too early:
+            //   * a fresh leader is exempt for one election timeout, so a
+            //     single lost heartbeat cannot depose it, and
+            //   * a peer that has never answered is not counted as reachable
+            //     (`last_ack` is the epoch until it answers).
+            if (!can_win_alone()) {
+                const auto window =
+                    std::chrono::milliseconds(random_election_timeout());
+                if (now - leader_since_ >= window) {
+                    std::size_t reachable = 1; // the leader itself
+                    for (const auto& peer : peers_) {
+                        if (peer.last_ack != monotonic_clock::time_point{} &&
+                            now - peer.last_ack < window) {
+                            ++reachable;
+                        }
+                    }
+                    if (reachable < quorum_size()) {
+                        become_follower(term_, std::string{});
+                        return;
+                    }
+                }
+            }
         }
         return;
     }
@@ -495,6 +530,20 @@ void raft_node::handle(const raft_message& msg) {
         if (role_ != raft_role::leader) {
             return;
         }
+        // Any reply -- success or a conflict report -- proves the peer is
+        // reachable, which is what CheckQuorum measures. Recording it only on
+        // success would depose a leader whose followers are merely behind.
+        {
+            auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
+                                   [&msg](const std::string& id) {
+                                       return id == msg.from;
+                                   });
+            if (it != config_.peers.end()) {
+                const std::size_t i =
+                    static_cast<std::size_t>(it - config_.peers.begin());
+                peers_[i].last_ack = clock_.read();
+            }
+        }
         if (msg.success) {
             auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
                                    [&msg](const std::string& id) {
@@ -589,6 +638,62 @@ result<u64> raft_node::propose(span<const std::byte> payload) {
     msg.entries.push_back(std::move(record));
     broadcast(msg);
     return appended;
+}
+
+result<u64> raft_node::wait_for_commit(u64 index,
+                                       monotonic_clock::time_point deadline) {
+    // A single-node cluster commits on its own: `propose` already advanced the
+    // commit index, so the loop body never runs. That is not a special case
+    // here -- it falls out of the same condition.
+    //
+    // The clock is injected and read-only, so this loop cannot advance time
+    // itself. It therefore drives replication directly (rather than waiting for
+    // the heartbeat interval to elapse) and bounds the wait by BOTH the
+    // deadline and an iteration cap. The cap is what terminates a partitioned
+    // wait: with a frozen clock the deadline never arrives, and an unbounded
+    // loop would hang instead of failing loudly.
+    constexpr int kMaxPumps = 1000;
+    for (int pump = 0; commit_index_ < index; ++pump) {
+        // A leadership loss ends the wait immediately. Continuing would let a
+        // deposed leader report a commit that a new leader may never make,
+        // which is exactly the acknowledgement S4 forbids.
+        if (role_ != raft_role::leader) {
+            return rpc_error(rpc_code::unavailable,
+                             "raft: leadership lost while waiting for commit");
+        }
+        if (clock_.read() >= deadline || pump >= kMaxPumps) {
+            return rpc_error(rpc_code::unavailable,
+                             "raft: commit timed out");
+        }
+        // Send whatever each peer is missing. The transport delivers replies
+        // synchronously, so `commit_index_` can advance inside this call.
+        pump_replication();
+    }
+    return commit_index_;
+}
+
+void raft_node::pump_replication() {
+    const auto replayed = log_.replay(0);
+    if (!replayed.ok()) {
+        return;
+    }
+    const std::vector<log_record>& records = replayed.value();
+    for (std::size_t i = 0; i < peers_.size(); ++i) {
+        raft_message msg;
+        msg.kind = raft_message::type::append;
+        msg.term = term_;
+        msg.from = config_.node_id;
+        msg.to = config_.peers[i];
+        msg.prev_log_index = peers_[i].next_index - 1;
+        msg.prev_log_term = entry_term(msg.prev_log_index);
+        msg.leader_commit = commit_index_;
+        for (const auto& record : records) {
+            if (record.index >= peers_[i].next_index) {
+                msg.entries.push_back(record);
+            }
+        }
+        send_to(config_.peers[i], msg);
+    }
 }
 
 } // namespace cluster

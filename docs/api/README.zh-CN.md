@@ -510,6 +510,8 @@ API 地图、快速开始、异步模型、错误处理与已知限制见
 - [`cluster/registry.hpp`](../../include/crpc/cluster/registry.hpp)
 - [`cluster/registry_log.hpp`](../../include/crpc/cluster/registry_log.hpp)
 - [`cluster/raft_state.hpp`](../../include/crpc/cluster/raft_state.hpp)
+- [`cluster/raft_node.hpp`](../../include/crpc/cluster/raft_node.hpp)
+- [`cluster/raft_fence_authority.hpp`](../../include/crpc/cluster/raft_fence_authority.hpp)
 - [`cluster/registry_acl.hpp`](../../include/crpc/cluster/registry_acl.hpp)
 - [`cluster/fence_authority.hpp`](../../include/crpc/cluster/fence_authority.hpp)
 - [`cluster/registry_wire.hpp`](../../include/crpc/cluster/registry_wire.hpp)
