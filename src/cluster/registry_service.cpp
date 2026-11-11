@@ -19,6 +19,7 @@
 
 #include <crpc/cluster/registry_service.hpp>
 
+#include <crpc/cluster/raft_command.hpp>
 #include <crpc/cluster/raft_node.hpp>
 
 #include <crpc/endian.hpp>
@@ -446,6 +447,17 @@ struct registry_service::impl {
     std::map<std::string, idempotency_record> idempotency;
     u64 anchor_epoch = 0;
 
+    // --- Replicated state machine (step4 PR-9) ------------------------------
+    //
+    // `last_applied` is the highest log index whose command has been applied to
+    // the local state below. It is the ONLY cursor: a command is applied exactly
+    // once, in index order, and a restart replays from zero.
+    u64 last_applied = 0;
+    // The live ACL table. It starts as a copy of `config.acl` (the static seed)
+    // and is then mutated only by `acl_upsert` / `acl_remove` commands, so every
+    // node that applies the same log ends with the same table.
+    std::vector<acl_rule> acl_rules;
+
     // The registry's catalog is the authority; the log's durable tail is read
     // during prepare() to tell whether the file grew behind our back. It is not
     // cached in a member: the only reader was the prepare-time check below.
@@ -453,6 +465,10 @@ struct registry_service::impl {
 
 registry_service::registry_service(registry_service_config config)
     : impl_(new impl(config)) {
+    // The live ACL table starts as the static seed. Every later change arrives
+    // as a committed `acl_upsert` / `acl_remove` command, so two nodes that
+    // applied the same log hold the same table.
+    impl_->acl_rules = config.acl;
 }
 
 registry_service::~registry_service() {
@@ -487,7 +503,7 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const acl_rule* matched = nullptr;
-    for (const acl_rule& rule : impl_->config.acl) {
+    for (const acl_rule& rule : impl_->acl_rules) {
         if (rule.token_hash == hash) {
             matched = &rule;
             break;
@@ -598,6 +614,192 @@ registry_anchor registry_service::anchor() const {
     }
     out.index = index;
     return out;
+}
+
+status registry_service::apply_committed() {
+    if (impl_->config.raft == nullptr) {
+        return status{};
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const u64 committed = impl_->config.raft->commit_index();
+    if (committed <= impl_->last_applied) {
+        return status{};
+    }
+    // Read the committed prefix once. `replay` returns every intact record at
+    // or after the cursor, so the loop below sees exactly the entries it has
+    // not applied, in index order.
+    const auto replayed = impl_->config.raft->log().replay(impl_->last_applied + 1);
+    if (!replayed.ok()) {
+        return replayed.error();
+    }
+    for (const log_record& record : replayed.value()) {
+        if (record.index > committed) {
+            break;
+        }
+        // Only `raft_entry` carries a state-machine command. The registry's own
+        // `registry_event` records live in a different log; a raft record of any
+        // other kind is consensus bookkeeping and has no command to apply.
+        if (record.kind != log_record_kind::raft_entry) {
+            impl_->last_applied = record.index;
+            continue;
+        }
+        raft_command command;
+        const status decoded = decode_raft_command(
+            span<const std::byte>(record.payload.data(), record.payload.size()),
+            command);
+        if (!decoded.ok()) {
+            // A committed entry that does not decode is unrecoverable: this node
+            // cannot reach the same state as the rest of the cluster, and
+            // skipping it would hide that. Fail loudly and leave the cursor
+            // where it is so the failure repeats on the next call.
+            return decoded;
+        }
+        const status applied = apply_command_locked(command, record.index);
+        if (!applied.ok()) {
+            return applied;
+        }
+        impl_->last_applied = record.index;
+    }
+    return status{};
+}
+
+status registry_service::apply_command_locked(const raft_command& command,
+                                              u64 index) {
+    switch (command.kind) {
+    case raft_command_kind::kv_put: {
+        if (impl_->config.kv == nullptr) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry: kv store not configured",
+                                           "kv_unavailable")};
+        }
+        (void)impl_->config.kv->put(command.key, command.value, index);
+        return status{};
+    }
+    case raft_command_kind::kv_cas: {
+        if (impl_->config.kv == nullptr) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry: kv store not configured",
+                                           "kv_unavailable")};
+        }
+        // The outcome is deliberately ignored. A CAS that conflicts on the
+        // leader conflicts identically on every follower, because they apply
+        // the same commands in the same order to the same state; the leader
+        // already reported the conflict to the client before proposing, so
+        // there is nothing left to decide here.
+        (void)impl_->config.kv->cas(command.key, command.value, command.cas,
+                                    index);
+        return status{};
+    }
+    case raft_command_kind::kv_delete: {
+        if (impl_->config.kv == nullptr) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry: kv store not configured",
+                                           "kv_unavailable")};
+        }
+        (void)impl_->config.kv->erase(command.key, index);
+        return status{};
+    }
+    case raft_command_kind::acl_upsert: {
+        for (acl_rule& rule : impl_->acl_rules) {
+            if (rule.token_hash == command.rule.token_hash) {
+                rule = command.rule;
+                return status{};
+            }
+        }
+        impl_->acl_rules.push_back(command.rule);
+        return status{};
+    }
+    case raft_command_kind::acl_remove: {
+        for (auto it = impl_->acl_rules.begin(); it != impl_->acl_rules.end();
+             ++it) {
+            if (it->token_hash == command.rule.token_hash) {
+                impl_->acl_rules.erase(it);
+                return status{};
+            }
+        }
+        // Removing a rule that is not present is a no-op, not an error: the
+        // command is idempotent, and a replay after a restart must not fail on
+        // a removal it already applied.
+        return status{};
+    }
+    }
+    return status{registry_failure(rpc_code::internal,
+                                   "registry: unknown raft command kind",
+                                   "command_kind")};
+}
+
+status registry_service::set_acl_rule(const acl_rule& rule) {
+    if (rule.token_hash == 0) {
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: acl token hash must not be zero",
+                                       "acl_invalid")};
+    }
+    raft_command command;
+    command.kind = raft_command_kind::acl_upsert;
+    command.rule = rule;
+    return replicate_command(command);
+}
+
+status registry_service::remove_acl_rule(u64 token_hash) {
+    if (token_hash == 0) {
+        return status{registry_failure(rpc_code::invalid_argument,
+                                       "registry: acl token hash must not be zero",
+                                       "acl_invalid")};
+    }
+    raft_command command;
+    command.kind = raft_command_kind::acl_remove;
+    command.rule.token_hash = token_hash;
+    return replicate_command(command);
+}
+
+std::vector<acl_rule> registry_service::acl_rules() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->acl_rules;
+}
+
+status registry_service::replicate_command(const raft_command& command) {
+    std::vector<std::byte> payload;
+    const status encoded = encode_raft_command(command, payload);
+    if (!encoded.ok()) {
+        return encoded;
+    }
+    if (impl_->config.raft == nullptr) {
+        // Single-authority mode: apply directly. There is no other node to
+        // disagree with, so the local state machine is the whole cluster.
+        //
+        // The index still has to be monotonic across EVERY mutation this
+        // service has made: the catalog, the KV high-water mark and the apply
+        // cursor are one counter. Reusing `last_applied + 1` alone would hand
+        // two consecutive KV writes the same index and leave `cas=N` matching
+        // after the first.
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        u64 index = std::max({impl_->last_applied, impl_->catalog.index(),
+                              impl_->config.kv != nullptr
+                                  ? impl_->config.kv->highest_index()
+                                  : u64{0}}) +
+                    1;
+        const status applied = apply_command_locked(command, index);
+        if (!applied.ok()) {
+            return applied;
+        }
+        impl_->last_applied = index;
+        return status{};
+    }
+    const result<u64> proposed = impl_->config.raft->propose(
+        span<const std::byte>(payload.data(), payload.size()));
+    if (!proposed.ok()) {
+        return status{proposed.error()};
+    }
+    const result<u64> committed = impl_->config.raft->wait_for_commit(
+        proposed.value(),
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    if (!committed.ok()) {
+        return status{committed.error()};
+    }
+    // Apply everything through the committed index, including this command.
+    // The leader's own entry is in the same log, so the loop applies it exactly
+    // once, in order, like any other.
+    return apply_committed();
 }
 
 status registry_service::prepare(server::builder& builder) {
@@ -1550,54 +1752,38 @@ status registry_service::on_kv_put(void* self, const call_envelope& /*envelope*/
                                        "registry: kv store not configured",
                                        "kv_unavailable")};
     }
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
-    // Resolve the write index: through Raft when a node is configured, else the
-    // next free index (single-authority mode).
+    // PR-9: the put is now a replicated command, not a local write followed by
+    // an empty proposal. An empty payload left every follower with no command to
+    // apply, so a multi-node cluster diverged on the first KV write.
     //
-    // The index must be monotonic across BOTH the catalog and the KV table.
-    // `catalog.index() + 1` alone is NOT enough: a KV write does not advance
-    // the catalog, so two consecutive puts would both receive the same index
-    // and a `cas=N` taken after the first would still match after the second.
-    // The high-water mark of the store is part of the same counter.
-    u64 index = std::max(owner->impl_->catalog.index(),
-                         owner->impl_->config.kv->highest_index()) +
-                1;
-    if (owner->impl_->config.raft != nullptr) {
-        const result<u64> proposed =
-            owner->impl_->config.raft->propose(span<const std::byte>{});
-        if (!proposed.ok()) {
-            return status{proposed.error()};
+    // Key validity is checked here, before anything is proposed: an invalid key
+    // must be refused without consuming a log slot, and the replicated apply
+    // path assumes its input is already valid.
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        if (!kv_store::valid_key(request.key)) {
+            return status{registry_failure(rpc_code::invalid_argument,
+                                           "registry: kv invalid key",
+                                           registry_reason_acl_denied)};
         }
-        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
-            proposed.value(),
-            std::chrono::steady_clock::now() + std::chrono::seconds(5));
-        if (!committed.ok()) {
-            return status{committed.error()};
-        }
-        index = committed.value();
     }
-    const kv_write_result written =
-        owner->impl_->config.kv->put(request.key, std::move(request.value),
-                                     index);
-    switch (written.kind) {
-    case kv_result_kind::cas_conflict:
-        return status{registry_failure(rpc_code::failed_precondition,
-                                       "registry: cas_conflict",
-                                       registry_reason_cas_conflict)};
-    case kv_result_kind::not_found:
-        return status{registry_failure(rpc_code::not_found,
-                                       "registry: kv key not found",
-                                       registry_reason_acl_denied)};
-    case kv_result_kind::invalid_key:
-        return status{registry_failure(rpc_code::invalid_argument,
-                                       "registry: kv invalid key",
-                                       registry_reason_acl_denied)};
-    default:
-        break;
+    raft_command command;
+    command.kind = raft_command_kind::kv_put;
+    command.key = request.key;
+    command.value = std::move(request.value);
+    const status replicated = owner->replicate_command(command);
+    if (!replicated.ok()) {
+        return replicated;
     }
+    // The apply loop already wrote the value and advanced the store's index.
+    // Report that index rather than recomputing it, so the response matches what
+    // every node now holds.
     kv_put_response out;
-    out.index = written.index;
-    out.modify_index = written.modify_index;
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        out.index = owner->impl_->config.kv->highest_index();
+        out.modify_index = out.index;
+    }
     return encode_kv_put_response(out, response);
 }
 
@@ -1624,48 +1810,45 @@ status registry_service::on_kv_cas(void* self, const call_envelope& /*envelope*/
                                        "registry: kv store not configured",
                                        "kv_unavailable")};
     }
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
-    // Resolve the write index: through Raft when a node is configured, else the
-    // next free index (single-authority mode). Same monotonicity rule as
-    // `on_kv_put`: the KV high-water mark is part of the shared counter.
-    u64 index = std::max(owner->impl_->catalog.index(),
-                         owner->impl_->config.kv->highest_index()) +
-                1;
-    if (owner->impl_->config.raft != nullptr) {
-        const result<u64> proposed =
-            owner->impl_->config.raft->propose(span<const std::byte>{});
-        if (!proposed.ok()) {
-            return status{proposed.error()};
+    // The CAS precondition is evaluated on the LEADER before proposing. A
+    // conflicting CAS must not consume a log slot: every node would then apply a
+    // command that changes nothing, and the log would fill with no-ops under
+    // contention. Evaluating it once, here, also means the decision and the
+    // write are made against the same state, which a follower cannot do.
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        if (!kv_store::valid_key(request.key)) {
+            return status{registry_failure(rpc_code::invalid_argument,
+                                           "registry: kv invalid key",
+                                           registry_reason_acl_denied)};
         }
-        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
-            proposed.value(),
-            std::chrono::steady_clock::now() + std::chrono::seconds(5));
-        if (!committed.ok()) {
-            return status{committed.error()};
+        const result<kv_entry> current =
+            owner->impl_->config.kv->get(request.key);
+        const u64 current_modify_index = current.ok() ? current.value().modify_index : 0;
+        const bool exists = current.ok();
+        const bool matches = request.cas == 0 ? !exists
+                                              : (exists && current_modify_index == request.cas);
+        if (!matches) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry: cas_conflict",
+                                           registry_reason_cas_conflict)};
         }
-        index = committed.value();
     }
-    const kv_write_result written = owner->impl_->config.kv->cas(
-        request.key, std::move(request.value), request.cas, index);
-    switch (written.kind) {
-    case kv_result_kind::cas_conflict:
-        return status{registry_failure(rpc_code::failed_precondition,
-                                       "registry: cas_conflict",
-                                       registry_reason_cas_conflict)};
-    case kv_result_kind::not_found:
-        return status{registry_failure(rpc_code::not_found,
-                                       "registry: kv key not found",
-                                       registry_reason_acl_denied)};
-    case kv_result_kind::invalid_key:
-        return status{registry_failure(rpc_code::invalid_argument,
-                                       "registry: kv invalid key",
-                                       registry_reason_acl_denied)};
-    default:
-        break;
+    raft_command command;
+    command.kind = raft_command_kind::kv_cas;
+    command.key = request.key;
+    command.value = std::move(request.value);
+    command.cas = request.cas;
+    const status replicated = owner->replicate_command(command);
+    if (!replicated.ok()) {
+        return replicated;
     }
     kv_put_response out;
-    out.index = written.index;
-    out.modify_index = written.modify_index;
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        out.index = owner->impl_->config.kv->highest_index();
+        out.modify_index = out.index;
+    }
     return encode_kv_put_response(out, response);
 }
 
@@ -1692,47 +1875,35 @@ status registry_service::on_kv_delete(void* self, const call_envelope& /*envelop
                                        "registry: kv store not configured",
                                        "kv_unavailable")};
     }
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
-    // Resolve the write index: through Raft when a node is configured, else the
-    // next free index (single-authority mode). Same monotonicity rule as
-    // `on_kv_put`: the KV high-water mark is part of the shared counter.
-    u64 index = std::max(owner->impl_->catalog.index(),
-                         owner->impl_->config.kv->highest_index()) +
-                1;
-    if (owner->impl_->config.raft != nullptr) {
-        const result<u64> proposed =
-            owner->impl_->config.raft->propose(span<const std::byte>{});
-        if (!proposed.ok()) {
-            return status{proposed.error()};
+    // The not-found precondition is evaluated on the leader before proposing,
+    // for the same reason as `on_kv_cas`: a delete of an absent key must not
+    // consume a log slot, and the decision must be made against the state the
+    // write will actually land on.
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        if (!kv_store::valid_key(request.key)) {
+            return status{registry_failure(rpc_code::invalid_argument,
+                                           "registry: kv invalid key",
+                                           registry_reason_acl_denied)};
         }
-        const result<u64> committed = owner->impl_->config.raft->wait_for_commit(
-            proposed.value(),
-            std::chrono::steady_clock::now() + std::chrono::seconds(5));
-        if (!committed.ok()) {
-            return status{committed.error()};
+        if (!owner->impl_->config.kv->get(request.key).ok()) {
+            return status{registry_failure(rpc_code::not_found,
+                                           "registry: kv key not found",
+                                           registry_reason_acl_denied)};
         }
-        index = committed.value();
     }
-    const kv_write_result written =
-        owner->impl_->config.kv->erase(request.key, index);
-    switch (written.kind) {
-    case kv_result_kind::cas_conflict:
-        return status{registry_failure(rpc_code::failed_precondition,
-                                       "registry: cas_conflict",
-                                       registry_reason_cas_conflict)};
-    case kv_result_kind::not_found:
-        return status{registry_failure(rpc_code::not_found,
-                                       "registry: kv key not found",
-                                       registry_reason_acl_denied)};
-    case kv_result_kind::invalid_key:
-        return status{registry_failure(rpc_code::invalid_argument,
-                                       "registry: kv invalid key",
-                                       registry_reason_acl_denied)};
-    default:
-        break;
+    raft_command command;
+    command.kind = raft_command_kind::kv_delete;
+    command.key = request.key;
+    const status replicated = owner->replicate_command(command);
+    if (!replicated.ok()) {
+        return replicated;
     }
     kv_delete_response out;
-    out.index = written.index;
+    {
+        std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+        out.index = owner->impl_->config.kv->highest_index();
+    }
     out.deleted = true;
     return encode_kv_delete_response(out, response);
 }

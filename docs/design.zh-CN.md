@@ -1536,7 +1536,9 @@ half_open --(any probe failure)--> open (reset duration, exponential backoff)
 
 写入权威只有一个节点。非权威写入返回 `unavailable` 并带 `metadata["leader"]`；R6 没有 `not_leader` 码，此点列入 §22。读使用不可变快照，通过 `shared_ptr<const catalog_snapshot>` 的 `atomic_load`/`atomic_store` 发布；权威不可用时读停留在最后快照（fail-static），写失败（fail-closed）。
 
-KV 值在 HTTP 与 wire 上都是 base64。`cas=N` 仅在 `modify_index == N` 时成功；`cas=0` 表示仅创建；冲突为 409。ACL 使用静态 token 表加读写前缀策略；`require_token=true` 时缺 token 为 401，权限不足为 403。二进制通道执行同样的检查。
+KV 值在 HTTP 与 wire 上都是 base64。`cas=N` 仅在 `modify_index == N` 时成功；`cas=0` 表示仅创建；冲突为 409。ACL 使用 token 表加读写前缀策略；`require_token=true` 时缺 token 为 401，权限不足为 403。二进制通道执行同样的检查。
+
+KV 写入与 ACL 变更都是**复制状态机命令**，不是本地变更：leader 编码 `raft_command`（`kv_put` / `kv_cas` / `kv_delete` / `acl_upsert` / `acl_remove`），提交后每个节点通过 `apply_committed()` 按索引顺序应用已提交条目。应用游标是唯一的 `last_applied` 索引，因此重启后的重放对每条命令恰好应用一次。无法解码的已提交条目是硬失败，绝不跳过索引——跳过一次命令会让该节点永久与其余节点不同且无法察觉。CAS 与删除的前置条件在 leader 提议前求值，因此冲突不消耗日志槽位。
 
 watch 使用长轮询：`index == current` 时 handler 协程挂起到变更或等待超时。超时返回 200 与当前值、index 不变，不是 504。HTTP/1.1 每连接最多一个 watch；全局 watch 上限 10k。
 
@@ -1792,4 +1794,4 @@ gossip/Raft 强一致、动态策略下发、io_uring/shm/RDMA、ARM64/大端/An
 | O17 | HTTP/1.1 pipelining 串行 | 流水线客户端无法超过一个在途请求 | 已文档化；HTTP/2 是多路复用路径。 |
 | O18 | Range 与压缩互斥 | 压缩下载忽略 `Range` | 已文档化；压缩开启时 `allow_range` 为 false。 |
 | O19 | 不做 WebSocket | 浏览器双向推送不可用 | SSE 加 CRPC 推送覆盖单向；v1.1 也不增加 WebSocket。 |
-| O20 | 注册中心 ACL 为静态 token | 无动态策略与角色 | v1 范围；动态策略为 v1.1（R5）。 |
+| O20 | 注册中心 ACL 为静态 token 表 | 无角色/策略语言 | 表本身已由 Raft 复制并动态变更（`set_acl_rule` / `remove_acl_rule`）；角色与策略语言仍为 v1.1（R5）。 |

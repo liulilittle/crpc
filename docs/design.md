@@ -1534,7 +1534,9 @@ Data model: `service_instance{node, endpoint, service, instance_id, tags, versio
 
 Write authority is a single node. A non-authority write returns `unavailable` with `metadata["leader"]`; R6 has no `not_leader` code, which is recorded in §22. Reads use an immutable snapshot published with `atomic_load`/`atomic_store` of `shared_ptr<const catalog_snapshot>`; an unavailable authority leaves reads on the last snapshot (fail-static) and writes failing (fail-closed).
 
-KV values are base64 on both HTTP and wire. `cas=N` succeeds only when `modify_index == N`; `cas=0` means create-only; conflict is 409. ACL uses a static token table with read/write prefix policies; a missing token when `require_token=true` is 401, insufficient permission is 403. The same check runs on the binary channel.
+KV values are base64 on both HTTP and wire. `cas=N` succeeds only when `modify_index == N`; `cas=0` means create-only; conflict is 409. ACL uses a token table with read/write prefix policies; a missing token when `require_token=true` is 401, insufficient permission is 403. The same check runs on the binary channel.
+
+KV writes and ACL changes are **replicated state-machine commands**, not local mutations: the leader encodes a `raft_command` (`kv_put` / `kv_cas` / `kv_delete` / `acl_upsert` / `acl_remove`), commits it, and every node applies the committed entries in index order through `apply_committed()`. The apply cursor is the single `last_applied` index, so a replay after a restart applies each command exactly once. A committed entry that does not decode is a hard failure, never a skipped index: skipping one command would leave that node permanently different with no way to notice. CAS and delete preconditions are evaluated on the leader before proposing, so a conflict does not consume a log slot.
 
 Watch uses long polling: `index == current` parks the handler coroutine until a change or the wait timeout. A timeout returns 200 with the current value and unchanged index, not 504. One watch per HTTP/1.1 connection; global watch count is capped at 10k.
 
@@ -1795,4 +1797,4 @@ Release gates (R11): zero errors and zero warnings on x86 and x64; ASan/LSan/UBS
 | O17 | HTTP/1.1 pipelining is serial | A pipelined client cannot exceed one in-flight request | Documented; HTTP/2 is the multiplexed path. |
 | O18 | Range and compression are mutually exclusive | A compressed download ignores `Range` | Documented; `allow_range` is false when compression is active. |
 | O19 | No WebSocket | Browser bidirectional push is unavailable | SSE plus CRPC push covers unidirectional; v1.1 does not add WebSocket. |
-| O20 | Registry ACL is static tokens | No dynamic policy or roles | v1 scope; dynamic policy is v1.1 (R5). |
+| O20 | Registry ACL starts from a static token table | No role/policy language | The table itself is now Raft-replicated and mutable at runtime (`set_acl_rule` / `remove_acl_rule`); roles and a policy language remain v1.1 (R5). |

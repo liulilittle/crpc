@@ -50,6 +50,7 @@ namespace crpc {
 namespace cluster {
 
 class raft_node;
+struct raft_command;
 
 // The result of an ACL check. A rule is returned by value (a copy) so the
 // caller cannot hold a reference into the table while another thread mutates
@@ -176,6 +177,31 @@ public:
                                          std::chrono::milliseconds issued_at,
                                          bool has_issued_at) const;
 
+    // Applies every committed raft entry that this service has not applied yet,
+    // in index order, to the local state machine (the KV table and the ACL
+    // table). Idempotent: it is a no-op when `commit_index` has not moved.
+    //
+    // The caller drives this: on a leader it runs at the end of every write, and
+    // on a follower it must run after the loop that feeds `raft_node::handle()`
+    // has delivered a batch. It is NOT called from a raft callback, because the
+    // node owns no service pointer and apply order is the service's business.
+    //
+    // An entry whose payload does not decode is a hard failure, never a skipped
+    // index: skipping one command would leave this node's state permanently
+    // different from the rest of the cluster with no way to notice.
+    [[nodiscard]] status apply_committed();
+
+    // ACL administration (step4 PR-9). Both replicate through raft when a node
+    // is configured and apply directly in single-authority mode. They return
+    // only after the change is committed, so a caller that sees success knows a
+    // majority holds it.
+    [[nodiscard]] status set_acl_rule(const acl_rule& rule);
+    [[nodiscard]] status remove_acl_rule(u64 token_hash);
+
+    // The live ACL table (the static seed plus every applied change). Exposed so
+    // a test can prove two nodes converged on the same rules.
+    [[nodiscard]] std::vector<acl_rule> acl_rules() const;
+
     // The current authority anchor. Exposed for tests.
     [[nodiscard]] registry_anchor anchor() const;
 
@@ -198,6 +224,14 @@ public:
                                   buffer& response);
 
 private:
+    // Applies one decoded command at `index`. Called with `impl_->mutex` held.
+    [[nodiscard]] status apply_command_locked(const struct raft_command& command,
+                                              u64 index);
+    // Encodes `command`, commits it (through raft when configured, directly
+    // otherwise) and applies it. The single replication path both KV writes and
+    // ACL administration go through.
+    [[nodiscard]] status replicate_command(const struct raft_command& command);
+
     // The six RPC handlers. They match `rpc::method_handler` exactly.
     static status on_register(void* self, const call_envelope& envelope,
                               span<const std::byte> body, buffer& response,

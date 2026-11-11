@@ -140,6 +140,11 @@ public:
     [[nodiscard]] u64 last_log_term() const noexcept;
     [[nodiscard]] std::string leader_id() const;
 
+    // The log this node replicates. The state machine reads committed entries
+    // from here: the service's own catalog log is a different file, and an
+    // apply loop that read the wrong one would silently apply nothing.
+    [[nodiscard]] registry_log& log() noexcept { return log_; }
+
     // Installs the outbound sink. A test collects messages here and delivers
     // them by calling `handle()` on the peer; production supplies a transport.
     void set_send_hook(std::function<void(const raft_message&)> hook);

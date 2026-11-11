@@ -637,6 +637,13 @@ result<u64> raft_node::propose(span<const std::byte> payload) {
     msg.leader_commit = commit_index_;
     msg.entries.push_back(std::move(record));
     broadcast(msg);
+
+    // A single-node cluster has no peer whose reply would advance the commit
+    // index, so `propose` must do it itself. `wait_for_commit` documents that
+    // "propose already advanced the commit index" for exactly this case; without
+    // this call that promise is false and every single-node proposal times out.
+    // With peers the loop below is a no-op until a majority acknowledges.
+    advance_commit_locked();
     return appended;
 }
 
