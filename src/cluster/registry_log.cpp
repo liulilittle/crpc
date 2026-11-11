@@ -1,4 +1,4 @@
-// CRPC -- G19 step1: durable log implementation.
+﻿// CRPC -- G19 step1: durable log implementation.
 //
 // On-disk framing (little-endian, 32-byte fixed header):
 //
@@ -370,7 +370,7 @@ file_registry_log::open(const std::string& path) {
 
     // Adopt the intact prefix. A corrupt record is an error: recovery must
     // never make a damaged log look like a shorter healthy one.
-    const result<std::vector<log_record>> all = log->replay(0);
+    const result<std::vector<log_record>> all = log->replay_locked(0);
     if (!all) {
         return all.error();
     }
@@ -390,6 +390,7 @@ file_registry_log::open(const std::string& path) {
 }
 
 result<u64> file_registry_log::append(const log_record& record) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (record.index == 0) {
         return rpc_error(rpc_code::invalid_argument,
                          "registry_log: record index must not be zero");
@@ -447,6 +448,12 @@ result<u64> file_registry_log::append(const log_record& record) {
 }
 
 result<std::vector<log_record>> file_registry_log::replay(u64 from_index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return replay_locked(from_index);
+}
+
+result<std::vector<log_record>> file_registry_log::replay_locked(
+    u64 from_index) const {
     if (handle_ == nullptr) {
         return rpc_error(rpc_code::failed_precondition, "registry_log: closed");
     }
@@ -485,6 +492,11 @@ result<std::vector<log_record>> file_registry_log::replay(u64 from_index) const 
 }
 
 status file_registry_log::sync() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sync_locked();
+}
+
+status file_registry_log::sync_locked() {
     if (handle_ == nullptr) {
         return status(rpc_error(rpc_code::failed_precondition,
                                 "registry_log: closed"));
@@ -517,6 +529,7 @@ bool file_registry_log::flush_handle() noexcept {
 }
 
 void file_registry_log::drop_unsynced_tail() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (handle_ == nullptr) {
         return;
     }
@@ -550,6 +563,7 @@ status registry_log::truncate_suffix(u64 from_index) {
 
 // --- truncate_suffix (file backend) ------------------------------------------
 status file_registry_log::truncate_suffix(u64 from_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (from_index == 0) {
         return status(rpc_code::invalid_argument,
                       "registry_log: truncate index must not be zero");
@@ -563,7 +577,7 @@ status file_registry_log::truncate_suffix(u64 from_index) {
     // span list and be told "nothing to do" while records remain on disk.
     // Replaying also re-validates every frame's CRC, so a corrupt log is
     // reported here rather than truncated around.
-    const auto replayed = replay(0);
+    const auto replayed = replay_locked(0);
     if (!replayed.ok()) {
         return replayed.error();
     }
@@ -600,19 +614,21 @@ status file_registry_log::truncate_suffix(u64 from_index) {
 
     // Raft requires the truncation to be durable: a follower that truncated in
     // memory only would replay the stale suffix after a restart.
-    return sync();
+    return sync_locked();
 }
 
 // --- memory_registry_log -----------------------------------------------------
 result<u64> memory_registry_log::append(const log_record& record) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (record.index == 0) {
         return rpc_error(rpc_code::invalid_argument,
                          "registry_log: record index must not be zero");
     }
-    if (record.index > last_index() + 1) {
+    const u64 last = records_.empty() ? 0 : records_.back().index;
+    if (record.index > last + 1) {
         return rpc_error(rpc_code::invalid_argument,
                          "registry_log: index gap (expected " +
-                             std::to_string(last_index() + 1) + ", got " +
+                             std::to_string(last + 1) + ", got " +
                              std::to_string(record.index) + ")");
     }
     while (!records_.empty() && records_.back().index >= record.index) {
@@ -623,6 +639,7 @@ result<u64> memory_registry_log::append(const log_record& record) {
 }
 
 status memory_registry_log::truncate_suffix(u64 from_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (from_index == 0) {
         return status(rpc_code::invalid_argument,
                       "registry_log: truncate index must not be zero");
@@ -635,6 +652,7 @@ status memory_registry_log::truncate_suffix(u64 from_index) {
 }
 
 result<std::vector<log_record>> memory_registry_log::replay(u64 from_index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<log_record> out;
     for (const log_record& record : records_) {
         if (record.index >= from_index) {
@@ -642,6 +660,32 @@ result<std::vector<log_record>> memory_registry_log::replay(u64 from_index) cons
         }
     }
     return out;
+}
+
+u64 memory_registry_log::last_index() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return records_.empty() ? 0 : records_.back().index;
+}
+
+// --- file_registry_log accessors ---------------------------------------------
+u64 file_registry_log::last_index() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_index_;
+}
+
+u64 file_registry_log::durable_size() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return durable_size_;
+}
+
+u64 file_registry_log::flush_count() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return flush_count_;
+}
+
+void file_registry_log::inject_flush_failure() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_flush_ = true;
 }
 
 } // namespace cluster

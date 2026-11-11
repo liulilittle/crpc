@@ -63,6 +63,15 @@ public:
     [[nodiscard]] std::vector<std::string> keys_with_prefix(
         const std::string& prefix) const;
 
+    // Drops every entry but keeps `highest_index()`. Used only by the apply
+    // loop when an applied suffix was truncated: the state machine must be
+    // rebuilt from the log, and replaying from index 1 over the old table would
+    // leave keys the new log no longer contains. The high-water mark is NOT
+    // reset, because it is the store's index contract: a replayed write may
+    // legitimately carry a lower index than one already observed, and a
+    // regression here would hand `cas=N` a stale expectation.
+    void clear() noexcept { entries_.clear(); }
+
     [[nodiscard]] u64 highest_index() const noexcept;
 
 private:

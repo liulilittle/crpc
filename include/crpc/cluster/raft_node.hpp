@@ -40,6 +40,7 @@
 #include <chrono>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,29 @@ struct raft_message {
 };
 
 // One node's view of the replicated log.
+//
+// Thread safety (G19 step4 D-A-2 / D-B-3)
+// ---------------------------------------
+// A node is reached from more than one thread in production: `registryd` drives
+// `tick()` from a timer thread while the HTTP handler threads call `propose()`
+// and `apply_committed()` reads `commit_index()`/`log()`. Every public method
+// therefore takes `mutex_`.
+//
+// The lock is NOT held across the send hook. `send_to` calls the hook
+// synchronously, and a test transport (and a real in-process one) delivers the
+// message by calling `handle()` on the peer, which can call back into THIS node
+// (`append_reply` -> `advance_commit_locked`). Holding a non-recursive mutex
+// across that re-entry self-deadlocks, and a recursive one would let the
+// re-entrant call observe a half-updated `match_index`. So the rule is:
+//
+//   * a public method takes the lock, mutates state, and builds the outbound
+//     messages into a local vector;
+//   * it releases the lock;
+//   * it then delivers the messages.
+//
+// A re-entrant `handle()` therefore sees a fully consistent state, and the
+// outer call's post-delivery work (`advance_commit_locked`) is a no-op because
+// the re-entrant call already advanced the commit index.
 class CRPC_API raft_node {
 public:
     raft_node(raft_config config, registry_log& log, fs::path state_dir,
@@ -195,6 +219,19 @@ private:
     // that can never arrive.
     [[nodiscard]] bool can_win_alone() const noexcept;
 
+    // Lock-held variants of the public readers. The public ones take `mutex_`
+    // and forward here; internal callers already hold it.
+    [[nodiscard]] u64 last_log_term_locked() const noexcept;
+    [[nodiscard]] u64 entry_term_locked(u64 index) const noexcept;
+
+    // Delivers a batch of messages built under the lock. Called with the lock
+    // RELEASED: the hook may re-enter `handle()` on this node.
+    void deliver(const std::vector<raft_message>& messages);
+
+    // Serialises every public entry point. See the class comment for why the
+    // lock is never held across `send_to`.
+    mutable std::mutex mutex_;
+
     raft_config config_;
     registry_log& log_;
     fs::path state_dir_;
@@ -213,6 +250,17 @@ private:
     // depose a leader that was just elected.
     monotonic_clock::time_point leader_since_{};
     bool voted_this_term_ = false;
+    // True while a PreVote round is collecting grants, false once it has
+    // converted to a real election. This is the key the `prevote_reply` guard
+    // uses to reject a PreVote grant that arrives after the round is over.
+    //
+    // It is deliberately NOT `voted_this_term_`/`voted_for_`: those are the
+    // per-term vote record and are NOT reset when a new PreVote round starts in
+    // the same term, so keying the guard on them would reject every grant in a
+    // second election round and the node could never win one (a liveness
+    // defect). A dedicated round flag is set on each new round and cleared on
+    // conversion, which is exactly the window the guard needs.
+    bool prevote_round_active_ = false;
     // True once this node has accepted a leader (a valid AppendEntries). A node
     // that has never seen a leader must not refuse PreVotes: its election timer
     // has not expired either, so a timer-only check would block every election.

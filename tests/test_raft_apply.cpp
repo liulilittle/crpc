@@ -13,11 +13,13 @@
 // each with its own state directory and its own `kv_store` -- because the
 // assertion is about convergence, not about the wire.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_framework.hpp"
@@ -644,6 +646,196 @@ CRPC_TEST(a_restart_replays_the_committed_log) {
         CRPC_REQUIRE(service.acl_rules().size() == 1);
         CRPC_CHECK(service.acl_rules()[0].token_hash == rule.token_hash);
     }
+}
+
+// --- D-A-4: a replaced entry at the same index must be re-applied -----------
+//
+// `apply_committed` kept `last_applied` at the highest index it had ever
+// applied and returned early whenever `committed <= last_applied`. A Raft
+// conflict replaces an entry at the SAME index with a DIFFERENT term, so after
+// a truncate-then-replace `last_applied == last_log_index == commit_index`
+// holds and the early return skipped the replacement forever: the node stayed
+// permanently divergent with no signal.
+//
+// The reproduction: apply index 1 (term 1), truncate it, land a different
+// command at index 1 with term 2, and apply again. The replacement must be
+// applied.
+
+CRPC_TEST(a_replaced_entry_at_the_same_index_is_reapplied) {
+    test_network net;
+    const char* only = "A";
+    net.add(only, {});
+    CRPC_REQUIRE(net.find(only)->raft->start().ok());
+    (void)net.elect();
+
+    service_node attached;
+    CRPC_REQUIRE(attached.start(*net.find(only), *net.find(only)->store,
+                                std::vector<cl::acl_rule>{}));
+
+    cl::raft_command first;
+    first.kind = cl::raft_command_kind::kv_put;
+    first.key = "k";
+    first.value = {std::byte{'o'}, std::byte{'l'}, std::byte{'d'}};
+    std::vector<std::byte> payload;
+    CRPC_REQUIRE(cl::encode_raft_command(first, payload).ok());
+    const auto proposed = net.find(only)->raft->propose(
+        crpc::span<const std::byte>(payload.data(), payload.size()));
+    CRPC_REQUIRE(proposed.ok());
+    CRPC_REQUIRE(net.find(only)
+                     ->raft->wait_for_commit(proposed.value(),
+                                             std::chrono::steady_clock::now() + 5s)
+                     .ok());
+    CRPC_REQUIRE(attached.service->apply_committed().ok());
+    CRPC_REQUIRE(net.find(only)->store->get("k").ok());
+    const u64 index = proposed.value();
+    const u64 old_term = net.find(only)->raft->entry_term(index);
+
+    // Replace the entry at the SAME index with a different term and a different
+    // command, exactly as a new leader's AppendEntries does to a follower's
+    // conflicting suffix. `commit_index` is unchanged (raft still believes the
+    // index is committed), so `last_applied == last_log == commit`.
+    CRPC_REQUIRE(net.find(only)->log->truncate_suffix(index).ok());
+    cl::raft_command second;
+    second.kind = cl::raft_command_kind::kv_put;
+    second.key = "k";
+    second.value = {std::byte{'n'}, std::byte{'e'}, std::byte{'w'}};
+    std::vector<std::byte> second_payload;
+    CRPC_REQUIRE(cl::encode_raft_command(second, second_payload).ok());
+    cl::log_record replacement;
+    replacement.kind = cl::log_record_kind::raft_entry;
+    replacement.term = old_term + 1;
+    replacement.index = index;
+    replacement.payload = second_payload;
+    CRPC_REQUIRE(net.find(only)->log->append(replacement).ok());
+    CRPC_REQUIRE(net.find(only)->raft->commit_index() == index);
+    CRPC_REQUIRE(net.find(only)->raft->last_log_index() == index);
+
+    // The replacement must be applied. Before the fix the cursor was still at
+    // `index`, so this apply was a no-op and the store kept "old".
+    CRPC_REQUIRE(attached.service->apply_committed().ok());
+    const auto entry = net.find(only)->store->get("k");
+    CRPC_REQUIRE(entry.ok());
+    CRPC_CHECK_EQ(std::size_t{3}, entry.value().value.size());
+    CRPC_CHECK(entry.value().value[0] == std::byte{'n'});
+    CRPC_CHECK(entry.value().value[1] == std::byte{'e'});
+    CRPC_CHECK(entry.value().value[2] == std::byte{'w'});
+}
+
+// A committed entry that is truncated is an upstream invariant violation
+// (`commit_index > last_log`). The apply loop must REPORT it, never silently
+// clamp, and must rebuild the state machine from the surviving log.
+
+CRPC_TEST(a_commit_index_past_the_log_is_reported) {
+    test_network net;
+    const char* only = "A";
+    net.add(only, {});
+    CRPC_REQUIRE(net.find(only)->raft->start().ok());
+    (void)net.elect();
+
+    service_node attached;
+    CRPC_REQUIRE(attached.start(*net.find(only), *net.find(only)->store,
+                                std::vector<cl::acl_rule>{}));
+
+    cl::raft_command first;
+    first.kind = cl::raft_command_kind::kv_put;
+    first.key = "k";
+    first.value = {std::byte{'v'}};
+    std::vector<std::byte> payload;
+    CRPC_REQUIRE(cl::encode_raft_command(first, payload).ok());
+    const auto proposed = net.find(only)->raft->propose(
+        crpc::span<const std::byte>(payload.data(), payload.size()));
+    CRPC_REQUIRE(proposed.ok());
+    CRPC_REQUIRE(net.find(only)
+                     ->raft->wait_for_commit(proposed.value(),
+                                             std::chrono::steady_clock::now() + 5s)
+                     .ok());
+    CRPC_REQUIRE(attached.service->apply_committed().ok());
+    CRPC_REQUIRE(net.find(only)->store->get("k").ok());
+
+    // Truncate the applied entry: `commit_index` is now past the log end.
+    CRPC_REQUIRE(net.find(only)->log->truncate_suffix(proposed.value()).ok());
+    CRPC_REQUIRE(net.find(only)->raft->commit_index() >
+                 net.find(only)->raft->last_log_index());
+
+    const crpc::status applied = attached.service->apply_committed();
+    CRPC_CHECK_FALSE(applied.ok());
+    CRPC_CHECK_EQ(crpc::rpc_code::internal, applied.code());
+    // The stale applied value is gone: the log no longer contains its command.
+    CRPC_CHECK_FALSE(net.find(only)->store->get("k").ok());
+}
+
+// --- D-A-3: two concurrent CAS on one expected index, one wins ---------------
+//
+// `on_kv_cas` read the entry, decided the precondition, released the lock, then
+// proposed. Two threads could both observe `modify_index == N`, both pass, and
+// both commit; the second silently overwrote the first. The fix makes the
+// check and the commit one critical section. This case drives the REAL path
+// (`consul_http::handle_kv` -> `dispatch` -> `on_kv_cas`) from two threads.
+
+CRPC_TEST(two_concurrent_cas_on_the_same_index_only_one_wins) {
+    test_network net;
+    const char* only = "A";
+    net.add(only, {});
+    CRPC_REQUIRE(net.find(only)->raft->start().ok());
+    (void)net.elect();
+
+    service_node attached;
+    CRPC_REQUIRE(attached.start(*net.find(only), *net.find(only)->store,
+                                std::vector<cl::acl_rule>{writer_rule("token-A")}));
+    cl::consul_http facade(*attached.service);
+
+    // Seed `k` through the facade so its modify index is a real one.
+    crpc::http::request seed_request;
+    seed_request.method = crpc::http::method::put;
+    seed_request.method_token = crpc::http::to_token(crpc::http::method::put);
+    seed_request.target = "/v1/kv/k";
+    seed_request.path = "/v1/kv/k";
+    seed_request.headers.add("X-Consul-Token", "token-A");
+    seed_request.body = "s";
+    crpc::http::response seed_response;
+    facade.handle_kv(seed_request, "k", cl::consul_kv_op::put, seed_response);
+    CRPC_REQUIRE(seed_response.status_code == 200);
+
+    const auto observed = net.find(only)->store->get("k");
+    CRPC_REQUIRE(observed.ok());
+    const u64 expected = observed.value().modify_index;
+    CRPC_REQUIRE(expected > 0);
+
+    // Two threads, same `cas = expected`. Exactly one may succeed.
+    std::atomic<int> ok_count{0};
+    std::atomic<int> conflict_count{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    for (int which = 0; which < 2; ++which) {
+        threads.emplace_back([&, which] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            crpc::http::request request;
+            request.method = crpc::http::method::put;
+            request.method_token =
+                crpc::http::to_token(crpc::http::method::put);
+            request.target = "/v1/kv/k?cas=" + std::to_string(expected);
+            request.path = "/v1/kv/k";
+            request.query = "cas=" + std::to_string(expected);
+            request.headers.add("X-Consul-Token", "token-A");
+            request.body = which == 0 ? "a" : "b";
+            crpc::http::response response;
+            facade.handle_kv(request, "k", cl::consul_kv_op::put, response);
+            if (response.status_code == 200) {
+                ok_count.fetch_add(1, std::memory_order_relaxed);
+            } else if (response.status_code == 409) {
+                conflict_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    CRPC_CHECK_EQ(1, ok_count.load());
+    CRPC_CHECK_EQ(1, conflict_count.load());
 }
 
 CRPC_TEST_MAIN()

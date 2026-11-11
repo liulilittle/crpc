@@ -90,6 +90,21 @@ struct fixture {
         reader.principal_id = "node-R";
         reader.read_prefixes.push_back("");
         config.acl.push_back(reader);
+        // A writer that may NOT read: an empty `read_prefixes` means "no read"
+        // (registry_acl.hpp:43), so this token can put but must not get.
+        cl::acl_rule write_only;
+        write_only.token_hash = fnv1a("token-writeonly");
+        write_only.principal_id = "node-W";
+        write_only.write_prefixes.push_back("");
+        config.acl.push_back(write_only);
+        // A reader scoped to one key prefix. It must read `svc/...` and be
+        // refused on any other key, which is what makes the prefix check a real
+        // scoping rule rather than an all-or-nothing gate.
+        cl::acl_rule scoped;
+        scoped.token_hash = fnv1a("token-scoped");
+        scoped.principal_id = "node-S";
+        scoped.read_prefixes.push_back("svc/");
+        config.acl.push_back(scoped);
 
         service = std::make_unique<cl::registry_service>(std::move(config));
         crpc::server::builder builder;
@@ -751,6 +766,163 @@ CRPC_TEST(empty_key_is_refused) {
                                    "token-A"),
                       "", cl::consul_kv_op::get, response);
     CRPC_CHECK_EQ(400, response.status_code);
+}
+
+// --- D-A-5: a second registration must take effect ---------------------------
+//
+// The facade stamped `incarnation = 1` on every register and built the
+// idempotency key from `name + node + "register"` only. A re-registration of the
+// same (Name, ID) therefore replayed the FIRST request's cached response: the
+// port never moved and the catalog was never touched, while the caller saw a
+// 200. Two independent things have to change for a real re-registration: the
+// incarnation must advance, and the idempotency key must name this request.
+
+CRPC_TEST(a_second_registration_of_the_same_instance_takes_effect) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_register_twice"));
+
+    const std::string body_first =
+        "{\"Name\":\"svc-r\",\"ID\":\"node-A\",\"Address\":\"127.0.0.1\","
+        "\"Port\":7001}";
+    crpc::http::response first;
+    f.http->handle_register(
+        make_request(crpc::http::method::put, "/v1/agent/service/register",
+                     "token-A", body_first),
+        first);
+    CRPC_REQUIRE(first.status_code == 200);
+
+    crpc::http::response listed_first;
+    f.http->handle_catalog_service(
+        make_request(crpc::http::method::get, "/v1/catalog/service/svc-r",
+                     "token-A"),
+        "svc-r", listed_first);
+    CRPC_REQUIRE(listed_first.status_code == 200);
+    CRPC_CHECK(listed_first.body.find("\"ServicePort\":7001") !=
+               std::string::npos);
+
+    // Re-register the SAME (Name, ID) with a new port. It is a genuinely
+    // different write, so it must reach the catalog.
+    const std::string body_second =
+        "{\"Name\":\"svc-r\",\"ID\":\"node-A\",\"Address\":\"127.0.0.1\","
+        "\"Port\":7002}";
+    crpc::http::response second;
+    f.http->handle_register(
+        make_request(crpc::http::method::put, "/v1/agent/service/register",
+                     "token-A", body_second),
+        second);
+    CRPC_CHECK_EQ(200, second.status_code);
+
+    crpc::http::response listed_second;
+    f.http->handle_catalog_service(
+        make_request(crpc::http::method::get, "/v1/catalog/service/svc-r",
+                     "token-A"),
+        "svc-r", listed_second);
+    CRPC_REQUIRE(listed_second.status_code == 200);
+    // The whole defect in one line: the port must have moved.
+    CRPC_CHECK(listed_second.body.find("\"ServicePort\":7002") !=
+               std::string::npos);
+    CRPC_CHECK(listed_second.body.find("\"ServicePort\":7001") ==
+               std::string::npos);
+}
+
+// A deregister followed by a re-register must succeed. With a fixed incarnation
+// of 1 the deregister leaves a tombstone at incarnation 2, and every later
+// register at incarnation 1 is rejected as `tombstone blocks resurrection`.
+
+CRPC_TEST(a_deregistered_instance_can_register_again) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_register_after_dereg"));
+
+    crpc::http::response registered;
+    f.http->handle_register(
+        make_request(crpc::http::method::put, "/v1/agent/service/register",
+                     "token-A",
+                     "{\"Name\":\"svc-t\",\"ID\":\"node-A\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":7010}"),
+        registered);
+    CRPC_REQUIRE(registered.status_code == 200);
+
+    crpc::http::response gone;
+    f.http->handle_deregister(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/deregister/node-A", "token-A"),
+        "node-A", gone);
+    CRPC_REQUIRE(gone.status_code == 200);
+
+    // Re-register: the incarnation must be strictly above the tombstone's.
+    crpc::http::response again;
+    f.http->handle_register(
+        make_request(crpc::http::method::put, "/v1/agent/service/register",
+                     "token-A",
+                     "{\"Name\":\"svc-t\",\"ID\":\"node-A\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":7011}"),
+        again);
+    CRPC_CHECK_EQ(200, again.status_code);
+
+    crpc::http::response listed;
+    f.http->handle_catalog_service(
+        make_request(crpc::http::method::get, "/v1/catalog/service/svc-t",
+                     "token-A"),
+        "svc-t", listed);
+    CRPC_REQUIRE(listed.status_code == 200);
+    CRPC_CHECK(listed.body.find("\"ServicePort\":7011") != std::string::npos);
+}
+
+// --- D-A-1: a KV read is subject to the read prefixes ------------------------
+//
+// `registry_acl.hpp:43` states `read_prefixes`: empty = no read (fail closed).
+// `check_acl` only applied that to `registry_method_query`; `kv_get` was
+// unchecked, so any valid token could read any KV key. These cases pin the
+// contract on the KV read path: no read prefix is a denial, and a scoped prefix
+// scopes the key.
+
+CRPC_TEST(a_token_without_a_read_prefix_cannot_read_a_kv_key) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_kv_read_acl"));
+
+    // The write-only token seeds a key it is allowed to write.
+    crpc::http::response seeded;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/secret",
+                                   "token-writeonly", "classified"),
+                      "secret", cl::consul_kv_op::put, seeded);
+    CRPC_REQUIRE(seeded.status_code == 200);
+
+    // Reading it back with the same token must be denied: it has no read prefix.
+    crpc::http::response read;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/secret",
+                                   "token-writeonly"),
+                      "secret", cl::consul_kv_op::get, read);
+    CRPC_CHECK_EQ(403, read.status_code);
+    // The denied body must not leak the value.
+    CRPC_CHECK(read.body.find("classified") == std::string::npos);
+}
+
+CRPC_TEST(a_scoped_read_prefix_scopes_the_kv_key) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_kv_read_scope"));
+
+    crpc::http::response inside;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/svc/a",
+                                   "token-A", "inside"),
+                      "svc/a", cl::consul_kv_op::put, inside);
+    CRPC_REQUIRE(inside.status_code == 200);
+    crpc::http::response outside;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/other/b",
+                                   "token-A", "outside"),
+                      "other/b", cl::consul_kv_op::put, outside);
+    CRPC_REQUIRE(outside.status_code == 200);
+
+    crpc::http::response allowed;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/svc/a",
+                                   "token-scoped"),
+                      "svc/a", cl::consul_kv_op::get, allowed);
+    CRPC_CHECK_EQ(200, allowed.status_code);
+
+    crpc::http::response refused;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/other/b",
+                                   "token-scoped"),
+                      "other/b", cl::consul_kv_op::get, refused);
+    CRPC_CHECK_EQ(403, refused.status_code);
 }
 
 CRPC_TEST_MAIN()

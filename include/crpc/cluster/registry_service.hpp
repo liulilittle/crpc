@@ -202,6 +202,19 @@ public:
     // a test can prove two nodes converged on the same rules.
     [[nodiscard]] std::vector<acl_rule> acl_rules() const;
 
+    // The incarnation currently stored for (service, node_id), or 0 when the key
+    // has no row. This is the source the HTTP facade uses to advance the
+    // incarnation on a re-registration: the registry rejects a register whose
+    // incarnation is not strictly above the stored one (and a tombstone rejects
+    // every incarnation at or below its own), so a fixed value makes a second
+    // registration -- or a re-registration after a deregister -- impossible.
+    //
+    // It reads the catalog directly and does NOT go through the ACL: the facade
+    // has already authorised the write, and a write-only token (no read prefix)
+    // must still be able to re-register. It is not a client-facing read.
+    [[nodiscard]] u64 instance_incarnation(const std::string& service,
+                                           const std::string& node_id) const;
+
     // The current authority anchor. Exposed for tests.
     [[nodiscard]] registry_anchor anchor() const;
 

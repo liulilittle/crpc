@@ -439,6 +439,18 @@ struct registry_service::impl {
     instance_lease lease;
 
     mutable std::mutex mutex;
+    // D-A-3: serialises the CAS "check + propose + apply" sequence. The check
+    // and the commit used to be two separate critical sections, so two callers
+    // presenting the same `cas = N` could both observe `modify_index == N`,
+    // both pass, and both commit -- the second silently overwriting the first.
+    // Holding this across the whole sequence makes the second caller's check
+    // observe the first caller's applied result and fail with a conflict.
+    //
+    // It is a SEPARATE mutex, not `mutex`, because `replicate_command` ->
+    // `apply_committed` re-enters `mutex`; holding `mutex` across the sequence
+    // would self-deadlock on a non-recursive mutex. Lock order is always
+    // `cas_mutex` then `mutex`, never the reverse.
+    std::mutex cas_mutex;
     // The last anchor each key accepted. A repeated request that presents the
     // same anchor as the last accepted write is an idempotent replay even when
     // the transport-level dedup window has expired.
@@ -453,6 +465,13 @@ struct registry_service::impl {
     // the local state below. It is the ONLY cursor: a command is applied exactly
     // once, in index order, and a restart replays from zero.
     u64 last_applied = 0;
+    // The term of the entry at `last_applied`. A conflicting suffix is replaced
+    // by an entry at the SAME index with a DIFFERENT term (that is what a Raft
+    // conflict is), so comparing the term is how the apply loop detects that the
+    // entry it applied is no longer the entry the log holds. Without it, a
+    // truncate-then-replace leaves `last_applied == last_log_index` and the
+    // early return skips the replacement forever (D-A-4).
+    u64 last_applied_term = 0;
     // The live ACL table. It starts as a copy of `config.acl` (the static seed)
     // and is then mutated only by `acl_upsert` / `acl_remove` commands, so every
     // node that applies the same log ends with the same table.
@@ -577,8 +596,15 @@ acl_decision registry_service::check_acl(const std::string& token, u64 method,
         decision.reason = registry_reason_acl_denied;
         return decision;
     }
-    // Rule 5: a read needs a matching read prefix.
-    if (method == registry_method_query) {
+    // Rule 5: a read needs a matching read prefix. This covers BOTH read
+    // methods: `query` (a catalog read scoped by service) and `kv_get` (a KV
+    // read scoped by key). `registry_acl.hpp:43` states `read_prefixes`:
+    // "empty = no read (fail closed)", so a rule with no read prefix must be
+    // denied on every read path -- the old code checked only `query`, which let
+    // any valid token read any KV key.
+    const bool is_read = method == registry_method_query ||
+                         method == registry_method_kv_get;
+    if (is_read) {
         bool prefix_ok = false;
         for (const std::string& prefix : matched->read_prefixes) {
             // Same as the write side: an empty prefix is already covered by the
@@ -622,6 +648,59 @@ status registry_service::apply_committed() {
     }
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const u64 committed = impl_->config.raft->commit_index();
+    const u64 last_log = impl_->config.raft->last_log_index();
+
+    // D-A-4: the apply cursor must follow a truncated suffix. Raft guarantees a
+    // COMMITTED entry is never truncated, so `commit_index` can never exceed the
+    // log; if it does, an upstream invariant is broken and silently clamping
+    // would hide it. Report it -- but first rebuild the state machine, because
+    // the cursor is now past the log and the surviving entries must be replayed.
+    const bool commit_past_log = committed > last_log;
+    // A follower that truncated a conflicting suffix can leave `last_applied`
+    // above the new log end. The old code returned early forever
+    // (`committed <= last_applied`), so a replacement entry at or below the old
+    // cursor was never applied and the node stayed permanently divergent.
+    //
+    // The applied KV/ACL changes cannot be rolled back individually, so the
+    // state machine is rebuilt from scratch: the KV table is cleared, the ACL
+    // table is reset to the static seed (clearing it alone would drop the seed
+    // and deny every request), and the cursor restarts at zero. The replay below
+    // then re-applies the surviving log. `kv_store::clear()` keeps
+    // `highest_index`, so the store's index contract is not regressed.
+    if (impl_->last_applied > last_log) {
+        if (impl_->config.kv != nullptr) {
+            impl_->config.kv->clear();
+        }
+        impl_->acl_rules = impl_->config.acl;
+        impl_->last_applied = 0;
+        impl_->last_applied_term = 0;
+    }
+    if (commit_past_log) {
+        return status{registry_failure(
+            rpc_code::internal,
+            "registry: commit index is past the end of the log",
+            "commit_past_log")};
+    }
+
+    // D-A-4 (the common case): a conflicting suffix is replaced by an entry at
+    // the SAME index with a DIFFERENT term. `last_applied == last_log_index`
+    // then holds, so the `committed <= last_applied` early return would skip the
+    // replacement forever. Detect it by comparing the term of the entry the
+    // cursor points at: if it no longer matches what was applied, the applied
+    // state is stale and must be rebuilt from the log.
+    if (impl_->last_applied > 0 && impl_->last_applied <= last_log) {
+        const u64 current_term =
+            impl_->config.raft->entry_term(impl_->last_applied);
+        if (current_term != impl_->last_applied_term) {
+            if (impl_->config.kv != nullptr) {
+                impl_->config.kv->clear();
+            }
+            impl_->acl_rules = impl_->config.acl;
+            impl_->last_applied = 0;
+            impl_->last_applied_term = 0;
+        }
+    }
+
     if (committed <= impl_->last_applied) {
         return status{};
     }
@@ -641,6 +720,7 @@ status registry_service::apply_committed() {
         // other kind is consensus bookkeeping and has no command to apply.
         if (record.kind != log_record_kind::raft_entry) {
             impl_->last_applied = record.index;
+            impl_->last_applied_term = record.term;
             continue;
         }
         raft_command command;
@@ -659,6 +739,7 @@ status registry_service::apply_committed() {
             return applied;
         }
         impl_->last_applied = record.index;
+        impl_->last_applied_term = record.term;
     }
     return status{};
 }
@@ -755,6 +836,28 @@ status registry_service::remove_acl_rule(u64 token_hash) {
 std::vector<acl_rule> registry_service::acl_rules() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->acl_rules;
+}
+
+u64 registry_service::instance_incarnation(const std::string& service,
+                                           const std::string& node_id) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    query_options options;
+    options.service = service;
+    options.node_id = node_id;
+    // A tombstone is the row a re-registration must clear, so it must be
+    // visible here: hiding it would report 0 and hand out an incarnation the
+    // tombstone then rejects.
+    options.include_deregistered = true;
+    const result<catalog_result> queried = impl_->catalog.query(options);
+    if (!queried.ok()) {
+        return 0;
+    }
+    for (const service_instance& instance : queried.value().instances) {
+        if (instance.service == service && instance.node_id == node_id) {
+            return instance.incarnation;
+        }
+    }
+    return 0;
 }
 
 status registry_service::replicate_command(const raft_command& command) {
@@ -1826,6 +1929,13 @@ status registry_service::on_kv_cas(void* self, const call_envelope& /*envelope*/
     // command that changes nothing, and the log would fill with no-ops under
     // contention. Evaluating it once, here, also means the decision and the
     // write are made against the same state, which a follower cannot do.
+    //
+    // D-A-3: the check and the commit are ONE critical section (`cas_mutex`).
+    // Two callers presenting the same `cas = N` must not both pass: the first
+    // commits and applies, and the second's check then sees the new
+    // `modify_index` and conflicts. `cas_mutex` is separate from `mutex`
+    // because `replicate_command` re-enters `mutex` through `apply_committed`.
+    std::lock_guard<std::mutex> cas_lock(owner->impl_->cas_mutex);
     {
         std::lock_guard<std::mutex> lock(owner->impl_->mutex);
         if (!kv_store::valid_key(request.key)) {

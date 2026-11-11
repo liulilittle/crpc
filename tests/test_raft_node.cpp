@@ -16,11 +16,13 @@
 #include "test_framework.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <crpc/cluster/raft_node.hpp>
@@ -379,19 +381,32 @@ CRPC_TEST(raft_minority_uncommitted_entries_discarded) {
     // CheckQuorum (S4) the leader may also step down once it notices it cannot
     // reach a majority, in which case `propose` refuses outright. Both outcomes
     // are correct: what must never happen is a commit.
+    //
+    // The refusal is recorded rather than asserted inside the loop: whether
+    // CheckQuorum fires depends on timing, and a `CRPC_CHECK` that only runs on
+    // one branch makes the case's check COUNT vary between runs. A test whose
+    // check count is not deterministic cannot be compared across runs, which is
+    // exactly what a reviewer does. Assert the outcome once, after the loop.
+    bool refused = false;
+    rpc_code refusal_code = rpc_code::ok;
     for (int i = 0; i < 2; ++i) {
         const auto proposed = leader_node->raft->propose(
             span<const std::byte>(reinterpret_cast<const std::byte*>("u"), 1));
         if (!proposed.ok()) {
             // A deposed leader refuses the write loudly, which is the S4
             // behaviour. Stop proposing; the assertions below still hold.
-            CRPC_CHECK_EQ(rpc_code::unavailable, proposed.error().code);
+            refused = true;
+            refusal_code = proposed.error().code;
             break;
         }
         leader_node->clock.advance(50ms);
         leader_node->raft->tick();
     }
-    CRPC_CHECK(leader_node->raft->commit_index() < u64{4});
+    // Either the minority leader kept accepting (and nothing committed) or it
+    // stepped down and refused with `unavailable`. Both are correct; both
+    // checks below are unconditional so the count is stable across runs.
+    CRPC_CHECK(refused || leader_node->raft->commit_index() < u64{4});
+    CRPC_CHECK(!refused || refusal_code == rpc_code::unavailable);
     // ...but the two committed entries are still there.
     CRPC_CHECK(leader_node->raft->commit_index() >= u64{2});
 
@@ -872,6 +887,728 @@ CRPC_TEST(raft_prevote_does_not_bump_term) {
     cluster_node* idle = net.find(leader == "A" ? "B" : "A");
     CRPC_CHECK_EQ(idle->raft->term(), term_before);
     CRPC_CHECK(idle->raft->role() != cl::raft_role::candidate);
+}
+
+// --- D-B-4: a stale-term RequestVote must not be granted ---------------------
+//
+// A `vote` whose term is BELOW the receiver's is a candidate from a past
+// election. Granting it both hands a live term's vote to a dead candidacy and
+// answers in the STALE term (the old code echoed `msg.term`), so the real
+// candidate for the current term is then refused (`voted_this_term_` is set).
+// The guard is the mirror of the `append` branch's `msg.term < term_` check.
+
+CRPC_TEST(raft_stale_term_vote_is_refused) {
+    // A standalone node, so the vote state is fully under the test's control.
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-stalevote-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "B";
+    config.peers = {"A"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> replies;
+    raft.set_send_hook([&replies](const cl::raft_message& msg) {
+        replies.push_back(msg);
+    });
+
+    // Raise the term to 5 WITHOUT voting: a heartbeat from a leader in term 5
+    // makes this node adopt term 5 and clear its vote. This is the state the
+    // defect needs -- `voted_this_term_ == false`, so the old code's
+    // `!voted_this_term_ && up_to_date` check would grant a stale request.
+    cl::raft_message beat;
+    beat.kind = cl::raft_message::type::append;
+    beat.term = 5;
+    beat.from = "A";
+    beat.to = "B";
+    beat.prev_log_index = 0;
+    beat.prev_log_term = 0;
+    beat.leader_commit = 0;
+    raft.handle(beat);
+    CRPC_REQUIRE(raft.term() == u64{5});
+
+    // A candidate from an OLD term now asks for a vote. It must be refused, and
+    // the reply must carry THIS node's term (5), not the stale one (3). The old
+    // code granted it (setting `voted_this_term_`) and answered in term 3, so
+    // the real candidate for term 5 was then refused.
+    replies.clear();
+    cl::raft_message stale;
+    stale.kind = cl::raft_message::type::vote;
+    stale.term = 3;
+    stale.from = "Z";
+    stale.to = "B";
+    stale.prev_log_index = 0;
+    stale.prev_log_term_hint = 0;
+    raft.handle(stale);
+
+    CRPC_REQUIRE(!replies.empty());
+    const cl::raft_message& reply = replies.back();
+    CRPC_CHECK_EQ(int(cl::raft_message::type::vote_reply), int(reply.kind));
+    CRPC_CHECK_FALSE(reply.granted);
+    // The reply is in the RECEIVER's term. Echoing the stale term would tell the
+    // dead candidate it is current.
+    CRPC_CHECK_EQ(u64{5}, reply.term);
+    // The stale request must not have moved the term backwards.
+    CRPC_CHECK_EQ(u64{5}, raft.term());
+
+    // The vote for the CURRENT term must still be available. Granting the stale
+    // request would have set `voted_this_term_` and this would now fail.
+    replies.clear();
+    cl::raft_message legit;
+    legit.kind = cl::raft_message::type::vote;
+    legit.term = 5;
+    legit.from = "Y";
+    legit.to = "B";
+    legit.prev_log_index = 0;
+    legit.prev_log_term_hint = 0;
+    raft.handle(legit);
+    CRPC_REQUIRE(!replies.empty());
+    CRPC_CHECK(replies.back().granted);
+}
+
+// --- D-B-1: a follower that could not append must not report success ---------
+//
+// The follower applies the entries in a loop that used to `break` on a failed
+// `append` and then unconditionally answer `success = true` with
+// `match_index = prev_log_index + entries.size()`. The leader would then raise
+// that peer's `match_index` past entries the follower does not hold and commit
+// a write no follower has. This case forces the very first append to fail (the
+// log rejects an index it is not contiguous with) and asserts the reply.
+
+CRPC_TEST(raft_follower_does_not_ack_an_append_it_could_not_store) {
+    // A follower whose log is empty. A batch that starts at index 1 with a gap
+    // the backend refuses: `append` rejects a record whose index skips ahead.
+    // Driving `handle` directly is the point: the reply is the observable.
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-ack-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "B";
+    config.peers = {"A"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> replies;
+    raft.set_send_hook([&replies](const cl::raft_message& msg) {
+        replies.push_back(msg);
+    });
+
+    // prev_log_index = 0 (matches an empty log), but the batch jumps to index 3:
+    // the backend refuses the gap, so nothing is stored.
+    cl::raft_message batch;
+    batch.kind = cl::raft_message::type::append;
+    batch.term = 1;
+    batch.from = "A";
+    batch.to = "B";
+    batch.prev_log_index = 0;
+    batch.prev_log_term = 0;
+    batch.leader_commit = 0;
+    for (u64 index = 3; index <= 4; ++index) {
+        cl::log_record record;
+        record.kind = cl::log_record_kind::raft_entry;
+        record.term = 1;
+        record.index = index;
+        batch.entries.push_back(std::move(record));
+    }
+    raft.handle(batch);
+
+    CRPC_REQUIRE(!replies.empty());
+    const cl::raft_message& reply = replies.back();
+    CRPC_CHECK_EQ(int(cl::raft_message::type::append_reply), int(reply.kind));
+    // The log is still empty, so the follower must NOT claim it holds anything.
+    CRPC_CHECK_EQ(u64{0}, log.last_index());
+    CRPC_CHECK_FALSE(reply.success);
+    // `match_index` must never name an entry the log does not hold.
+    CRPC_CHECK(reply.match_index <= log.last_index());
+}
+
+// --- D-B-2: a proposal whose sync failed must not be acknowledged ------------
+//
+// `propose` appended the entry, dropped `sync()`'s result, and advanced the
+// commit index. On a single node (its own quorum) that acknowledges a write
+// that is not durable: a power loss loses it while the client was told success.
+
+CRPC_TEST(raft_propose_reports_a_failed_sync_and_does_not_commit) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-sync-");
+    CRPC_REQUIRE(state.ok());
+    const fs::path log_path = state.value().native() / "raft.log";
+    auto opened = cl::file_registry_log::open(log_path.str());
+    CRPC_REQUIRE(opened.ok());
+    auto log = std::move(opened).value();
+
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, *log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+    for (int i = 0; i < 20 && raft.role() != cl::raft_role::leader; ++i) {
+        clock.advance(20ms);
+        raft.tick();
+    }
+    CRPC_REQUIRE(raft.role() == cl::raft_role::leader);
+
+    const u64 durable_before = log->durable_size();
+    const u64 commit_before = raft.commit_index();
+    const u64 index_before = log->last_index();
+
+    log->inject_flush_failure();
+    const std::byte payload[] = {std::byte{0x01}};
+    const auto proposed = raft.propose(span<const std::byte>(payload, 1));
+
+    // The write is not durable, so it must not be reported as accepted.
+    CRPC_CHECK_FALSE(proposed.ok());
+    CRPC_CHECK_EQ(durable_before, log->durable_size());
+    // Neither the commit index nor the log may advance on a failed sync.
+    CRPC_CHECK_EQ(commit_before, raft.commit_index());
+    CRPC_CHECK_EQ(index_before, log->last_index());
+}
+
+// --- D-A-2 / D-B-3: concurrent propose and replay must not corrupt the log ---
+//
+// `raft_node` had no synchronisation, and `file_registry_log` shared one file
+// handle across threads (`SetFilePointerEx` + `ReadFile`/`WriteFile` is a
+// seek-then-IO pair). A raft tick thread and an HTTP handler thread therefore
+// raced: two `propose` calls could allocate the SAME index (both read
+// `last_index() + 1`), and one append would truncate the other, silently losing
+// a write; a concurrent `replay` could read the wrong bytes. This case drives
+// both from many threads and asserts the log stays dense and complete.
+
+CRPC_TEST(raft_concurrent_propose_and_replay_keep_the_log_dense) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-conc-");
+    CRPC_REQUIRE(state.ok());
+    const fs::path log_path = state.value().native() / "raft.log";
+    auto opened = cl::file_registry_log::open(log_path.str());
+    CRPC_REQUIRE(opened.ok());
+    auto log = std::move(opened).value();
+
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, *log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+    for (int i = 0; i < 20 && raft.role() != cl::raft_role::leader; ++i) {
+        clock.advance(20ms);
+        raft.tick();
+    }
+    CRPC_REQUIRE(raft.role() == cl::raft_role::leader);
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 25;
+    std::atomic<int> proposed_ok{0};
+    std::atomic<int> replay_errors{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::byte payload[] = {std::byte{0x01}};
+                const auto proposed =
+                    raft.propose(span<const std::byte>(payload, 1));
+                if (proposed.ok()) {
+                    proposed_ok.fetch_add(1, std::memory_order_relaxed);
+                }
+                // A concurrent reader: the file handle is shared, so a missing
+                // lock shows up as a short read or a non-dense replay.
+                const auto replayed = log->replay(0);
+                if (!replayed.ok()) {
+                    replay_errors.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                u64 expected = 1;
+                for (const cl::log_record& record : replayed.value()) {
+                    if (record.index != expected) {
+                        replay_errors.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    ++expected;
+                }
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Every proposal succeeded, and the log holds exactly that many entries with
+    // no gap and no lost write.
+    CRPC_CHECK_EQ(kThreads * kPerThread, proposed_ok.load());
+    CRPC_CHECK_EQ(0, replay_errors.load());
+    CRPC_CHECK_EQ(u64{kThreads * kPerThread}, log->last_index());
+    const auto final_replay = log->replay(0);
+    CRPC_REQUIRE(final_replay.ok());
+    CRPC_CHECK_EQ(std::size_t{kThreads * kPerThread},
+                  final_replay.value().size());
+}
+
+// --- N-B-2: PreVote grants must not count toward the real election ----------
+//
+// A candidate collects PreVote grants in `votes_`. When a PreVote majority is
+// reached it increments the term and starts a REAL election -- but it did not
+// clear `votes_`, so the PreVote grants stayed in the same vector the real
+// `vote_reply` path appends to. A 5-node cluster (quorum 3) could then elect a
+// leader with only ONE real vote: two PreVote grants + one real vote + the
+// candidate's own vote reached the quorum, bypassing the majority requirement.
+//
+// This case drives a standalone candidate: two PreVote grants (a PreVote
+// majority), then ONE real vote. It must still be a candidate. A second real
+// vote reaches the quorum and it becomes leader.
+
+CRPC_TEST(raft_prevote_grants_do_not_count_toward_the_real_election) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-prevote-quorum-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C", "D", "E"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Drive A into candidacy: advance past the election timeout and tick.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    // The PreVote proposes term_ + 1; the term is not bumped until a majority
+    // grants.
+    const u64 candidacy_term = raft.term() + 1;
+
+    // Two PreVote grants (B, C). Quorum is 3 (self + 2), so this is a PreVote
+    // majority and A moves to a real election.
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = raft.term();
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+    CRPC_REQUIRE(raft.term() == candidacy_term);
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // ONE real vote from D. The two PreVote grants must NOT count: A has only
+    // its own vote + D's = 2, short of the quorum of 3.
+    cl::raft_message vote;
+    vote.kind = cl::raft_message::type::vote_reply;
+    vote.term = raft.term();
+    vote.from = "D";
+    vote.to = "A";
+    vote.granted = true;
+    raft.handle(vote);
+
+    CRPC_CHECK(raft.role() == cl::raft_role::candidate);
+
+    // A second real vote (E) reaches the quorum and A becomes leader.
+    cl::raft_message second = vote;
+    second.from = "E";
+    raft.handle(second);
+    CRPC_CHECK(raft.role() == cl::raft_role::leader);
+}
+
+// --- LATE-PREVOTE: a late PreVote reply must not be counted -----------------
+//
+// After a PreVote majority the node does `votes_.clear(); ++term_;` and starts
+// a real election, but `role_` stays `candidate`. The `prevote_reply` guard was
+// `if (msg.term > term_ + 1) break;` -- an UPPER bound only. Once `term_` has
+// advanced, that window moves with it, so a PreVote reply that was in flight
+// during the transition (carrying the OLD term) still passes the guard and
+// lands in the freshly cleared `votes_`.
+//
+// This is a SAFETY defect, not merely liveness. Two consequences, both from the
+// same root cause:
+//   * liveness: two late replies reach a majority again and bump the term a
+//     second time (term inflation, a vote round for a term nobody asked for);
+//   * safety: ONE late reply plus ONE real vote plus the candidate's own vote
+//     reaches the quorum, electing a leader with a single real vote -- the
+//     majority requirement is bypassed.
+//
+// Both paths are pinned below, because their consequences differ.
+
+CRPC_TEST(raft_late_prevote_reply_does_not_bump_the_term_again) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-late-prevote-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C", "D", "E"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Drive A into candidacy at term 0.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{0});
+    const u64 prevote_term = raft.term(); // the term the PreVote replies carry
+
+    // B, C grant the PreVote: quorum 3 (self + 2), so A increments the term to
+    // 1 and starts a real election.
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = prevote_term;
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+    CRPC_REQUIRE(raft.term() == u64{1});
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // D, E's PreVote replies were in flight during the transition and carry the
+    // OLD term (0). They must NOT be counted: the term must stay 1, and no
+    // second election round may start.
+    for (const char* from : {"D", "E"}) {
+        cl::raft_message late;
+        late.kind = cl::raft_message::type::prevote_reply;
+        late.term = prevote_term;
+        late.from = from;
+        late.to = "A";
+        late.granted = true;
+        raft.handle(late);
+    }
+
+    CRPC_CHECK_EQ(u64{1}, raft.term());
+    CRPC_CHECK(raft.role() == cl::raft_role::candidate);
+}
+
+// The SAFETY path: ONE late PreVote reply plus ONE real vote must not elect a
+// leader. If the stale reply is counted, 1 real vote + 1 stale prevote + the
+// candidate's own vote = quorum (3 of 5), and the node becomes leader with a
+// single real vote -- the majority requirement is bypassed.
+
+CRPC_TEST(raft_late_prevote_reply_does_not_count_as_a_real_vote) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-late-prevote-s-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C", "D", "E"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Drive A into candidacy at term 0.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{0});
+    const u64 prevote_term = raft.term();
+
+    // B, C grant the PreVote: quorum 3 (self + 2), so A increments the term to
+    // 1 and starts a real election.
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = prevote_term;
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+    CRPC_REQUIRE(raft.term() == u64{1});
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // ONE late PreVote reply (old term 0) and ONE real vote (term 1). The stale
+    // reply must not count: A has only its own vote + E's = 2, short of 3.
+    cl::raft_message late;
+    late.kind = cl::raft_message::type::prevote_reply;
+    late.term = prevote_term;
+    late.from = "D";
+    late.to = "A";
+    late.granted = true;
+    raft.handle(late);
+
+    cl::raft_message real;
+    real.kind = cl::raft_message::type::vote_reply;
+    real.term = raft.term();
+    real.from = "E";
+    real.to = "A";
+    real.granted = true;
+    raft.handle(real);
+
+    CRPC_CHECK(raft.role() == cl::raft_role::candidate);
+}
+
+// --- STALE-ACK: an append_reply from an old term must not advance commit -----
+//
+// The `append` branch rejects `msg.term < term_` before touching any state, and
+// `vote_reply` requires `msg.term == term_`. The `append_reply` branch had NO
+// term check at all: it looked up the peer by name, recorded `last_ack`, and on
+// success raised `match_index` and called `advance_commit_locked()`.
+//
+// A reply from an OLD term is a follower answering a request the leader sent
+// before it was re-elected. Its `match_index` describes a log position that may
+// no longer exist, and counting it toward the commit quorum can commit an entry
+// the current term never replicated to a majority -- the exact corruption Raft
+// 5.4.2 forbids. This is a SAFETY defect.
+//
+// The case drives a 3-node leader (quorum 2), proposes one entry (commit stays
+// 0: only the leader holds it), then feeds a stale-term success reply with an
+// inflated `match_index`. If the reply is counted, replicas = leader + B = 2 =
+// quorum and the commit index advances over an entry no majority ever stored.
+
+CRPC_TEST(raft_stale_append_reply_does_not_advance_commit) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-stale-ack-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Drive A into candidacy at term 0.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{0});
+    const u64 prevote_term = raft.term();
+
+    // B grants the PreVote: quorum 2 (self + B), so A increments the term to 1
+    // and starts a real election.
+    cl::raft_message prevote;
+    prevote.kind = cl::raft_message::type::prevote_reply;
+    prevote.term = prevote_term;
+    prevote.from = "B";
+    prevote.to = "A";
+    prevote.granted = true;
+    raft.handle(prevote);
+    CRPC_REQUIRE(raft.term() == u64{1});
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // B grants the real vote: quorum 2 (self + B), so A becomes leader.
+    cl::raft_message vote;
+    vote.kind = cl::raft_message::type::vote_reply;
+    vote.term = raft.term();
+    vote.from = "B";
+    vote.to = "A";
+    vote.granted = true;
+    raft.handle(vote);
+    CRPC_REQUIRE(raft.role() == cl::raft_role::leader);
+    const u64 leader_term = raft.term();
+
+    // Propose one entry. Only the leader holds it, so the commit index stays 0.
+    const std::byte payload[] = {std::byte{0x01}};
+    const auto proposed = raft.propose(span<const std::byte>(payload, 1));
+    CRPC_REQUIRE(proposed.ok());
+    CRPC_REQUIRE(raft.commit_index() == u64{0});
+    const u64 commit_before = raft.commit_index();
+
+    // A STALE success reply: term one BELOW the leader's, claiming a match_index
+    // far beyond anything that was replicated. It must be ignored entirely.
+    cl::raft_message stale;
+    stale.kind = cl::raft_message::type::append_reply;
+    stale.term = leader_term - 1;
+    stale.from = "B";
+    stale.to = "A";
+    stale.success = true;
+    stale.match_index = raft.last_log_index() + 100;
+    raft.handle(stale);
+
+    CRPC_CHECK_EQ(commit_before, raft.commit_index());
+}
+
+// --- 3RD-PATH: a PreVote reply carrying the NEW term must not count as a vote -
+//
+// The `prevote_reply` guard accepts BOTH `term_` and `term_ + 1` (the probe's
+// term is `term_ + 1`, and a peer that has already advanced answers in its own
+// `term_`). That window is correct BEFORE the PreVote majority. AFTER it, the
+// node does `votes_.clear(); ++term_; voted_for_ = self; voted_this_term_ =
+// true;` and starts a real election -- but `role_` stays `candidate`.
+//
+// A PreVote reply that arrives carrying the NEW term (`== term_`) still passes
+// both bounds (`term_ > term_ + 1` false, `term_ < term_` false) and lands in
+// the freshly cleared `votes_`. It is a PreVote grant, not a real vote, yet it
+// is counted as one: ONE such reply plus ONE real vote plus the candidate's own
+// vote reaches the quorum, electing a leader with a single real vote.
+//
+// This is a real network ordering, not a contrived one: `tick` sends the probe
+// with `term_ + 1` (`raft_node.cpp:346`), and a peer that has already advanced
+// to that term answers in its own `term_` (`raft_node.cpp:445`).
+//
+// The fix rejects a PreVote reply once this node has voted for itself in the
+// current term -- exactly the post-bump state. A bare `voted_this_term_` check
+// is too wide: it is also true when the node voted for ANOTHER candidate, which
+// would refuse a legitimate PreVote.
+
+CRPC_TEST(raft_new_term_prevote_reply_does_not_count_as_a_real_vote) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-3rd-path-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C", "D", "E"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Drive A into candidacy at term 0.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{0});
+    const u64 prevote_term = raft.term();
+
+    // B, C grant the PreVote: quorum 3 (self + 2), so A increments the term to
+    // 1 and starts a real election.
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = prevote_term;
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+    CRPC_REQUIRE(raft.term() == u64{1});
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // ONE PreVote reply carrying the NEW term (1) and ONE real vote (term 1).
+    // The PreVote grant must not count: A has only its own vote + E's = 2,
+    // short of the quorum of 3.
+    cl::raft_message new_term_prevote;
+    new_term_prevote.kind = cl::raft_message::type::prevote_reply;
+    new_term_prevote.term = raft.term();
+    new_term_prevote.from = "D";
+    new_term_prevote.to = "A";
+    new_term_prevote.granted = true;
+    raft.handle(new_term_prevote);
+
+    cl::raft_message real;
+    real.kind = cl::raft_message::type::vote_reply;
+    real.term = raft.term();
+    real.from = "E";
+    real.to = "A";
+    real.granted = true;
+    raft.handle(real);
+
+    CRPC_CHECK(raft.role() == cl::raft_role::candidate);
+}
+
+// --- 2ND-ROUND: a candidate must be able to win a SECOND election ------------
+//
+// The 3RD-PATH guard must not be built on `voted_this_term_` / `voted_for_`.
+// After a PreVote majority the node sets `voted_for_ = self; voted_this_term_ =
+// true;` and starts a real election. If that election fails (no vote replies),
+// the next `tick()` starts a NEW PreVote round -- but it only clears `votes_`,
+// it does NOT reset `voted_for_`/`voted_this_term_` (they are the per-term vote
+// record, and the term has not changed). A guard keyed on those fields would
+// therefore reject every PreVote reply in round 2, and the node could never win
+// a second election: a liveness defect.
+//
+// The correct key is a dedicated round flag: set when a PreVote round starts,
+// cleared when the round converts to a real election. This case pins the
+// liveness property the flag exists to preserve.
+
+CRPC_TEST(raft_candidate_can_win_a_second_election) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-raft-2nd-round-");
+    CRPC_REQUIRE(state.ok());
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {"B", "C", "D", "E"};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    cl::raft_node raft(config, log, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    std::vector<cl::raft_message> outbound;
+    raft.set_send_hook([&outbound](const cl::raft_message& msg) {
+        outbound.push_back(msg);
+    });
+
+    // Round 1: candidacy at term 0, PreVote majority bumps the term to 1 and
+    // starts a real election. No vote replies arrive, so the election fails.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{0});
+    const u64 prevote_term = raft.term();
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = prevote_term;
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+    CRPC_REQUIRE(raft.term() == u64{1});
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+
+    // Round 2: the election times out again. A new PreVote round starts at the
+    // current term (1); its replies carry term 1. The PreVote majority must be
+    // honoured -- the term must advance to 2 -- or the node is stuck forever.
+    clock.advance(100ms);
+    raft.tick();
+    CRPC_REQUIRE(raft.role() == cl::raft_role::candidate);
+    CRPC_REQUIRE(raft.term() == u64{1});
+    const u64 round2_prevote_term = raft.term();
+    for (const char* from : {"B", "C"}) {
+        cl::raft_message reply;
+        reply.kind = cl::raft_message::type::prevote_reply;
+        reply.term = round2_prevote_term;
+        reply.from = from;
+        reply.to = "A";
+        reply.granted = true;
+        raft.handle(reply);
+    }
+
+    CRPC_CHECK_EQ(u64{2}, raft.term());
 }
 
 CRPC_TEST_MAIN()

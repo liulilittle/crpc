@@ -1298,6 +1298,14 @@ void consul_http::handle_register(const http::request& request,
         return;
     }
 
+    // D-A-5: the incarnation must advance on every registration. The registry
+    // rejects a register whose incarnation is not strictly above the stored one,
+    // and a tombstone rejects every incarnation at or below its own, so a fixed
+    // value of 1 makes a second registration (or a re-registration after a
+    // deregister) impossible. Derive it from the current row: first registration
+    // is 1, each later one is stored + 1.
+    const u64 incarnation = service_.instance_incarnation(name, node) + 1;
+
     std::vector<std::byte> tags_wire;
     put_string_tag(tags_wire, registry_tag_token, token);
     put_u64_tag(tags_wire, registry_tag_token_issued_at, now_millis());
@@ -1305,7 +1313,7 @@ void consul_http::handle_register(const http::request& request,
     put_string_tag(tags_wire, registry_tag_node_id, node);
     put_string_tag(tags_wire, registry_tag_host, address);
     put_u16_tag(tags_wire, registry_tag_port, static_cast<u16>(port));
-    put_u64_tag(tags_wire, registry_tag_incarnation, 1);
+    put_u64_tag(tags_wire, registry_tag_incarnation, incarnation);
     put_u64_tag(tags_wire, registry_tag_fence, fence);
     put_u64_tag(tags_wire, registry_tag_writer_epoch,
                 writer_epoch_for(service_));
@@ -1315,8 +1323,16 @@ void consul_http::handle_register(const http::request& request,
     // the catalog is never touched and the instance survives. The binary
     // client appends the method for exactly this reason
     // (registry_client.cpp:326-336).
+    //
+    // D-A-5: it must ALSO name the incarnation. A key of `name + node +
+    // "register"` alone is identical for every registration of the same
+    // instance, so a second registration replays the FIRST request's cached
+    // response: the port never moves and the catalog is never touched, while
+    // the caller sees a 200. The incarnation is what distinguishes one
+    // registration from the next.
     put_string_tag(tags_wire, registry_tag_client_request_id,
-                   name + '\x1f' + node + '\x1f' + "register");
+                   name + '\x1f' + node + '\x1f' + std::to_string(incarnation) +
+                       '\x1f' + "register");
     if (!tags.empty()) {
         metadata_list meta;
         for (const std::string& tag : tags) {
@@ -1408,18 +1424,28 @@ void consul_http::handle_deregister(const http::request& request,
         return;
     }
 
+    // D-A-5: the deregister must present the SAME incarnation the row holds.
+    // The registry rejects a deregister whose incarnation is below the stored
+    // one (`stale_incarnation`), so a fixed 1 fails on any row that was
+    // registered more than once. Read the current value; a row that is already
+    // gone keeps 0, which the registry treats as "no expectation".
+    const u64 incarnation = service_.instance_incarnation(service_name, node_name);
+
     std::vector<std::byte> tags;
     put_string_tag(tags, registry_tag_token, token);
     put_u64_tag(tags, registry_tag_token_issued_at, now_millis());
     put_string_tag(tags, registry_tag_service, service_name);
     put_string_tag(tags, registry_tag_node_id, node_name);
-    put_u64_tag(tags, registry_tag_incarnation, 1);
+    put_u64_tag(tags, registry_tag_incarnation, incarnation);
     put_u64_tag(tags, registry_tag_fence, fence);
     put_u64_tag(tags, registry_tag_writer_epoch, writer_epoch_for(service_));
     // The idempotency key names the method: a deregister must not be answered
-    // from a register's cached response (see `handle_register`).
+    // from a register's cached response (see `handle_register`). It also names
+    // the incarnation, so a deregister of one incarnation is not confused with
+    // a later one.
     put_string_tag(tags, registry_tag_client_request_id,
-                   service_name + '\x1f' + node_name + '\x1f' + "deregister");
+                   service_name + '\x1f' + node_name + '\x1f' +
+                       std::to_string(incarnation) + '\x1f' + "deregister");
     const std::vector<std::byte> frame = finish_frame(tags);
 
     buffer encoded;

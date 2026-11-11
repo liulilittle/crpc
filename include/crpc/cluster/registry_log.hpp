@@ -52,6 +52,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -125,6 +126,14 @@ public:
 
 // File-backed log. Owns its file handle for the whole lifetime and appends with
 // an explicit write at end-of-file, so a crash cannot interleave two writers.
+//
+// Thread safety (G19 step4 D-B-3): every public method takes `mutex_`. The
+// consensus node and the service's apply loop reach this object from different
+// threads (a raft tick thread and an HTTP handler thread), and the file handle
+// is shared: `SetFilePointerEx` + `ReadFile`/`WriteFile` are a seek-then-IO
+// pair, so two concurrent calls interleave the seek and read the wrong bytes.
+// The lock is per-object and non-recursive; the internal helpers
+// (`replay_locked`, `read_all`, `write_at`, `current_size`) assume it is held.
 class CRPC_API file_registry_log final : public registry_log {
 public:
     ~file_registry_log() override;
@@ -141,15 +150,15 @@ public:
     result<std::vector<log_record>> replay(u64 from_index) const override;
     status truncate_suffix(u64 from_index) override;
     status sync() override;
-    [[nodiscard]] u64 last_index() const noexcept override { return last_index_; }
+    [[nodiscard]] u64 last_index() const noexcept override;
 
     // Byte offset of the last successful `sync()`. Everything written after it
     // is not durable yet.
-    [[nodiscard]] u64 durable_size() const noexcept { return durable_size_; }
+    [[nodiscard]] u64 durable_size() const noexcept;
 
     // Number of successful flush calls. Zero means nothing was ever made
     // durable.
-    [[nodiscard]] u64 flush_count() const noexcept { return flush_count_; }
+    [[nodiscard]] u64 flush_count() const noexcept;
 
     // Makes the next `sync()` fail at the device. The injection lives inside
     // the same gate the real flush uses, so a `sync()` that skips the flush and
@@ -160,7 +169,7 @@ public:
     // satisfied by a mutant that advances the boundary without flushing -- the
     // mutation would be self-consistent. The failure path is the only
     // observable that separates "flushed" from "claimed to have flushed".
-    void inject_flush_failure() noexcept { fail_flush_ = true; }
+    void inject_flush_failure() noexcept;
 
     // Power-loss model: discards every byte written after the last `sync()`.
     // This is NOT an I/O-error injection; the distinction matters because an
@@ -186,9 +195,20 @@ private:
     status read_all(std::vector<std::byte>& out) const;
     status truncate_to(u64 size);
     [[nodiscard]] u64 current_size() const;
+    // The body of `replay`, without taking the lock. `open()` calls it before
+    // the object is published, and `truncate_suffix` calls it with the lock
+    // already held.
+    result<std::vector<log_record>> replay_locked(u64 from_index) const;
+    // The body of `sync`, without taking the lock. `truncate_suffix` calls it
+    // with the lock already held.
+    status sync_locked();
+
+    // Serialises every public entry point. `mutable` so the const readers
+    // (`replay`, `last_index`, `durable_size`) can take it.
+    mutable std::mutex mutex_;
 
     // 0/negative when closed. Kept as void* so the public header stays free of
-    // <windows.h>; on POSIX the descriptor is stored as intptr_t.
+    // <windows.h>; on the POSIX path the descriptor is stored as intptr_t.
     void* handle_ = nullptr;
     u64 last_index_ = 0;
     u64 durable_size_ = 0;
@@ -206,17 +226,20 @@ private:
 
 // In-memory log with the same semantics minus durability. `sync()` is a
 // successful no-op and the durable boundary equals the written size.
+//
+// Thread safety: same contract as `file_registry_log` -- every public method
+// takes `mutex_`, because the consensus node and the apply loop reach it from
+// different threads.
 class CRPC_API memory_registry_log final : public registry_log {
 public:
     result<u64> append(const log_record& record) override;
     result<std::vector<log_record>> replay(u64 from_index) const override;
     status truncate_suffix(u64 from_index) override;
     status sync() override { return status(); }
-    [[nodiscard]] u64 last_index() const noexcept override {
-        return records_.empty() ? 0 : records_.back().index;
-    }
+    [[nodiscard]] u64 last_index() const noexcept override;
 
 private:
+    mutable std::mutex mutex_;
     std::vector<log_record> records_;
 };
 

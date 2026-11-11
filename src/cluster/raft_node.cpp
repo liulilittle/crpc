@@ -13,6 +13,19 @@
 //     matches but the follower's term there differs from the leader's, every
 //     record from that index is removed before the leader's entries are
 //     appended.
+//
+// Threading (G19 step4 D-A-2 / D-B-3)
+// -----------------------------------
+// Every public method takes `mutex_`. The lock is NEVER held across the send
+// hook: `send_to` calls the hook synchronously, and a transport delivers the
+// message by calling `handle()` on the peer, which can re-enter THIS node
+// (`append_reply` -> `advance_commit_locked`). Holding a non-recursive mutex
+// across that re-entry self-deadlocks; a recursive one would let the re-entrant
+// call observe a half-updated `match_index`. So each public method mutates
+// state and builds its outbound messages under the lock, releases it, and only
+// then delivers. A re-entrant `handle()` therefore sees a fully consistent
+// state, and the outer call's post-delivery `advance_commit_locked` is a no-op
+// because the re-entrant call already advanced the commit index.
 #include <crpc/cluster/raft_node.hpp>
 
 #include <algorithm>
@@ -50,6 +63,7 @@ raft_node::raft_node(raft_config config, registry_log& log, fs::path state_dir,
 }
 
 status raft_node::start() {
+    std::lock_guard<std::mutex> lock(mutex_);
     raft_persistent_state persisted;
     const status loaded = raft_state_store::load(state_dir_, persisted);
     if (!loaded.ok()) {
@@ -95,18 +109,31 @@ status raft_node::start() {
 }
 
 void raft_node::set_send_hook(std::function<void(const raft_message&)> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
     send_hook_ = std::move(hook);
 }
 
-raft_role raft_node::role() const noexcept { return role_; }
+raft_role raft_node::role() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return role_;
+}
 
-u64 raft_node::term() const noexcept { return term_; }
+u64 raft_node::term() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return term_;
+}
 
-u64 raft_node::commit_index() const noexcept { return commit_index_; }
+u64 raft_node::commit_index() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return commit_index_;
+}
 
-u64 raft_node::last_log_index() const noexcept { return log_.last_index(); }
+u64 raft_node::last_log_index() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return log_.last_index();
+}
 
-u64 raft_node::last_log_term() const noexcept {
+u64 raft_node::last_log_term_locked() const noexcept {
     const auto replayed = log_.replay(0);
     if (!replayed.ok()) {
         return 0;
@@ -114,7 +141,12 @@ u64 raft_node::last_log_term() const noexcept {
     return term_of_index(replayed.value(), log_.last_index());
 }
 
-u64 raft_node::entry_term(u64 index) const noexcept {
+u64 raft_node::last_log_term() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_log_term_locked();
+}
+
+u64 raft_node::entry_term_locked(u64 index) const noexcept {
     if (index == 0) {
         return 0;
     }
@@ -125,7 +157,15 @@ u64 raft_node::entry_term(u64 index) const noexcept {
     return term_of_index(replayed.value(), index);
 }
 
-std::string raft_node::leader_id() const { return leader_id_; }
+u64 raft_node::entry_term(u64 index) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return entry_term_locked(index);
+}
+
+std::string raft_node::leader_id() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return leader_id_;
+}
 
 u64 raft_node::quorum_size() const noexcept {
     return (config_.peers.size() + 1) / 2 + 1;
@@ -224,98 +264,144 @@ void raft_node::broadcast(const raft_message& msg) {
     }
 }
 
-void raft_node::tick() {
-    const auto now = clock_.read();
-    if (role_ == raft_role::leader) {
-        // Heartbeats are periodic and empty: they carry no entries, so a
-        // follower whose log already matches has nothing to write.
-        if (now - last_heartbeat_ >= config_.heartbeat_interval) {
-            raft_message beat;
-            beat.kind = raft_message::type::append;
-            beat.term = term_;
-            beat.from = config_.node_id;
-            beat.prev_log_index = log_.last_index();
-            beat.prev_log_term = last_log_term();
-            beat.leader_commit = commit_index_;
-            broadcast(beat);
-            last_heartbeat_ = now;
+void raft_node::deliver(const std::vector<raft_message>& messages) {
+    // Called with the lock RELEASED. The hook may re-enter `handle()` on this
+    // node, which is why the caller must have finished mutating state first.
+    for (const raft_message& msg : messages) {
+        send_to(msg.to, msg);
+    }
+}
 
-            // CheckQuorum runs AFTER the heartbeat, not before it: the
-            // transport delivers replies synchronously, so a reachable peer
-            // has already refreshed `last_ack` by the time this runs. Checking
-            // first would count the interval that just elapsed as silence and
-            // depose a healthy leader.
+void raft_node::tick() {
+    std::vector<raft_message> outbound;
+    bool sent_heartbeat = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = clock_.read();
+        if (role_ == raft_role::leader) {
+            // Heartbeats are periodic and empty: they carry no entries, so a
+            // follower whose log already matches has nothing to write.
+            if (now - last_heartbeat_ >= config_.heartbeat_interval) {
+                raft_message beat;
+                beat.kind = raft_message::type::append;
+                beat.term = term_;
+                beat.from = config_.node_id;
+                beat.prev_log_index = log_.last_index();
+                beat.prev_log_term = last_log_term_locked();
+                beat.leader_commit = commit_index_;
+                for (const auto& peer : config_.peers) {
+                    if (peer == config_.node_id) {
+                        continue;
+                    }
+                    raft_message copy = beat;
+                    copy.to = peer;
+                    outbound.push_back(std::move(copy));
+                }
+                last_heartbeat_ = now;
+                sent_heartbeat = true;
+            }
+        } else if (now >= election_deadline_) {
+            // PreVote asks "could I win if I start an election now". It MUST NOT
+            // increment the term: a probe that bumped the term would make every
+            // peer adopt it, so a partitioned node could drag the whole
+            // cluster's term upwards one step at a time (the failure mode
+            // `election.cpp:111-113` and Raft section 8 both warn about).
             //
-            // Two guards keep it from firing too early:
-            //   * a fresh leader is exempt for one election timeout, so a
-            //     single lost heartbeat cannot depose it, and
-            //   * a peer that has never answered is not counted as reachable
-            //     (`last_ack` is the epoch until it answers).
-            if (!can_win_alone()) {
-                const auto window =
-                    std::chrono::milliseconds(random_election_timeout());
-                if (now - leader_since_ >= window) {
-                    std::size_t reachable = 1; // the leader itself
-                    for (const auto& peer : peers_) {
-                        if (peer.last_ack != monotonic_clock::time_point{} &&
-                            now - peer.last_ack < window) {
-                            ++reachable;
-                        }
+            // `tick()` therefore leaves `term_` alone and records the term this
+            // candidacy is FOR. The increment happens in `prevote_reply` once a
+            // majority has agreed.
+            role_ = raft_role::candidate;
+            leader_id_.clear();
+            votes_.clear();
+            // A new PreVote round is starting: grants are accepted again. The
+            // flag is cleared when the round converts to a real election, so a
+            // PreVote grant that arrives after the conversion is rejected.
+            prevote_round_active_ = true;
+            election_deadline_ =
+                now + std::chrono::milliseconds(random_election_timeout());
+            // A single-node cluster has no one to ask: the pre-vote would never
+            // be answered and the node would campaign forever.
+            if (can_win_alone()) {
+                ++term_;
+                become_leader();
+                (void)persist_locked();
+                raft_message beat;
+                beat.kind = raft_message::type::append;
+                beat.term = term_;
+                beat.from = config_.node_id;
+                beat.prev_log_index = log_.last_index();
+                beat.prev_log_term = last_log_term_locked();
+                beat.leader_commit = commit_index_;
+                for (const auto& peer : config_.peers) {
+                    if (peer == config_.node_id) {
+                        continue;
                     }
-                    if (reachable < quorum_size()) {
-                        become_follower(term_, std::string{});
-                        return;
+                    raft_message copy = beat;
+                    copy.to = peer;
+                    outbound.push_back(std::move(copy));
+                }
+                last_heartbeat_ = now;
+            } else {
+                raft_message pre;
+                pre.kind = raft_message::type::prevote;
+                // The term the candidate WOULD adopt. Peers must not adopt it;
+                // they answer in their own term and the candidate recognises
+                // its own probe.
+                pre.term = term_ + 1;
+                pre.from = config_.node_id;
+                pre.prev_log_index = log_.last_index();
+                pre.prev_log_term_hint = last_log_term_locked();
+                for (const auto& peer : config_.peers) {
+                    if (peer == config_.node_id) {
+                        continue;
                     }
+                    raft_message copy = pre;
+                    copy.to = peer;
+                    outbound.push_back(std::move(copy));
                 }
             }
         }
+    }
+    // Deliver with the lock released: the hook may re-enter `handle()` on this
+    // node, which refreshes `last_ack` for a reachable peer.
+    deliver(outbound);
+
+    // CheckQuorum runs AFTER the heartbeat is delivered, not before it: the
+    // transport delivers replies synchronously, so a reachable peer has already
+    // refreshed `last_ack` by the time this runs. Checking first would count the
+    // interval that just elapsed as silence and depose a healthy leader.
+    //
+    // Two guards keep it from firing too early:
+    //   * a fresh leader is exempt for one election timeout, so a single lost
+    //     heartbeat cannot depose it, and
+    //   * a peer that has never answered is not counted as reachable
+    //     (`last_ack` is the epoch until it answers).
+    if (!sent_heartbeat) {
         return;
     }
-    if (now >= election_deadline_) {
-        // PreVote asks "could I win if I start an election now". It MUST NOT
-        // increment the term: a probe that bumped the term would make every
-        // peer adopt it, so a partitioned node could drag the whole cluster's
-        // term upwards one step at a time (the failure mode
-        // `election.cpp:111-113` and Raft section 8 both warn about).
-        //
-        // `tick()` therefore leaves `term_` alone and records the term this
-        // candidacy is FOR. The increment happens in `prevote_reply` once a
-        // majority has agreed.
-        role_ = raft_role::candidate;
-        leader_id_.clear();
-        votes_.clear();
-        election_deadline_ = now + std::chrono::milliseconds(random_election_timeout());
-        // A single-node cluster has no one to ask: the pre-vote would never be
-        // answered and the node would campaign forever.
-        if (can_win_alone()) {
-            ++term_;
-            become_leader();
-            (void)persist_locked();
-            raft_message beat;
-            beat.kind = raft_message::type::append;
-            beat.term = term_;
-            beat.from = config_.node_id;
-            beat.prev_log_index = log_.last_index();
-            beat.prev_log_term = last_log_term();
-            beat.leader_commit = commit_index_;
-            broadcast(beat);
-            last_heartbeat_ = now;
-            return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (role_ != raft_role::leader || can_win_alone()) {
+        return;
+    }
+    const auto now = clock_.read();
+    const auto window = std::chrono::milliseconds(random_election_timeout());
+    if (now - leader_since_ < window) {
+        return;
+    }
+    std::size_t reachable = 1; // the leader itself
+    for (const auto& peer : peers_) {
+        if (peer.last_ack != monotonic_clock::time_point{} &&
+            now - peer.last_ack < window) {
+            ++reachable;
         }
-        raft_message pre;
-        pre.kind = raft_message::type::prevote;
-        // The term the candidate WOULD adopt. Peers must not adopt it; they
-        // answer in their own term and the candidate recognises its own probe.
-        pre.term = term_ + 1;
-        pre.from = config_.node_id;
-        pre.prev_log_index = log_.last_index();
-        pre.prev_log_term_hint = last_log_term();
-        broadcast(pre);
+    }
+    if (reachable < quorum_size()) {
+        become_follower(term_, std::string{});
     }
 }
 
 bool raft_node::log_ok_for_vote(u64 last_term, u64 last_index) const noexcept {
-    const u64 mine_term = last_log_term();
+    const u64 mine_term = last_log_term_locked();
     const u64 mine_index = log_.last_index();
     if (last_term != mine_term) {
         return last_term > mine_term;
@@ -324,280 +410,420 @@ bool raft_node::log_ok_for_vote(u64 last_term, u64 last_index) const noexcept {
 }
 
 void raft_node::handle(const raft_message& msg) {
-    // A PreVote is answered in the RECEIVER's term and never changes it: the
-    // whole point is that a probe must not bump a healthy node's term. Any
-    // other message from a higher term is adopted.
-    if (msg.kind != raft_message::type::prevote && msg.term > term_) {
-        // A higher term always wins, whatever the message is.
-        become_follower(msg.term, role_ == raft_role::leader ? std::string{} : leader_id_);
-        if (role_ == raft_role::leader) {
-            leader_id_.clear();
+    std::vector<raft_message> outbound;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // A PreVote is answered in the RECEIVER's term and never changes it: the
+        // whole point is that a probe must not bump a healthy node's term. Any
+        // other message from a higher term is adopted.
+        if (msg.kind != raft_message::type::prevote && msg.term > term_) {
+            // A higher term always wins, whatever the message is.
+            become_follower(msg.term,
+                            role_ == raft_role::leader ? std::string{}
+                                                       : leader_id_);
+            if (role_ == raft_role::leader) {
+                leader_id_.clear();
+            }
+            has_leader_ = false;
+            voted_for_.clear();
+            voted_this_term_ = false;
+            (void)persist_locked();
         }
-        has_leader_ = false;
-        voted_for_.clear();
-        voted_this_term_ = false;
-        (void)persist_locked();
-    }
 
-    switch (msg.kind) {
-    case raft_message::type::prevote: {
-        // A candidate may not disrupt a leader that is still alive, but that
-        // guard is deliberately NOT here. Raft's PreVote only requires the
-        // log-up-to-date check; refusing a probe because a leader was seen
-        // recently is an optional optimisation, and maintaining "was a leader
-        // seen" reliably proved to be the source of a livelock (a node whose
-        // own timer keeps being extended looks permanently fresh). A partitioned
-        // node that prevotes does not bump anyone's term, so the cost of dropping
-        // the guard is a harmless probe, not an election storm.
-        raft_message reply;
-        reply.kind = raft_message::type::prevote_reply;
-        // Answer in THIS node's term, never the probe's. The probe's term is a
-        // proposal, not a fact; echoing it would let a candidate drag a healthy
-        // node's term upwards one probe at a time.
-        reply.term = term_;
-        reply.from = config_.node_id;
-        reply.to = msg.from;
-        reply.granted =
-            log_ok_for_vote(msg.prev_log_term_hint, msg.prev_log_index);
-        send_to(msg.from, reply);
-        return;
-    }
-    case raft_message::type::prevote_reply: {
-        if (role_ != raft_role::candidate) {
-            return;
+        switch (msg.kind) {
+        case raft_message::type::prevote: {
+            // A candidate may not disrupt a leader that is still alive, but that
+            // guard is deliberately NOT here. Raft's PreVote only requires the
+            // log-up-to-date check; refusing a probe because a leader was seen
+            // recently is an optional optimisation, and maintaining "was a
+            // leader seen" reliably proved to be the source of a livelock (a
+            // node whose own timer keeps being extended looks permanently
+            // fresh). A partitioned node that prevotes does not bump anyone's
+            // term, so the cost of dropping the guard is a harmless probe, not
+            // an election storm.
+            raft_message reply;
+            reply.kind = raft_message::type::prevote_reply;
+            // Answer in THIS node's term, never the probe's. The probe's term is
+            // a proposal, not a fact; echoing it would let a candidate drag a
+            // healthy node's term upwards one probe at a time.
+            reply.term = term_;
+            reply.from = config_.node_id;
+            reply.to = msg.from;
+            reply.granted =
+                log_ok_for_vote(msg.prev_log_term_hint, msg.prev_log_index);
+            outbound.push_back(std::move(reply));
+            break;
         }
-        // A reply in a term other than the one this candidacy is for is not
-        // about this probe. In particular, a reply in the candidate's own term
-        // (term_ + 1 was the proposal, term_ is the current term) still counts:
-        // the peer has not moved on, so the probe is still live.
-        if (msg.term > term_ + 1) {
-            return;
+        case raft_message::type::prevote_reply: {
+            if (role_ != raft_role::candidate) {
+                break;
+            }
+            // A reply in a term other than the one this candidacy is for is not
+            // about this probe. In particular, a reply in the candidate's own
+            // term (term_ + 1 was the proposal, term_ is the current term) still
+            // counts: the peer has not moved on, so the probe is still live.
+            if (msg.term > term_ + 1) {
+                break;
+            }
+            // LATE-PREVOTE: a reply from a term BELOW the current one is a
+            // PreVote that was in flight during the transition. After a PreVote
+            // majority the node does `votes_.clear(); ++term_;` and starts a
+            // real election, but `role_` stays `candidate`. Without this lower
+            // bound, a late reply carrying the OLD term passes the upper-bound
+            // check above (the window moves with `term_`), lands in the freshly
+            // cleared `votes_`, and either (a) reaches a majority again and
+            // bumps the term a second time, or (b) -- worse -- combines with ONE
+            // real vote to reach the quorum, electing a leader with a single
+            // real vote. Both are the same root cause: a stale PreVote reply
+            // must not be counted once the term has advanced.
+            if (msg.term < term_) {
+                break;
+            }
+            // 3RD-PATH: once the PreVote majority has been reached, this node
+            // has already done `votes_.clear(); ++term_;` and started a REAL
+            // election. A PreVote reply carrying the NEW term (`== term_`)
+            // still passes both bounds above, so without this guard it lands in
+            // the freshly cleared `votes_` and is counted as a real vote: one
+            // such grant plus one real vote plus the candidate's own vote
+            // reaches the quorum, electing a leader with a single real vote.
+            //
+            // The key is the round flag, NOT `voted_this_term_`/`voted_for_`:
+            // those are the per-term vote record and are not reset when a new
+            // PreVote round starts in the same term, so keying on them would
+            // reject every grant in a second election round (a liveness defect).
+            if (!prevote_round_active_) {
+                break;
+            }
+            if (!msg.granted) {
+                break;
+            }
+            const auto already = std::find(votes_.begin(), votes_.end(), msg.from);
+            if (already != votes_.end()) {
+                break;
+            }
+            votes_.push_back(msg.from);
+            // A pre-vote majority means the candidate could win, so it now
+            // spends the term increment on a real election. The PreVote itself
+            // never touched `term_`, which is why this is safe.
+            if (votes_.size() + 1 >= quorum_size()) {
+                // N-B-2: the PreVote grants are NOT votes for the real
+                // election. `votes_` is the same vector the `vote_reply` path
+                // appends to, so leaving the PreVote grants in it lets a
+                // 5-node cluster (quorum 3) elect a leader with only ONE real
+                // vote: two PreVote grants + one real vote + the candidate's
+                // own vote reach the quorum, bypassing the majority
+                // requirement. Clear it before the term increment so the real
+                // election counts only real votes.
+                votes_.clear();
+                // The PreVote round is over: it has converted to a real
+                // election. A PreVote grant that arrives from here on must not
+                // be counted as a real vote.
+                prevote_round_active_ = false;
+                ++term_;
+                voted_for_ = config_.node_id;
+                voted_this_term_ = true;
+                (void)persist_locked();
+                raft_message vote;
+                vote.kind = raft_message::type::vote;
+                vote.term = term_;
+                vote.from = config_.node_id;
+                vote.prev_log_index = log_.last_index();
+                vote.prev_log_term_hint = last_log_term_locked();
+                for (const auto& peer : config_.peers) {
+                    if (peer == config_.node_id) {
+                        continue;
+                    }
+                    raft_message copy = vote;
+                    copy.to = peer;
+                    outbound.push_back(std::move(copy));
+                }
+            }
+            break;
         }
-        if (!msg.granted) {
-            return;
+        case raft_message::type::vote: {
+            raft_message reply;
+            reply.kind = raft_message::type::vote_reply;
+            // D-B-4: a vote request from a STALE term must be refused, and the
+            // reply must carry THIS node's term. Granting it would hand a live
+            // term's vote to a dead candidacy (setting `voted_this_term_`), so
+            // the real candidate for the current term is then refused. Echoing
+            // `msg.term` would additionally tell the dead candidate it is
+            // current. This mirrors the `append` branch's `msg.term < term_`
+            // guard.
+            if (msg.term < term_) {
+                reply.term = term_;
+                reply.from = config_.node_id;
+                reply.to = msg.from;
+                reply.granted = false;
+                outbound.push_back(std::move(reply));
+                break;
+            }
+            reply.term = term_;
+            reply.from = config_.node_id;
+            reply.to = msg.from;
+            const bool up_to_date = log_ok_for_vote(msg.prev_log_term_hint,
+                                                    msg.prev_log_index);
+            if (!voted_this_term_ && up_to_date) {
+                voted_this_term_ = true;
+                voted_for_ = msg.from;
+                (void)persist_locked();
+                reply.granted = true;
+                election_deadline_ =
+                    clock_.read() +
+                    std::chrono::milliseconds(random_election_timeout());
+            } else {
+                reply.granted = false;
+            }
+            outbound.push_back(std::move(reply));
+            break;
         }
-        const auto already = std::find(votes_.begin(), votes_.end(), msg.from);
-        if (already != votes_.end()) {
-            return;
+        case raft_message::type::vote_reply: {
+            if (role_ != raft_role::candidate) {
+                break;
+            }
+            // A reply in a term other than the one this candidacy is for is
+            // stale.
+            if (msg.term != term_) {
+                break;
+            }
+            if (!msg.granted) {
+                break;
+            }
+            const auto already = std::find(votes_.begin(), votes_.end(), msg.from);
+            if (already != votes_.end()) {
+                break;
+            }
+            votes_.push_back(msg.from);
+            // The candidate's own vote is cast locally, so the count includes
+            // it.
+            if (votes_.size() + 1 >= quorum_size()) {
+                become_leader();
+                raft_message beat;
+                beat.kind = raft_message::type::append;
+                beat.term = term_;
+                beat.from = config_.node_id;
+                beat.prev_log_index = log_.last_index();
+                beat.prev_log_term = last_log_term_locked();
+                beat.leader_commit = commit_index_;
+                for (const auto& peer : config_.peers) {
+                    if (peer == config_.node_id) {
+                        continue;
+                    }
+                    raft_message copy = beat;
+                    copy.to = peer;
+                    outbound.push_back(std::move(copy));
+                }
+                last_heartbeat_ = clock_.read();
+            }
+            break;
         }
-        votes_.push_back(msg.from);
-        // A pre-vote majority means the candidate could win, so it now spends
-        // the term increment on a real election. The PreVote itself never
-        // touched `term_`, which is why this is safe.
-        if (votes_.size() + 1 >= quorum_size()) {
-            ++term_;
-            voted_for_ = config_.node_id;
-            voted_this_term_ = true;
-            (void)persist_locked();
-            raft_message vote;
-            vote.kind = raft_message::type::vote;
-            vote.term = term_;
-            vote.from = config_.node_id;
-            vote.prev_log_index = log_.last_index();
-            vote.prev_log_term_hint = last_log_term();
-            broadcast(vote);
-        }
-        return;
-    }
-    case raft_message::type::vote: {
-        raft_message reply;
-        reply.kind = raft_message::type::vote_reply;
-        reply.term = msg.term;
-        reply.from = config_.node_id;
-        reply.to = msg.from;
-        const bool up_to_date = log_ok_for_vote(msg.prev_log_term_hint,
-                                                msg.prev_log_index);
-        if (!voted_this_term_ && up_to_date) {
-            voted_this_term_ = true;
-            voted_for_ = msg.from;
-            (void)persist_locked();
-            reply.granted = true;
-            election_deadline_ = clock_.read() +
-                                std::chrono::milliseconds(random_election_timeout());
-        } else {
-            reply.granted = false;
-        }
-        send_to(msg.from, reply);
-        return;
-    }
-    case raft_message::type::vote_reply: {
-        if (role_ != raft_role::candidate) {
-            return;
-        }
-        // A reply in a term other than the one this candidacy is for is stale.
-        if (msg.term != term_) {
-            return;
-        }
-        if (!msg.granted) {
-            return;
-        }
-        const auto already = std::find(votes_.begin(), votes_.end(), msg.from);
-        if (already != votes_.end()) {
-            return;
-        }
-        votes_.push_back(msg.from);
-        // The candidate's own vote is cast locally, so the count includes it.
-        if (votes_.size() + 1 >= quorum_size()) {
-            become_leader();
-            raft_message beat;
-            beat.kind = raft_message::type::append;
-            beat.term = term_;
-            beat.from = config_.node_id;
-            beat.prev_log_index = log_.last_index();
-            beat.prev_log_term = last_log_term();
-            beat.leader_commit = commit_index_;
-            broadcast(beat);
+        case raft_message::type::append: {
+            // Reject a message from a stale term before touching any state: a
+            // delayed heartbeat from a deposed leader must not reset this node's
+            // election timer, or a deposed leader could keep an election from
+            // ever starting.
+            if (msg.term < term_) {
+                break;
+            }
+            // A leader heartbeat or replication. A higher term was handled
+            // above, so this is the current leader (or this node's own term).
+            leader_id_ = msg.from;
+            has_leader_ = true;
             last_heartbeat_ = clock_.read();
-        }
-        return;
-    }
-    case raft_message::type::append: {
-        // Reject a message from a stale term before touching any state: a
-        // delayed heartbeat from a deposed leader must not reset this node's
-        // election timer, or a deposed leader could keep an election from ever
-        // starting.
-        if (msg.term < term_) {
-            return;
-        }
-        // A leader heartbeat or replication. A higher term was handled above, so
-        // this is the current leader (or this node's own term).
-        leader_id_ = msg.from;
-        has_leader_ = true;
-        last_heartbeat_ = clock_.read();
-        election_deadline_ = last_heartbeat_ +
-                            std::chrono::milliseconds(random_election_timeout());
-        role_ = raft_role::follower;
+            election_deadline_ =
+                last_heartbeat_ +
+                std::chrono::milliseconds(random_election_timeout());
+            role_ = raft_role::follower;
 
-        const u64 last = log_.last_index();
-        const bool prev_ok =
-            msg.prev_log_index == 0 ||
-            (msg.prev_log_index <= last &&
-             entry_term(msg.prev_log_index) == msg.prev_log_term);
-        if (!prev_ok) {
+            const u64 last = log_.last_index();
+            const bool prev_ok =
+                msg.prev_log_index == 0 ||
+                (msg.prev_log_index <= last &&
+                 entry_term_locked(msg.prev_log_index) == msg.prev_log_term);
+            if (!prev_ok) {
+                raft_message reply;
+                reply.kind = raft_message::type::append_reply;
+                reply.term = term_;
+                reply.from = config_.node_id;
+                reply.to = msg.from;
+                reply.success = false;
+                reply.match_index = 0;
+                // Tell the leader where to resume, so it does not walk back one
+                // index at a time.
+                reply.conflict_index =
+                    msg.prev_log_index == 0 ? 1 : msg.prev_log_index;
+                outbound.push_back(std::move(reply));
+                break;
+            }
+
+            // D-B-1: track what was ACTUALLY stored. The old code broke out of
+            // the append loop on a failure and then answered `success = true`
+            // with `match_index = prev_log_index + entries.size()`, so the
+            // leader raised this peer's match index past entries the follower
+            // does not hold and committed a write no follower has.
+            bool append_ok = true;
+            u64 match = msg.prev_log_index;
+
+            // Append the entries the leader sent, truncating a conflicting
+            // suffix. A failed truncate is a failed append: the follower cannot
+            // claim a consistent prefix it could not establish.
+            for (const auto& entry : msg.entries) {
+                const u64 existing_term = entry_term_locked(entry.index);
+                if (existing_term != 0 && existing_term != entry.term) {
+                    const status trimmed = log_.truncate_suffix(entry.index);
+                    if (!trimmed.ok()) {
+                        append_ok = false;
+                    }
+                    break;
+                }
+            }
+            if (append_ok) {
+                for (const auto& entry : msg.entries) {
+                    if (entry_term_locked(entry.index) == entry.term) {
+                        // Already held and matching: it counts toward the
+                        // follower's match index.
+                        match = entry.index;
+                        continue;
+                    }
+                    const result<u64> appended = log_.append(entry);
+                    if (!appended.ok()) {
+                        append_ok = false;
+                        break;
+                    }
+                    match = entry.index;
+                }
+            }
+            // A follower discards a suffix the leader has superseded. The
+            // boundary is the end of the leader's batch: everything through
+            // `prev_log_index + entries.size()` is now consistent with the
+            // leader (the loop above appended it), and anything beyond it is a
+            // stale record from an older term or an entry a deposed leader
+            // appended.
+            //
+            // An empty batch (a heartbeat) therefore trims back to
+            // `prev_log_index`, which is exactly how L2-2 removes a minority's
+            // uncommitted suffix: the new leader's heartbeat carries its own
+            // last index, and the follower sheds whatever lies past it.
+            if (append_ok) {
+                const u64 leader_prefix = msg.prev_log_index + msg.entries.size();
+                if (log_.last_index() > leader_prefix) {
+                    const status trimmed =
+                        log_.truncate_suffix(leader_prefix + 1);
+                    if (!trimmed.ok()) {
+                        append_ok = false;
+                    }
+                }
+            }
+
+            // The leader's commit index only ever advances this node's view; it
+            // can never move it backwards. It is advanced only when the batch
+            // was stored: a failed append may have truncated a suffix, and
+            // committing past what we hold would be a lie.
+            if (append_ok && msg.leader_commit > commit_index_) {
+                const u64 last_new = log_.last_index();
+                commit_index_ = std::min(msg.leader_commit, last_new);
+            }
+            // A failed sync means the appended bytes are not durable, so the
+            // follower must not acknowledge them.
+            if (append_ok) {
+                const status synced = log_.sync();
+                if (!synced.ok()) {
+                    append_ok = false;
+                }
+            }
+
             raft_message reply;
             reply.kind = raft_message::type::append_reply;
             reply.term = term_;
             reply.from = config_.node_id;
             reply.to = msg.from;
-            reply.success = false;
-            reply.match_index = 0;
-            // Tell the leader where to resume, so it does not walk back one
-            // index at a time.
-            reply.conflict_index = msg.prev_log_index == 0 ? 1 : msg.prev_log_index;
-            send_to(msg.from, reply);
-            return;
+            reply.success = append_ok;
+            // `match_index` names the last index the follower actually holds
+            // from this batch, never an index it failed to store.
+            reply.match_index = append_ok ? match : 0;
+            reply.conflict_index = append_ok ? 0 : match + 1;
+            outbound.push_back(std::move(reply));
+            break;
         }
-
-        // Append the entries the leader sent, truncating a conflicting suffix.
-        for (const auto& entry : msg.entries) {
-            const u64 existing_term = entry_term(entry.index);
-            if (existing_term != 0 && existing_term != entry.term) {
-                (void)log_.truncate_suffix(entry.index);
+        case raft_message::type::append_reply: {
+            if (role_ != raft_role::leader) {
                 break;
             }
-        }
-        for (const auto& entry : msg.entries) {
-            if (entry_term(entry.index) == entry.term) {
-                continue;
-            }
-            const result<u64> appended = log_.append(entry);
-            if (!appended.ok()) {
+            // STALE-ACK: a reply from a term other than the one this leadership
+            // is for is stale. It answers an AppendEntries the leader sent
+            // before it was re-elected, so its `match_index` describes a log
+            // position that may no longer exist. Counting it toward the commit
+            // quorum would commit an entry the current term never replicated to
+            // a majority -- the corruption Raft 5.4.2 forbids. The `append`
+            // branch rejects `msg.term < term_` and `vote_reply` requires
+            // equality; this branch had no check at all.
+            if (msg.term != term_) {
                 break;
             }
-        }
-        // A follower discards a suffix the leader has superseded. The boundary is
-        // the end of the leader's batch: everything through
-        // `prev_log_index + entries.size()` is now consistent with the leader
-        // (the loop above appended it), and anything beyond it is a stale record
-        // from an older term or an entry a deposed leader appended.
-        //
-        // An empty batch (a heartbeat) therefore trims back to `prev_log_index`,
-        // which is exactly how L2-2 removes a minority's uncommitted suffix: the
-        // new leader's heartbeat carries its own last index, and the follower
-        // sheds whatever lies past it.
-        const u64 leader_prefix = msg.prev_log_index + msg.entries.size();
-        if (log_.last_index() > leader_prefix) {
-            (void)log_.truncate_suffix(leader_prefix + 1);
-        }
-
-        // The leader's commit index only ever advances this node's view; it can
-        // never move it backwards.
-        if (msg.leader_commit > commit_index_) {
-            const u64 last_new = log_.last_index();
-            commit_index_ = std::min(msg.leader_commit, last_new);
-        }
-        (void)log_.sync();
-
-        raft_message reply;
-        reply.kind = raft_message::type::append_reply;
-        reply.term = term_;
-        reply.from = config_.node_id;
-        reply.to = msg.from;
-        reply.success = true;
-        reply.match_index = msg.prev_log_index + msg.entries.size();
-        send_to(msg.from, reply);
-        return;
-    }
-    case raft_message::type::append_reply: {
-        if (role_ != raft_role::leader) {
-            return;
-        }
-        // Any reply -- success or a conflict report -- proves the peer is
-        // reachable, which is what CheckQuorum measures. Recording it only on
-        // success would depose a leader whose followers are merely behind.
-        {
-            auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
-                                   [&msg](const std::string& id) {
-                                       return id == msg.from;
-                                   });
-            if (it != config_.peers.end()) {
+            // Any reply -- success or a conflict report -- proves the peer is
+            // reachable, which is what CheckQuorum measures. Recording it only
+            // on success would depose a leader whose followers are merely
+            // behind.
+            {
+                auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
+                                       [&msg](const std::string& id) {
+                                           return id == msg.from;
+                                       });
+                if (it != config_.peers.end()) {
+                    const std::size_t i =
+                        static_cast<std::size_t>(it - config_.peers.begin());
+                    peers_[i].last_ack = clock_.read();
+                }
+            }
+            if (msg.success) {
+                auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
+                                       [&msg](const std::string& id) {
+                                           return id == msg.from;
+                                       });
+                if (it == config_.peers.end()) {
+                    break;
+                }
                 const std::size_t i =
                     static_cast<std::size_t>(it - config_.peers.begin());
-                peers_[i].last_ack = clock_.read();
+                peers_[i].match_index =
+                    std::max(peers_[i].match_index, msg.match_index);
+                peers_[i].next_index = peers_[i].match_index + 1;
+                advance_commit_locked();
+                break;
             }
-        }
-        if (msg.success) {
+            // Retry from the follower's conflict point, or one before the
+            // current cursor when it reported nothing.
             auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
                                    [&msg](const std::string& id) {
                                        return id == msg.from;
                                    });
             if (it == config_.peers.end()) {
-                return;
+                break;
             }
-            const std::size_t i = static_cast<std::size_t>(it - config_.peers.begin());
-            peers_[i].match_index = std::max(peers_[i].match_index, msg.match_index);
-            peers_[i].next_index = peers_[i].match_index + 1;
-            advance_commit_locked();
-            return;
+            const std::size_t i =
+                static_cast<std::size_t>(it - config_.peers.begin());
+            if (msg.conflict_index > 0 &&
+                msg.conflict_index < peers_[i].next_index) {
+                peers_[i].next_index = msg.conflict_index;
+            } else if (peers_[i].next_index > 1) {
+                --peers_[i].next_index;
+            }
+            // Send the corrected batch now rather than waiting for the next
+            // tick.
+            raft_message retry;
+            retry.kind = raft_message::type::append;
+            retry.term = term_;
+            retry.from = config_.node_id;
+            retry.to = msg.from;
+            retry.prev_log_index = peers_[i].next_index - 1;
+            retry.prev_log_term = entry_term_locked(retry.prev_log_index);
+            retry.leader_commit = commit_index_;
+            outbound.push_back(std::move(retry));
+            break;
         }
-        // Retry from the follower's conflict point, or one before the current
-        // cursor when it reported nothing.
-        auto it = std::find_if(config_.peers.begin(), config_.peers.end(),
-                               [&msg](const std::string& id) {
-                                   return id == msg.from;
-                               });
-        if (it == config_.peers.end()) {
-            return;
         }
-        const std::size_t i = static_cast<std::size_t>(it - config_.peers.begin());
-        if (msg.conflict_index > 0 && msg.conflict_index < peers_[i].next_index) {
-            peers_[i].next_index = msg.conflict_index;
-        } else if (peers_[i].next_index > 1) {
-            --peers_[i].next_index;
-        }
-        // Send the corrected batch now rather than waiting for the next tick.
-        raft_message retry;
-        retry.kind = raft_message::type::append;
-        retry.term = term_;
-        retry.from = config_.node_id;
-        retry.to = msg.from;
-        retry.prev_log_index = peers_[i].next_index - 1;
-        retry.prev_log_term = entry_term(retry.prev_log_index);
-        retry.leader_commit = commit_index_;
-        send_to(msg.from, retry);
-        return;
     }
-    }
+    deliver(outbound);
 }
 
 void raft_node::advance_commit_locked() {
@@ -606,7 +832,7 @@ void raft_node::advance_commit_locked() {
     // let a stale entry commit after a leader change.
     const u64 last = log_.last_index();
     for (u64 index = commit_index_ + 1; index <= last; ++index) {
-        if (entry_term(index) != term_) {
+        if (entry_term_locked(index) != term_) {
             continue;
         }
         u64 replicas = 1; // the leader holds it
@@ -624,39 +850,70 @@ void raft_node::advance_commit_locked() {
 }
 
 result<u64> raft_node::propose(span<const std::byte> payload) {
-    if (role_ != raft_role::leader) {
-        return rpc_error(rpc_code::unavailable,
-                         "raft: only the leader can propose");
-    }
-    log_record record;
-    record.kind = kEntryKind;
-    record.term = term_;
-    record.index = log_.last_index() + 1;
-    record.payload.assign(payload.data(), payload.data() + payload.size());
-    const result<u64> appended = log_.append(record);
-    if (!appended.ok()) {
-        return appended.error();
-    }
-    (void)log_.sync();
+    std::vector<raft_message> outbound;
+    u64 index = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (role_ != raft_role::leader) {
+            return rpc_error(rpc_code::unavailable,
+                             "raft: only the leader can propose");
+        }
+        log_record record;
+        record.kind = kEntryKind;
+        record.term = term_;
+        record.index = log_.last_index() + 1;
+        record.payload.assign(payload.data(), payload.data() + payload.size());
+        const result<u64> appended = log_.append(record);
+        if (!appended.ok()) {
+            return appended.error();
+        }
+        index = appended.value();
 
-    // Replicate immediately so a client does not wait for the next heartbeat.
-    raft_message msg;
-    msg.kind = raft_message::type::append;
-    msg.term = term_;
-    msg.from = config_.node_id;
-    msg.prev_log_index = record.index - 1;
-    msg.prev_log_term = entry_term(msg.prev_log_index);
-    msg.leader_commit = commit_index_;
-    msg.entries.push_back(std::move(record));
-    broadcast(msg);
+        // D-B-2: the entry is not durable until `sync()` succeeds. The old code
+        // dropped the result and then advanced the commit index, so a
+        // single-node cluster (its own quorum) acknowledged a write a power loss
+        // would lose. On failure, roll the record back and report the error.
+        const status synced = log_.sync();
+        if (!synced.ok()) {
+            (void)log_.truncate_suffix(index);
+            return synced.error();
+        }
+
+        // Replicate immediately so a client does not wait for the next
+        // heartbeat.
+        raft_message msg;
+        msg.kind = raft_message::type::append;
+        msg.term = term_;
+        msg.from = config_.node_id;
+        msg.prev_log_index = record.index - 1;
+        msg.prev_log_term = entry_term_locked(msg.prev_log_index);
+        msg.leader_commit = commit_index_;
+        msg.entries.push_back(std::move(record));
+        for (const auto& peer : config_.peers) {
+            if (peer == config_.node_id) {
+                continue;
+            }
+            raft_message copy = msg;
+            copy.to = peer;
+            outbound.push_back(std::move(copy));
+        }
+    }
+    // Deliver with the lock released: the hook may re-enter `handle()` on this
+    // node, which advances the commit index itself.
+    deliver(outbound);
 
     // A single-node cluster has no peer whose reply would advance the commit
     // index, so `propose` must do it itself. `wait_for_commit` documents that
     // "propose already advanced the commit index" for exactly this case; without
     // this call that promise is false and every single-node proposal times out.
-    // With peers the loop below is a no-op until a majority acknowledges.
-    advance_commit_locked();
-    return appended;
+    // With peers the loop below is a no-op until a majority acknowledges. A
+    // re-entrant `handle()` during `deliver` may already have advanced it, in
+    // which case this is a no-op.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        advance_commit_locked();
+    }
+    return index;
 }
 
 result<u64> raft_node::wait_for_commit(u64 index,
@@ -672,47 +929,81 @@ result<u64> raft_node::wait_for_commit(u64 index,
     // wait: with a frozen clock the deadline never arrives, and an unbounded
     // loop would hang instead of failing loudly.
     constexpr int kMaxPumps = 1000;
-    for (int pump = 0; commit_index_ < index; ++pump) {
-        // A leadership loss ends the wait immediately. Continuing would let a
-        // deposed leader report a commit that a new leader may never make,
-        // which is exactly the acknowledgement S4 forbids.
-        if (role_ != raft_role::leader) {
-            return rpc_error(rpc_code::unavailable,
-                             "raft: leadership lost while waiting for commit");
+    for (int pump = 0;; ++pump) {
+        std::vector<raft_message> outbound;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (commit_index_ >= index) {
+                return commit_index_;
+            }
+            // A leadership loss ends the wait immediately. Continuing would let
+            // a deposed leader report a commit that a new leader may never make,
+            // which is exactly the acknowledgement S4 forbids.
+            if (role_ != raft_role::leader) {
+                return rpc_error(rpc_code::unavailable,
+                                 "raft: leadership lost while waiting for commit");
+            }
+            if (clock_.read() >= deadline || pump >= kMaxPumps) {
+                return rpc_error(rpc_code::unavailable,
+                                 "raft: commit timed out");
+            }
+            // Build whatever each peer is missing. The transport delivers
+            // replies synchronously, so `commit_index_` can advance inside the
+            // delivery below.
+            const auto replayed = log_.replay(0);
+            if (replayed.ok()) {
+                const std::vector<log_record>& records = replayed.value();
+                for (std::size_t i = 0; i < peers_.size(); ++i) {
+                    raft_message msg;
+                    msg.kind = raft_message::type::append;
+                    msg.term = term_;
+                    msg.from = config_.node_id;
+                    msg.to = config_.peers[i];
+                    msg.prev_log_index = peers_[i].next_index - 1;
+                    msg.prev_log_term = entry_term_locked(msg.prev_log_index);
+                    msg.leader_commit = commit_index_;
+                    for (const auto& record : records) {
+                        if (record.index >= peers_[i].next_index) {
+                            msg.entries.push_back(record);
+                        }
+                    }
+                    outbound.push_back(std::move(msg));
+                }
+            }
         }
-        if (clock_.read() >= deadline || pump >= kMaxPumps) {
-            return rpc_error(rpc_code::unavailable,
-                             "raft: commit timed out");
-        }
-        // Send whatever each peer is missing. The transport delivers replies
-        // synchronously, so `commit_index_` can advance inside this call.
-        pump_replication();
+        deliver(outbound);
     }
-    return commit_index_;
 }
 
 void raft_node::pump_replication() {
-    const auto replayed = log_.replay(0);
-    if (!replayed.ok()) {
-        return;
-    }
-    const std::vector<log_record>& records = replayed.value();
-    for (std::size_t i = 0; i < peers_.size(); ++i) {
-        raft_message msg;
-        msg.kind = raft_message::type::append;
-        msg.term = term_;
-        msg.from = config_.node_id;
-        msg.to = config_.peers[i];
-        msg.prev_log_index = peers_[i].next_index - 1;
-        msg.prev_log_term = entry_term(msg.prev_log_index);
-        msg.leader_commit = commit_index_;
-        for (const auto& record : records) {
-            if (record.index >= peers_[i].next_index) {
-                msg.entries.push_back(record);
-            }
+    // Retained for the header contract; `wait_for_commit` now builds and
+    // delivers its own batch so it can release the lock before sending.
+    std::vector<raft_message> outbound;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto replayed = log_.replay(0);
+        if (!replayed.ok()) {
+            return;
         }
-        send_to(config_.peers[i], msg);
+        const std::vector<log_record>& records = replayed.value();
+        for (std::size_t i = 0; i < peers_.size(); ++i) {
+            raft_message msg;
+            msg.kind = raft_message::type::append;
+            msg.term = term_;
+            msg.from = config_.node_id;
+            msg.to = config_.peers[i];
+            msg.prev_log_index = peers_[i].next_index - 1;
+            msg.prev_log_term = entry_term_locked(msg.prev_log_index);
+            msg.leader_commit = commit_index_;
+            for (const auto& record : records) {
+                if (record.index >= peers_[i].next_index) {
+                    msg.entries.push_back(record);
+                }
+            }
+            outbound.push_back(std::move(msg));
+        }
     }
+    deliver(outbound);
 }
 
 } // namespace cluster
