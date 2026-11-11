@@ -281,11 +281,20 @@ Windows 上用 `crpc::iocp_backend`，Linux 上用 `crpc::io::epoll_backend`，
 配置、信号、启动、停止，全部行为都在库内：
 
 ```powershell
-.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>]
+.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>] [--http-port <n>]
 ```
 
-该 token 是 **bearer token**，不是身份认证凭据：持有合法 token 的一方即以其被签发
-的 principal 身份行事，而 RPC 层不携带对端身份、也没有 TLS。完整信任边界见
+两个通道服务同一个服务。`--port` 是原生 CRPC 二进制通道；`--http-port` 加上
+Consul 兼容的 HTTP 门面，已有的 Consul 客户端无需适配层即可工作。两者都经
+`registry_service::dispatch` 到达同一批 handler，因此 ACL 检查、anchor 水位与日志
+追加不可能在两者之间漂移。
+
+KV 数据面由文件日志（`<state-dir>/raft.log`）上的单节点 `raft_node` 支撑。KV 写入
+经与多节点集群相同的复制状态机提交并应用，且 `prepare` 在启动时回放已提交日志，
+因此重启前写入的值在重启后仍在。没有 raft 节点时写入只会落在内存里并丢失。
+
+该 token 是 **bearer token**，不是身份验证凭据：持有合法 token 者即以签发它的
+principal 行事，且 RPC 层不携带对端身份、也没有 TLS。信任边界见
 `include/crpc/cluster/registry_acl.hpp`。
 
 ## 下一步

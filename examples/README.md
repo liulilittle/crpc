@@ -260,8 +260,20 @@ It is a thin main -- configuration, signals, start, stop; all behaviour lives in
 the library:
 
 ```powershell
-.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>]
+.\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>] [--http-port <n>]
 ```
+
+Two channels serve the same service. `--port` is the native CRPC binary channel;
+`--http-port` adds the Consul-compatible HTTP facade, so an existing Consul
+client works without a shim. Both reach the same handlers through
+`registry_service::dispatch`, so the ACL check, the anchor water-mark and the log
+append cannot diverge between them.
+
+The KV data plane is backed by a single-node `raft_node` over a file log
+(`<state-dir>/raft.log`). A KV write is committed and applied through the same
+replicated state machine a multi-node cluster uses, and `prepare` replays the
+committed log on start, so a value written before a restart is still there
+afterwards. Without the raft node the write would land in memory and be lost.
 
 The token is a **bearer token**, not an authentication credential: a holder of a
 valid token acts as the principal it was issued to, and the RPC layer carries no
