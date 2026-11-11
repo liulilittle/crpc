@@ -58,21 +58,26 @@ rule is a review obligation.
 
 ## 3. AP before C <a id="s3"></a>
 
-**Forbids:** refusing a write because a quorum is unreachable; making the
-data plane depend on Raft; losing the last readable snapshot when the authority
-disappears.
+**Forbids:** making the data plane depend on Raft; losing the last readable
+snapshot when the authority disappears.
 
 **Enforcement:** the registry accepts writes only through its single authority
-path, but that path is local and does not wait for a majority. Readers load the
-last immutable snapshot (`fail-static`) while writes fail closed. Conflict
-resolution is by incarnation and fence, not by arrival order. No Raft/PreVote
-code is on the data path; `cluster::election` is a separate primitive. A
+path. In the default (single-authority) mode that path is local and does not
+wait for a majority; in consensus mode (step3) a write is committed only after
+a majority of nodes have durably accepted it, and a leader that cannot reach a
+quorum steps down and fails the write loudly rather than acknowledging it.
+Readers load the last immutable snapshot (`fail-static`) in both modes.
+Conflict resolution is by incarnation and fence, not by arrival order. A
 tombstone cannot be revived by an older incarnation.
 
 **Verification:** `registry_concurrent_snapshots`, the non-owner/stale-incarnation
-tests, and the lease expiry tests. A partitioned multi-node deployment cannot be
-tested yet because the network registry service is **specified, not
-implemented**.
+tests, and the lease expiry tests. The consensus mode is verified by the L2
+cases (`raft_new_leader_log_contains_committed`,
+`raft_minority_uncommitted_entries_discarded`,
+`raft_vote_requires_up_to_date_log`, `raft_term_vote_persisted_across_restart`,
+`raft_leader_completeness`) and the S4 cases (`raft_write_needs_majority`,
+`raft_minority_leader_steps_down`, `raft_minority_write_fails_loudly`,
+`raft_partition_never_acknowledges_uncommitted`).
 
 ## 4. No-stall <a id="s4"></a>
 

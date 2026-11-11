@@ -53,19 +53,23 @@
 | 13 | 端到端论证 | 把中间层 ACK 当作正确性 | 幂等键到达端点；TCP 帧只是传输，不是业务保证 | 信封携带键；服务端去重已在 `rpc/dedup.hpp` 实现（进程级；见 §6） |
 | 14 | 观测会干扰 | 在转发路径上因日志或指标阻塞 | 日志进入每线程环；追踪使用有界队列；钩子冻结，空链开销低 | 日志/追踪分配与溢出测试；AOP 尚未接到调用路径 |
 
-## 3. AP 优先于 C <a id="s3"></a>
+## 3. AP 先于 C <a id="s3"></a>
 
-**禁止：** 因多数派不可达而拒绝写入；让数据面依赖 Raft；权威消失时丢失最后可读快照。
+**禁止：** 让数据面依赖 Raft；权威消失时丢失最后可读的快照。
 
-**执行：** registry 只通过单一权威路径接受写入，但该路径是本地的，不等待多数派。
-读者加载最后一个不可变快照（fail-static），写入则 fail-closed。冲突由
-incarnation 与 fence 解决，而不是到达顺序。数据路径上没有 Raft/PreVote
-代码；`cluster::election` 是独立原语。墓碑不能被更老的 incarnation
-复活。
+**执行：** registry 只通过单一权威路径接受写入。默认（单权威）模式下该路径是
+本地的，不等待多数派；共识模式（step3）下，写入只有在多数节点持久接受后才算
+提交，无法联系到法定多数的 leader 会主动退位并**响亮地**让写入失败，而不是
+确认它。两种模式下读者都加载最后一个不可变快照（fail-static）。冲突按
+incarnation 与 fence 解决，不按到达顺序。墓碑不能被更旧的 incarnation 复活。
 
-**验证：** `registry_concurrent_snapshots`、非属主/过期
-incarnation 测试、租约到期测试。分区多节点部署尚无法测试，因为网络 registry
-服务属于**已设计，未实现**。
+**验证：** `registry_concurrent_snapshots`、非属主/陈旧 incarnation 测试、租约
+到期测试。共识模式由 L2 用例验证（`raft_new_leader_log_contains_committed`、
+`raft_minority_uncommitted_entries_discarded`、
+`raft_vote_requires_up_to_date_log`、`raft_term_vote_persisted_across_restart`、
+`raft_leader_completeness`）与 S4 用例验证（`raft_write_needs_majority`、
+`raft_minority_leader_steps_down`、`raft_minority_write_fails_loudly`、
+`raft_partition_never_acknowledges_uncommitted`）。
 
 ## 4. 不停摆（no-stall） <a id="s4"></a>
 
