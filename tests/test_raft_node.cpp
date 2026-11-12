@@ -513,6 +513,99 @@ CRPC_TEST(d_b8_entry_term_surfaces_replay_error) {
     CRPC_CHECK_EQ(u64{0}, node->raft->entry_term(999).value());
 }
 
+// --- D-B-8 (residual): last_log_term() must surface a replay error -----------
+//
+// last_log_term() has a result<u64> signature but wrapped
+// u64{last_log_term_locked()} into an always-success result. On a cache hit it
+// returned ok(term) without ever replaying; on a cache miss the locked helper's
+// replay failure collapsed to 0 and was wrapped into ok(0). Both branches are
+// an API-contract lie: entry_term() (always-replay + return replayed.error())
+// shows the honest shape this reader must mirror.
+//
+// The probe below injects a replay failure AFTER start() (start() itself must
+// replay successfully to fill the cache). Two damaged states are driven:
+//   * cache-hit + corruption: last_index() is still 2 and the cache holds
+//     index 2, so a cache-first implementation would answer ok(5) and never
+//     see the injected error. The shape-lock assertion (C2) rejects that.
+//   * cache-miss + corruption: an index-3 record is appended straight to the
+//     backend after start(), bypassing the cache, so last_index()==3 is a miss.
+// An always-replay implementation surfaces rpc_code::internal in BOTH states.
+struct failing_log : cl::registry_log {
+    cl::memory_registry_log inner;
+    bool fail_replay = false;
+
+    result<u64> append(const cl::log_record& record) override {
+        return inner.append(record);
+    }
+    result<std::vector<cl::log_record>> replay(u64 from_index) const override {
+        if (fail_replay) {
+            return rpc_error(rpc_code::internal, "injected replay failure");
+        }
+        return inner.replay(from_index);
+    }
+    status truncate_suffix(u64 from_index) override {
+        return inner.truncate_suffix(from_index);
+    }
+    status sync() override { return inner.sync(); }
+    [[nodiscard]] u64 last_index() const noexcept override {
+        return inner.last_index();
+    }
+    void set_fail_replay(bool value) { fail_replay = value; }
+};
+
+CRPC_TEST(d_b8_last_log_term_surfaces_replay_error) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-d-b8-llt-");
+    CRPC_REQUIRE(state.ok());
+
+    failing_log probe;
+    // Seed index 1/2 term 5 BEFORE start(): start()'s replay(0) must succeed
+    // (fail_replay stays false) so the cache is filled {1->5, 2->5}.
+    for (u64 i = 1; i <= 2; ++i) {
+        cl::log_record rec;
+        rec.kind = cl::log_record_kind::raft_entry;
+        rec.term = 5;
+        rec.index = i;
+        rec.payload.assign(1, std::byte{0});
+        CRPC_REQUIRE(probe.append(rec).ok());
+    }
+    CRPC_REQUIRE(probe.sync().ok());
+
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    config.heartbeat_interval = 20ms;
+    cl::raft_node raft(config, probe, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    // Healthy baseline: no injected failure, last term is 5.
+    const auto healthy = raft.last_log_term();
+    CRPC_CHECK(healthy.ok() && healthy.value() == u64{5});
+
+    // cache-hit + corruption: last_index()==2 is a cache hit. Inject a replay
+    // failure WITHOUT creating a miss. always-replay must surface the error;
+    // a cache-first reader would answer ok(5) and never observe it.
+    probe.set_fail_replay(true);
+    const auto hit = raft.last_log_term();
+    // Shape-lock (5th clause): hit must NOT be ok and must carry internal.
+    CRPC_CHECK(!hit.ok() && hit.error().code == rpc_code::internal);
+    CRPC_CHECK_EQ(rpc_code::internal, hit.code());
+
+    // cache-miss + corruption: append index 3 straight to the backend after
+    // start(), bypassing the cache, so last_index()==3 is a cache miss.
+    cl::log_record rec3;
+    rec3.kind = cl::log_record_kind::raft_entry;
+    rec3.term = 9;
+    rec3.index = 3;
+    rec3.payload.assign(1, std::byte{0});
+    CRPC_REQUIRE(probe.append(rec3).ok());
+    const auto miss = raft.last_log_term();
+    CRPC_CHECK(!miss.ok());
+    CRPC_CHECK_EQ(rpc_code::internal, miss.code());
+}
+
 // --- G2: D-B-9 replay(0) once, cache (index, term) ---------------------------
 
 // Counting log probe: wraps a memory_registry_log and records every replay()

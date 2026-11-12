@@ -162,7 +162,23 @@ u64 raft_node::last_log_term_locked() const noexcept {
 
 result<u64> raft_node::last_log_term() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return u64{last_log_term_locked()};
+    // Always replay, mirroring entry_term(): a cache hit above would answer
+    // ok(term) without observing a failing/corrupt log, which a result<u64>
+    // signature must not hide. O(n) replay is acceptable for this public
+    // reader; the internal hot paths keep using the O(1) locked helper.
+    const auto replayed = log_.replay(0);
+    if (!replayed.ok()) {
+        return replayed.error();
+    }
+    const u64 last = log_.last_index();
+    u64 term = 0;
+    for (const auto& record : replayed.value()) {
+        if (record.index == last) {
+            term = record.term;
+            break;
+        }
+    }
+    return u64{term};
 }
 
 u64 raft_node::entry_term_locked(u64 index) const noexcept {
