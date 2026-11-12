@@ -487,31 +487,9 @@ CRPC_TEST(d_b7_replicate_command_reads_injected_clock) {
 
 // --- G2: D-B-8 entry_term/last_log_term return result<u64> -------------------
 
-CRPC_TEST(d_b8_entry_term_surfaces_replay_error) {
-    test_network net;
-    net.add("A", {}, 40ms, 60ms);
-    cluster_node* node = net.find("A");
-    CRPC_REQUIRE(node != nullptr);
-    CRPC_REQUIRE(node->raft->start().ok());
-
-    // A log with entries: index 1 term 1, index 2 term 1.
-    for (u64 i = 1; i <= 2; ++i) {
-        cl::log_record rec;
-        rec.kind = cl::log_record_kind::raft_entry;
-        rec.term = 1;
-        rec.index = i;
-        rec.payload.assign(1, std::byte{0});
-        CRPC_CHECK(node->log->append(rec).ok());
-    }
-    CRPC_CHECK(node->log->sync().ok());
-
-    // Both terms are readable.
-    CRPC_CHECK_EQ(u64{1}, node->raft->entry_term(1).value());
-    CRPC_CHECK_EQ(u64{1}, node->raft->entry_term(2).value());
-    CRPC_CHECK_EQ(u64{1}, node->raft->last_log_term().value());
-    CRPC_CHECK_EQ(u64{0}, node->raft->entry_term(0).value());
-    CRPC_CHECK_EQ(u64{0}, node->raft->entry_term(999).value());
-}
+// The entry_term case is defined just BELOW failing_log: it needs that probe
+// to inject a replay failure, and failing_log is declared further down this
+// file. See d_b8_entry_term_surfaces_replay_error.
 
 // --- D-B-8 (residual): last_log_term() must surface a replay error -----------
 //
@@ -552,6 +530,73 @@ struct failing_log : cl::registry_log {
     }
     void set_fail_replay(bool value) { fail_replay = value; }
 };
+
+// --- D-B-8: entry_term() must surface a replay error --------------------------
+//
+// The original case used test_network (memory_registry_log::replay never fails),
+// so it asserted only healthy values and had zero power over the error branch:
+// swallowing raft_node.cpp:203's replay error left it green (D-FAKE-TEST-2).
+// This rewrite drives entry_term() itself with failing_log's injected failure.
+//
+// Two damaged states are driven AFTER start() (start's own replay must succeed
+// to fill the cache): a cache-hit (index 1, seeded before start) and a
+// cache-miss (index 777). Both must surface rpc_code::internal. The cache-hit
+// assertion also pins "always replay": a cache-first reader that returns the
+// cached term without replaying would silently answer ok(5) and never observe
+// the injected error (H1). index==0 returns early (raft_node.cpp:194-196), so
+// it is asserted ONLY as a healthy ok(0) baseline, never as a damaged !ok() (H2).
+CRPC_TEST(d_b8_entry_term_surfaces_replay_error) {
+    auto state = fs::temp_dir::create(fs::path(), "crpc-d-b8-et-");
+    CRPC_REQUIRE(state.ok());
+
+    failing_log probe;
+    // Seed index 1/2 term 5 BEFORE start(): start()'s replay(0) must succeed
+    // (fail_replay stays false) so the cache is filled {1->5, 2->5}. appends to
+    // the in-memory backend are infallible; sync() and start() are the checked
+    // preconditions, keeping every assertion loop-free with a fixed check count.
+    for (u64 i = 1; i <= 2; ++i) {
+        cl::log_record rec;
+        rec.kind = cl::log_record_kind::raft_entry;
+        rec.term = 5;
+        rec.index = i;
+        rec.payload.assign(1, std::byte{0});
+        (void)probe.append(rec);
+    }
+    CRPC_REQUIRE(probe.sync().ok());
+
+    manual_clock clock;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    config.heartbeat_interval = 20ms;
+    cl::raft_node raft(config, probe, state.value().native(), make_clock(clock));
+    CRPC_REQUIRE(raft.start().ok());
+
+    // Healthy baseline (4 checks, loop-free): replay succeeds, so entry_term
+    // answers ok() with the exact term; index 0 early-returns ok(0); a missing
+    // index returns ok(0).
+    const auto h1 = raft.entry_term(1);
+    CRPC_CHECK(h1.ok() && h1.value() == u64{5});
+    const auto h2 = raft.entry_term(2);
+    CRPC_CHECK(h2.ok() && h2.value() == u64{5});
+    const auto h0 = raft.entry_term(0);
+    CRPC_CHECK(h0.ok() && h0.value() == u64{0});
+    const auto hm = raft.entry_term(999);
+    CRPC_CHECK(hm.ok() && hm.value() == u64{0});
+
+    // Damaged state: replay(0) now fails. entry_term() MUST surface the error,
+    // not silently answer ok(0) or a stale cached term. Both a cache-hit and a
+    // cache-miss are driven, each with a !ok() + code()==internal double lock.
+    probe.set_fail_replay(true);
+    const auto hit = raft.entry_term(1);
+    CRPC_CHECK(!hit.ok());
+    CRPC_CHECK_EQ(rpc_code::internal, hit.code());
+    const auto miss = raft.entry_term(777);
+    CRPC_CHECK(!miss.ok());
+    CRPC_CHECK_EQ(rpc_code::internal, miss.code());
+}
 
 CRPC_TEST(d_b8_last_log_term_surfaces_replay_error) {
     auto state = fs::temp_dir::create(fs::path(), "crpc-d-b8-llt-");
