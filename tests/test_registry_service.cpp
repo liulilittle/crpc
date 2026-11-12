@@ -19,10 +19,12 @@
 #include <crpc/cluster/registry_service.hpp>
 #include <crpc/cluster/fence_authority.hpp>
 #include <crpc/error.hpp>
+#include <crpc/frame.hpp>
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
 #include <crpc/io.hpp>
 #include <crpc/io/iocp_backend.hpp>
+#include <crpc/rpc/dispatcher.hpp>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -2244,6 +2246,297 @@ CRPC_TEST(prepare_then_start_twice_is_ok) {
     service->set_server(std::move(candidate));
     service->stop();
     (void)fs::remove_all(dir);
+}
+
+// --- D-B-12: anchor()/ping() must decode the real anchor response -----------
+//
+// `encode_anchor_response` (registry_wire.cpp:978-986) writes the authority
+// epoch in tag 19 (`registry_tag_authority_epoch`) and the index in tag 14
+// (`registry_tag_index`). `registry_client::anchor()` used to read tags 7 and 8
+// in an inline decode, so both fields silently came back as the default {0,0}
+// on a success status. `ping()` delegates to `anchor()` and is affected too.
+//
+// These cases drive a REAL `registry_client::anchor()` / `ping()` RPC round trip
+// over an injected fake `connection`: the peer replies with a genuine
+// `encode_anchor_response` body wrapped by `encode_response`, so the response
+// really reaches `finished.value()` before the client decodes it. This is not a
+// `decode_query_response` unit test (which would not exercise the defective
+// inline decode at all).
+
+namespace {
+
+// Completes every push and hands the pushed bytes to the peer. This is the
+// synchronous in-process backend contract: a request written by the client is
+// delivered to `peer` inside the same call, and `peer` writes the response back
+// into the client's reader source before `start_call` returns.
+struct anchor_noop_completion final : crpc::io::completion {
+    void complete(crpc::io::io_result) noexcept override {}
+};
+
+class anchor_direct_sink final : public crpc::io::sink {
+public:
+    explicit anchor_direct_sink(crpc::io::source* peer) noexcept : peer_(peer) {}
+    void push(crpc::span<const std::byte> data, crpc::io::completion* c) noexcept override {
+        if (peer_ != nullptr) {
+            (void)peer_->on_data(data);
+        }
+        c->complete(crpc::io::io_result{{}, data.size()});
+    }
+
+private:
+    crpc::io::source* peer_ = nullptr;
+};
+
+// A peer that answers each REQUEST with the caller-chosen RESPONSE body. It
+// counts the decoded requests and records the stream ids, so a case can prove
+// the RESPONSE really reached `finished.value()` (a real round trip, not a
+// hand-crafted body fed straight into a decoder).
+class anchor_peer final : public crpc::io::source {
+public:
+    explicit anchor_peer(std::vector<std::byte> response_body)
+        : body_(std::move(response_body)) {}
+
+    void attach_delivery(crpc::io::source* delivery) noexcept { delivery_ = delivery; }
+
+    std::size_t on_data(crpc::span<const std::byte> data) noexcept override {
+        decoder_.feed(data);
+        crpc::frame value;
+        while (decoder_.next(value) == crpc::frame_decoder::result::frame_ready) {
+            ++requests_seen;
+            last_stream_id = value.header.stream_id;
+            if (value.header.type == crpc::frame_type::request) {
+                send(value.header.stream_id);
+            }
+        }
+        return data.size();
+    }
+    void on_eof() noexcept override {}
+    void on_error(std::error_code) noexcept override {}
+
+    int requests_seen = 0;
+    crpc::u32 last_stream_id = 0;
+
+private:
+    void send(crpc::u32 stream_id) {
+        crpc::buffer payload;
+        (void)crpc::rpc::encode_response(
+            crpc::rpc_code::ok, crpc::rpc_error{},
+            crpc::span<const std::byte>(body_.data(), body_.size()), payload);
+        crpc::frame response;
+        response.header.type = crpc::frame_type::response;
+        response.header.stream_id = stream_id;
+        response.payload = payload.readable();
+        const std::size_t size = crpc::encoded_frame_size(response);
+        std::vector<std::byte> bytes(size);
+        std::size_t written = 0;
+        if (!crpc::encode_frame(crpc::span<std::byte>(bytes.data(), bytes.size()), response,
+                                written)
+                 .ok()) {
+            return;
+        }
+        anchor_noop_completion done;
+        if (delivery_ != nullptr) {
+            (void)delivery_->on_data(
+                crpc::span<const std::byte>(bytes.data(), written));
+        }
+    }
+
+    std::vector<std::byte> body_;
+    crpc::frame_decoder decoder_;
+    crpc::io::source* delivery_ = nullptr;
+};
+
+// A `connection` whose sink feeds `peer` and whose inbound delivery is fed by
+// `peer` back into the client's reader source (bound via `bind_source`).
+class anchor_connection final : public crpc::connection {
+public:
+    explicit anchor_connection(std::vector<std::byte> response_body)
+        : peer_(std::move(response_body)), sink_(&peer_) {}
+
+    crpc::io::source& source() noexcept override { return dummy_; }
+    crpc::io::sink& sink() noexcept override { return sink_; }
+    void bind_source(crpc::io::source* source) noexcept override {
+        peer_.attach_delivery(source);
+    }
+    void resume_read() noexcept override {}
+    void close() noexcept override { open_ = false; }
+    [[nodiscard]] bool is_open() const noexcept override { return open_; }
+    [[nodiscard]] crpc::endpoint remote() const override {
+        return crpc::endpoint::inproc("anchor");
+    }
+
+    [[nodiscard]] anchor_peer& peer() noexcept { return peer_; }
+
+private:
+    struct dummy_source final : crpc::io::source {
+        std::size_t on_data(crpc::span<const std::byte> data) noexcept override {
+            return data.size();
+        }
+        void on_eof() noexcept override {}
+        void on_error(std::error_code) noexcept override {}
+    };
+
+    dummy_source dummy_;
+    anchor_peer peer_;
+    anchor_direct_sink sink_;
+    bool open_ = true;
+};
+
+// Builds a complete registry tag frame (6-byte prefix + tags) with a correct
+// total_len. Used to express the malformed fail-closed frames.
+void anchor_put_u8(std::vector<std::byte>& out, crpc::u8 value) {
+    out.push_back(static_cast<std::byte>(value));
+}
+void anchor_put_u16(std::vector<std::byte>& out, crpc::u16 value) {
+    const std::size_t at = out.size();
+    out.resize(at + 2);
+    crpc::endian::store_le16(out.data() + at, value);
+}
+void anchor_put_u32(std::vector<std::byte>& out, crpc::u32 value) {
+    const std::size_t at = out.size();
+    out.resize(at + 4);
+    crpc::endian::store_le32(out.data() + at, value);
+}
+void anchor_put_u64(std::vector<std::byte>& out, crpc::u64 value) {
+    const std::size_t at = out.size();
+    out.resize(at + 8);
+    crpc::endian::store_le64(out.data() + at, value);
+}
+void anchor_put_tag(std::vector<std::byte>& out, crpc::u8 id,
+                    const std::vector<std::byte>& value) {
+    anchor_put_u8(out, id);
+    anchor_put_u32(out, static_cast<crpc::u32>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+void anchor_put_u64_tag(std::vector<std::byte>& out, crpc::u8 id, crpc::u64 value) {
+    std::vector<std::byte> bytes;
+    anchor_put_u64(bytes, value);
+    anchor_put_tag(out, id, bytes);
+}
+std::vector<std::byte> anchor_frame_with(const std::vector<std::byte>& tags) {
+    std::vector<std::byte> out;
+    anchor_put_u16(out, cl::registry_dto_version);
+    anchor_put_u32(out, static_cast<crpc::u32>(tags.size()));
+    out.insert(out.end(), tags.begin(), tags.end());
+    return out;
+}
+
+// The genuine server reply: `encode_anchor_response({9,42})` writes tag 19 and
+// tag 14. Copied out of the `buffer` into a byte vector the peer can hold.
+std::vector<std::byte> real_anchor_frame() {
+    crpc::buffer out;
+    const crpc::status encoded = cl::encode_anchor_response(cl::registry_anchor{9, 42}, out);
+    if (!encoded.ok()) {
+        return {};
+    }
+    const crpc::span<const std::byte> readable = out.readable();
+    return std::vector<std::byte>(readable.begin(), readable.end());
+}
+
+std::shared_ptr<crpc::rpc::client> make_anchor_client(
+    std::vector<std::byte> response_body, anchor_peer*& peer_out) {
+    auto conn = std::make_unique<anchor_connection>(std::move(response_body));
+    peer_out = &conn->peer();
+    crpc::rpc::client_options options;
+    options.slot_capacity = 16;
+    return std::make_shared<crpc::rpc::client>(std::move(conn), options);
+}
+
+} // namespace
+
+CRPC_TEST(client_anchor_decodes_real_epoch_and_index_tags) {
+    const std::vector<std::byte> body = real_anchor_frame();
+    CRPC_REQUIRE(!body.empty());
+
+    anchor_peer* peer = nullptr;
+    auto transport = make_anchor_client(body, peer);
+    CRPC_REQUIRE(peer != nullptr);
+    cl::registry_client registry(transport);
+
+    const auto anchored = registry.anchor();
+    const int anchor_requests = peer->requests_seen;
+    // The RESPONSE really reached finished.value(): one REQUEST was decoded by
+    // the peer and answered, so the client's inline decode ran on real bytes.
+    CRPC_CHECK_EQ(1, anchor_requests);
+    CRPC_REQUIRE(anchored.ok());
+    // Two distinct non-zero values, not just "ok" or "non-empty".
+    CRPC_CHECK_EQ(crpc::u64{9}, anchored.value().authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{42}, anchored.value().index);
+
+    // ping() delegates to anchor() and must decode identically.
+    const auto pinged = registry.ping();
+    const int ping_requests = peer->requests_seen;
+    CRPC_CHECK_EQ(2, ping_requests);
+    CRPC_REQUIRE(pinged.ok());
+    CRPC_CHECK_EQ(crpc::u64{9}, pinged.value().authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{42}, pinged.value().index);
+}
+
+CRPC_TEST(client_anchor_rejects_frames_missing_required_tags) {
+    // All four frames are well-formed tag frames (is_known_tag accepts 7/8/14/19
+    // and the walker does not apply the required-set rule), so the inline decode
+    // must fail closed on PRESENCE of tag 19 / tag 14 of width 8 -- never on the
+    // numeric value (a zero anchor is legal). next_fence() is deliberately not
+    // touched here: it reads tag 8 correctly and is a different method.
+
+    std::vector<std::byte> missing_epoch_tags;
+    anchor_put_u64_tag(missing_epoch_tags, cl::registry_tag_index, 42);
+    const std::vector<std::byte> missing_epoch = anchor_frame_with(missing_epoch_tags);
+
+    std::vector<std::byte> missing_index_tags;
+    anchor_put_u64_tag(missing_index_tags, cl::registry_tag_authority_epoch, 9);
+    const std::vector<std::byte> missing_index = anchor_frame_with(missing_index_tags);
+
+    std::vector<std::byte> wrong_width_tags;
+    std::vector<std::byte> four_bytes;
+    anchor_put_u32(four_bytes, 9);
+    anchor_put_tag(wrong_width_tags, cl::registry_tag_authority_epoch, four_bytes);
+    anchor_put_u64_tag(wrong_width_tags, cl::registry_tag_index, 42);
+    const std::vector<std::byte> wrong_width = anchor_frame_with(wrong_width_tags);
+
+    // Zero values are a LEGAL anchor: encode_anchor_response writes both tags
+    // unconditionally, so a {0,0} frame must still succeed. This guards against
+    // a "reject when value == 0" implementation of the presence check.
+    crpc::buffer zero_out;
+    CRPC_REQUIRE(cl::encode_anchor_response(cl::registry_anchor{0, 0}, zero_out).ok());
+    const crpc::span<const std::byte> zero_readable = zero_out.readable();
+    const std::vector<std::byte> zero_anchor(zero_readable.begin(), zero_readable.end());
+
+    const std::vector<std::vector<std::byte>> rejected{missing_epoch, missing_index,
+                                                       wrong_width};
+    // Every CRPC_CHECK* lives OUTSIDE the loop with a fixed check count; the
+    // loop only accumulates decoded evidence into fixed-size counters.
+    int decode_errors = 0;
+    int ok_results = 0;
+    int total_requests = 0;
+    for (const auto& frame : rejected) {
+        anchor_peer* peer = nullptr;
+        auto transport = make_anchor_client(frame, peer);
+        CRPC_REQUIRE(peer != nullptr);
+        cl::registry_client registry(transport);
+        const auto anchored = registry.anchor();
+        total_requests += peer->requests_seen;
+        if (!anchored.ok() && anchored.error().code == crpc::rpc_code::decode_error) {
+            ++decode_errors;
+        }
+        if (anchored.ok()) {
+            ++ok_results;
+        }
+    }
+    CRPC_CHECK_EQ(3, total_requests);
+    CRPC_CHECK_EQ(3, decode_errors);
+    CRPC_CHECK_EQ(0, ok_results);
+
+    // A real zero-valued anchor must still succeed (presence, not value).
+    anchor_peer* zero_peer = nullptr;
+    auto zero_transport = make_anchor_client(zero_anchor, zero_peer);
+    CRPC_REQUIRE(zero_peer != nullptr);
+    cl::registry_client zero_registry(zero_transport);
+    const auto zero_result = zero_registry.anchor();
+    CRPC_CHECK_EQ(1, zero_peer->requests_seen);
+    CRPC_REQUIRE(zero_result.ok());
+    CRPC_CHECK_EQ(crpc::u64{0}, zero_result.value().authority_epoch);
+    CRPC_CHECK_EQ(crpc::u64{0}, zero_result.value().index);
 }
 
 CRPC_TEST_MAIN()

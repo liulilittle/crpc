@@ -642,12 +642,24 @@ result<registry_anchor> registry_client::anchor() {
     if (!walked.ok()) {
         return walked.error();
     }
+    // Fail-closed is a PRESENCE check, not a value check: encode_anchor_response
+    // writes both tags unconditionally, so a {0,0} anchor is legal and must not
+    // be rejected. next_fence() is deliberately unchanged: it reads tag 8
+    // (registry_tag_fence) correctly and is a different method.
+    bool have_epoch = false;
+    bool have_index = false;
     for (const registry_tag& tag : decoded_tags) {
-        if (tag.id == registry_tag_incarnation && tag.value.size() == sizeof(u64)) {
+        if (tag.id == registry_tag_authority_epoch && tag.value.size() == sizeof(u64)) {
             out.authority_epoch = endian::load_le64(tag.value.data());
-        } else if (tag.id == registry_tag_fence && tag.value.size() == sizeof(u64)) {
+            have_epoch = true;
+        } else if (tag.id == registry_tag_index && tag.value.size() == sizeof(u64)) {
             out.index = endian::load_le64(tag.value.data());
+            have_index = true;
         }
+    }
+    if (!have_epoch || !have_index) {
+        return rpc_error(rpc_code::decode_error,
+                         "registry_client: anchor response missing/wrong-width tag");
     }
     return out;
 }
