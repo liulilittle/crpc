@@ -28,6 +28,7 @@
 #include <crpc/cluster/raft_node.hpp>
 #include <crpc/cluster/raft_state.hpp>
 #include <crpc/cluster/registry_log.hpp>
+#include <crpc/cluster/registry_service.hpp>
 #include <crpc/fs/temp.hpp>
 
 namespace cl = crpc::cluster;
@@ -51,6 +52,29 @@ cl::monotonic_clock::time_point manual_now(void* context) noexcept {
 
 cl::monotonic_clock make_clock(manual_clock& clock) noexcept {
     return cl::monotonic_clock{&manual_now, &clock};
+}
+
+// --- D-B-7: counting injected clock -----------------------------------------
+//
+// Every read() increments read_count and returns a fixed time_point. Injected
+// into raft_node via make_clock(counting_clock), it makes a single observable
+// read of the injected clock visible to the test. See
+// d_b7_replicate_command_reads_injected_clock for the capability boundary.
+struct counting_clock {
+    cl::monotonic_clock::time_point now{};
+    std::atomic<int> read_count{0};
+
+    void advance(std::chrono::milliseconds delta) { now += delta; }
+};
+
+cl::monotonic_clock::time_point counting_now(void* context) noexcept {
+    auto* clock = static_cast<counting_clock*>(context);
+    clock->read_count.fetch_add(1, std::memory_order_relaxed);
+    return clock->now;
+}
+
+cl::monotonic_clock make_clock(counting_clock& clock) noexcept {
+    return cl::monotonic_clock{&counting_now, &clock};
 }
 
 // --- Test network ------------------------------------------------------------
@@ -390,6 +414,75 @@ CRPC_TEST(d_b7_raft_now_uses_injected_clock) {
     CRPC_CHECK(observed >= cl::monotonic_clock::time_point{});
     CRPC_CHECK(node->clock.now <= observed ||
                node->clock.now == observed);
+}
+
+// --- G2: D-B-7 replicate_command's deadline reads the injected clock ---------
+//
+// Capability boundary (do not over-promise): this case verifies ONLY that the
+// deadline expression at registry_service.cpp:1007 performs one observable read
+// of the injected clock (raft->now()), not steady_clock::now(). It does NOT
+// verify the "+ seconds(5)", the numeric value, or that the deadline is ever
+// compared: on a single node wait_for_commit (raft_node.cpp:999-1000) short-
+// circuits on commit_index >= index, so :1009 never runs and the deadline
+// parameter is never consumed. It also does not introduce a production seam.
+//
+// History: a prior fix was overwritten back to steady_clock::now() (D-B-9) and
+// the whole ctest suite stayed green. The existing d_b7_raft_now_uses_injected
+// case above asserts a tautology/self-comparison and guards nothing. This case
+// is the discriminating guard: mutating :1007 back to steady_clock::now()+5s
+// makes read_count stay 0 and this assertion fail.
+CRPC_TEST(d_b7_replicate_command_reads_injected_clock) {
+    auto raft_dir = fs::temp_dir::create(fs::path(), "crpc-d-b7-raft-");
+    auto svc_dir = fs::temp_dir::create(fs::path(), "crpc-d-b7-svc-");
+    CRPC_REQUIRE(raft_dir.ok());
+    CRPC_REQUIRE(svc_dir.ok());
+
+    counting_clock clock;
+    cl::memory_registry_log raft_log;
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    config.heartbeat_interval = 20ms;
+    // F12: raft_node.cpp:52 clock_(clock) has no null fallback, so the injected
+    // clock MUST be passed via make_clock(counting_clock), never a default.
+    cl::raft_node raft(config, raft_log, raft_dir.value().native(),
+                       make_clock(clock));
+    raft.set_send_hook([](const cl::raft_message&) {});
+    CRPC_REQUIRE(raft.start().ok());
+
+    // Elect the single node: it is its own quorum (can_win_alone).
+    for (int i = 0; i < 20 && raft.role() != cl::raft_role::leader; ++i) {
+        clock.advance(20ms);
+        raft.tick();
+    }
+    CRPC_REQUIRE(raft.role() == cl::raft_role::leader);
+
+    cl::registry_service_config service_config;
+    service_config.state_dir = svc_dir.value().native();
+    service_config.listen = crpc::endpoint{};  // no listener, no server thread
+    service_config.raft = &raft;
+    cl::registry_service service(std::move(service_config));
+    crpc::server::builder builder;
+    CRPC_REQUIRE(service.prepare(builder).ok());
+
+    // Clear the counter AFTER prepare/leader election: those paths may read the
+    // injected clock for their own timers, which is not what this case guards.
+    clock.read_count.store(0, std::memory_order_relaxed);
+
+    cl::acl_rule valid_rule;
+    valid_rule.token_hash = 0x9876;  // nonzero -> accepted by set_acl_rule
+    valid_rule.principal_id = "node-A";
+    // Public seam set_acl_rule -> replicate_command (registry_service.cpp:921-930).
+    // No hand-built deadline, no direct wait_for_commit: the production path is
+    // the only thing under test.
+    CRPC_REQUIRE(service.set_acl_rule(valid_rule).ok());
+
+    // Exactly one unconditional check (loop-free): a correct :1007 reads the
+    // injected clock once (raft->now()); a steady_clock::now()+5s mutation reads
+    // it zero times. A conditional CRPC_CHECK would make the check count wobble.
+    CRPC_CHECK(clock.read_count.load(std::memory_order_relaxed) >= 1);
 }
 
 // --- G2: D-B-8 entry_term/last_log_term return result<u64> -------------------
