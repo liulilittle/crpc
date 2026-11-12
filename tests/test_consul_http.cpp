@@ -31,10 +31,14 @@
 
 #include <crpc/cluster/consul_http.hpp>
 #include <crpc/cluster/kv_store.hpp>
+#include <crpc/cluster/raft_command.hpp>
+#include <crpc/cluster/raft_node.hpp>
+#include <crpc/cluster/registry_log.hpp>
 #include <crpc/cluster/registry_service.hpp>
 #include <crpc/crypto/base64.hpp>
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
+#include <crpc/io/iocp_backend.hpp>
 
 namespace cl = crpc::cluster;
 namespace fs = crpc::fs;
@@ -868,6 +872,390 @@ CRPC_TEST(a_deregistered_instance_can_register_again) {
     CRPC_CHECK(listed.body.find("\"ServicePort\":7011") != std::string::npos);
 }
 
+// --- D-A-10: DELETE must honour ?cas -----------------------------------------
+//
+// DELETE with a stale ?cas must be refused with 409 and the key must survive.
+// A matching ?cas deletes the key.
+
+CRPC_TEST(delete_stale_cas_is_409_and_key_survives) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da10_stale_cas"));
+
+    crpc::http::response put;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/k",
+                                   "token-A", "v1"),
+                      "k", cl::consul_kv_op::put, put);
+    CRPC_CHECK_EQ(200, put.status_code);
+
+    crpc::http::response got;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::get, got);
+    CRPC_CHECK_EQ(200, got.status_code);
+    crpc::u64 modify_index = 0;
+    CRPC_REQUIRE(json_u64(got.body, "ModifyIndex", modify_index));
+    CRPC_CHECK(modify_index != 0);
+
+    // A stale cas (one below the current modify index) must be refused.
+    crpc::http::response stale;
+    f.http->handle_kv(make_request(crpc::http::method::put,
+                                   "/v1/kv/k?cas=" +
+                                       std::to_string(modify_index - 1),
+                                   "token-A", "v2"),
+                      "k", cl::consul_kv_op::del, stale);
+    CRPC_CHECK_EQ(409, stale.status_code);
+
+    // The key must still be there.
+    crpc::http::response after;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::get, after);
+    CRPC_CHECK_EQ(200, after.status_code);
+    std::string raw;
+    CRPC_REQUIRE(value_field(after.body, raw));
+    CRPC_CHECK_EQ(std::string("v1"), raw);
+}
+
+CRPC_TEST(delete_matching_cas_removes_the_key) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da10_match_cas"));
+
+    crpc::http::response put;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/k",
+                                   "token-A", "v1"),
+                      "k", cl::consul_kv_op::put, put);
+    CRPC_CHECK_EQ(200, put.status_code);
+
+    crpc::http::response got;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::get, got);
+    CRPC_CHECK_EQ(200, got.status_code);
+    crpc::u64 modify_index = 0;
+    CRPC_REQUIRE(json_u64(got.body, "ModifyIndex", modify_index));
+    CRPC_CHECK(modify_index != 0);
+
+    crpc::http::response erased;
+    f.http->handle_kv(make_request(crpc::http::method::put,
+                                   "/v1/kv/k?cas=" +
+                                       std::to_string(modify_index),
+                                   "token-A"),
+                      "k", cl::consul_kv_op::del, erased);
+    CRPC_CHECK_EQ(200, erased.status_code);
+
+    crpc::http::response after;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::get, after);
+    CRPC_CHECK_EQ(404, after.status_code);
+}
+
+CRPC_TEST(delete_without_cas_still_deletes) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da10_no_cas"));
+
+    crpc::http::response put;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/k",
+                                   "token-A", "v1"),
+                      "k", cl::consul_kv_op::put, put);
+    CRPC_CHECK_EQ(200, put.status_code);
+
+    crpc::http::response erased;
+    f.http->handle_kv(make_request(crpc::http::method::del, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::del, erased);
+    CRPC_CHECK_EQ(200, erased.status_code);
+
+    crpc::http::response after;
+    f.http->handle_kv(make_request(crpc::http::method::get, "/v1/kv/k",
+                                   "token-A"),
+                      "k", cl::consul_kv_op::get, after);
+    CRPC_CHECK_EQ(404, after.status_code);
+}
+
+// --- D-A-11: watch authenticates before parking ------------------------------
+//
+// Anonymous watch must return 401 immediately, not park a handler thread for
+// the full wait.
+
+CRPC_TEST(anonymous_watch_is_401_immediately_not_after_park) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da11_watch_auth"));
+
+    const auto started = std::chrono::steady_clock::now();
+    crpc::http::response response;
+    f.http->handle_watch(
+        make_request(crpc::http::method::get,
+                     "/v1/watch/kv/k?wait=10s", ""),
+        "k", response);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CRPC_CHECK_EQ(401, response.status_code);
+    // Auth happens before parking: elapsed must be far below the wait.
+    CRPC_CHECK(elapsed < std::chrono::seconds(1));
+}
+
+CRPC_TEST(authenticated_watch_times_out_normally) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da11_watch_ok"));
+
+    crpc::http::response put;
+    f.http->handle_kv(make_request(crpc::http::method::put, "/v1/kv/k",
+                                   "token-A", "v"),
+                      "k", cl::consul_kv_op::put, put);
+    CRPC_CHECK_EQ(200, put.status_code);
+
+    crpc::http::response response;
+    f.http->handle_watch(
+        make_request(crpc::http::method::get,
+                     "/v1/watch/kv/k?index=999999&wait=30ms", "token-A"),
+        "k", response);
+    CRPC_CHECK_EQ(200, response.status_code);
+}
+
+// --- D-A-12: unknown query flag is refused with 400 --------------------------
+//
+// Every endpoint accepts only its documented flags; anything unknown is a 400,
+// never silently ignored.
+
+CRPC_TEST(kv_put_unknown_flag_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da12_put_flag"));
+
+    crpc::http::response response;
+    f.http->handle_kv(
+        make_request(crpc::http::method::put, "/v1/kv/k?bogus=1", "token-A",
+                     "v"),
+        "k", cl::consul_kv_op::put, response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(kv_delete_unknown_flag_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da12_del_flag"));
+
+    crpc::http::response response;
+    f.http->handle_kv(
+        make_request(crpc::http::method::del, "/v1/kv/k?bogus=1", "token-A"),
+        "k", cl::consul_kv_op::del, response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(kv_get_unknown_flag_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da12_get_flag"));
+
+    crpc::http::response response;
+    f.http->handle_kv(
+        make_request(crpc::http::method::get, "/v1/kv/k?bogus=1", "token-A"),
+        "k", cl::consul_kv_op::get, response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(watch_unknown_flag_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da12_watch_flag"));
+
+    crpc::http::response response;
+    f.http->handle_watch(
+        make_request(crpc::http::method::get,
+                     "/v1/watch/kv/k?bogus=1&wait=10ms", "token-A"),
+        "k", response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(kv_put_known_flags_are_accepted) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da12_put_known"));
+
+    crpc::http::response response;
+    f.http->handle_kv(
+        make_request(crpc::http::method::put, "/v1/kv/k?cas=1", "token-A",
+                     "v"),
+        "k", cl::consul_kv_op::put, response);
+    // cas is a known flag; the request is parsed (409 conflict is fine, the
+    // point is it is not 400 for an unknown flag).
+    CRPC_CHECK(response.status_code == 200 || response.status_code == 409);
+}
+
+// --- D-A-13: Port range validation 1..65535 ----------------------------------
+//
+// Port 0 and Port > 65535 are refused with 400. Port 0 would create an instance
+// that can never be dialled; Port 70000 is silently truncated to 4464 by the
+// u16 cast otherwise.
+
+CRPC_TEST(register_port_zero_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da13_port0"));
+
+    crpc::http::response response;
+    f.http->handle_register(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/register", "token-A",
+                     "{\"Name\":\"svc-p0\",\"ID\":\"node-p0\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":0}"),
+        response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(register_port_70000_is_400) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da13_port70000"));
+
+    crpc::http::response response;
+    f.http->handle_register(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/register", "token-A",
+                     "{\"Name\":\"svc-p7\",\"ID\":\"node-p7\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":70000}"),
+        response);
+    CRPC_CHECK_EQ(400, response.status_code);
+}
+
+CRPC_TEST(register_port_65535_is_not_rejected_for_range) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da13_port65535"));
+
+    crpc::http::response response;
+    f.http->handle_register(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/register", "token-A",
+                     "{\"Name\":\"svc-p65535\",\"ID\":\"node-p65535\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":65535}"),
+        response);
+    // Port 65535 is within range: it must not be rejected for being out of
+    // range (400). Any other outcome (200, 409 for a pre-existing key) is
+    // acceptable for this case.
+    CRPC_CHECK(response.status_code != 400);
+}
+
+// --- D-A-14: Consul ID persist + deregister by ID ---------------------------
+//
+// A registration whose ID differs from Node must be deregisterable by that ID.
+// The facade must persist the ID (in meta) and deregister must look it up.
+
+CRPC_TEST(deregister_by_id_distinct_from_node) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da14_dereg_by_id"));
+
+    crpc::http::response registered;
+    f.http->handle_register(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/register", "token-A",
+                     "{\"Name\":\"svc-id\",\"ID\":\"my-id\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":7020,\"Node\":\"node-A\"}"),
+        registered);
+    CRPC_CHECK_EQ(200, registered.status_code);
+
+    // Deregister by the ID (which differs from Node).
+    crpc::http::response gone;
+    f.http->handle_deregister(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/deregister/my-id", "token-A"),
+        "my-id", gone);
+    CRPC_CHECK_EQ(200, gone.status_code);
+
+    // The row must be gone.
+    crpc::http::response listed;
+    f.http->handle_catalog_service(
+        make_request(crpc::http::method::get, "/v1/catalog/service/svc-id",
+                     "token-A"),
+        "svc-id", listed);
+    CRPC_CHECK_EQ(std::string("[]"), listed.body);
+}
+
+CRPC_TEST(deregister_by_node_still_works) {
+    fixture f;
+    CRPC_REQUIRE(f.start("crpc_g19p4_da14_dereg_by_node"));
+
+    crpc::http::response registered;
+    f.http->handle_register(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/register", "token-A",
+                     "{\"Name\":\"svc-id2\",\"ID\":\"my-id2\",\"Address\":"
+                     "\"127.0.0.1\",\"Port\":7021,\"Node\":\"node-A\"}"),
+        registered);
+    CRPC_CHECK_EQ(200, registered.status_code);
+
+    // Deregister by Node (== ID default when ID omitted).
+    crpc::http::response gone;
+    f.http->handle_deregister(
+        make_request(crpc::http::method::put,
+                     "/v1/agent/service/deregister/my-id2", "token-A"),
+        "my-id2", gone);
+    CRPC_CHECK_EQ(200, gone.status_code);
+
+    crpc::http::response listed;
+    f.http->handle_catalog_service(
+        make_request(crpc::http::method::get, "/v1/catalog/service/svc-id2",
+                     "token-A"),
+        "svc-id2", listed);
+    CRPC_CHECK_EQ(std::string("[]"), listed.body);
+}
+
+// --- D-A-16: bound_endpoint reports the OS-chosen port -----------------------
+//
+// When the configured port is 0, bound_endpoint() must report the actual port
+// the OS assigned, not the configured 0. A fixed port is echoed unchanged.
+
+CRPC_TEST(bound_endpoint_reports_actual_port) {
+    // Build a service with a listener and verify bound_endpoint() reflects the
+    // listener's real address rather than config.listen.
+    fs::path state_dir =
+        fs::temporary_directory().value() / fs::path("crpc_g19p4_da16_bound");
+    (void)fs::remove_all(state_dir);
+
+    auto store = std::make_unique<cl::kv_store>();
+    cl::registry_service_config config;
+    config.state_dir = state_dir;
+    // Port 0: the OS chooses.
+    config.listen = crpc::endpoint::tcp("127.0.0.1", 0);
+    auto backend = std::make_unique<crpc::iocp_backend>();
+    config.backend = backend.get();
+    config.kv = store.get();
+    config.registry.admin_token = "admin-secret";
+    cl::acl_rule writer;
+    writer.token_hash = fnv1a("token-A");
+    writer.principal_id = "node-A";
+    writer.read_prefixes.push_back("");
+    writer.write_prefixes.push_back("");
+    config.acl.push_back(writer);
+
+    auto service = std::make_unique<cl::registry_service>(std::move(config));
+    crpc::server::builder builder;
+    const crpc::status prepared = service->prepare(builder);
+    CRPC_CHECK(prepared.ok());
+    auto server = builder.build();
+    CRPC_CHECK(server != nullptr);
+    const crpc::status started = server->start();
+    CRPC_CHECK(started.ok());
+    service->set_server(std::move(server));
+
+    const crpc::endpoint bound = service->bound_endpoint();
+    CRPC_CHECK(bound.valid());
+    CRPC_CHECK(bound.port() != 0);
+
+    // A fixed port is echoed unchanged.
+    cl::registry_service_config fixed_cfg;
+    fixed_cfg.state_dir = std::string(state_dir.str()) + "-fixed";
+    auto fixed_backend = std::make_unique<crpc::iocp_backend>();
+    fixed_cfg.backend = fixed_backend.get();
+    fixed_cfg.listen = crpc::endpoint::tcp("127.0.0.1", 30041);
+    fixed_cfg.kv = store.get();
+    fixed_cfg.registry.admin_token = "admin-secret";
+    auto fixed_service =
+        std::make_unique<cl::registry_service>(std::move(fixed_cfg));
+    crpc::server::builder fixed_builder;
+    CRPC_CHECK(fixed_service->prepare(fixed_builder).ok());
+    auto fixed_server = fixed_builder.build();
+    CRPC_CHECK(fixed_server != nullptr);
+    CRPC_CHECK(fixed_server->start().ok());
+    fixed_service->set_server(std::move(fixed_server));
+    CRPC_CHECK_EQ(30041u, fixed_service->bound_endpoint().port());
+
+    (void)fs::remove_all(state_dir);
+    (void)fs::remove_all(fs::path(std::string(state_dir.str()) + "-fixed"));
+}
+
 // --- D-A-1: a KV read is subject to the read prefixes ------------------------
 //
 // `registry_acl.hpp:43` states `read_prefixes`: empty = no read (fail closed).
@@ -923,6 +1311,76 @@ CRPC_TEST(a_scoped_read_prefix_scopes_the_kv_key) {
                                    "token-scoped"),
                       "other/b", cl::consul_kv_op::get, refused);
     CRPC_CHECK_EQ(403, refused.status_code);
+}
+
+// --- A1-3 single submission index: discriminating probe -------------------
+//
+// Non-contiguous raft indices (3, 7, 11) deliberately diverge from the
+// catalog's auto-increment (1, 2, 3). A pure-catalog probe would pass
+// identically on the mutant tree; only non-contiguous indices catch the
+// `snapshot_with(next->index = index_+1)` bug. Walks the catalog producer
+// path (register_instance with raft_index) and asserts snapshot.index,
+// registry.index(), and instance.revision all read the raft commit index.
+CRPC_TEST(anchor_and_index_single_submission_index) {
+    const fs::path dir =
+        fs::temporary_directory().value() /
+        "crpc_g19s2_anchor_single_submission_index";
+    (void)fs::remove_all(dir);
+
+    cl::registry_config cfg;
+    cfg.strict_fencing = false;
+    cfg.separate_state_writers = true;
+    cfg.admin_token = "admin-secret";
+    cl::registry reg(cfg);
+
+    auto make_ctx = [](const std::string& node, crpc::u64 raft_index,
+                       crpc::u64 fence) {
+        cl::write_context c;
+        c.node_id = node;
+        c.admin_token = "admin-secret";
+        c.incarnation = 1;
+        c.fence = fence;
+        c.writer_epoch = 0;
+        c.raft_index = raft_index;
+        return c;
+    };
+
+    // Three rounds with non-contiguous raft indices: 3, 7, 11.
+    const crpc::u64 raft_indices[] = {3, 7, 11};
+    for (int k = 0; k < 3; ++k) {
+        const std::string node = "node-" + std::to_string(k);
+        cl::service_instance inst;
+        inst.service = "svc";
+        inst.node_id = node;
+        inst.address.host = "127.0.0.1";
+        inst.address.port = static_cast<crpc::u16>(8000 + k);
+        inst.weight = 1;
+        inst.incarnation = 1;
+
+        const auto issued = reg.next_fence("svc", node);
+        CRPC_REQUIRE(issued.ok());
+        auto ctx = make_ctx(node, raft_indices[k], issued.value());
+        const auto written = reg.register_instance(inst, ctx);
+        CRPC_REQUIRE(written.ok());
+
+        // Discriminating assertions: snapshot.index, registry.index(),
+        // instance.revision all equal the raft commit index passed in.
+        CRPC_CHECK_EQ(raft_indices[k], written.value().index);
+        const auto q = reg.query(cl::query_options{});
+        CRPC_REQUIRE(q.ok());
+        CRPC_CHECK_EQ(raft_indices[k], q.value().index);
+        CRPC_CHECK_EQ(raft_indices[k], reg.index());
+        bool found = false;
+        for (const auto& row : q.value().instances) {
+            if (row.node_id == node) {
+                CRPC_CHECK_EQ(raft_indices[k], row.revision);
+                found = true;
+            }
+        }
+        CRPC_CHECK(found);
+    }
+
+    (void)fs::remove_all(dir);
 }
 
 CRPC_TEST_MAIN()

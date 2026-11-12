@@ -192,6 +192,12 @@ struct write_context {
     // one unless NOMINMAX is set) would break every consumer that includes
     // windows.h first. Wrapping the name stops the macro from being applied.
     u64 writer_epoch = (std::numeric_limits<u64>::max)();
+    // Raft commit index at which this mutation was committed (D-A-9 A1: single
+    // submission index). When > 0 the catalog uses it instead of its own
+    // per-key index_, so the anchor and query ModifyIndex agree with
+    // anchor()/commit_index(). Zero means "not raft-replicated" (the catalog
+    // keeps its own index).
+    u64 raft_index = 0;
 };
 
 struct write_result {
@@ -558,9 +564,11 @@ private:
                                              bool compare_state) noexcept;
 
     // Builds a snapshot from the current one with one instance replaced or
-    // appended. Must be called with mutex_ held.
+    // appended. `index` is the global index this mutation commits at (D-A-9 A1:
+    // snapshot.index must equal raft commit index, not a stale catalog index_).
+    // Must be called with mutex_ held.
     [[nodiscard]] std::shared_ptr<registry_snapshot>
-    snapshot_with(const service_instance& instance) const;
+    snapshot_with(const service_instance& instance, u64 index) const;
 
     void notify(const catalog_event& event);
 

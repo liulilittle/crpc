@@ -946,6 +946,14 @@ status decode_kv_delete_request(span<const std::byte> body,
     if (const status s = read_string(*key, out.key); !s.ok()) {
         return s;
     }
+    for (const registry_tag& tag : tags) {
+        if (tag.id == registry_tag_cas) {
+            if (const status s = read_u64(tag, out.cas); !s.ok()) {
+                return s;
+            }
+            out.has_cas = true;
+        }
+    }
     return read_token_window(tags, out.token_issued_at, out.has_token_issued_at,
                              out.token_nonce);
 }

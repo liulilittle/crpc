@@ -354,7 +354,7 @@ file_registry_log::open(const std::string& path) {
                          "registry_log: path is not valid UTF-8");
     }
     HANDLE h = CreateFileW(wide.value().c_str(), GENERIC_READ | GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         return win_fail(GetLastError(), "registry_log_open", path).error();

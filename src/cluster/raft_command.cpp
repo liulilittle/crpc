@@ -143,6 +143,12 @@ const char* to_string(raft_command_kind kind) noexcept {
         return "acl_upsert";
     case raft_command_kind::acl_remove:
         return "acl_remove";
+    case raft_command_kind::catalog_upsert:
+        return "catalog_upsert";
+    case raft_command_kind::catalog_remove:
+        return "catalog_remove";
+    case raft_command_kind::fence_alloc:
+        return "fence_alloc";
     }
     return "unknown";
 }
@@ -183,6 +189,34 @@ status encode_raft_command(const raft_command& value,
     case raft_command_kind::acl_remove:
         put_u64(body, value.rule.token_hash);
         break;
+    case raft_command_kind::catalog_upsert: {
+        put_u64(body, value.fence);
+        put_u64(body, value.incarnation);
+        put_u8(body, value.state);
+        put_string(body, value.service);
+        put_string(body, value.node_id);
+        put_string(body, value.host);
+        put_u16(body, value.port);
+        put_u32(body, value.weight);
+        put_u32(body, static_cast<u32>(value.meta.size()));
+        for (const auto& entry : value.meta) {
+            put_string(body, entry.first);
+            put_string(body, entry.second);
+        }
+        break;
+    }
+    case raft_command_kind::catalog_remove: {
+        put_u64(body, value.fence);
+        put_u64(body, value.incarnation);
+        put_string(body, value.service);
+        put_string(body, value.node_id);
+        break;
+    }
+    case raft_command_kind::fence_alloc: {
+        put_u64(body, value.fence_token);
+        put_u64(body, value.lease_id);
+        break;
+    }
     default:
         return status{registry_failure(rpc_code::invalid_argument,
                                        "raft command kind is out of range",
@@ -301,6 +335,73 @@ status decode_raft_command(span<const std::byte> in, raft_command& out) {
         if (!input.u64(decoded.rule.token_hash)) {
             return status{registry_failure(
                 rpc_code::decode_error, "raft acl remove token is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        break;
+    }
+    case raft_command_kind::catalog_upsert: {
+        decoded.kind = raft_command_kind::catalog_upsert;
+        if (!input.u64(decoded.fence) || !input.u64(decoded.incarnation) ||
+            !input.u8(decoded.state)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog upsert header is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        if (!input.string(decoded.service) || !input.string(decoded.node_id) ||
+            !input.string(decoded.host)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog upsert identity is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        if (!input.u16(decoded.port) || !input.u32(decoded.weight)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog upsert port/weight is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        u32 meta_count = 0;
+        if (!input.u32(meta_count)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog upsert meta count is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        for (u32 i = 0; i < meta_count; ++i) {
+            std::string k, v;
+            if (!input.string(k) || !input.string(v)) {
+                return status{registry_failure(
+                    rpc_code::decode_error,
+                    "raft catalog upsert meta entry is truncated",
+                    registry_reason_dto_truncated_field)};
+            }
+            decoded.meta[std::move(k)] = std::move(v);
+        }
+        break;
+    }
+    case raft_command_kind::catalog_remove: {
+        decoded.kind = raft_command_kind::catalog_remove;
+        if (!input.u64(decoded.fence) || !input.u64(decoded.incarnation)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog remove header is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        if (!input.string(decoded.service) || !input.string(decoded.node_id)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft catalog remove identity is truncated",
+                registry_reason_dto_truncated_field)};
+        }
+        break;
+    }
+    case raft_command_kind::fence_alloc: {
+        decoded.kind = raft_command_kind::fence_alloc;
+        if (!input.u64(decoded.fence_token) || !input.u64(decoded.lease_id)) {
+            return status{registry_failure(
+                rpc_code::decode_error,
+                "raft fence_alloc header is truncated",
                 registry_reason_dto_truncated_field)};
         }
         break;

@@ -278,7 +278,7 @@ CRPC_TEST(a_kv_put_reaches_every_node) {
         beat.from = leader;
         beat.to = node->id;
         beat.prev_log_index = node->raft->last_log_index();
-        beat.prev_log_term = node->raft->entry_term(beat.prev_log_index);
+        beat.prev_log_term = node->raft->entry_term(beat.prev_log_index).value();
         beat.leader_commit = net.find(leader)->raft->commit_index();
         node->raft->handle(beat);
     }
@@ -338,7 +338,7 @@ CRPC_TEST(an_acl_upsert_and_remove_reach_every_node) {
             beat.from = leader;
             beat.to = node->id;
             beat.prev_log_index = node->raft->last_log_index();
-            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index);
+            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index).value();
             beat.leader_commit = net.find(leader)->raft->commit_index();
             node->raft->handle(beat);
         }
@@ -374,7 +374,7 @@ CRPC_TEST(an_acl_upsert_and_remove_reach_every_node) {
             beat.from = leader;
             beat.to = node->id;
             beat.prev_log_index = node->raft->last_log_index();
-            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index);
+            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index).value();
             beat.leader_commit = net.find(leader)->raft->commit_index();
             node->raft->handle(beat);
         }
@@ -526,7 +526,7 @@ CRPC_TEST(a_kv_put_through_the_http_facade_reaches_every_node) {
             beat.from = leader;
             beat.to = node->id;
             beat.prev_log_index = node->raft->last_log_index();
-            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index);
+            beat.prev_log_term = node->raft->entry_term(beat.prev_log_index).value();
             beat.leader_commit = net.find(leader)->raft->commit_index();
             node->raft->handle(beat);
         }
@@ -688,7 +688,7 @@ CRPC_TEST(a_replaced_entry_at_the_same_index_is_reapplied) {
     CRPC_REQUIRE(attached.service->apply_committed().ok());
     CRPC_REQUIRE(net.find(only)->store->get("k").ok());
     const u64 index = proposed.value();
-    const u64 old_term = net.find(only)->raft->entry_term(index);
+    const u64 old_term = net.find(only)->raft->entry_term(index).value();
 
     // Replace the entry at the SAME index with a different term and a different
     // command, exactly as a new leader's AppendEntries does to a follower's

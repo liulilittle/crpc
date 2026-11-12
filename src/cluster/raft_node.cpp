@@ -1,4 +1,4 @@
-// CRPC -- G19 step3: Raft consensus node (single-process, test-driven).
+﻿// CRPC -- G19 step3: Raft consensus node (single-process, test-driven).
 //
 // The rules implemented here are Raft sections 5.1-5.4. The three that are easy
 // to get wrong, and that the tests pin explicitly:
@@ -44,15 +44,6 @@ namespace {
 // service's own kind. See raft_node.hpp for the term-semantics note.
 constexpr log_record_kind kEntryKind = log_record_kind::raft_entry;
 
-u64 term_of_index(const std::vector<log_record>& stream, u64 index) {
-    for (const auto& record : stream) {
-        if (record.index == index) {
-            return record.term;
-        }
-    }
-    return 0;
-}
-
 } // namespace
 
 raft_node::raft_node(raft_config config, registry_log& log, fs::path state_dir,
@@ -85,6 +76,10 @@ status raft_node::start() {
     if (!replayed.ok()) {
         return replayed.error();
     }
+    index_term_cache_.clear();
+    for (const auto& record : replayed.value()) {
+        index_term_cache_[record.index] = record.term;
+    }
     const u64 last = log_.last_index();
     for (auto& peer : peers_) {
         peer.next_index = last + 1;
@@ -95,12 +90,21 @@ status raft_node::start() {
     // the log's last index here is what lets a restarted single node serve reads
     // and apply its log without waiting for a leader that does not exist.
     //
+    // But only entries written in THIS term are safe to adopt: an entry whose
+    // term differs from the persisted term was written by a previous (ghost)
+    // incarnation and must not be committed just because this node is alone.
+    // D-B-5: a 3->1 shrink followed by restart must not "ghost-commit" an entry
+    // a quorum never accepted.
+    //
     // A multi-node node deliberately keeps commit_index at zero. Its own log may
     // hold entries a quorum never accepted, and committing them locally is the
     // exact mistake Raft 5.4.2 forbids; it learns the real value from the
     // leader's next AppendEntries.
     if (can_win_alone()) {
-        commit_index_ = last;
+        const u64 last_term = last_log_term_locked();
+        if (last_term == 0 || last_term == term_) {
+            commit_index_ = last;
+        }
     }
     last_heartbeat_ = clock_.read();
     election_deadline_ = last_heartbeat_ +
@@ -134,37 +138,72 @@ u64 raft_node::last_log_index() const noexcept {
 }
 
 u64 raft_node::last_log_term_locked() const noexcept {
+    const u64 last = log_.last_index();
+    const auto it = index_term_cache_.find(last);
+    if (it != index_term_cache_.end()) {
+        return it->second;
+    }
+    // Cache miss: full replay fallback and populate the cache so subsequent
+    // calls are O(1). Entries appended directly to `node->log` after `start()`
+    // bypass raft_node's cache maintenance.
     const auto replayed = log_.replay(0);
     if (!replayed.ok()) {
         return 0;
     }
-    return term_of_index(replayed.value(), log_.last_index());
+    u64 term = 0;
+    for (const auto& record : replayed.value()) {
+        index_term_cache_[record.index] = record.term;
+        if (record.index == last) {
+            term = record.term;
+        }
+    }
+    return term;
 }
 
-u64 raft_node::last_log_term() const noexcept {
+result<u64> raft_node::last_log_term() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return last_log_term_locked();
+    return u64{last_log_term_locked()};
 }
 
 u64 raft_node::entry_term_locked(u64 index) const noexcept {
     if (index == 0) {
         return 0;
     }
-    const auto replayed = log_.replay(0);
-    if (!replayed.ok()) {
-        return 0;
-    }
-    return term_of_index(replayed.value(), index);
+    const auto it = index_term_cache_.find(index);
+    return it == index_term_cache_.end() ? 0 : it->second;
 }
 
-u64 raft_node::entry_term(u64 index) const noexcept {
+result<u64> raft_node::entry_term(u64 index) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    return entry_term_locked(index);
+    if (index == 0) {
+        return u64{0};
+    }
+    // Always replay: tests append directly to `node->log` after `start()`,
+    // which bypasses raft_node's cache maintenance. `entry_term_locked()`
+    // stays O(1) for the internal hot paths; this public reader is called
+    // once per apply_committed(), so O(n) replay here is acceptable.
+    const auto replayed = log_.replay(0);
+    if (!replayed.ok()) {
+        return replayed.error();
+    }
+    u64 term = 0;
+    for (const auto& record : replayed.value()) {
+        if (record.index == index) {
+            term = record.term;
+            break;
+        }
+    }
+    return u64{term};
 }
 
 std::string raft_node::leader_id() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return leader_id_;
+}
+
+monotonic_clock::time_point raft_node::now() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return clock_.read();
 }
 
 u64 raft_node::quorum_size() const noexcept {
@@ -664,6 +703,10 @@ void raft_node::handle(const raft_message& msg) {
             bool append_ok = true;
             u64 match = msg.prev_log_index;
 
+            // D-B-9: `entry_term_locked` now uses the member-level
+            // `index_term_cache_` (built once in `start()`, maintained on
+            // append/truncate), so each lookup is O(1) instead of O(n) replay.
+
             // Append the entries the leader sent, truncating a conflicting
             // suffix. A failed truncate is a failed append: the follower cannot
             // claim a consistent prefix it could not establish.
@@ -674,6 +717,9 @@ void raft_node::handle(const raft_message& msg) {
                     if (!trimmed.ok()) {
                         append_ok = false;
                     }
+                    index_term_cache_.erase(
+                        index_term_cache_.lower_bound(entry.index),
+                        index_term_cache_.end());
                     break;
                 }
             }
@@ -691,6 +737,7 @@ void raft_node::handle(const raft_message& msg) {
                         break;
                     }
                     match = entry.index;
+                    index_term_cache_[entry.index] = entry.term;
                 }
             }
             // A follower discards a suffix the leader has superseded. The
@@ -711,6 +758,10 @@ void raft_node::handle(const raft_message& msg) {
                         log_.truncate_suffix(leader_prefix + 1);
                     if (!trimmed.ok()) {
                         append_ok = false;
+                    } else {
+                        index_term_cache_.erase(
+                            index_term_cache_.lower_bound(leader_prefix + 1),
+                            index_term_cache_.end());
                     }
                 }
             }
@@ -868,6 +919,7 @@ result<u64> raft_node::propose(span<const std::byte> payload) {
             return appended.error();
         }
         index = appended.value();
+        index_term_cache_[index] = term_;
 
         // D-B-2: the entry is not durable until `sync()` succeeds. The old code
         // dropped the result and then advanced the commit index, so a
@@ -876,6 +928,9 @@ result<u64> raft_node::propose(span<const std::byte> payload) {
         const status synced = log_.sync();
         if (!synced.ok()) {
             (void)log_.truncate_suffix(index);
+            index_term_cache_.erase(
+                index_term_cache_.lower_bound(index),
+                index_term_cache_.end());
             return synced.error();
         }
 
@@ -929,6 +984,14 @@ result<u64> raft_node::wait_for_commit(u64 index,
     // wait: with a frozen clock the deadline never arrives, and an unbounded
     // loop would hang instead of failing loudly.
     constexpr int kMaxPumps = 1000;
+    // Replay once before the pump loop: entries don't change while waiting for
+    // commit (no appends happen here), so per-pump replay would be O(n²) —
+    // exactly the D-B-9 defect `entry_term_locked` used to cause.
+    const auto replayed = log_.replay(0);
+    std::vector<log_record> records;
+    if (replayed.ok()) {
+        records = std::move(replayed.value());
+    }
     for (int pump = 0;; ++pump) {
         std::vector<raft_message> outbound;
         {
@@ -950,25 +1013,21 @@ result<u64> raft_node::wait_for_commit(u64 index,
             // Build whatever each peer is missing. The transport delivers
             // replies synchronously, so `commit_index_` can advance inside the
             // delivery below.
-            const auto replayed = log_.replay(0);
-            if (replayed.ok()) {
-                const std::vector<log_record>& records = replayed.value();
-                for (std::size_t i = 0; i < peers_.size(); ++i) {
-                    raft_message msg;
-                    msg.kind = raft_message::type::append;
-                    msg.term = term_;
-                    msg.from = config_.node_id;
-                    msg.to = config_.peers[i];
-                    msg.prev_log_index = peers_[i].next_index - 1;
-                    msg.prev_log_term = entry_term_locked(msg.prev_log_index);
-                    msg.leader_commit = commit_index_;
-                    for (const auto& record : records) {
-                        if (record.index >= peers_[i].next_index) {
-                            msg.entries.push_back(record);
-                        }
+            for (std::size_t i = 0; i < peers_.size(); ++i) {
+                raft_message msg;
+                msg.kind = raft_message::type::append;
+                msg.term = term_;
+                msg.from = config_.node_id;
+                msg.to = config_.peers[i];
+                msg.prev_log_index = peers_[i].next_index - 1;
+                msg.prev_log_term = entry_term_locked(msg.prev_log_index);
+                msg.leader_commit = commit_index_;
+                for (const auto& record : records) {
+                    if (record.index >= peers_[i].next_index) {
+                        msg.entries.push_back(record);
                     }
-                    outbound.push_back(std::move(msg));
                 }
+                outbound.push_back(std::move(msg));
             }
         }
         deliver(outbound);
@@ -979,13 +1038,13 @@ void raft_node::pump_replication() {
     // Retained for the header contract; `wait_for_commit` now builds and
     // delivers its own batch so it can release the lock before sending.
     std::vector<raft_message> outbound;
+    const auto replayed = log_.replay(0);
+    if (!replayed.ok()) {
+        return;
+    }
+    const std::vector<log_record>& records = replayed.value();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto replayed = log_.replay(0);
-        if (!replayed.ok()) {
-            return;
-        }
-        const std::vector<log_record>& records = replayed.value();
         for (std::size_t i = 0; i < peers_.size(); ++i) {
             raft_message msg;
             msg.kind = raft_message::type::append;
@@ -1008,3 +1067,4 @@ void raft_node::pump_replication() {
 
 } // namespace cluster
 } // namespace crpc
+

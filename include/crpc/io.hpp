@@ -253,6 +253,8 @@ public:
     virtual ~listener() = default;
     virtual void start(accept_sink* sink) = 0;
     virtual void stop() noexcept = 0;
+    // Default implementation: subclasses that bind a real socket override this.
+    [[nodiscard]] virtual endpoint local() const noexcept { return endpoint{}; }
 };
 
 class CRPC_API backend_factory {

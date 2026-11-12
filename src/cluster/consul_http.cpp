@@ -290,6 +290,25 @@ void append_json_string(std::string& out, std::string_view text) {
     return nullptr;
 }
 
+// D-A-12: the documented query flags each endpoint accepts. Anything outside
+// the endpoint's set is refused with 400 instead of being silently ignored.
+
+[[nodiscard]] bool flag_is_known(const std::vector<std::pair<std::string, std::string>>& query,
+                                 std::initializer_list<const char*> known) {
+    for (const auto& entry : query) {
+        bool known_flag = false;
+        for (const char* name : known) {
+            if (entry.first == name) {
+                known_flag = true;
+                break;
+            }
+        }
+        if (!known_flag) {
+            return false;
+        }
+    }
+    return true;
+}
 // A strict unsigned parse: the whole string must be digits, and the value must
 // fit. `"12x"`, `"-1"` and `""` are all failures.
 [[nodiscard]] bool parse_u64(std::string_view text, u64& out) {
@@ -1280,6 +1299,16 @@ void consul_http::handle_register(const http::request& request,
                       0);
         return;
     }
+    // D-A-13: Port must be a valid TCP port 1..65535. Port 0 would create an
+    // instance that can never be dialled; Port > 65535 is silently truncated by
+    // the u16 cast otherwise.
+    if (port < 1 || port > 65535) {
+        write_failure(response,
+                      consul_error{rpc_code::invalid_argument, 400,
+                                   "Port must be in 1..65535", {}, false},
+                      0);
+        return;
+    }
     if (id.empty()) {
         id = name;
     }
@@ -1333,7 +1362,16 @@ void consul_http::handle_register(const http::request& request,
     put_string_tag(tags_wire, registry_tag_client_request_id,
                    name + '\x1f' + node + '\x1f' + std::to_string(incarnation) +
                        '\x1f' + "register");
-    if (!tags.empty()) {
+    // D-A-14: persist the Consul ID so a later deregister can find the row by
+    // ID even when ID != Node. Stored in meta under the key "consul_id".
+    if (!id.empty() && id != name) {
+        metadata_list meta;
+        meta.set("consul_id", id);
+        std::vector<std::byte> encoded_meta;
+        if (encode_meta_map(meta, encoded_meta).ok()) {
+            put_tag(tags_wire, registry_tag_meta, encoded_meta);
+        }
+    } else if (!tags.empty()) {
         metadata_list meta;
         for (const std::string& tag : tags) {
             meta.set(tag, tag);
@@ -1383,6 +1421,9 @@ void consul_http::handle_deregister(const http::request& request,
     // ID == Name (the default this facade applies) has service == node == id,
     // but a caller that chose a distinct ID has neither. Guessing would
     // deregister the wrong row or 404 a row that exists; the lookup cannot.
+    //
+    // D-A-14: the Consul ID is persisted in meta under "consul_id", so match
+    // against meta first, then fall back to node_id for default-ID registrations.
     std::string service_name = instance_id;
     std::string node_name = instance_id;
     {
@@ -1404,6 +1445,13 @@ void consul_http::handle_deregister(const http::request& request,
                     catalog)
                     .ok()) {
                 for (const registry_query_row& row : catalog.rows) {
+                    const std::string* meta_id =
+                        row.instance.meta.find("consul_id");
+                    if (meta_id != nullptr && *meta_id == instance_id) {
+                        service_name = row.instance.service;
+                        node_name = row.instance.node_id;
+                        break;
+                    }
                     if (row.instance.node_id == instance_id) {
                         service_name = row.instance.service;
                         node_name = row.instance.node_id;
@@ -1483,6 +1531,13 @@ void consul_http::handle_kv(const http::request& request,
         write_failure(response,
                       consul_error{rpc_code::invalid_argument, 400,
                                    "malformed query string", {}, false},
+                      0);
+        return;
+    }
+    if (!flag_is_known(query, {"cas", "index", "wait"})) {
+        write_failure(response,
+                      consul_error{rpc_code::invalid_argument, 400,
+                                   "unknown query flag", {}, false},
                       0);
         return;
     }
@@ -1616,10 +1671,27 @@ void consul_http::handle_kv(const http::request& request,
     }
 
     // delete
+    u64 cas = 0;
+    bool has_cas = false;
+    if (const std::string* raw_cas = query_value(query, "cas")) {
+        if (!parse_u64(*raw_cas, cas)) {
+            write_failure(response,
+                          consul_error{rpc_code::invalid_argument, 400,
+                                       "cas must be an unsigned integer", {},
+                                       false},
+                          0);
+            return;
+        }
+        has_cas = true;
+    }
+
     std::vector<std::byte> tags;
     put_string_tag(tags, registry_tag_token, token);
     put_u64_tag(tags, registry_tag_token_issued_at, now_millis());
     put_string_tag(tags, registry_tag_key, key);
+    if (has_cas) {
+        put_u64_tag(tags, registry_tag_cas, cas);
+    }
     const std::vector<std::byte> frame = finish_frame(tags);
 
     buffer encoded;
@@ -1653,6 +1725,13 @@ void consul_http::handle_watch(const http::request& request,
                       0);
         return;
     }
+    if (!flag_is_known(query, {"index", "wait"})) {
+        write_failure(response,
+                      consul_error{rpc_code::invalid_argument, 400,
+                                   "unknown query flag", {}, false},
+                      0);
+        return;
+    }
     u64 wait_index = 0;
     if (const std::string* raw_index = query_value(query, "index")) {
         if (!parse_u64(*raw_index, wait_index)) {
@@ -1676,6 +1755,17 @@ void consul_http::handle_watch(const http::request& request,
         if (wait > config_.max_watch_wait) {
             wait = config_.max_watch_wait;
         }
+    }
+
+    // D-A-11: authenticate before parking. An anonymous watch must be refused
+    // with 401 immediately, not occupy a handler thread for the full wait.
+    const std::string token = header_token(request);
+    if (token.empty()) {
+        write_failure(response,
+                      consul_error{rpc_code::permission_denied, 401,
+                                   "missing token", {}, false},
+                      0);
+        return;
     }
 
     // Long poll: park until the index moves past `wait_index`, the wait

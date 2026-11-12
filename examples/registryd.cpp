@@ -23,9 +23,9 @@
 #include <cstring>
 #include <atomic>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <thread>
-
 #include <crpc/cluster/consul_http.hpp>
 #include <crpc/cluster/kv_store.hpp>
 #include <crpc/cluster/raft_node.hpp>
@@ -149,36 +149,12 @@ int main(int argc, char** argv) {
     // empty: the "authority" would be memory. One node is its own quorum, so the
     // commit path is the same code a real cluster uses, and the log is a file.
     const crpc::fs::path state_path = crpc::fs::path(state_dir);
-    // The raft log is opened before `registry_service::prepare`, which is what
-    // normally creates the state directory, so the directory must exist first.
+    // The state directory must exist before `registry_service::prepare` creates
+    // the lease over it.
     const crpc::status dir_created = crpc::fs::create_directories(state_path);
     if (!dir_created.ok()) {
         std::fprintf(stderr, "registryd: state dir create failed: %s\n",
                      dir_created.message().c_str());
-        return 1;
-    }
-    auto opened = crpc::cluster::file_registry_log::open(
-        (state_path / "raft.log").str());
-    if (!opened.ok()) {
-        std::fprintf(stderr, "registryd: raft log open failed: %s\n",
-                     opened.error().message.c_str());
-        return 1;
-    }
-    auto raft_log = std::move(opened).value();
-
-    crpc::cluster::raft_config raft_config;
-    raft_config.node_id = node_id;
-    // No peers: a single-node cluster. It elects itself and commits alone.
-    raft_config.election_timeout_min = std::chrono::milliseconds(1000);
-    raft_config.election_timeout_max = std::chrono::milliseconds(2000);
-    raft_config.heartbeat_interval = std::chrono::milliseconds(300);
-    auto raft = std::make_unique<crpc::cluster::raft_node>(
-        raft_config, *raft_log, state_path,
-        crpc::cluster::system_monotonic_clock());
-    const crpc::status raft_started = raft->start();
-    if (!raft_started.ok()) {
-        std::fprintf(stderr, "registryd: raft start failed: %s\n",
-                     raft_started.message().c_str());
         return 1;
     }
 
@@ -187,7 +163,6 @@ int main(int argc, char** argv) {
     config.listen = crpc::endpoint::tcp("127.0.0.1", port);
     config.backend = backend.get();
     config.kv = store.get();
-    config.raft = raft.get();
     config.registry.admin_token = admin_token;
 
     crpc::cluster::acl_rule rule;
@@ -213,6 +188,37 @@ int main(int argc, char** argv) {
                      prepared.message().c_str());
         return 1;
     }
+
+    // D-A-6: raft.log is opened only after the single-instance lease is held
+    // (registry_service::prepare acquired it), so a raft-only opener cannot
+    // write raft.log while a service holds the lease.
+    auto opened = crpc::cluster::file_registry_log::open(
+        (state_path / "raft.log").str());
+    if (!opened.ok()) {
+        std::fprintf(stderr, "registryd: raft log open failed: %s\n",
+                     opened.error().message.c_str());
+        return 1;
+    }
+    auto raft_log = std::move(opened).value();
+
+    crpc::cluster::raft_config raft_config;
+    raft_config.node_id = node_id;
+    // No peers: a single-node cluster. It elects itself and commits alone.
+    raft_config.election_timeout_min = std::chrono::milliseconds(1000);
+    raft_config.election_timeout_max = std::chrono::milliseconds(2000);
+    raft_config.heartbeat_interval = std::chrono::milliseconds(300);
+    auto raft = std::make_unique<crpc::cluster::raft_node>(
+        raft_config, *raft_log, state_path,
+        crpc::cluster::system_monotonic_clock());
+    const crpc::status raft_started = raft->start();
+    if (!raft_started.ok()) {
+        std::fprintf(stderr, "registryd: raft start failed: %s\n",
+                     raft_started.message().c_str());
+        return 1;
+    }
+
+    // Attach the raft node after the lease is held (D-A-6).
+    service->set_raft(raft.get());
     auto server = builder.build();
     if (!server) {
         std::fprintf(stderr, "registryd: server build failed\n");
@@ -227,13 +233,12 @@ int main(int argc, char** argv) {
     service->set_server(std::move(server));
     g_service = service.get();
 
-    // The raft node needs its timer driven: an election happens only when
-    // `tick()` observes the deadline pass. A single node elects itself on the
-    // first deadline, so this thread settles within one election timeout and
-    // then only produces (empty) heartbeats.
+    // D-B-10: std::jthread RAII guard -- its destructor calls request_stop()
+    // and joins, so an early exit never leaves a joinable thread that would
+    // trigger std::terminate.
     std::atomic<bool> raft_stop{false};
-    std::thread raft_thread([&raft, &raft_stop] {
-        while (!raft_stop.load(std::memory_order_acquire)) {
+    std::jthread raft_thread([&raft, &raft_stop](std::stop_token st) {
+        while (!st.stop_requested() && !raft_stop.load(std::memory_order_acquire)) {
             raft->tick();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -248,7 +253,6 @@ int main(int argc, char** argv) {
     if (raft->role() != crpc::cluster::raft_role::leader) {
         std::fprintf(stderr, "registryd: raft did not become leader\n");
         raft_stop.store(true, std::memory_order_release);
-        raft_thread.join();
         return 1;
     }
 

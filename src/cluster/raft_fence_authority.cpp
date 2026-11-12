@@ -11,53 +11,50 @@
 #include <vector>
 
 #include <crpc/cluster/registry.hpp>
+#include <crpc/cluster/raft_command.hpp>
 
 namespace crpc {
 namespace cluster {
 
 namespace {
 
-// The payload a fence allocation commits. It is deliberately small and
-// self-describing: the token, the key it belongs to, and the lease binding.
+// The payload a fence allocation commits. It is a raft_command of kind
+// fence_alloc, encoded with the shared raft_command codec:
+//   u16 version(1) | u8 kind(8) | u64 fence_token | u64 lease_id
 // A reader that replays the log can tell which allocation this was without
 // consulting the catalog.
 //
-//   u64 token
-//   u32 service_len | service bytes
-//   u32 node_len    | node bytes
-//   u64 lease_id
+//   u64 token           (the allocation result, carried in fence_token)
+//   u64 lease_id        (from the fence_request)
 std::vector<std::byte> encode_allocation(u64 token, const fence_request& request) {
+    raft_command cmd;
+    cmd.kind = raft_command_kind::fence_alloc;
+    cmd.fence_token = token;
+    cmd.lease_id = request.lease_id;
     std::vector<std::byte> out;
-    const std::string service = request.service != nullptr ? request.service : "";
-    const std::string node = request.node_id != nullptr ? request.node_id : "";
-    out.reserve(8 + 4 + service.size() + 4 + node.size() + 8);
-
-    const auto put_u64 = [&out](u64 v) {
-        for (int i = 0; i < 8; ++i) {
-            out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-        }
-    };
-    const auto put_u32 = [&out](u32 v) {
-        for (int i = 0; i < 4; ++i) {
-            out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-        }
-    };
-    const auto put_str = [&out](const std::string& s) {
-        for (const char c : s) {
-            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
-        }
-    };
-
-    put_u64(token);
-    put_u32(static_cast<u32>(service.size()));
-    put_str(service);
-    put_u32(static_cast<u32>(node.size()));
-    put_str(node);
-    put_u64(request.lease_id);
+    const status encoded = encode_raft_command(cmd, out);
+    if (!encoded.ok()) {
+        return {};
+    }
     return out;
 }
 
 } // namespace
+
+// Decodes a fence_alloc payload back into (token, lease_id). Used by the apply
+// loop to make a committed fence allocation observable.
+result<std::pair<u64, u64>> decode_allocation(span<const std::byte> in) {
+    raft_command cmd;
+    const status decoded = decode_raft_command(in, cmd);
+    if (!decoded.ok()) {
+        return decoded.error();
+    }
+    if (cmd.kind != raft_command_kind::fence_alloc) {
+        return rpc_error(rpc_code::decode_error,
+                         "raft fence_alloc payload has wrong kind");
+    }
+    return std::pair<u64, u64>{cmd.fence_token, cmd.lease_id};
+}
 
 fence_authority raft_fence_authority::as_authority() noexcept {
     fence_authority out;

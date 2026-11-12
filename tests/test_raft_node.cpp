@@ -344,6 +344,189 @@ CRPC_TEST(raft_leader_replicates_to_followers) {
     }
 }
 
+// --- G2: D-B-5 single-node start() only adopts last when term matches --------
+//
+// A single-node start() must not adopt last_index as commit when the persisted
+// term differs from the entries' term. That is the ghost-commit a 3->1 shrink
+// would cause.
+
+CRPC_TEST(d_b5_single_node_start_does_not_commit_foreign_term) {
+    test_network net;
+    net.add("A", {}, 40ms, 60ms);
+    cluster_node* node = net.find("A");
+    CRPC_REQUIRE(node != nullptr);
+
+    // The raft log holds a committed-looking entry at index 1 with term 7, but
+    // the persisted state file says term 0 (no such term was ever committed).
+    // start() must NOT adopt index 1 as commit.
+    cl::memory_registry_log& log = *node->log;
+    // Put an entry at index 1 term 7 directly into the log.
+    cl::log_record rec;
+    rec.kind = cl::log_record_kind::raft_entry;
+    rec.term = 7;
+    rec.index = 1;
+    rec.payload.assign(1, std::byte{0});
+    CRPC_CHECK(log.append(rec).ok());
+    CRPC_CHECK(log.sync().ok());
+
+    // persisted term is 0 (nothing written to the state file yet), so start()
+    // must leave commit_index at 0.
+    CRPC_CHECK(node->raft->start().ok());
+    CRPC_CHECK_EQ(u64{0}, node->raft->commit_index());
+    CRPC_CHECK_EQ(u64{1}, node->raft->last_log_index());
+}
+
+// --- G2: D-B-7 raft_node::now() exposes the injected clock -------------------
+
+CRPC_TEST(d_b7_raft_now_uses_injected_clock) {
+    test_network net;
+    net.add("A", {}, 40ms, 60ms);
+    cluster_node* node = net.find("A");
+    CRPC_REQUIRE(node != nullptr);
+    CRPC_REQUIRE(node->raft->start().ok());
+
+    node->clock.advance(100ms);
+    const cl::monotonic_clock::time_point observed = node->raft->now();
+    CRPC_CHECK(observed >= cl::monotonic_clock::time_point{});
+    CRPC_CHECK(node->clock.now <= observed ||
+               node->clock.now == observed);
+}
+
+// --- G2: D-B-8 entry_term/last_log_term return result<u64> -------------------
+
+CRPC_TEST(d_b8_entry_term_surfaces_replay_error) {
+    test_network net;
+    net.add("A", {}, 40ms, 60ms);
+    cluster_node* node = net.find("A");
+    CRPC_REQUIRE(node != nullptr);
+    CRPC_REQUIRE(node->raft->start().ok());
+
+    // A log with entries: index 1 term 1, index 2 term 1.
+    for (u64 i = 1; i <= 2; ++i) {
+        cl::log_record rec;
+        rec.kind = cl::log_record_kind::raft_entry;
+        rec.term = 1;
+        rec.index = i;
+        rec.payload.assign(1, std::byte{0});
+        CRPC_CHECK(node->log->append(rec).ok());
+    }
+    CRPC_CHECK(node->log->sync().ok());
+
+    // Both terms are readable.
+    CRPC_CHECK_EQ(u64{1}, node->raft->entry_term(1).value());
+    CRPC_CHECK_EQ(u64{1}, node->raft->entry_term(2).value());
+    CRPC_CHECK_EQ(u64{1}, node->raft->last_log_term().value());
+    CRPC_CHECK_EQ(u64{0}, node->raft->entry_term(0).value());
+    CRPC_CHECK_EQ(u64{0}, node->raft->entry_term(999).value());
+}
+
+// --- G2: D-B-9 replay(0) once, cache (index, term) ---------------------------
+
+// Counting log probe: wraps a memory_registry_log and records every replay()
+// call with the number of records returned. A replay-per-entry implementation
+// would call replay() once per entry (O(n^2) records scanned); the fixed tree
+// calls it once per append batch (O(n) records scanned).
+struct counting_log : cl::registry_log {
+    cl::memory_registry_log inner;
+    int replay_calls = 0;
+    u64 records_returned = 0;
+
+    result<u64> append(const cl::log_record& record) override {
+        return inner.append(record);
+    }
+    result<std::vector<cl::log_record>> replay(u64 from_index) const override {
+        auto* self = const_cast<counting_log*>(this);
+        ++self->replay_calls;
+        const auto result = inner.replay(from_index);
+        if (result.ok()) {
+            self->records_returned += static_cast<u64>(result.value().size());
+        }
+        return result;
+    }
+    status truncate_suffix(u64 from_index) override {
+        return inner.truncate_suffix(from_index);
+    }
+    status sync() override { return inner.sync(); }
+    [[nodiscard]] u64 last_index() const noexcept override {
+        return inner.last_index();
+    }
+};
+
+CRPC_TEST(d_b9_replay_once_caches_index_term) {
+    // Build a node manually with a counting log probe, because raft_node holds
+    // its log by reference and test_network::add() already bound a
+    // memory_registry_log.
+    cl::raft_config config;
+    config.node_id = "A";
+    config.peers = {};
+    config.election_timeout_min = 40ms;
+    config.election_timeout_max = 60ms;
+    config.heartbeat_interval = 20ms;
+
+    auto probe = std::make_unique<counting_log>();
+    counting_log* probe_ptr = probe.get();
+    auto state = fs::temp_dir::create(fs::path(), "crpc-d-b9-");
+    CRPC_REQUIRE(state.ok());
+
+    manual_clock clock;
+    auto raft = std::make_unique<cl::raft_node>(
+        config, *probe_ptr, state.value().native(), make_clock(clock));
+
+    // Pre-populate the log with n entries BEFORE start(), so start()'s single
+    // replay(0) loads them into `index_term_cache_`.
+    const int n = 200;
+    for (int i = 0; i < n; ++i) {
+        cl::log_record rec;
+        rec.kind = cl::log_record_kind::raft_entry;
+        rec.term = 1;
+        rec.index = i + 1;
+        rec.payload.assign(1, std::byte{0});
+        CRPC_CHECK(probe_ptr->append(rec).ok());
+    }
+    CRPC_CHECK(probe_ptr->sync().ok());
+
+    CRPC_REQUIRE(raft->start().ok());
+
+    // Become leader: a single node elects itself on the first deadline.
+    clock.advance(100ms);
+    raft->tick();
+    CRPC_CHECK_EQ(cl::raft_role::leader, raft->role());
+
+    // Deliver ONE append batch of n entries via handle(). With per-entry
+    // entry_term_locked this calls replay() n times (O(n^2) records scanned);
+    // with the D-B-9 snapshot it calls replay() exactly once.
+    cl::raft_message msg;
+    msg.kind = cl::raft_message::type::append;
+    msg.term = raft->term();
+    msg.from = "leader";
+    msg.to = "A";
+    msg.prev_log_index = n;
+    msg.prev_log_term = 1;
+    msg.leader_commit = n;
+    for (int i = 0; i < n; ++i) {
+        cl::log_record rec;
+        rec.kind = cl::log_record_kind::raft_entry;
+        rec.term = 1;
+        rec.index = n + 1 + static_cast<u64>(i);
+        rec.payload.assign(1, std::byte{0});
+        msg.entries.push_back(std::move(rec));
+    }
+    std::vector<cl::raft_message> outbound;
+    raft->set_send_hook([&outbound](const cl::raft_message& m) {
+        outbound.push_back(m);
+    });
+    raft->handle(msg);
+    // Drain replies (append_reply; non-leader ignores it, no-op is safe).
+    for (auto& reply : outbound) {
+        raft->handle(reply);
+    }
+
+    // D-B-9: replay() called exactly once (the snapshot), returning all n
+    // pre-existing records — not once per entry.
+    CRPC_CHECK_EQ(1, probe_ptr->replay_calls);
+    CRPC_CHECK_EQ(static_cast<u64>(n), probe_ptr->records_returned);
+}
+
 // --- L2-2: a minority leader's uncommitted entries are discarded -------------
 
 CRPC_TEST(raft_minority_uncommitted_entries_discarded) {
@@ -488,7 +671,7 @@ CRPC_TEST(raft_vote_requires_up_to_date_log) {
         ask.term = voter->raft->term() + 1;
         ask.from = "C";
         ask.prev_log_index = poor->raft->last_log_index();
-        ask.prev_log_term_hint = poor->raft->entry_term(poor->raft->last_log_index());
+        ask.prev_log_term_hint = poor->raft->entry_term(poor->raft->last_log_index()).value();
 
         // Capture the reply the voter sends back to C. The reply's `granted`
         // flag is the observable: a voter that finds the candidate's log behind
@@ -605,7 +788,7 @@ CRPC_TEST(raft_leader_completeness) {
     CRPC_CHECK(new_leader->raft->commit_index() >= committed_index);
     // The entry's term is unchanged: it was committed in the old term and the
     // new leader carries it verbatim, not a copy written in the new term.
-    CRPC_CHECK(new_leader->raft->entry_term(committed_index) >= u64{1});
+    CRPC_CHECK(new_leader->raft->entry_term(committed_index).value() >= u64{1});
 }
 
 // --- supplementary: the consistency check rejects a stale prev term ----------
@@ -657,7 +840,7 @@ CRPC_TEST(raft_append_entries_rejects_stale_prev_term) {
     leader_node->raft->tick();
     net.tick_all(1ms);
     CRPC_REQUIRE(net.find("C")->raft->last_log_index() >= u64{1});
-    const u64 real_term = net.find("C")->raft->entry_term(1);
+    const u64 real_term = net.find("C")->raft->entry_term(1).value();
 
     cl::raft_message wrong_term;
     wrong_term.kind = cl::raft_message::type::append;
@@ -671,7 +854,7 @@ CRPC_TEST(raft_append_entries_rejects_stale_prev_term) {
     CRPC_REQUIRE(got_reply);
     CRPC_CHECK(!reply.success);
     // C still holds the record the leader actually sent.
-    CRPC_CHECK(net.find("C")->raft->entry_term(1) == real_term);
+    CRPC_CHECK(net.find("C")->raft->entry_term(1).value() == real_term);
 }
 
 // --- supplementary: a conflicting suffix is truncated, not merged ------------
@@ -702,7 +885,7 @@ CRPC_TEST(raft_conflicting_suffix_is_truncated) {
     bogus.payload.assign(1, std::byte{'z'});
     CRPC_REQUIRE(c_log.append(bogus).ok());
     CRPC_CHECK(net.find("C")->raft->last_log_index() == u64{2});
-    CRPC_CHECK(net.find("C")->raft->entry_term(2) == u64{999});
+    CRPC_CHECK(net.find("C")->raft->entry_term(2).value() == u64{999});
 
     // The leader proposes at index 2, so its batch covers the conflict. The
     // node's rule must discard C's bogus record and append the leader's.
@@ -712,9 +895,10 @@ CRPC_TEST(raft_conflicting_suffix_is_truncated) {
     leader_node->raft->tick();
     net.tick_all(1ms);
     CRPC_CHECK(net.find("C")->raft->last_log_index() == u64{2});
-    CRPC_CHECK(net.find("C")->raft->entry_term(2) != u64{999});
+    CRPC_CHECK(net.find("C")->raft->entry_term(2).value() != u64{999});
     // The leader's own record won: C's term at index 2 is the leader's term.
-    CRPC_CHECK(net.find("C")->raft->entry_term(2) == leader_node->raft->entry_term(2));
+    CRPC_CHECK(net.find("C")->raft->entry_term(2).value()
+               == leader_node->raft->entry_term(2).value());
 
     // Now the case only the NODE's rule handles: the leader's batch starts
     // AFTER the conflict, so `registry_log::append` (which only compares the
@@ -735,7 +919,7 @@ CRPC_TEST(raft_conflicting_suffix_is_truncated) {
     beat.from = leader_node->id;
     beat.to = "C";
     beat.prev_log_index = 2;
-    beat.prev_log_term = leader_node->raft->entry_term(2);
+    beat.prev_log_term = leader_node->raft->entry_term(2).value();
     beat.leader_commit = leader_node->raft->commit_index();
     net.find("C")->raft->handle(beat);
     CRPC_CHECK(net.find("C")->raft->last_log_index() == u64{2});
@@ -1609,6 +1793,38 @@ CRPC_TEST(raft_candidate_can_win_a_second_election) {
     }
 
     CRPC_CHECK_EQ(u64{2}, raft.term());
+}
+
+// --- D-B-7: wait_for_commit uses raft_node::now() (injected clock) -----------
+
+CRPC_TEST(raft_wait_for_commit_uses_injected_clock) {
+    test_network net;
+    net.add("A", peers_of_three("A"), 40ms, 60ms);
+    net.add("B", peers_of_three("B"), 40ms, 60ms);
+    net.add("C", peers_of_three("C"), 40ms, 60ms);
+    for (const char* id : {"A", "B", "C"}) {
+        CRPC_REQUIRE(net.find(id)->raft->start().ok());
+    }
+    const std::string leader = elect(net);
+    CRPC_REQUIRE(!leader.empty());
+
+    // Isolate the leader so its proposal can never reach a majority.
+    net.partition({leader});
+    cluster_node* node = net.find(leader);
+
+    // Propose: the entry is appended locally but cannot commit.
+    const std::byte payload[2] = {std::byte{0x0a}, std::byte{0x0b}};
+    const auto proposed = node->raft->propose(span<const std::byte>(payload, 2));
+    CRPC_REQUIRE(proposed.ok());
+
+    // Deadline already passed at propose time: wait_for_commit must return at
+    // pump 0 (no time to wait) rather than block until wall-clock catches up.
+    const auto deadline = node->clock.now;  // now, already overdue
+    const auto committed = node->raft->wait_for_commit(proposed.value(), deadline);
+    CRPC_CHECK_FALSE(committed.ok());
+    if (!committed.ok()) {
+        CRPC_CHECK_EQ(rpc_code::unavailable, committed.error().code);
+    }
 }
 
 CRPC_TEST_MAIN()

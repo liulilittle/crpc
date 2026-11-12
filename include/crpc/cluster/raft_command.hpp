@@ -23,6 +23,7 @@
 #define CRPC_CLUSTER_RAFT_COMMAND_HPP
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,10 @@ enum class raft_command_kind : u8 {
     kv_cas = 2,
     kv_delete = 3,
     acl_upsert = 4,
-    acl_remove = 5
+    acl_remove = 5,
+    catalog_upsert = 6,
+    catalog_remove = 7,
+    fence_alloc = 8
 };
 
 // One replicated mutation.
@@ -52,6 +56,24 @@ struct CRPC_API raft_command {
     // Only for kv_cas: the modify index the write expects to match. Zero means
     // create-only.
     u64 cas = 0;
+
+    // Catalog fields (catalog_upsert, catalog_remove).
+    u64 fence = 0;
+    u64 incarnation = 0;
+    u8 state = 0;
+    std::string service;
+    std::string node_id;
+    std::string host;
+    u16 port = 0;
+    u32 weight = 0;
+    std::map<std::string, std::string> meta;
+
+    u64 writer_epoch = 0;
+    std::string admin_token;
+
+    // Fence fields (fence_alloc).
+    u64 fence_token = 0;
+    u64 lease_id = 0;
 
     // ACL fields (acl_upsert). `acl_remove` uses only `token_hash`.
     acl_rule rule{};

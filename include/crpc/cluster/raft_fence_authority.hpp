@@ -23,11 +23,13 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 
 #include <crpc/cluster/fence_authority.hpp>
 #include <crpc/cluster/raft_node.hpp>
 #include <crpc/config.hpp>
 #include <crpc/error.hpp>
+#include <crpc/span.hpp>
 
 namespace crpc {
 namespace cluster {
@@ -72,6 +74,10 @@ struct CRPC_API raft_fence_authority {
     // exception escaping here would call `std::terminate`, not return an error.
     [[nodiscard]] result<u64> allocate(const fence_request& request) noexcept;
 };
+
+// Decodes a fence_alloc raft_command payload back into (token, lease_id). Used
+// by the apply loop to make a committed fence allocation observable.
+[[nodiscard]] result<std::pair<u64, u64>> decode_allocation(span<const std::byte> in);
 
 } // namespace cluster
 } // namespace crpc

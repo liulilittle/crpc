@@ -458,6 +458,10 @@ struct registry_service::impl {
     // Idempotency map: client_request_id -> outcome.
     std::map<std::string, idempotency_record> idempotency;
     u64 anchor_epoch = 0;
+    // D-A-15: prepare() is idempotent. start() may call it more than once; the
+    // second call must not re-acquire the lease (which would fail because we
+    // already hold it).
+    bool prepared_once = false;
 
     // --- Replicated state machine (step4 PR-9) ------------------------------
     //
@@ -629,14 +633,17 @@ registry_anchor registry_service::anchor() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     registry_anchor out;
     out.authority_epoch = impl_->anchor_epoch;
-    // The index a caller observes must cover every mutation this service has
-    // accepted, not just catalog rows: a KV write does not touch the catalog
-    // but does advance the store's high-water mark, and a watcher parked on the
-    // catalog-only index would never see it move. The larger of the two is the
-    // honest answer.
-    u64 index = impl_->catalog.index();
-    if (impl_->config.kv != nullptr) {
-        index = std::max(index, impl_->config.kv->highest_index());
+    // D-A-9 A1: when raft is configured, commit_index is the single submission
+    // index shared by catalog and KV writes. Otherwise fall back to the local
+    // catalog/KV high water (single-authority mode).
+    u64 index = 0;
+    if (impl_->config.raft != nullptr) {
+        index = impl_->config.raft->commit_index();
+    } else {
+        index = impl_->catalog.index();
+        if (impl_->config.kv != nullptr) {
+            index = std::max(index, impl_->config.kv->highest_index());
+        }
     }
     out.index = index;
     return out;
@@ -689,9 +696,12 @@ status registry_service::apply_committed() {
     // cursor points at: if it no longer matches what was applied, the applied
     // state is stale and must be rebuilt from the log.
     if (impl_->last_applied > 0 && impl_->last_applied <= last_log) {
-        const u64 current_term =
+        const auto current_term =
             impl_->config.raft->entry_term(impl_->last_applied);
-        if (current_term != impl_->last_applied_term) {
+        if (!current_term.ok()) {
+            return current_term.error();
+        }
+        if (current_term.value() != impl_->last_applied_term) {
             if (impl_->config.kv != nullptr) {
                 impl_->config.kv->clear();
             }
@@ -740,6 +750,34 @@ status registry_service::apply_committed() {
         }
         impl_->last_applied = record.index;
         impl_->last_applied_term = record.term;
+    }
+    return status{};
+}
+
+// Appends one catalog mutation to the log. Only register/set_state/deregister
+// call this: `fence_barrier` deliberately appends nothing (VERDICT section 11
+// / A2 D1), so the log's index advances only when the catalog changes.
+[[nodiscard]] status append_catalog_record(registry_log& log,
+                                          const service_instance& instance,
+                                          u64 fence, u64 incarnation) {
+    std::vector<std::byte> payload;
+    const status encoded = encode_log_payload(instance, fence, incarnation, payload);
+    if (!encoded.ok()) {
+        return encoded;
+    }
+    const u64 next = log.last_index() + 1;
+    log_record record;
+    record.kind = log_record_kind::registry_event;
+    record.term = 0;
+    record.index = next;
+    record.payload = std::move(payload);
+    const result<u64> appended = log.append(record);
+    if (!appended.ok()) {
+        return appended.error();
+    }
+    const status synced = log.sync();
+    if (!synced.ok()) {
+        return synced;
     }
     return status{};
 }
@@ -803,10 +841,81 @@ status registry_service::apply_command_locked(const raft_command& command,
         // a removal it already applied.
         return status{};
     }
+    case raft_command_kind::catalog_upsert: {
+        service_instance instance;
+        instance.service = command.service;
+        instance.node_id = command.node_id;
+        instance.address.host = command.host;
+        instance.address.port = command.port;
+        instance.weight = command.weight;
+        instance.incarnation = command.incarnation;
+        instance.state = static_cast<instance_state>(command.state);
+        for (const auto& entry : command.meta) {
+            instance.meta.set(entry.first, entry.second);
+        }
+        write_context ctx;
+        ctx.node_id = command.node_id;
+        ctx.incarnation = command.incarnation;
+        ctx.fence = command.fence;
+        ctx.admin_token = command.admin_token;
+        ctx.writer_epoch = command.writer_epoch;
+        ctx.raft_index = index;
+        const result<write_result> written =
+            impl_->catalog.register_instance(instance, ctx);
+        if (!written.ok()) {
+            return status{written.error()};
+        }
+        // Persist to the log so restore_from_log can replay it.
+        const status appended = append_catalog_record(*impl_->log, instance,
+                                                      written.value().fence,
+                                                      written.value().incarnation);
+        if (!appended.ok()) {
+            return appended;
+        }
+        return status{};
     }
-    return status{registry_failure(rpc_code::internal,
-                                   "registry: unknown raft command kind",
-                                   "command_kind")};
+    case raft_command_kind::catalog_remove: {
+        write_context ctx;
+        ctx.node_id = command.node_id;
+        ctx.incarnation = command.incarnation;
+        ctx.fence = command.fence;
+        ctx.admin_token = command.admin_token;
+        ctx.writer_epoch = command.writer_epoch;
+        ctx.raft_index = index;
+        const result<write_result> written =
+            impl_->catalog.deregister(command.service, command.node_id, ctx);
+        if (!written.ok()) {
+            return status{written.error()};
+        }
+        service_instance tombstone;
+        tombstone.service = command.service;
+        tombstone.node_id = command.node_id;
+        tombstone.state = static_cast<instance_state>(command.state);
+        tombstone.incarnation = written.value().incarnation;
+        const status appended = append_catalog_record(*impl_->log, tombstone,
+                                                      written.value().fence,
+                                                      written.value().incarnation);
+        if (!appended.ok()) {
+            return appended;
+        }
+        return status{};
+    }
+    case raft_command_kind::fence_alloc: {
+        // A committed fence allocation is a no-op for the state machine: the
+        // token was already handed to the caller by the fence authority. The
+        // entry exists only to make the allocation durable and reproducible.
+        return status{};
+    }
+    default:
+        return status{registry_failure(rpc_code::internal,
+                                       "registry: unknown raft command kind",
+                                       "command_kind")};
+    }
+}
+
+void registry_service::set_authority_for_test(fence_authority authority) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->config.authority = authority;
 }
 
 status registry_service::set_acl_rule(const acl_rule& rule) {
@@ -895,7 +1004,7 @@ status registry_service::replicate_command(const raft_command& command) {
     }
     const result<u64> committed = impl_->config.raft->wait_for_commit(
         proposed.value(),
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        impl_->config.raft->now() + std::chrono::seconds(5));
     if (!committed.ok()) {
         return status{committed.error()};
     }
@@ -906,6 +1015,12 @@ status registry_service::replicate_command(const raft_command& command) {
 }
 
 status registry_service::prepare(server::builder& builder) {
+    // D-A-15: idempotent -- a second prepare() skips the lease acquisition so
+    // start() can call prepare() without re-acquiring the already-held lease.
+    if (impl_->prepared_once) {
+        return status{};
+    }
+
     // 1. Single-instance lease. Acquiring it is what makes the later log base
     //    check meaningful: without the lease a second instance could interleave
     //    appends with ours.
@@ -974,10 +1089,11 @@ status registry_service::prepare(server::builder& builder) {
         return anchors;
     }
 
-    // 5. The fence authority is the local registry allocator (step2). step3
-    //    replaces this function pointer and the service does not change.
-    impl_->config.authority.fn = &allocate_local;
-    impl_->config.authority.context = &impl_->catalog;
+    // 5. The fence authority is the local registry allocator (step2).
+    if (impl_->config.authority.fn == nullptr) {
+        impl_->config.authority.fn = &allocate_local;
+        impl_->config.authority.context = &impl_->catalog;
+    }
 
     // 5b. Replay the replicated state machine. The KV table lives in memory and
     //     the ACL table is mutated only by committed commands, so without this
@@ -1019,6 +1135,7 @@ status registry_service::prepare(server::builder& builder) {
         }
         builder.add_listener(impl_->config.listen, *impl_->config.backend);
     }
+    impl_->prepared_once = true;
     return status{};
 }
 
@@ -1042,7 +1159,9 @@ status registry_service::start() {
         return started;
     }
     impl_->server_ = std::move(candidate);
-    impl_->bound_ep = impl_->config.listen;
+    // D-A-16: report the actual bound endpoint from the listener, not the
+    // configured one: port 0 lets the OS choose and the real port lives there.
+    impl_->bound_ep = impl_->server_->local_endpoint();
     return status{};
 }
 
@@ -1060,42 +1179,25 @@ crpc::endpoint registry_service::bound_endpoint() const noexcept { return impl_-
 
 void registry_service::set_server(std::unique_ptr<server> owned) {
     impl_->server_ = std::move(owned);
-    impl_->bound_ep = impl_->config.listen;
+    if (impl_->server_) {
+        impl_->bound_ep = impl_->server_->local_endpoint();
+    } else {
+        impl_->bound_ep = impl_->config.listen;
+    }
+}
+
+void registry_service::set_raft(raft_node* raft) {
+    impl_->config.raft = raft;
+    // Replay the replicated state machine now that the raft node is attached
+    // (D-A-6: raft.log is opened after the lease, so the replay happens here
+    // rather than inside prepare()).
+    const status replayed = apply_committed();
+    (void)replayed;
 }
 
 // --- Handlers -----------------------------------------------------------------
 
 namespace {
-
-// Appends one catalog mutation to the log. Only register/set_state/deregister
-// call this: `fence_barrier` deliberately appends nothing (VERDICT section 11
-// / A2 D1), so the log's index advances only when the catalog changes.
-[[nodiscard]] status append_catalog_record(registry_log& log,
-                                          const service_instance& instance,
-                                          u64 fence, u64 incarnation) {
-    std::vector<std::byte> payload;
-    const status encoded = encode_log_payload(instance, fence, incarnation, payload);
-    if (!encoded.ok()) {
-        return encoded;
-    }
-    const u64 next = log.last_index() + 1;
-    log_record record;
-    record.kind = log_record_kind::registry_event;
-    record.term = 0;
-    record.index = next;
-    record.payload = std::move(payload);
-    const result<u64> appended = log.append(record);
-    if (!appended.ok()) {
-        return appended.error();
-    }
-    const status synced = log.sync();
-    if (!synced.ok()) {
-        return synced;
-    }
-    return status{};
-}
-
-// Maps a registry reason to its rpc_code, per VERDICT section 2.5. Two entries
 // are NOT `failed_precondition`: `not_live` is 9 (`not_found`, deliberately not
 // 12) and `limit` / `index_overflow` are 13 (`resource_exhausted`). Everything
 // else on the section-2.5 table is 12.
@@ -1297,7 +1399,7 @@ status registry_service::on_register(void* self, const call_envelope& /*envelope
                                        registry_reason_acl_denied)};
     }
 
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    std::unique_lock<std::mutex> lock(owner->impl_->mutex);
     // Remote writers must present an epoch. This check sits after the epoch
     // store exists, so a client that ignores it still cannot overwrite a
     // tracked writer (VERDICT section 4.4).
@@ -1363,34 +1465,67 @@ status registry_service::on_register(void* self, const call_envelope& /*envelope
         return encode_write_response(cached, response);
     }
 
-    const result<write_result> written = owner->impl_->catalog.register_instance(
-        instance, context);
-    if (!written.ok()) {
-        const u64 index = owner->impl_->catalog.index();
-        return status{service_error(written.error(), index)};
+    const write_result* written_ptr = nullptr;
+    write_result local_written{};
+    if (owner->impl_->config.raft == nullptr) {
+        const result<write_result> written =
+            owner->impl_->catalog.register_instance(instance, context);
+        if (!written.ok()) {
+            const u64 index = owner->impl_->catalog.index();
+            return status{service_error(written.error(), index)};
+        }
+        local_written = written.value();
+        written_ptr = &local_written;
+
+        // Persist the mutation before the client can observe it as committed.
+        const status appended = append_catalog_record(*owner->impl_->log, instance,
+                                                      local_written.fence,
+                                                      local_written.incarnation);
+        if (!appended.ok()) {
+            return appended;
+        }
     }
 
-    // Persist the mutation before the client can observe it as committed.
-    const status appended = append_catalog_record(*owner->impl_->log, instance,
-                                                 written.value().fence,
-                                                 written.value().incarnation);
-    if (!appended.ok()) {
-        return appended;
+    // D-A-9 A1: when raft is configured, replicate the catalog mutation through
+    // raft so followers apply it too (apply_command_locked writes catalog+log).
+    // Release `mutex` first because `replicate_command` -> `apply_committed`
+    // re-acquires it, and holding it here would self-deadlock.
+    if (owner->impl_->config.raft != nullptr) {
+        lock.unlock();
+
+        raft_command command;
+        command.kind = raft_command_kind::catalog_upsert;
+        command.fence = context.fence;
+        command.incarnation = request.incarnation;
+        command.state = static_cast<u8>(instance.state);
+        command.service = request.service;
+        command.node_id = request.node_id;
+        command.host = request.host;
+        command.port = request.port;
+        command.weight = request.weight;
+        command.writer_epoch = context.writer_epoch;
+        command.admin_token = context.admin_token;
+        for (const auto& entry : instance.meta) {
+            command.meta.emplace(entry.first, entry.second);
+        }
+        const status replicated = owner->replicate_command(command);
+        if (!replicated.ok()) {
+            return replicated;
+        }
+
+        // Re-acquire `mutex` for the water-mark update below.
+        lock.lock();
     }
 
-    // The water-mark moves only after the mutation is durable. A crash between
-    // the registry commit and this update leaves the water-mark behind, which
-    // makes the next writer re-anchor rather than silently overtake.
-    //
-    // The epoch half is the service's OWN epoch (`epoch_store::value()`), not a
-    // constant: it is the authority's term number, so a restarted service has a
-    // higher one and every anchor a pre-restart client still holds becomes
-    // stale. It was previously left at the initialised 0, which made the first
-    // half of the two-dimensional comparison dead and reduced `not_stale` to a
-    // one-dimensional index comparison.
+    // The water-mark moves only after the mutation is durable.
+    const u64 index = written_ptr ? written_ptr->index
+                                  : owner->impl_->config.raft->commit_index();
+    const u64 fence = written_ptr ? written_ptr->fence : context.fence;
+    const u64 incarnation =
+        written_ptr ? written_ptr->incarnation : request.incarnation;
     owner->impl_->anchor_epoch = owner->impl_->epochs.value();
     owner->impl_->last_anchor[key] =
-        registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+        registry_anchor{owner->impl_->anchor_epoch, index};
     // Persist the water-mark BEFORE the response can be observed: a crash after
     // the write but before this leaves the anchor behind, so a replayed write
     // would be accepted. Same order as `epoch_store::persist` (write, then
@@ -1402,9 +1537,9 @@ status registry_service::on_register(void* self, const call_envelope& /*envelope
     }
 
     registry_write_response out;
-    out.index = written.value().index;
-    out.fence = written.value().fence;
-    out.incarnation = written.value().incarnation;
+    out.index = index;
+    out.fence = fence;
+    out.incarnation = incarnation;
     out.authority_epoch = owner->impl_->anchor_epoch;
     // Record only after the catalog AND the log accepted the write: a failed
     // attempt must remain retryable (VERDICT section 5.3, layer 2).
@@ -1433,7 +1568,7 @@ status registry_service::on_deregister(void* self, const call_envelope& /*envelo
                                        registry_reason_acl_denied)};
     }
 
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    std::unique_lock<std::mutex> lock(owner->impl_->mutex);
     if (request.writer_epoch == 0) {
         return status{registry_failure(rpc_code::failed_precondition,
                                        "registry: remote writers must present an epoch",
@@ -1471,35 +1606,74 @@ status registry_service::on_deregister(void* self, const call_envelope& /*envelo
         return encode_write_response(cached, response);
     }
 
-    const result<write_result> written = owner->impl_->catalog.deregister(
-        request.service, request.node_id, context);
-    if (!written.ok()) {
-        const u64 index = owner->impl_->catalog.index();
-        return status{service_error(written.error(), index)};
+    const write_result* written_ptr = nullptr;
+    write_result local_written{};
+    if (owner->impl_->config.raft == nullptr) {
+        const result<write_result> written =
+            owner->impl_->catalog.deregister(request.service, request.node_id,
+                                             context);
+        if (!written.ok()) {
+            const u64 index = owner->impl_->catalog.index();
+            return status{service_error(written.error(), index)};
+        }
+        local_written = written.value();
+        written_ptr = &local_written;
+
+        // The tombstone is the instance the log stores, so a restore
+        // reproduces the same catalog state.
+        service_instance tombstone;
+        tombstone.service = request.service;
+        tombstone.node_id = request.node_id;
+        tombstone.state = instance_state::deregistered;
+        tombstone.incarnation = local_written.incarnation;
+        const status appended = append_catalog_record(*owner->impl_->log,
+                                                      tombstone,
+                                                      local_written.fence,
+                                                      local_written.incarnation);
+        if (!appended.ok()) {
+            return appended;
+        }
     }
 
-    // The tombstone is the instance the log stores, so a restore reproduces
-    // the same catalog state.
-    service_instance tombstone;
-    tombstone.service = request.service;
-    tombstone.node_id = request.node_id;
-    tombstone.state = instance_state::deregistered;
-    tombstone.incarnation = written.value().incarnation;
-    const status appended = append_catalog_record(*owner->impl_->log, tombstone, written.value().fence, written.value().incarnation);
-    if (!appended.ok()) {
-        return appended;
+    // D-A-9 A1: when raft is configured, replicate the catalog mutation through
+    // raft so followers apply it too. Release `mutex` first because
+    // `replicate_command` -> `apply_committed` re-acquires it.
+    if (owner->impl_->config.raft != nullptr) {
+        lock.unlock();
+
+        raft_command command;
+        command.kind = raft_command_kind::catalog_remove;
+        command.fence = context.fence;
+        command.incarnation = request.incarnation;
+        command.state = static_cast<u8>(instance_state::deregistered);
+        command.service = request.service;
+        command.node_id = request.node_id;
+        command.writer_epoch = context.writer_epoch;
+        command.admin_token = context.admin_token;
+
+        const status replicated = owner->replicate_command(command);
+        if (!replicated.ok()) {
+            return replicated;
+        }
+
+        lock.lock();
     }
 
     registry_write_response out;
-    out.index = written.value().index;
-    out.fence = written.value().fence;
-    out.incarnation = written.value().incarnation;
+    const u64 index = written_ptr ? written_ptr->index
+                                  : owner->impl_->config.raft->commit_index();
+    const u64 fence = written_ptr ? written_ptr->fence : context.fence;
+    const u64 incarnation =
+        written_ptr ? written_ptr->incarnation : request.incarnation;
+    out.index = index;
+    out.fence = fence;
+    out.incarnation = incarnation;
     // Advance the water-mark exactly as `on_register` does: a deregister is a
     // write, and a stalled water-mark would keep an already-superseded anchor
     // acceptable forever.
     owner->impl_->anchor_epoch = owner->impl_->epochs.value();
     owner->impl_->last_anchor[key] =
-        registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+        registry_anchor{owner->impl_->anchor_epoch, index};
     const status anchored = anchor_store::save(owner->impl_->config.state_dir,
                                                owner->impl_->last_anchor);
     if (!anchored.ok()) {
@@ -1531,7 +1705,7 @@ status registry_service::on_set_state(void* self, const call_envelope& /*envelop
                                        registry_reason_acl_denied)};
     }
 
-    std::lock_guard<std::mutex> lock(owner->impl_->mutex);
+    std::unique_lock<std::mutex> lock(owner->impl_->mutex);
     if (request.writer_epoch == 0) {
         return status{registry_failure(rpc_code::failed_precondition,
                                        "registry: remote writers must present an epoch",
@@ -1569,38 +1743,80 @@ status registry_service::on_set_state(void* self, const call_envelope& /*envelop
         return encode_write_response(cached, response);
     }
 
-    const result<write_result> written = owner->impl_->catalog.set_state(
-        request.service, request.node_id, static_cast<instance_state>(request.state),
-        context);
-    if (!written.ok()) {
-        const u64 index = owner->impl_->catalog.index();
-        return status{service_error(written.error(), index)};
+    const write_result* written_ptr = nullptr;
+    write_result local_written{};
+    service_instance persisted_instance{};
+    if (owner->impl_->config.raft == nullptr) {
+        const result<write_result> written =
+            owner->impl_->catalog.set_state(request.service, request.node_id,
+                                            static_cast<instance_state>(request.state),
+                                            context);
+        if (!written.ok()) {
+            const u64 index = owner->impl_->catalog.index();
+            return status{service_error(written.error(), index)};
+        }
+        local_written = written.value();
+        written_ptr = &local_written;
+
+        query_options options;
+        options.service = request.service;
+        options.node_id = request.node_id;
+        options.include_deregistered = true;
+        const result<catalog_result> queried =
+            owner->impl_->catalog.query(options);
+        if (!queried.ok() || queried.value().instances.empty()) {
+            return status{registry_failure(rpc_code::internal,
+                                           "registry: state change did not produce a row",
+                                           "internal")};
+        }
+        persisted_instance = queried.value().instances.front();
+
+        // Persist the mutation before the client can observe it as committed.
+        const status appended = append_catalog_record(
+            *owner->impl_->log, persisted_instance, local_written.fence,
+            local_written.incarnation);
+        if (!appended.ok()) {
+            return appended;
+        }
     }
 
-    query_options options;
-    options.service = request.service;
-    options.node_id = request.node_id;
-    options.include_deregistered = true;
-    const result<catalog_result> queried = owner->impl_->catalog.query(options);
-    if (!queried.ok() || queried.value().instances.empty()) {
-        return status{registry_failure(rpc_code::internal,
-                                       "registry: state change did not produce a row",
-                                       "internal")};
-    }
-    const status appended = append_catalog_record(*owner->impl_->log, queried.value().instances.front(), written.value().fence,
-        written.value().incarnation);
-    if (!appended.ok()) {
-        return appended;
+    // D-A-9 A1: when raft is configured, replicate the catalog mutation through
+    // raft so followers apply it too. Release `mutex` first because
+    // `replicate_command` -> `apply_committed` re-acquires it.
+    if (owner->impl_->config.raft != nullptr) {
+        lock.unlock();
+
+        raft_command command;
+        command.kind = raft_command_kind::catalog_upsert;
+        command.fence = context.fence;
+        command.incarnation = request.incarnation;
+        command.state = static_cast<u8>(request.state);
+        command.service = request.service;
+        command.node_id = request.node_id;
+        command.writer_epoch = context.writer_epoch;
+        command.admin_token = context.admin_token;
+
+        const status replicated = owner->replicate_command(command);
+        if (!replicated.ok()) {
+            return replicated;
+        }
+
+        lock.lock();
     }
 
     registry_write_response out;
-    out.index = written.value().index;
-    out.fence = written.value().fence;
-    out.incarnation = written.value().incarnation;
+    const u64 index = written_ptr ? written_ptr->index
+                                  : owner->impl_->config.raft->commit_index();
+    const u64 fence = written_ptr ? written_ptr->fence : context.fence;
+    const u64 incarnation =
+        written_ptr ? written_ptr->incarnation : request.incarnation;
+    out.index = index;
+    out.fence = fence;
+    out.incarnation = incarnation;
     // Advance the water-mark exactly as `on_register` / `on_deregister` do.
     owner->impl_->anchor_epoch = owner->impl_->epochs.value();
     owner->impl_->last_anchor[key] =
-        registry_anchor{owner->impl_->anchor_epoch, written.value().index};
+        registry_anchor{owner->impl_->anchor_epoch, index};
     const status anchored = anchor_store::save(owner->impl_->config.state_dir,
                                                owner->impl_->last_anchor);
     if (!anchored.ok()) {
@@ -1996,10 +2212,17 @@ status registry_service::on_kv_delete(void* self, const call_envelope& /*envelop
                                        "registry: kv store not configured",
                                        "kv_unavailable")};
     }
-    // The not-found precondition is evaluated on the leader before proposing,
-    // for the same reason as `on_kv_cas`: a delete of an absent key must not
-    // consume a log slot, and the decision must be made against the state the
-    // write will actually land on.
+    // The not-found and cas preconditions are evaluated on the leader before
+    // proposing, so a delete of an absent key or a delete with a stale cas
+    // must not consume a log slot, and the decision must be made against the
+    // state the write will actually land on.
+    //
+    // D-A-3: the check and the commit are ONE critical section (`cas_mutex`).
+    // Two callers presenting the same `cas = N` must not both pass: the first
+    // commits and applies, and the second's check then sees the new
+    // `modify_index` and conflicts. `cas_mutex` is separate from `mutex`
+    // because `replicate_command` re-enters `mutex` through `apply_committed`.
+    std::lock_guard<std::mutex> cas_lock(owner->impl_->cas_mutex);
     {
         std::lock_guard<std::mutex> lock(owner->impl_->mutex);
         if (!kv_store::valid_key(request.key)) {
@@ -2007,10 +2230,19 @@ status registry_service::on_kv_delete(void* self, const call_envelope& /*envelop
                                            "registry: kv invalid key",
                                            registry_reason_acl_denied)};
         }
-        if (!owner->impl_->config.kv->get(request.key).ok()) {
+        const result<kv_entry> current =
+            owner->impl_->config.kv->get(request.key);
+        const u64 current_modify_index = current.ok() ? current.value().modify_index : 0;
+        const bool exists = current.ok();
+        if (!exists) {
             return status{registry_failure(rpc_code::not_found,
                                            "registry: kv key not found",
                                            registry_reason_acl_denied)};
+        }
+        if (request.has_cas && current_modify_index != request.cas) {
+            return status{registry_failure(rpc_code::failed_precondition,
+                                           "registry: cas_conflict",
+                                           registry_reason_cas_conflict)};
         }
     }
     raft_command command;

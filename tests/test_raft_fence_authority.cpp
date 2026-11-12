@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <crpc/cluster/raft_fence_authority.hpp>
+#include <crpc/cluster/raft_command.hpp>
 #include <crpc/cluster/raft_node.hpp>
 #include <crpc/cluster/raft_state.hpp>
 #include <crpc/cluster/registry.hpp>
@@ -443,6 +444,38 @@ CRPC_TEST(raft_wait_for_commit_fails_on_leadership_loss) {
         CRPC_CHECK(committed.error().message.find("leadership lost") !=
                    std::string::npos);
     }
+}
+
+// --- D-A-7: decode_allocation round-trips a fence_alloc payload --------------
+
+CRPC_TEST(decode_allocation_round_trip_values) {
+    cl::raft_command cmd;
+    cmd.kind = cl::raft_command_kind::fence_alloc;
+    cmd.fence_token = 123456789;
+    cmd.lease_id = 987654321;
+    std::vector<std::byte> encoded;
+    const status encoded_ok = cl::encode_raft_command(cmd, encoded);
+    CRPC_REQUIRE(encoded_ok.ok());
+
+    const auto decoded = cl::decode_allocation(
+        span<const std::byte>(encoded.data(), encoded.size()));
+    CRPC_REQUIRE(decoded.ok());
+    CRPC_CHECK_EQ(u64{123456789}, decoded.value().first);
+    CRPC_CHECK_EQ(u64{987654321}, decoded.value().second);
+}
+
+CRPC_TEST(decode_allocation_wrong_kind_fails) {
+    cl::raft_command cmd;
+    cmd.kind = cl::raft_command_kind::kv_put;
+    cmd.fence_token = 1;
+    cmd.lease_id = 2;
+    std::vector<std::byte> encoded;
+    const status encoded_ok = cl::encode_raft_command(cmd, encoded);
+    CRPC_REQUIRE(encoded_ok.ok());
+
+    const auto decoded = cl::decode_allocation(
+        span<const std::byte>(encoded.data(), encoded.size()));
+    CRPC_CHECK_FALSE(decoded.ok());
 }
 
 CRPC_TEST_MAIN()

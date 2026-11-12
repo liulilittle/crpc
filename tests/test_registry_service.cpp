@@ -17,6 +17,8 @@
 
 #include <crpc/cluster/registry_client.hpp>
 #include <crpc/cluster/registry_service.hpp>
+#include <crpc/cluster/fence_authority.hpp>
+#include <crpc/error.hpp>
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
 #include <crpc/io.hpp>
@@ -2129,6 +2131,118 @@ CRPC_TEST(a_deregister_for_an_unknown_instance_maps_to_not_found) {
                   static_cast<int>(rejected.error().code));
 
     n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- D-A-8: authority.fn nullptr guard is exercised by next_fence ----------
+
+CRPC_TEST(next_fence_uses_fence_authority) {
+    // A counting fence authority: the register path hands allocation to
+    // authority.allocate(), so a null fn must refuse rather than hand out a
+    // token from the raw registry allocator.
+    int calls = 0;
+    cl::fence_authority counting;
+    counting.fn = [](void* ctx, const crpc::cluster::fence_request& req)
+        noexcept -> crpc::result<crpc::u64> {
+        (void)req;
+        int* c = static_cast<int*>(ctx);
+        ++(*c);
+        return crpc::u64{42};
+    };
+    counting.context = &calls;
+
+    const fs::path dir =
+        fs::temporary_directory().value() / "crpc_g19s2_next_fence_authority";
+    (void)fs::remove_all(dir);
+
+    // Build the service directly (not via node::start()) so the counting
+    // authority is injected BEFORE prepare(): the null-fn guard at
+    // prepare():1091 runs during prepare(), and authority must be present
+    // then for the test to exercise it.
+    node n;
+    n.backend = std::make_unique<crpc::iocp_backend>();
+    n.token = "token-A";
+    n.state_dir = fs::path(dir);
+
+    cl::registry_service_config config;
+    config.state_dir = n.state_dir;
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config.backend = n.backend.get();
+    cl::acl_rule rule;
+    rule.token_hash = fnv1a("token-A");
+    rule.principal_id = "node-A";
+    rule.node_id = "node-A";
+    rule.read_prefixes.push_back("");
+    rule.write_prefixes.push_back("");
+    config.acl.push_back(rule);
+    config.registry.admin_token = "admin-secret";
+    cl::acl_rule other;
+    other.token_hash = fnv1a("token-B");
+    other.principal_id = "node-B";
+    other.node_id = "node-B";
+    other.read_prefixes.push_back("");
+    other.write_prefixes.push_back("");
+    config.acl.push_back(other);
+
+    n.service = std::make_unique<cl::registry_service>(std::move(config));
+    n.service->set_authority_for_test(counting);
+    crpc::server::builder builder;
+    CRPC_REQUIRE(n.service->prepare(builder).ok());
+    auto candidate = builder.build();
+    CRPC_REQUIRE(candidate.get() != nullptr);
+    CRPC_REQUIRE(candidate->start().ok());
+    n.service->set_server(std::move(candidate));
+    n.bound_ep = n.service->bound_endpoint();
+    auto connection = n.backend->connect(n.bound_ep, crpc::connect_options{});
+    CRPC_REQUIRE(connection != nullptr);
+    crpc::rpc::client_options options;
+    options.default_timeout = 2s;
+    n.client = std::make_shared<crpc::rpc::client>(std::move(connection),
+                                                   options);
+
+    cl::registry_client client(n.client, cl::registry_client_options{"token-A"});
+    const auto fence = client.next_fence("svc", "node-A");
+    CRPC_REQUIRE(fence.ok());
+    CRPC_CHECK_EQ(crpc::u64{42}, fence.value());
+    CRPC_CHECK(calls >= 1);
+
+    n.stop();
+    (void)fs::remove_all(dir);
+}
+
+// --- D-A-15: prepare() is idempotent; start() may follow prepare() ----------
+
+CRPC_TEST(prepare_then_start_twice_is_ok) {
+    const fs::path dir =
+        fs::temporary_directory().value() / "crpc_g19s2_prepare_start_idempotent";
+    (void)fs::remove_all(dir);
+
+    cl::registry_service_config config;
+    config.state_dir = dir.str();
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    cl::acl_rule rule;
+    rule.token_hash = fnv1a("token-A");
+    rule.principal_id = "node-A";
+    rule.node_id = "node-A";
+    rule.read_prefixes.push_back("");
+    rule.write_prefixes.push_back("");
+    config.acl.push_back(rule);
+
+    auto backend = std::make_unique<crpc::iocp_backend>();
+    config.backend = backend.get();
+
+    auto service = std::make_unique<cl::registry_service>(std::move(config));
+    crpc::server::builder builder;
+    CRPC_REQUIRE(service->prepare(builder).ok());
+    // Second prepare() must be a no-op (idempotent): no re-acquire of the
+    // lease, which would fail because we already hold it.
+    CRPC_CHECK(service->prepare(builder).ok());
+
+    auto candidate = builder.build();
+    CRPC_REQUIRE(candidate.get() != nullptr);
+    CRPC_REQUIRE(candidate->start().ok());
+    service->set_server(std::move(candidate));
+    service->stop();
     (void)fs::remove_all(dir);
 }
 

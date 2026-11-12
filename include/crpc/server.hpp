@@ -474,6 +474,11 @@ public:
     // and tests can observe the auto-sharding decision behind `shards_auto()`.
     [[nodiscard]] std::size_t shard_count() const noexcept;
 
+    // The actual bound endpoint of the first listener, valid after a successful
+    // `start()`. When the configured port was 0 the OS chose one; this is the
+    // real bound address, not the configured one.
+    [[nodiscard]] crpc::endpoint local_endpoint() const noexcept;
+
     // Snapshot of the send-path record pool. Cheap (one mutex lock, two atomic
     // reads); safe from any thread. The counters are monotonic until the pool is
     // destroyed, so a caller can assert they stop growing after warm-up.

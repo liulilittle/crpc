@@ -465,9 +465,9 @@ std::size_t registry::metadata_size(const metadata_list& meta) {
 }
 
 std::shared_ptr<registry_snapshot>
-registry::snapshot_with(const service_instance& instance) const {
+registry::snapshot_with(const service_instance& instance, u64 index) const {
     auto next = std::make_shared<registry_snapshot>();
-    next->index = index_ + 1;
+    next->index = index;
     const std::shared_ptr<const registry_snapshot> current =
         snapshot_.load(std::memory_order_acquire);
     next->instances.reserve(current->instances.size() + 1);
@@ -665,7 +665,8 @@ result<write_result> registry::register_with(service_instance instance,
                           "registry index exhausted", reason_overflow);
         }
 
-        const u64 next_index = index_ + 1;
+        const u64 next_index =
+            context.raft_index > 0 ? context.raft_index : index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
             accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
@@ -680,7 +681,7 @@ result<write_result> registry::register_with(service_instance instance,
         record_writer_epoch_locked(id, context.writer_epoch);
         instance.revision = next_index;
 
-        auto next = snapshot_with(instance);
+        auto next = snapshot_with(instance, next_index);
         if (existing == instances_.end()) {
             instances_.emplace(id, instance);
         } else {
@@ -804,7 +805,8 @@ result<write_result> registry::deregister_with(const std::string& service,
         if (context.incarnation > updated.incarnation) {
             updated.incarnation = context.incarnation;
         }
-        const u64 next_index = index_ + 1;
+        const u64 next_index =
+            context.raft_index > 0 ? context.raft_index : index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
             accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
@@ -826,7 +828,7 @@ result<write_result> registry::deregister_with(const std::string& service,
             watermark = updated.incarnation;
         }
 
-        auto next = snapshot_with(updated);
+        auto next = snapshot_with(updated, next_index);
         existing->second = updated;
         index_ = next_index;
         std::shared_ptr<const registry_snapshot> published(std::move(next));
@@ -941,7 +943,8 @@ result<write_result> registry::set_state_with(const std::string& service,
 
         service_instance updated = stored;
         updated.state = state;
-        const u64 next_index = index_ + 1;
+        const u64 next_index =
+            context.raft_index > 0 ? context.raft_index : index_ + 1;
         const auto accepted_fence = last_fence_.find(id);
         const u64 key_high_water =
             accepted_fence != last_fence_.end() ? accepted_fence->second.token : 0;
@@ -956,7 +959,7 @@ result<write_result> registry::set_state_with(const std::string& service,
         record_writer_epoch_locked(id, context.writer_epoch);
         updated.revision = next_index;
 
-        auto next = snapshot_with(updated);
+        auto next = snapshot_with(updated, next_index);
         existing->second = updated;
         index_ = next_index;
         std::shared_ptr<const registry_snapshot> published(std::move(next));

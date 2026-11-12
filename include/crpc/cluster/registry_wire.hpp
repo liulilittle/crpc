@@ -292,6 +292,8 @@ struct kv_put_response {
 struct kv_delete_request {
     std::string token;
     std::string key;
+    u64 cas = 0;
+    bool has_cas = false;
     std::chrono::milliseconds token_issued_at{0};
     std::string token_nonce;
     bool has_token_issued_at = false;

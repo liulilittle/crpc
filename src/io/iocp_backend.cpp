@@ -274,6 +274,7 @@ struct listener_state {
     std::atomic<std::size_t> pending{0};
     std::vector<std::unique_ptr<accept_slot>> slots;
     std::mutex m;
+    crpc::endpoint local_ep;
 };
 
 // --- Control completions -----------------------------------------------------
@@ -1299,6 +1300,10 @@ public:
         }
     }
 
+    [[nodiscard]] endpoint local() const noexcept override {
+        return st_ ? st_->local_ep : endpoint();
+    }
+
 private:
     std::shared_ptr<listener_state> st_;
 };
@@ -1600,6 +1605,29 @@ std::unique_ptr<listener> iocp_backend::impl::do_listen(
     ls->id = next_listener_id.fetch_add(1, std::memory_order_relaxed);
     ls->lsock = lsock;
     ls->family = family;
+
+    // Record the real bound address so an ephemeral port (0) can be learned.
+    sockaddr_storage ss{};
+    int ss_len = static_cast<int>(sizeof(ss));
+    if (::getsockname(lsock, reinterpret_cast<sockaddr*>(&ss), &ss_len) == 0) {
+        if (ss.ss_family == AF_INET) {
+            const sockaddr_in* in = reinterpret_cast<const sockaddr_in*>(&ss);
+            char host[INET_ADDRSTRLEN] = {0};
+            if (::InetNtopA(AF_INET, &in->sin_addr, host,
+                            sizeof(host)) != nullptr) {
+                ls->local_ep = crpc::endpoint::tcp(
+                    host, static_cast<u16>(::ntohs(in->sin_port)));
+            }
+        } else if (ss.ss_family == AF_INET6) {
+            const sockaddr_in6* in6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+            char host[INET6_ADDRSTRLEN] = {0};
+            if (::InetNtopA(AF_INET6, &in6->sin6_addr, host,
+                            sizeof(host)) != nullptr) {
+                ls->local_ep = crpc::endpoint::tcp(
+                    host, static_cast<u16>(::ntohs(in6->sin6_port)));
+            }
+        }
+    }
 
     const std::size_t posts = opt.accept_posts == 0 ? 1 : opt.accept_posts;
     for (std::size_t i = 0; i < posts; ++i) {

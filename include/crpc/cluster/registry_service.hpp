@@ -165,6 +165,11 @@ public:
     // `start()` uses this internally after `build()`.
     void set_server(std::unique_ptr<server> owned);
 
+    // Sets the raft node after `prepare` has acquired the lease. Used by
+    // registryd so that raft.log is opened only after the single-instance lease
+    // is held (D-A-6).
+    void set_raft(raft_node* raft);
+
     // The ACL verdict for a token. Exposed for tests; handlers use it directly.
     // `issued_at` and `has_issued_at` come from the request DTO; a missing
     // issue time is treated as outside the window (fail closed). `now` is the
@@ -201,6 +206,10 @@ public:
     // The live ACL table (the static seed plus every applied change). Exposed so
     // a test can prove two nodes converged on the same rules.
     [[nodiscard]] std::vector<acl_rule> acl_rules() const;
+
+    // Test seam: replaces the fence authority seam so a test can count
+    // allocations or inject a null fn (D-A-8: nullptr guard).
+    void set_authority_for_test(fence_authority authority) noexcept;
 
     // The incarnation currently stored for (service, node_id), or 0 when the key
     // has no row. This is the source the HTTP facade uses to advance the

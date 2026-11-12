@@ -28,6 +28,26 @@
 // carry the real Raft term. The two kinds share one index space but not one
 // term semantics, which is why `restore_from_log` reads only `registry_event`.
 //
+// D-B-11: there are TWO distinct log concepts with TWO separate index spaces,
+// and they must never be confused.
+//
+//   1. `registry_log` (the WAL, persistent): dense index space 1..N across ALL
+//      record kinds (registry_event AND raft_entry). `restore_from_log` replays
+//      only registry_event records (term==0 ones); raft_entry records with a
+//      real term are not interpreted here because they belong to the Raft
+//      state machine, not the catalog.
+//
+//   2. Raft's own log (in-memory on `raft_node`, term-carrying entries): its
+//      index is the position in the sequence of proposed raft commands. It
+//      shares the dense numbering with registry_log but lives in the same
+//      index space: a raft entry proposed at registry_log index k occupies
+//      raft log index k. Committing raft index k advances `commit_index` to k.
+//
+// A command's raft index IS its registry_log index: they are one dense sequence.
+// Two separate structures (the WAL file and the in-memory entry vector), but a
+// single index space. Writing to one without the other, or reading raft state
+// from registry_event records (or vice versa), is a bug.
+//
 // PreVote
 // -------
 // A candidate first asks whether it could win *without* incrementing the term.
@@ -161,8 +181,14 @@ public:
     [[nodiscard]] u64 term() const noexcept;
     [[nodiscard]] u64 commit_index() const noexcept;
     [[nodiscard]] u64 last_log_index() const noexcept;
-    [[nodiscard]] u64 last_log_term() const noexcept;
+    [[nodiscard]] result<u64> last_log_term() const noexcept;
     [[nodiscard]] std::string leader_id() const;
+
+    // The injected clock's current reading. Used by callers (e.g. the registry
+    // service) to build wait_for_commit deadlines on the same clock source the
+    // node compares against, so a real-time deadline and an injected clock
+    // never disagree.
+    [[nodiscard]] monotonic_clock::time_point now() const noexcept;
 
     // The log this node replicates. The state machine reads committed entries
     // from here: the service's own catalog log is a different file, and an
@@ -173,10 +199,9 @@ public:
     // them by calling `handle()` on the peer; production supplies a transport.
     void set_send_hook(std::function<void(const raft_message&)> hook);
 
-    // Test seam: the term of the entry at `index`, or 0 when absent. Exposed
-    // because `last_log_term()` alone cannot answer "what term is entry N in",
-    // which several L2 cases need.
-    [[nodiscard]] u64 entry_term(u64 index) const noexcept;
+    // Test seam: the term of the entry at `index`, or an error when the entry
+    // is absent / the log is corrupt.
+    [[nodiscard]] result<u64> entry_term(u64 index) const noexcept;
 
     // Drives `tick()` until `commit_index() >= index` or `deadline` passes.
     //
@@ -236,6 +261,10 @@ private:
     registry_log& log_;
     fs::path state_dir_;
     monotonic_clock clock_;
+    // D-B-9: O(1) (index -> term) cache so `entry_term_locked` no longer
+    // replays the whole log per lookup. Maintained on start() (single replay),
+    // append (insert new entry) and truncate_suffix (drop evicted entries).
+    mutable std::map<u64, u64> index_term_cache_;
 
     raft_role role_ = raft_role::follower;
     u64 term_ = 0;

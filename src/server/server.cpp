@@ -3014,4 +3014,11 @@ std::size_t server::shard_count() const noexcept {
     return impl_->opt.shards;
 }
 
+crpc::endpoint server::local_endpoint() const noexcept {
+    if (impl_->listeners.empty()) {
+        return crpc::endpoint{};
+    }
+    return impl_->listeners[0]->local();
+}
+
 } // namespace crpc
