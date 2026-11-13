@@ -1156,6 +1156,163 @@ CRPC_TEST(raft_conflicting_suffix_is_truncated) {
     CRPC_CHECK(net.find("C")->raft->last_log_index() == u64{2});
 }
 
+// --- G2: an append must never truncate/replace a COMMITTED entry -------------
+//
+// Both truncate_suffix calls in the append branch take their from_index from the
+// inbound message (entry.index at :732, leader_prefix+1 at :774). A higher-term
+// append is trusted as a leader without sender auth (:474-486/:683-691), and
+// prev_log_index==0 short-circuits the consistency check (:695). So a forged
+// append CAN reach a follower whose commit_index_ > 0. Refusing it keeps the
+// Raft invariant "a committed entry is never truncated" at the entry point;
+// the downstream apply_committed() only REPORTS (and the :732 refill path even
+// hides the loss), so it is not a substitute.
+//
+// Two states, each with a real handle(append) through the real implementation:
+//   (A) conflict at entry.index == commit_index_ and a different term -> :732
+//   (B) empty heartbeat with leader_prefix+1 <= commit_index_ -> :774
+// Assertions pin the target property: reply.success=false AND the committed
+// entry's payload / term / commit_index / last_log_index are all unchanged.
+// Fixed check count, every CRPC_CHECK outside any loop, no tautologies.
+namespace {
+
+struct committed_follower {
+    fs::temp_dir dir;
+    cl::memory_registry_log log;
+    manual_clock clock;
+    cl::raft_node raft;
+
+    committed_follower()
+        : dir(fs::temp_dir::create(fs::path(), "crpc-append-guard-").value()),
+          raft(make_config(), log, dir.native(), make_clock(clock)) {}
+
+    static cl::raft_config make_config() {
+        cl::raft_config cfg;
+        cfg.node_id = "A";
+        cfg.peers = {};  // single node: can_win_alone(), quorum of one
+        cfg.election_timeout_min = 40ms;
+        cfg.election_timeout_max = 60ms;
+        cfg.heartbeat_interval = 20ms;
+        return cfg;
+    }
+};
+
+// Drives a single node to a committed log of `count` entries (term 1). Returns
+// false if the environment or a precondition fails, so the caller's CRPC_REQUIRE
+// records the first failure instead of dereferencing a broken state.
+bool build_committed_log(committed_follower& f, int count) {
+    if (!f.raft.start().ok()) return false;
+    f.clock.advance(200ms);
+    f.raft.tick();  // single node elects itself leader at term 1
+    if (f.raft.role() != cl::raft_role::leader) return false;
+    for (int i = 0; i < count; ++i) {
+        const std::byte payload[2] = {std::byte{'G'},
+                                      static_cast<std::byte>('0' + i)};
+        if (!f.raft.propose(span<const std::byte>(payload, 2)).ok()) return false;
+    }
+    return f.raft.commit_index() == static_cast<u64>(count);
+}
+
+std::vector<std::byte> payload_at(cl::memory_registry_log& log, u64 index) {
+    const auto replayed = log.replay(0);
+    if (!replayed.ok()) return {};
+    for (const auto& r : replayed.value())
+        if (r.index == index) return r.payload;
+    return {};
+}
+
+}  // namespace
+
+CRPC_TEST(d_append_rejects_conflict_below_commit) {
+    // ---- State A: :732 conflict truncation at entry.index == commit_index_ ----
+    committed_follower a;
+    CRPC_REQUIRE(build_committed_log(a, 2));
+    const u64 a_commit_before = a.raft.commit_index();
+    const u64 a_term1 = a.raft.entry_term(1).value();
+    const u64 a_term2_before = a.raft.entry_term(2).value();
+    const std::vector<std::byte> a_payload2_before = payload_at(a.log, 2);
+    CRPC_REQUIRE(!a_payload2_before.empty());
+    CRPC_REQUIRE(a_term1 != u64{0});
+    CRPC_REQUIRE(a_term2_before != u64{0});
+
+    // Forged higher-term append with a VALID prefix at index 1 (so prev_ok passes
+    // via the term compare, not the ==0 shortcut). Its single entry conflicts at
+    // index 2 == commit_index_ with a different term and a different payload.
+    cl::raft_message conflict;
+    conflict.kind = cl::raft_message::type::append;
+    conflict.term = a.raft.term() + 5;
+    conflict.from = "ATTACKER";
+    conflict.to = "A";
+    conflict.prev_log_index = 1;
+    conflict.prev_log_term = a_term1;
+    conflict.leader_commit = 0;
+    cl::log_record evil;
+    evil.kind = cl::log_record_kind::raft_entry;
+    evil.term = a_term2_before + 100;
+    evil.index = 2;
+    evil.payload.assign(3, std::byte{'E'});
+    conflict.entries.push_back(evil);
+
+    bool a_got_reply = false;
+    bool a_reply_success = true;
+    a.raft.set_send_hook([&](const cl::raft_message& m) {
+        if (m.kind == cl::raft_message::type::append_reply) {
+            a_got_reply = true;
+            a_reply_success = m.success;
+        }
+    });
+    a.raft.handle(conflict);
+    CRPC_REQUIRE(a_got_reply);
+
+    const u64 a_term2_after = a.raft.entry_term(2).value();
+    const std::vector<std::byte> a_payload2_after = payload_at(a.log, 2);
+    CRPC_CHECK_FALSE(a_reply_success);
+    CRPC_CHECK_EQ(a_term2_before, a_term2_after);
+    CRPC_CHECK(a_payload2_after == a_payload2_before);
+    CRPC_CHECK_EQ(a_commit_before, a.raft.commit_index());
+    CRPC_CHECK_EQ(u64{2}, a.raft.last_log_index());
+
+    // ---- State B: :774 suffix trim via empty heartbeat below commit ----------
+    committed_follower b;
+    CRPC_REQUIRE(build_committed_log(b, 3));
+    const u64 b_commit_before = b.raft.commit_index();
+    const u64 b_term1 = b.raft.entry_term(1).value();
+    const u64 b_term3_before = b.raft.entry_term(3).value();
+    const std::vector<std::byte> b_payload3_before = payload_at(b.log, 3);
+    CRPC_REQUIRE(!b_payload3_before.empty());
+    CRPC_REQUIRE(b_term1 != u64{0});
+    CRPC_REQUIRE(b_term3_before != u64{0});
+
+    // Forged higher-term EMPTY heartbeat at prev_log_index=1. leader_prefix = 1,
+    // so :774 would truncate_suffix(2) and delete committed indexes 2 and 3.
+    cl::raft_message beat;
+    beat.kind = cl::raft_message::type::append;
+    beat.term = b.raft.term() + 5;
+    beat.from = "ATTACKER";
+    beat.to = "A";
+    beat.prev_log_index = 1;
+    beat.prev_log_term = b_term1;
+    beat.leader_commit = 0;
+
+    bool b_got_reply = false;
+    bool b_reply_success = true;
+    b.raft.set_send_hook([&](const cl::raft_message& m) {
+        if (m.kind == cl::raft_message::type::append_reply) {
+            b_got_reply = true;
+            b_reply_success = m.success;
+        }
+    });
+    b.raft.handle(beat);
+    CRPC_REQUIRE(b_got_reply);
+
+    const u64 b_term3_after = b.raft.entry_term(3).value();
+    const std::vector<std::byte> b_payload3_after = payload_at(b.log, 3);
+    CRPC_CHECK_FALSE(b_reply_success);
+    CRPC_CHECK_EQ(u64{3}, b.raft.last_log_index());
+    CRPC_CHECK_EQ(b_term3_before, b_term3_after);
+    CRPC_CHECK(b_payload3_after == b_payload3_before);
+    CRPC_CHECK_EQ(b_commit_before, b.raft.commit_index());
+}
+
 // --- supplementary: only the current term's entries commit by counting -------
 
 CRPC_TEST(raft_commit_only_current_term_entries) {

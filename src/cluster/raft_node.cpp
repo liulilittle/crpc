@@ -729,6 +729,16 @@ void raft_node::handle(const raft_message& msg) {
             for (const auto& entry : msg.entries) {
                 const u64 existing_term = entry_term_locked(entry.index);
                 if (existing_term != 0 && existing_term != entry.term) {
+                    // A committed entry must never be truncated. Both the
+                    // index and the term come from the inbound message; a
+                    // forged higher-term append is trusted without sender
+                    // auth, so refuse rather than let :742-758 silently
+                    // replace a committed command. The existing reply path
+                    // turns append_ok=false into success=false / no ack.
+                    if (entry.index <= commit_index_) {
+                        append_ok = false;
+                        break;
+                    }
                     const status trimmed = log_.truncate_suffix(entry.index);
                     if (!trimmed.ok()) {
                         append_ok = false;
@@ -770,14 +780,23 @@ void raft_node::handle(const raft_message& msg) {
             if (append_ok) {
                 const u64 leader_prefix = msg.prev_log_index + msg.entries.size();
                 if (log_.last_index() > leader_prefix) {
-                    const status trimmed =
-                        log_.truncate_suffix(leader_prefix + 1);
-                    if (!trimmed.ok()) {
+                    // Suffix trimming must not cross into the committed
+                    // prefix: leader_prefix+1 is message-controlled, so an
+                    // empty heartbeat from a forged higher term could delete
+                    // committed entries with no refill. Refuse the append
+                    // (append_ok=false -> reply.success=false) instead.
+                    if (leader_prefix + 1 <= commit_index_) {
                         append_ok = false;
                     } else {
-                        index_term_cache_.erase(
-                            index_term_cache_.lower_bound(leader_prefix + 1),
-                            index_term_cache_.end());
+                        const status trimmed =
+                            log_.truncate_suffix(leader_prefix + 1);
+                        if (!trimmed.ok()) {
+                            append_ok = false;
+                        } else {
+                            index_term_cache_.erase(
+                                index_term_cache_.lower_bound(leader_prefix + 1),
+                                index_term_cache_.end());
+                        }
                     }
                 }
             }
