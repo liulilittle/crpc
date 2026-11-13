@@ -364,6 +364,10 @@ status append_bytes(const path& p, span<const std::byte> data) {
             CloseHandle(h);
             return win_status(code, "append", p.str());
         }
+        if (wrote == 0) {
+            CloseHandle(h);
+            return win_status(ERROR_DISK_FULL, "append", p.str());
+        }
         pos += wrote;
         left -= wrote;
     }

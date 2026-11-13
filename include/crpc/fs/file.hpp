@@ -74,6 +74,18 @@ CRPC_API result<std::string> read_all_text(const path& p);
 CRPC_API status write_all_bytes(const path& p, span<const std::byte> data);
 CRPC_API status write_all_text(const path& p, const std::string& text);
 
+// Appends `data` to `p` (creating the file if absent). NOT durable: a
+// successful return only means the bytes reached the OS page cache (S2);
+// `CloseHandle` / `::close` are not a physical-media barrier, so a power loss
+// may drop them. No `FlushFileBuffers` (Windows) / `fsync` (POSIX) runs here.
+// Callers needing durability must use an explicit durable channel or
+// `write_all_bytes_atomic`, which flushes before the rename.
+//
+// An append spanning multiple `kIoChunk` slices is not atomic, and a failed
+// write does not roll back: already-appended bytes may remain as a torn tail.
+// On POSIX the shared `posix_write_all` helper still lacks an `n == 0` guard
+// (a `::write` returning 0); that gap is W5 because hardening the shared
+// helper would also change `write_all_bytes`.
 CRPC_API status append_bytes(const path& p, span<const std::byte> data);
 CRPC_API status append_text(const path& p, const std::string& text);
 
