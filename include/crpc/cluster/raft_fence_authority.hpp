@@ -77,7 +77,7 @@ struct CRPC_API raft_fence_authority {
 
 // Decodes a fence_alloc raft_command payload back into (token, lease_id). Used
 // by the apply loop to make a committed fence allocation observable.
-[[nodiscard]] result<std::pair<u64, u64>> decode_allocation(span<const std::byte> in);
+[[nodiscard]] CRPC_API result<std::pair<u64, u64>> decode_allocation(span<const std::byte> in);
 
 } // namespace cluster
 } // namespace crpc

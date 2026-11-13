@@ -26,6 +26,11 @@ param(
     [ValidateSet('x86', 'x64')]
     [string]$Arch = 'x64',
 
+    # Platform boundary: 'asan'/'ubsan'/'tsan' are Linux/GCC/Clang workflows.
+    # MSVC only implements /fsanitize=address, so the Windows script rejects
+    # every non-'none' sanitizer explicitly at runtime (see the guard below).
+    # The set itself is kept intact (dynamic config not crippled); the gate is
+    # driven by the detected compiler, not by a trimmed parameter list.
     [ValidateSet('none', 'asan', 'ubsan', 'tsan')]
     [string]$Sanitizer = 'none',
 
@@ -202,6 +207,27 @@ $sanFlags = @{
     asan  = @('-DCRPC_SANITIZER=address')
     ubsan = @('-DCRPC_SANITIZER=undefined')
     tsan  = @('-DCRPC_SANITIZER=thread')
+}
+
+# Windows/MSVC sanitizer gate (W11 adjudication (a)+(e)). MSVC only implements
+# /fsanitize=address; it has no undefined/thread sanitizer, and a partial
+# /fsanitize=address instrumentation of crpc vs. the EXCLUDE_FROM_ALL
+# third-party _deps makes the STL detect_mismatch ABI contract disagree
+# (33x LNK2038 + 2x LNK1319). 'undefined'/'thread' are not real gates here:
+# they only produce 455x D9002 warnings promoted by /WX (a fake red). The
+# Windows sanitizer gate is therefore unavailable; coverage is provided by
+# the Linux CI three-gate job (ci.yml linux-sanitizers / test.sh --sanitizer all).
+# Reject explicitly (non-zero exit, not a silent no-op) so the failure is
+# legible instead of surfacing as a linker error. `-Sanitizer` and the
+# CRPC_SANITIZER cache variable stay intact; the gate follows the runtime
+# compiler detection ($vcvars is MSVC).
+if ($Sanitizer -ne 'none' -and $vcvars) {
+    $reason = ("MSVC does not support sanitizer '" + $Sanitizer + "': MSVC only implements /fsanitize=address; " +
+               "the Windows sanitizer gate is unavailable and sanitizer coverage is provided by " +
+               "the Linux CI three-gate job (asan/ubsan/tsan). Use the POSIX scripts for sanitizer builds.")
+    Write-Log $reason 'ERROR'
+    Write-Log "refusing -Sanitizer $Sanitizer on MSVC; re-run with -Sanitizer none" 'ERROR'
+    exit 4
 }
 
 foreach ($cfg in $configs) {

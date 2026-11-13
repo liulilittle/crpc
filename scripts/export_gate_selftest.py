@@ -23,11 +23,14 @@ Three halves:
 
 Exit code 0 = every assertion held; 1 = a failure, printed with its input.
 """
+import contextlib
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import export_gate  # noqa: E402
@@ -461,6 +464,257 @@ def test_exported_classes_shapes():
     check('parameter type alone is not an export', 'widget' not in scopes2,
           sorted(scopes2))
 
+# ---------------------------------------------------------------------------
+# Rule F: over-export / ship-view seam difference
+#
+# These pin the checker in BOTH directions. A vacuous checker (one that always
+# returns []) would still pass `ship clean -> OK`; the seam-present FAIL, the
+# x64/x86 manglings and the three read_exports shapes make sure a broken
+# detection is caught. The end-to-end tests exercise main()'s activation gates
+# (--build-dir table, --tests-enabled / CMakeCache view, --update-baseline,
+# exit 2) so a regression cannot hide behind a lower-level helper that still
+# works in isolation.
+# ---------------------------------------------------------------------------
+_F_SEAM_X64 = '?set_stale_retries@registry_client@cluster@crpc@@QEAAXH@Z'
+_F_SEAM_X86 = '?set_stale_retries@registry_client@cluster@crpc@@QAEXH@Z'
+_F_SEAM_REQID = ('?set_request_identity@registry_client@cluster@crpc@@'
+                 'QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@'
+                 'V?$allocator@D@2@@std@@@Z')
+_F_PROD = '?check_acl@registry_service@cluster@crpc@@QEBAXXZ'
+_F_PLAIN = 'crpc_version_string'
+
+
+def _f_headers():
+    return (
+        'Dump of file fake.dll\n'
+        '    ordinal hint RVA      name\n'
+        '\n'
+    )
+
+
+def _f_summary():
+    return '\n  Summary\n\n        1000 .text\n'
+
+
+def test_rule_f_ship_seam_fails():
+    print('rule F: a ship DLL exporting a test-only seam MUST fail')
+    v = export_gate.rule_f_check({_F_SEAM_X64, _F_PLAIN}, False)
+    check('seam exported in ship -> 1 violation',
+          len(v) == 1 and v[0][0] == 'F', v)
+    check('violation names the seam',
+          bool(v) and 'set_stale_retries' in v[0][2], v)
+    check('evidence is attached (verifiable, not comment-derived)',
+          bool(v) and 'P-C9.out.txt' in v[0][2], v)
+    v2 = export_gate.rule_f_check({_F_SEAM_REQID}, False)
+    check('4th seam set_request_identity also caught',
+          len(v2) == 1 and 'set_request_identity' in v2[0][2], v2)
+
+
+def test_rule_f_ship_clean_ok():
+    print('rule F: a ship DLL with no test-only seams MUST pass')
+    v = export_gate.rule_f_check({_F_PLAIN, _F_PROD}, False)
+    check('clean ship table -> no violation', v == [], v)
+    # Production dual-use symbols must never be flagged (they are the explicit
+    # whitelist; guarding them breaks -Examples -NoTests with LNK2019).
+    for name, _ev in export_gate._PROD_DUAL_USE:
+        check('whitelist %s is not a seam' % name,
+              name not in dict(export_gate._TEST_ONLY_SEAMS))
+
+
+def test_rule_f_view_gate():
+    print('rule F: view gating (test-enabled / unknown / no table)')
+    seam = {_F_SEAM_X64}
+    check('test-enabled view (True) skips',
+          export_gate.rule_f_check(seam, True) == [])
+    check('unknown view (None) skips',
+          export_gate.rule_f_check(seam, None) == [])
+    check('no table (None exported) skips',
+          export_gate.rule_f_check(None, False) == [])
+    check('ship view (False) is the only active one',
+          len(export_gate.rule_f_check(seam, False)) == 1)
+
+
+def test_rule_f_mangling_and_symbols():
+    print('rule F: x64/x86 mangling + symbol classification')
+    check('x64 QEAA mangling parsed',
+          export_gate.seam_method(_F_SEAM_X64) == 'set_stale_retries',
+          export_gate.seam_method(_F_SEAM_X64))
+    check('x86 QAE (stdcall-ish) mangling parsed',
+          export_gate.seam_method(_F_SEAM_X86) == 'set_stale_retries',
+          export_gate.seam_method(_F_SEAM_X86))
+    check('ELF demangled member parsed',
+          export_gate.seam_method('crpc::cluster::registry_client::'
+                                  'set_token_issued_at(long)')
+          == 'set_token_issued_at')
+    check('constructor special name is not a plain member',
+          export_gate.seam_method('??0registry_client@cluster@crpc@@QEAA@XZ')
+          is None)
+    check('RTTI special name is not a plain member',
+          export_gate.seam_method('??_7registry_client@cluster@crpc@@6B@')
+          is None)
+    check('plain C symbol has no seam',
+          export_gate.seam_method(_F_PLAIN) is None)
+    check('buckets are disjoint (fail-closed self-consistency)',
+          not (set(dict(export_gate._TEST_ONLY_SEAMS))
+               & {n for n, _e in export_gate._PROD_DUAL_USE}))
+    v = export_gate.rule_f_check({_F_SEAM_X86, _F_SEAM_X64}, False)
+    check('x86 seam FAILs in ship, x64 deduped (one violation per seam)',
+          len(v) == 1, v)
+
+
+def test_rule_f_3_shapes_via_read_exports():
+    print('rule F: ILT / annotation / wrapped shapes through read_exports')
+    # (1) ILT suffix, (2) annotation suffix, (3) a name wrapped across two
+    # lines. All three are fed through the REAL parser (no regex rewrite), so
+    # seam detection is proven against the shapes the field code documented at
+    # export_gate.py:67-80.
+    payload = (_f_headers()
+               + '          1    0 00001000 ' + _F_SEAM_X64
+               + ' = @ILT+141195(' + _F_SEAM_X64 + ')\n'
+               + '          2    1 00002000 ' + _F_SEAM_X86
+               + ' = ' + _F_SEAM_X86 + ' (void `public: void ...\')\n'
+               + '          3    2 00003000 '
+               '?set_request_identity@registry_client@cluster@crpc@@QEAAXA\n'
+               + '          EBV?$basic_string@DU?$char_traits@D@std@@V?$'
+                 'allocator@D@2@@std@@@Z = @ILT+90045(?set_request_identity@'
+                 'registry_client@cluster@crpc@@QEAAXAEBV?$basic_string@DU?$'
+                 'char_traits@D@std@@V?$allocator@D@2@@std@@@Z)\n'
+               + '          4    3 00004000 ' + _F_PLAIN + '\n'
+               + _f_summary())
+    names = parse(payload)
+    check('ILT-suffix seam parsed', _F_SEAM_X64 in names, sorted(names))
+    check('annotation-suffix seam parsed', _F_SEAM_X86 in names, sorted(names))
+    check('wrapped set_request_identity rejoined', _F_SEAM_REQID in names,
+          sorted(names))
+    v = export_gate.rule_f_check(names, False)
+    got = sorted(x[1] for x in v)
+    check('all 3 shapes -> ship FAIL (2 distinct seams: x64/x86 dedup + 4th)',
+          len(v) == 2, (v, got))
+
+
+def test_rule_f_anti_vacuity():
+    print('rule F: anti-vacuity (monkeypatched broken checker MUST be caught)')
+    seam = {_F_SEAM_X64}
+    original = export_gate.seam_method
+    export_gate.seam_method = lambda _sym: None  # constant-False detector
+    try:
+        check('broken detector -> selftest-level RED',
+              export_gate.rule_f_check(seam, False) == [])
+    finally:
+        export_gate.seam_method = original
+    check('restored detector -> GREEN again',
+          len(export_gate.rule_f_check(seam, False)) == 1)
+
+
+def _f_tree(root, cache_tests=None):
+    os.makedirs(os.path.join(root, 'include', 'crpc'), exist_ok=True)
+    io.open(os.path.join(root, 'include', 'crpc', 'probe.hpp'), 'w',
+            encoding='utf-8').write(
+        '#ifndef P_HPP\n#define P_HPP\nnamespace crpc {\nnamespace cluster {\n'
+        '[[nodiscard]] CRPC_API int decode_allocation(int in);\n}\n}\n#endif\n')
+    os.makedirs(os.path.join(root, 'scripts'), exist_ok=True)
+    # main() only checks existence before read_exports, whose subprocess.run
+    # is monkeypatched by run_main below -- no native dumper is launched.
+    io.open(os.path.join(root, 'crpc.dll'), 'wb').write(b'MZ')
+    if cache_tests is not None:
+        io.open(os.path.join(root, 'CMakeCache.txt'), 'w',
+                encoding='utf-8').write(
+            'CRPC_BUILD_TESTS:BOOL=%s\n' % cache_tests)
+
+
+def test_rule_f_main_end_to_end():
+    print('rule F: main() activation gates (end-to-end)')
+    # main() reads the table via read_exports(args.dumpbin or find_dumpbin()).
+    # Point --dumpbin at a python wrapper that prints a synthetic table; patch
+    # subprocess.run inside read_exports so no native exe runs in the selftest.
+    def dispatch(payload):
+        def run(cmd, **_kw):
+            return _Proc(payload.encode('utf-8'))
+        return run
+
+    def run_main(root, extra, payload):
+        original = subprocess.run
+        subprocess.run = dispatch(payload)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = export_gate.main(
+                    ['--root', root, '--build-dir', root,
+                     '--dumpbin', 'dumpbin'] + extra)
+            return rc, buf.getvalue()
+        finally:
+            subprocess.run = original
+
+    # Put the temp tree inside F:\crpc, never %TEMP% (AGENTS.md). Prefer the
+    # repo's evidence dir when this file is the real scripts/ copy; a sandbox
+    # copy under .opencode/sandbox/exec-shared/ has no such layout, so fall
+    # back to its own directory. Both are inside the repo and both are removed
+    # in the finally block below.
+    preferred = os.path.join(_ROOT, '.opencode', 'tmp', 'exec-shared')
+    tmp_root = preferred if os.path.isdir(preferred) else _HERE
+    os.makedirs(tmp_root, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix='crpc_rF_', dir=tmp_root)
+    try:
+        payload_ship = (_f_headers()
+                        + '          1    0 00001000 ' + _F_SEAM_X64 + '\n'
+                        + '          2    1 00002000 ' + _F_PLAIN + '\n'
+                        + _f_summary())
+        payload_clean = (_f_headers()
+                         + '          1    0 00001000 ' + _F_PLAIN + '\n'
+                         + '          2    1 00002000 ' + _F_PROD + '\n'
+                         + _f_summary())
+        _f_tree(tmp, cache_tests='ON')
+        # (1) ship seam + explicit off -> FAIL (rule fires end-to-end)
+        rc, out = run_main(tmp, ['--tests-enabled', 'off'], payload_ship)
+        check('ship seam + --tests-enabled off -> rc=1 [F]',
+              rc == 1 and '[F]' in out, (rc, out))
+        # (2) ship clean + explicit off -> OK (not "everything non-API fails")
+        rc, out = run_main(tmp, ['--tests-enabled', 'off'], payload_clean)
+        check('ship clean table -> rc=0 OK (4879 legal symbols tolerated)',
+              rc == 0 and 'OK' in out and '[F]' not in out, (rc, out))
+        # (3) test-enabled view (CMakeCache ON) -> seam legal -> OK
+        rc, out = run_main(tmp, [], payload_ship)
+        check('CMakeCache CRPC_BUILD_TESTS=ON -> seam legal, rc=0',
+              rc == 0 and 'test-enabled' in out, (rc, out))
+        # (4) CMakeCache OFF (dynamic channel) -> seam FAIL without a flag
+        io.open(os.path.join(tmp, 'CMakeCache.txt'), 'w',
+                encoding='utf-8').write('CRPC_BUILD_TESTS:BOOL=OFF\n')
+        rc, out = run_main(tmp, [], payload_ship)
+        check('CMakeCache=OFF drives rule F (no explicit flag) -> [F]',
+              rc == 1 and '[F]' in out, (rc, out))
+        # (5) explicit --tests-enabled on overrides cache OFF -> OK
+        rc, out = run_main(tmp, ['--tests-enabled', 'on'], payload_ship)
+        check('explicit on overrides cache OFF -> rc=0',
+              rc == 0 and '[F]' not in out, (rc, out))
+        # (6) unknown view (no cache, no flag) -> skip, not a false FAIL
+        os.remove(os.path.join(tmp, 'CMakeCache.txt'))
+        rc, out = run_main(tmp, [], payload_ship)
+        check('unknown view -> rule F skipped (rc=0, no [F])',
+              rc == 0 and 'unknown' in out, (rc, out))
+        # (7) --update-baseline must NOT swallow rule F
+        rc, out = run_main(tmp, ['--tests-enabled', 'off',
+                                 '--update-baseline'], payload_ship)
+        check('--update-baseline does not swallow rule F -> [F]',
+              rc == 1 and '[F]' in out, (rc, out))
+        # (8) exit 2 (could-not-run) is never swallowed into OK: a malformed
+        # table (no header) makes read_exports raise -> main returns 2.
+        rc, out = run_main(tmp, ['--tests-enabled', 'off'],
+                           'Dump of file fake.dll\n  Summary\n')
+        check('malformed table -> exit 2 (not OK)', rc == 2, (rc, out))
+        # (9) no --build-dir -> rule F inactive (static skip)
+        original = subprocess.run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = export_gate.main(['--root', tmp,
+                                       '--tests-enabled', 'off'])
+            out = buf.getvalue()
+        finally:
+            subprocess.run = original
+        check('no --build-dir -> rule F inactive, rc=0',
+              rc == 0 and '[F]' not in out, (rc, out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _msvc_install_present():
     """True when an MSVC toolset directory exists on this machine.
 
@@ -557,6 +811,13 @@ def main():
     test_declaration_shapes()
     test_inline_definition_exemption()
     test_initialiser_member_is_not_out_of_line()
+    test_rule_f_ship_seam_fails()
+    test_rule_f_ship_clean_ok()
+    test_rule_f_view_gate()
+    test_rule_f_mangling_and_symbols()
+    test_rule_f_3_shapes_via_read_exports()
+    test_rule_f_anti_vacuity()
+    test_rule_f_main_end_to_end()
     print('')
     if _failures:
         print('export_gate_selftest: FAIL -- %d check(s): %s'

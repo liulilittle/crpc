@@ -244,7 +244,10 @@ Test behavior: `test.ps1`/`test.sh` build first (calling the build script), then
 run CTest in each build directory and inspect the output for sanitizer reports.
 `-Filter`/`--filter` is a CTest regex. `-Repeat`/`--repeat` runs the whole CTest
 set N times. `-Sanitizer all` builds and runs ASan, UBSan and TSan in separate
-directories; this is a Linux/Clang workflow, because MSVC has no TSan.
+directories; this is a Linux/Clang workflow. On MSVC the Windows scripts reject
+`-Sanitizer all` (and `asan`/`ubsan`/`tsan`) with a non-zero exit, because MSVC
+implements only `address` and the Windows sanitizer gate is unavailable;
+coverage is provided by the Linux CI three-gate job.
 
 Every script writes a timestamped UTF-8 log and exits non-zero on the first
 failure summary. PowerShell uses `[System.IO.File]::AppendAllText` with UTF-8
@@ -274,9 +277,20 @@ The scripts map their names to CMake values:
 
 | Script name | CMake `CRPC_SANITIZER` | Compiler flag |
 |---|---|---|
-| `asan` | `address` | `-fsanitize=address` / `/fsanitize=address` |
-| `ubsan` | `undefined` | `-fsanitize=undefined` / `/fsanitize=undefined` |
-| `tsan` | `thread` | `-fsanitize=thread` (GCC/Clang only) |
+| `asan` | `address` | `-fsanitize=address` / `/fsanitize=address` (MSVC: address only) |
+| `ubsan` | `undefined` | `-fsanitize=undefined` (GCC/Clang only; MSVC: no such option) |
+| `tsan` | `thread` | `-fsanitize=thread` (GCC/Clang only; MSVC: no such option) |
+
+The mapping above is the Linux/GCC/Clang workflow. MSVC only implements
+`/fsanitize=address`; it has no `undefined`/`thread` sanitizer (these are
+future-release items). The Windows scripts (`build.ps1`/`test.ps1`)
+therefore reject every non-`none` sanitizer explicitly with a non-zero exit,
+and `-Sanitizer all` is a Linux/Clang workflow only. Windows has no sanitizer
+coverage; that coverage is provided by the Linux CI three-gate job
+(`linux-sanitizers` / `test.sh --sanitizer all` in `ci.yml`). Passing
+`-DCRPC_SANITIZER=undefined|thread` to CMake directly on MSVC is not a
+validated gate: it only produces `D9002` unknown-option warnings promoted by
+`/WX` (a fake red), not real sanitizer instrumentation.
 
 On GCC/Clang the build adds `-fno-omit-frame-pointer` and the sanitizer to the
 link line. A sanitizer build disables LTO. `test.ps1`/`test.sh` detect
@@ -288,8 +302,11 @@ The intended merge matrix is ASan+LSan (frame parsing, buffers, slot recycling,
 close races), UBSan (`-fno-sanitize-recover=all` on Linux), and TSan (multi-shard
 concurrency, Linux Clang `-O1 -g`). The current code has no shard, so TSan
 coverage is limited to the implemented thread-safe primitives; this is a
-coverage gap, not a passing claim. MSVC supports ASan/UBSan flags but not TSan;
-use the POSIX script for the TSan gate.
+coverage gap, not a passing claim. This matrix is a Linux/GCC/Clang workflow.
+MSVC implements only `address`; `ubsan`/`tsan` are future releases. The
+Windows scripts uniformly reject sanitizer builds, so Windows has no
+sanitizer coverage and that coverage is provided by the Linux CI three-gate
+job. Use the POSIX script (`test.sh --sanitizer all`) for the sanitizer gate.
 
 ## 8. Unattended Windows tests <a id="s8"></a>
 
@@ -356,7 +373,7 @@ subsystems are added, so no fixed number is stated here.
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | point it at the checkout root, not `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | point it at the root containing `include/corocc/coro.h` |
 | examples are not built | examples are now available: set `CRPC_BUILD_EXAMPLES=ON`; every `quickstart*.cpp` is built as `crpc_example_<file-stem>` and registered in CTest |
-| a sanitizer is requested on MSVC | TSan is unavailable; use Linux/Clang for the TSan job |
+| a sanitizer is requested on MSVC | the Windows scripts reject it explicitly (non-zero exit): MSVC only implements `address`, `ubsan`/`tsan` are future releases, Windows sanitizer coverage is provided by the Linux CI three-gate job; use `test.sh --sanitizer all` |
 | `cmake` or `ninja` not found | the scripts search `PATH`, Program Files and the VS bundle; install CMake/Ninja or add them to `PATH` |
 | a test hangs on Windows | inspect `.opencode/tmp/out/dumps`, the test log, and the 300 s CTest timeout |
 

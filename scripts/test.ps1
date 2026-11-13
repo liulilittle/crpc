@@ -35,6 +35,12 @@
 param(
     [ValidateSet('Debug', 'Release', 'Both')] [string]$Config = 'Debug',
     [ValidateSet('x86', 'x64')] [string]$Arch = 'x64',
+    # Platform boundary: 'all' (asan+ubsan+tsan) and each named sanitizer are
+    # Linux/GCC/Clang workflows. MSVC only implements /fsanitize=address, so
+    # the Windows script rejects any non-'none' sanitizer (and 'all') before
+    # the three-segment build loop, which would otherwise waste three builds
+    # on a linker error / D9002 fake red. The set is kept intact; the gate is
+    # driven by the runtime compiler detection, not a trimmed parameter list.
     [ValidateSet('none', 'asan', 'ubsan', 'tsan', 'all')] [string]$Sanitizer = 'none',
     [string]$Filter = '',
     [int]$Repeat = 1,
@@ -90,8 +96,25 @@ function Find-CTest {
     return $null
 }
 
+function Find-VcVars {
+    param([string]$TargetArch)
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        $vswhere = Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe'
+    }
+    if (-not (Test-Path -LiteralPath $vswhere)) { return $null }
+    $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if (-not $install) { return $null }
+    $install = ($install | Select-Object -First 1).Trim()
+    $name = if ($TargetArch -eq 'x86') { 'vcvars32.bat' } else { 'vcvars64.bat' }
+    $bat = Join-Path $install "VC\Auxiliary\Build\$name"
+    if (Test-Path -LiteralPath $bat) { return $bat }
+    return $null
+}
+
 $cmake = Find-CMake
 $ctest = Find-CTest
+$vcvars = Find-VcVars -TargetArch $Arch
 if (-not $cmake) { Write-Host 'cmake not found'; exit 2 }
 
 if (-not $BuildRoot) { $BuildRoot = Join-Path $SourceDir '.opencode/tmp/out' }
@@ -135,6 +158,22 @@ $env:CRPC_TEST_MINIDUMP_DIR = $dumpDir
 # relying on the runner to hang forever.
 $testTimeoutSeconds = 30
 
+
+# Windows/MSVC sanitizer gate (W11 adjudication (a)+(e)). MSVC only implements
+# /fsanitize=address; the Windows sanitizer gate is unavailable and coverage is
+# provided by the Linux CI three-gate job (ci.yml linux-sanitizers /
+# test.sh --sanitizer all). Reject any non-'none' sanitizer (including 'all',
+# which would otherwise run three doomed builds) explicitly with a non-zero
+# exit before the build loop. `-Sanitizer` stays intact; the gate follows the
+# runtime compiler detection ($vcvars is MSVC), not a trimmed parameter list.
+if ($Sanitizer -ne 'none' -and $vcvars) {
+    $reason = ("MSVC does not support sanitizer '" + $Sanitizer + "': MSVC only implements /fsanitize=address; " +
+               "the Windows sanitizer gate is unavailable and sanitizer coverage is provided by " +
+               "the Linux CI three-gate job (asan/ubsan/tsan). Use the POSIX scripts for sanitizer builds.")
+    Write-Log $reason 'ERROR'
+    Write-Log "refusing -Sanitizer $Sanitizer on MSVC (all/asan/ubsan/tsan are Linux/Clang workflows); re-run with -Sanitizer none" 'ERROR'
+    exit 4
+}
 
 $sanList = if ($Sanitizer -eq 'all') { @('asan', 'ubsan', 'tsan') } else { @($Sanitizer) }
 $cfgList = if ($Config -eq 'Both') { @('Debug', 'Release') } else { @($Config) }

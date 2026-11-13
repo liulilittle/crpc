@@ -190,13 +190,13 @@ Linux/macOS：
 （`...-cxx20`），因此 C++20 的配置不会静默地重配 C++17 的目录。
 `-Jobs`/`--jobs` 默认为处理器数量。`-Clean`/`--clean` 只删除所选构建目录，绝不删除源码或整个产物根。Windows 脚本在检测到 `vcvars` 时于其中运行 CMake；POSIX 脚本显式选择 `g++`/`clang++`，`--arch x86` 会传 `-m32`。
 
-测试行为：`test.ps1`/`test.sh` 先构建（调用构建脚本），然后在每个构建目录运行 CTest 并检查输出中的消毒器报告。`-Filter`/`--filter` 是 CTest 正则。`-Repeat`/`--repeat` 把整套 CTest 运行 N 次。`-Sanitizer all` 在独立目录中构建并运行 ASan、UBSan、TSan；这是 Linux/Clang 流程，因为 MSVC 没有 TSan。
+测试行为：`test.ps1`/`test.sh` 先构建（调用构建脚本），然后在每个构建目录运行 CTest 并检查输出中的消毒器报告。`-Filter`/`--filter` 是 CTest 正则。`-Repeat`/`--repeat` 把整套 CTest 运行 N 次。`-Sanitizer all` 在独立目录中构建并运行 ASan、UBSan、TSan；这是 Linux/Clang 流程。在 MSVC 上 Windows 脚本会以非零退出明确拒绝 `-Sanitizer all`（以及 `asan`/`ubsan`/`tsan`），因为 MSVC 仅实现 `address`、Windows 消毒器门禁不可用；覆盖由 Linux CI 三门任务承担。
 
 参数语义：
 
 - `-Config`/`--config`：`Debug`、`Release` 或 `Both`；`Both` 生成两个独立目录。
 - `-Arch`/`--arch`：`x86` 或 `x64`；POSIX 的 x86 通过 `-m32` 实现。
-- `-Sanitizer`/`--sanitizer`：`none`、`asan`、`ubsan`、`tsan`，测试脚本额外接受 `all`。
+- `-Sanitizer`/`--sanitizer`：`none`、`asan`、`ubsan`、`tsan`，测试脚本额外接受 `all`（Windows 脚本在 MSVC 下仅 `none` 可用，其余值会被明确拒绝；`all` 是 Linux/Clang 流程）。
 - `-Jobs`/`--jobs`：并行编译任务数；零或省略表示处理器数量。
 - `-Filter`/`--filter`：传给 CTest `-R` 的正则，只影响测试选择。
 - `-Clean`/`--clean`：只删除所选构建目录，可安全重复执行。
@@ -218,19 +218,21 @@ Linux/macOS：
 
 | 脚本名 | CMake `CRPC_SANITIZER` | 编译选项 |
 |---|---|---|
-| `asan` | `address` | `-fsanitize=address` / `/fsanitize=address` |
-| `ubsan` | `undefined` | `-fsanitize=undefined` / `/fsanitize=undefined` |
-| `tsan` | `thread` | `-fsanitize=thread`（仅 GCC/Clang） |
+| `asan` | `address` | `-fsanitize=address` / `/fsanitize=address`（MSVC 仅 `address`） |
+| `ubsan` | `undefined` | `-fsanitize=undefined`（仅 GCC/Clang；MSVC 无此选项） |
+| `tsan` | `thread` | `-fsanitize=thread`（仅 GCC/Clang；MSVC 无此选项） |
+
+上表是 Linux/GCC/Clang 流程。MSVC 仅实现 `/fsanitize=address`，没有 `undefined`/`thread` 消毒器（属于未来版本计划）。因此 Windows 脚本（`build.ps1`/`test.ps1`）以非零退出明确拒绝任何非 `none` 的消毒器，`-Sanitizer all` 仅适用于 Linux/Clang 流程。Windows 没有消毒器覆盖，该覆盖由 Linux CI 三门任务承担（`ci.yml` 的 `linux-sanitizers` / `test.sh --sanitizer all`）。在 MSVC 上直接向 CMake 传 `-DCRPC_SANITIZER=undefined|thread` 不是有效门禁：只会产生被 `/WX` 升级的 `D9002` 未知选项警告（假红），并非真实消毒器插桩。
 
 GCC/Clang 上构建会加入 `-fno-omit-frame-pointer`，并把消毒器加入链接选项。消毒器构建禁用 LTO。`test.ps1`/`test.sh` 检测 `AddressSanitizer`、`LeakSanitizer`、`UndefinedBehaviorSanitizer`、`ThreadSanitizer` 报告以及 `runtime error:`，即使进程以零退出也计为失败。
 
-目标合并矩阵是 ASan+LSan（帧解析、缓冲区、槽回收、关闭竞争）、UBSan（Linux 上 `-fno-sanitize-recover=all`）与 TSan（多分片并发、Linux Clang `-O1 -g`）。当前代码没有分片，因此 TSan 覆盖仅限已实现的线程安全原语；这是覆盖缺口，不是通过声明。MSVC 支持 ASan/UBSan 选项但不支持 TSan；TSan 门禁请使用 POSIX 脚本。
+目标合并矩阵是 ASan+LSan（帧解析、缓冲区、槽回收、关闭竞争）、UBSan（Linux 上 `-fno-sanitize-recover=all`）与 TSan（多分片并发、Linux Clang `-O1 -g`）。当前代码没有分片，因此 TSan 覆盖仅限已实现的线程安全原语；这是覆盖缺口，不是通过声明。该矩阵是 Linux/GCC/Clang 流程。MSVC 仅实现 `address`，`ubsan`/`tsan` 属于未来版本计划。Windows 脚本统一拒绝消毒器构建，因此 Windows 没有消毒器覆盖，该覆盖由 Linux CI 三门任务承担。消毒器门禁请使用 POSIX 脚本（`test.sh --sanitizer all`）。
 
 常用调用：
 
 ```powershell
-.\scripts\build.ps1 -Config Debug -Arch x64 -Sanitizer asan
-.\scripts\test.ps1  -Config Debug -Arch x64 -Sanitizer asan -Repeat 3
+.\scripts\build.ps1 -Config Debug -Arch x64 -Sanitizer none
+.\scripts\test.ps1  -Config Debug -Arch x64 -Sanitizer none -Repeat 3
 ```
 
 ```sh
@@ -276,7 +278,7 @@ Debug 构建遇到 CRT 断言、无效参数、纯虚调用或访问违例时可
 | `CRPC_RTTI_DIR does not look like an RTTI checkout` | 指向仓库根，而不是 `include/` |
 | `CRPC_COROCC_DIR does not look like a corocc checkout` | 指向包含 `include/corocc/coro.h` 的根 |
 | `examples` 未构建 | 示例现已可用：设置 `CRPC_BUILD_EXAMPLES=ON`；每个 `quickstart*.cpp` 生成 `crpc_example_<文件名>` 并注册进 CTest |
-| 在 MSVC 上请求消毒器 | TSan 不可用；TSan 任务使用 Linux/Clang |
+| 在 MSVC 上请求消毒器 | Windows 脚本以非零退出明确拒绝：MSVC 仅实现 `address`，`ubsan`/`tsan` 属于未来版本计划，Windows 消毒器覆盖由 Linux CI 三门任务承担；请使用 `test.sh --sanitizer all` |
 | 找不到 `cmake` 或 `ninja` | 脚本搜索 `PATH`、Program Files 与 VS 包；安装或加入 `PATH` |
 | Windows 上测试挂起 | 检查 `.opencode/tmp/out/dumps`、测试日志与 300 秒 CTest 超时 |
 

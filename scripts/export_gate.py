@@ -884,6 +884,151 @@ def write_baseline(path, keys, old):
 
 
 # ---------------------------------------------------------------------------
+# Rule F: over-export / ship-view test-only seam set difference
+# ---------------------------------------------------------------------------
+# Rules A-E all point one way: a symbol that SHOULD be exported but is not.
+# None of them asks the opposite question -- is a symbol that should NOT be
+# exported present in the table? A `#if defined(CRPC_TESTING)` seam (or a
+# genuinely test-only member with zero production callers) that leaks into a
+# ship (CRPC_BUILD_TESTS=OFF) DLL widens the API surface with no consumer.
+# audit-A P5 measured exactly this: the real 4879-name TESTS=ON DLL exported
+# six seams while the gate printed OK (`.opencode/tmp/audit-shared-a/P-probe
+# .out.txt:27-39`). Rule F closes that direction.
+#
+# The two views are NOT interchangeable. A test-enabled build (TESTS=ON)
+# defines CRPC_TESTING for the library itself (CMakeLists.txt:257), so its
+# seams are contract-legal exports -- flagging them would be wrong. Only a
+# ship / TESTS=OFF table is required to be seam-free. The view is resolved
+# dynamically: `--tests-enabled`, then CMakeCache.txt in --build-dir, then a
+# conservative "unknown" that skips rather than misreports (dynamic config is
+# preserved, per the no-hardcoded-channel rule).
+#
+# Both lists are explicit and individually verifiable, never derived from a
+# comment. Classification came from the 236-production-file scan in
+# `.opencode/tmp/audit-shared-a/P-C9.out.txt` (ANTI-VACUITY + 0 PROBE-BUG) and
+# team-final.md section 2(4). Each entry carries the evidence that justifies
+# its bucket.
+
+# (i) Genuine test-only seams (prod_calls=0). A ship DLL must NOT export them.
+_TEST_ONLY_SEAMS = (
+    ('set_stale_retries',
+     'registry_client.hpp:94; P-C9.out.txt:21 prod_calls=0'),
+    ('set_token_issued_at',
+     'registry_client.hpp:98; P-C9.out.txt:22 prod_calls=0'),
+    ('local_anchor_for',
+     'registry_client.hpp:130; P-C9.out.txt:18 prod_calls=0'),
+    ('set_request_identity',
+     'registry_client.hpp:89 (4th seam); P-C9.out.txt:20,23 prod_calls=0'),
+    ('set_authority_for_test',
+     'registry_service.hpp; P-C9.out.txt:19 prod_calls=0'),
+    ('inject_persist_failure',
+     'epoch_store; P-C9.out.txt:17 prod_calls=0'),
+    ('set_local_anchor',
+     'registry_client.hpp:154 in #if CRPC_TESTING; S3 1afd9cb contract'),
+)
+
+# (ii) Production dual-use / internal-dependency whitelist. These MUST stay
+# exported in every configuration; rule F must NEVER target them. Guarding any
+# of them with CRPC_TESTING breaks `-Examples -NoTests` (ci.yml:317) with
+# LNK2019. Kept here so the seam/whitelist partition is checkable, not folklore.
+_PROD_DUAL_USE = (
+    ('check_acl',
+     'registry_service.cpp:1392..2201 (10 production handler calls)'),
+    ('set_raft',
+     'examples/registryd.cpp:221 service->set_raft(...)'),
+    ('set_server',
+     'registryd.cpp:233; quickstart_game.cpp:245 (2 production calls)'),
+    ('set_send_hook',
+     'raft_node.cpp:115 unique setter; :302-303 internal send_hook_ dep; '
+     '0 direct production calls'),
+    ('entry_term',
+     'registry_service.cpp:700 production call'),
+    ('entry_term_locked',
+     'raft_node.cpp prod_defs=1 (private helper, internal dependency)'),
+)
+
+
+def seam_method(sym):
+    """Bare member name from a mangled/demangled export, else None.
+
+    MSVC x64 and x86 both spell a member as `?<name>@<scope>...`; the calling
+    convention suffix differs but the name position does not, so one rule
+    handles both manglings without re-writing a parser (ILT blindness lesson,
+    export_gate.py:67-80). ELF demangled names carry `::<name>(...)`, handled
+    by the `::` branch. Constructor/destructor/RTTI special names (`??0`,
+    `??_7`, ...) start with `??` and are deliberately not plain members.
+    """
+    if sym.startswith('??'):
+        return None
+    if sym.startswith('?'):
+        tail = sym[1:]
+        at = tail.find('@')
+        return tail[:at] if at > 0 else None
+    if '::' in sym:
+        head = sym.split('(', 1)[0]
+        name = head.split('::')[-1].strip()
+        return name or None
+    return None
+
+
+def rule_f_check(exported, tests_enabled):
+    """Rule F violations for one resolved view.
+
+    `tests_enabled`: True = test-enabled (seams are legal), False = ship
+    (seams must be absent), None = unknown (skip). Never raises on a missing
+    table; main() handles that before a table reaches here as exit 2.
+    """
+    violations = []
+    if exported is None or tests_enabled is not False:
+        return violations  # no table, or test-enabled / unknown view: not active
+    seam_evidence = dict(_TEST_ONLY_SEAMS)
+    whitelist = {name for name, _ev in _PROD_DUAL_USE}
+    overlap = set(seam_evidence) & whitelist
+    if overlap:
+        # A symbol classified into both buckets means the partition is broken;
+        # fail closed rather than silently trusting either side.
+        violations.append(
+            ('F', 'scripts/export_gate.py',
+             'rule F seam/whitelist overlap (mis-classification): %s'
+             % ', '.join(sorted(overlap))))
+    hits = {}
+    for sym in exported:
+        name = seam_method(sym)
+        if name in seam_evidence:
+            hits.setdefault(name, sym)
+    for name in sorted(hits):
+        violations.append(
+            ('F', hits[name],
+             'ship DLL exports test-only seam %s (must be absent in the '
+             'TESTS=OFF view); evidence: %s' % (name, seam_evidence[name])))
+    return violations
+
+
+def resolve_tests_enabled(args):
+    """Resolve the DLL's build view: True / False / None (unknown).
+
+    Order: explicit `--tests-enabled`, then `CRPC_BUILD_TESTS:BOOL` in
+    --build-dir/CMakeCache.txt (the dynamic channel CI's shared job provides),
+    then None. None means "cannot tell", which skips rule F rather than
+    guessing -- a gate that cannot classify must not misreport.
+    """
+    explicit = getattr(args, 'tests_enabled', None)
+    if explicit == 'on':
+        return True
+    if explicit == 'off':
+        return False
+    cache = getattr(args, 'build_dir', None)
+    if cache:
+        path = os.path.join(cache, 'CMakeCache.txt')
+        if os.path.isfile(path):
+            for line in io.open(path, encoding='utf-8', errors='replace'):
+                m = re.match(r'\s*CRPC_BUILD_TESTS:BOOL=(\w+)', line)
+                if m:
+                    return m.group(1).upper() in ('ON', 'TRUE', '1', 'YES')
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -903,6 +1048,11 @@ def main(argv=None):
                         help='ELF dynamic-symbol reader fallback (objdump -T)')
     parser.add_argument('--baseline', default=None)
     parser.add_argument('--update-baseline', action='store_true')
+    parser.add_argument('--tests-enabled', default=None, choices=('on', 'off'),
+                        help=("explicit build view for rule F: 'on' = "
+                              "test-enabled (seams legal), 'off' = ship "
+                              "(seams must be absent). Overrides CMakeCache; "
+                              "without either, rule F skips (view unknown)"))
     args = parser.parse_args(argv)
 
     include_dir = os.path.join(args.root, 'include')
@@ -1090,10 +1240,20 @@ def main(argv=None):
                  'free function %s is declared without a body but has no '
                  'CRPC_API' % _qualified(key)))
 
+    # Rule F: a ship (TESTS=OFF) DLL must not export test-only seams. It is a
+    # structural violation (like B/C/E/M), NOT a baseline entry, so
+    # --update-baseline must not swallow it. Only active when --build-dir
+    # actually yielded a table (exported is not None), mirroring rule B.
+    tests_enabled = resolve_tests_enabled(args)
+    violations.extend(rule_f_check(exported, tests_enabled))
+
     print('export_gate: %d header classes, %d free declarations, %d baseline'
           % (len(index.classes), len(index.free_decls), len(baseline)))
     if exported is not None:
-        print('export_gate: %d exported names' % len(exported))
+        view = ('test-enabled' if tests_enabled is True else
+                'ship' if tests_enabled is False else 'unknown (rule F skipped)')
+        print('export_gate: %d exported names (view: %s)'
+              % (len(exported), view))
 
     # Coverage counters, printed on every run.
     #
