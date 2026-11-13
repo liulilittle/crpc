@@ -241,17 +241,20 @@ if(CRPC_SANITIZER_OPTIONS)
     target_link_options(crpc PUBLIC ${CRPC_SANITIZER_OPTIONS})
 endif()
 
-# CRPC_TESTING is defined for the LIBRARY only in a Debug build, so the test-only
-# seam (`registry_client::set_local_anchor`) is compiled into `crpc.lib` when the
-# test suite is built (tests/CMakeLists.txt defines it for test executables too,
-# so their calls link). A Release build defines it nowhere, so the symbol is
-# absent from the shipped library and cannot be reached by a caller -- the header
-# declaration is inside `#if defined(CRPC_TESTING)`.
+# CRPC_TESTING is defined for the LIBRARY only when the test suite is built
+# (CRPC_BUILD_TESTS=ON), so the test-only seam (`registry_client::set_local_anchor`)
+# is compiled into `crpc.lib` in exactly the same configurations where test
+# executables exist (tests/CMakeLists.txt defines it for those targets too, so
+# declaration, definition and calls all agree). A pure ship build
+# (CRPC_BUILD_TESTS=OFF) defines it nowhere, so the symbol is absent from the
+# shipped library and cannot be reached by a caller -- the header declaration is
+# inside `#if defined(CRPC_TESTING)`.
 #
-# Debug-only is deliberate: the seam is for tests, and a production build must
-# not carry it. The generator expression keeps the two configurations distinct
-# without a second target.
-target_compile_definitions(crpc PRIVATE $<$<CONFIG:Debug>:CRPC_TESTING>)
+# Keying off CRPC_BUILD_TESTS (not the build configuration) is deliberate: the
+# seam is for tests, and a production build must not carry it in any config. The
+# generator expression ties the library to the real test-build flag without a
+# second target, keeping every configuration consistent.
+target_compile_definitions(crpc PRIVATE $<$<BOOL:${CRPC_BUILD_TESTS}>:CRPC_TESTING>)
 
 # Sources are discovered by pattern so that independent subsystems can be added
 # without editing this file. CONFIGURE_DEPENDS re-globs on reconfigure.
