@@ -257,7 +257,9 @@ only this library can parse.
 `registryd.cpp` is the G19 step2 executable: a real `cluster::registry_service`
 on loopback TCP, with the ACL, the epoch store and the single-instance lease.
 It is a thin main -- configuration, signals, start, stop; all behaviour lives in
-the library:
+the library. It is a daemon that needs `--state-dir` / `--token` and runs until
+stopped, so it is not registered as a CTest case (a no-argument run prints usage
+and exits 2); its behaviour is covered by `tests/test_registryd_composition.cpp`:
 
 ```powershell
 .\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>] [--http-port <n>]

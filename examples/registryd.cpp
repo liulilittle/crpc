@@ -55,6 +55,16 @@ void on_signal(int) {
     g_stop.store(true, std::memory_order_release);
 }
 
+#if defined(_WIN32)
+BOOL WINAPI on_console_ctrl(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        g_stop.store(true, std::memory_order_release);
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
+
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --state-dir <dir> --token <bearer-token> "
@@ -309,7 +319,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
 #if defined(_WIN32)
-    (void)::SetConsoleCtrlHandler(nullptr, TRUE);
+    (void)::SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 #endif
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

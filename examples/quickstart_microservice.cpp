@@ -76,12 +76,18 @@ cl::service_instance make_instance(const std::string& node, crpc::u16 port) {
     return instance;
 }
 
-cl::write_context make_context(const std::string& node) {
+cl::write_context make_context(cl::registry& registry, const std::string& node) {
     cl::write_context context;
     context.node_id = node;
     // External writer: not epoch-tracked. The default writer_epoch
     // (UINT64_MAX) would be rejected with registry.reason=epoch_required.
     context.writer_epoch = 0;
+    // strict_fencing/require_issued_fence are on by default: a zero fence is
+    // rejected on every path, so the token must come from the authority.
+    const auto token = registry.next_fence(kServiceName, node);
+    if (token.ok()) {
+        context.fence = token.value();
+    }
     return context;
 }
 
@@ -197,11 +203,11 @@ int main() {
     // --- registry: two provider instances ------------------------------------
     cl::registry registry;
     check(registry.register_instance(make_instance("greeter-1", 8001),
-                                     make_context("greeter-1"))
+                                     make_context(registry, "greeter-1"))
               .ok(),
           "register greeter-1");
     check(registry.register_instance(make_instance("greeter-2", 8002),
-                                     make_context("greeter-2"))
+                                     make_context(registry, "greeter-2"))
               .ok(),
           "register greeter-2");
 

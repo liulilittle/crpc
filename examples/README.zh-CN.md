@@ -278,7 +278,9 @@ Windows 上用 `crpc::iocp_backend`，Linux 上用 `crpc::io::epoll_backend`，
 
 `registryd.cpp` 是 G19 step2 的可执行程序：一个跑在 loopback TCP 上的真实
 `cluster::registry_service`，带 ACL、epoch 持久化与单实例租约。它是薄 main——
-配置、信号、启动、停止，全部行为都在库内：
+配置、信号、启动、停止，全部行为都在库内。它是需要 `--state-dir` / `--token`
+并运行到被停止为止的守护进程，因此不注册为 CTest 用例（无参数运行会打印用法
+并退出 2）；其行为由 `tests/test_registryd_composition.cpp` 覆盖：
 
 ```powershell
 .\crpc_example_registryd.exe --state-dir <dir> --token <bearer-token> [--port <n>] [--http-port <n>]
