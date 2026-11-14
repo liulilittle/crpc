@@ -28,6 +28,15 @@ foreach(source ${CRPC_EXAMPLE_SOURCES})
     set(target "crpc_example_${file_name}")
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE crpc)
+    # registryd drives the raft driver with `std::jthread`/`std::stop_token`
+    # (D-B-10 RAII guard), which are C++20. The library's `cxx_std_17` is a
+    # floor, not a uniform standard, and the project default is C++17, so this
+    # target has to declare its own requirement. Without it every default
+    # (cxx17) examples build fails with C2039/STL4038. Only this target is
+    # upgraded: the other examples stay at the project default.
+    if(file_name STREQUAL "registryd")
+        target_compile_features(${target} PRIVATE cxx_std_20)
+    endif()
     # A multi-configuration generator appends `/<CONFIG>` to this directory
     # automatically, so the plain form is correct for those too.
     set_target_properties(${target} PROPERTIES
