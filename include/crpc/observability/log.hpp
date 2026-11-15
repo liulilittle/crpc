@@ -238,7 +238,10 @@ inline std::size_t format_double_g6(char* out, std::size_t capacity, double valu
     }
 
     const int biased = static_cast<int>(magnitude_bits >> 52);
-    std::uint64_t mantissa = magnitude_bits & 0x000FFFFFFFFFFFFFull;
+    // The 52-bit mantissa field; the algorithm rescales from `magnitude_bits`
+    // instead of reading it, so Clang reports it as set-but-unused.
+    [[maybe_unused]] std::uint64_t mantissa =
+        magnitude_bits & 0x000FFFFFFFFFFFFFull;
     int binary_exponent;
     if (biased == 0) {
         binary_exponent = -1074;  // subnormal: |v| = mantissa * 2^-1074

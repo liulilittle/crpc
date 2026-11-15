@@ -94,7 +94,12 @@ public:
         std::chrono::milliseconds watch_poll_interval{20};
     };
 
-    explicit consul_http(registry_service& service, config options = config{});
+    // Two constructors rather than one with a default argument: a default
+    // argument written as `config options = config{}` inside the class body
+    // needs the nested `config`'s member initializers before the enclosing
+    // class is complete, which GCC and Clang reject.
+    explicit consul_http(registry_service& service);
+    explicit consul_http(registry_service& service, const config& options);
 
     // Registers every endpoint on `routes`. The router must not be frozen yet.
     // Each route's `controller` is `this`, so the facade must outlive the

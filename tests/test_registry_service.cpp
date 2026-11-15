@@ -23,8 +23,14 @@
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
 #include <crpc/io.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/rpc/dispatcher.hpp>
+
+#if !defined(_WIN32)
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -47,6 +53,8 @@ crpc::u64 fnv1a(const std::string& value) {
     return hash;
 }
 
+// The port candidate sequence: deterministic per process so two cases do not
+// deliberately choose the same port.
 crpc::u16 next_port() {
     static std::atomic<unsigned> counter{0};
 #if defined(_WIN32)
@@ -58,9 +66,47 @@ crpc::u16 next_port() {
     return static_cast<crpc::u16>(value % 60000u + 1024u);
 }
 
+// Probes whether a TCP port is free by asking the kernel to bind it. This is
+// the only way a fixed-port case can avoid a race: two listeners in the same
+// process (or two processes) that picked the same candidate would otherwise
+// make `server->start()` fail intermittently, which is what the registry
+// restart cases hit on Linux.
+[[nodiscard]] bool port_is_free(crpc::u16 port) {
+#if defined(_WIN32)
+    (void)port;
+    return true;
+#else
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool free = ::bind(fd, reinterpret_cast<sockaddr*>(&addr),
+                             sizeof(addr)) == 0;
+    (void)::close(fd);
+    return free;
+#endif
+}
+
+// The next candidate port that is actually free. Only probes when the platform
+// can do so; on Windows the candidate is returned unchanged, preserving the
+// original behaviour there.
+crpc::u16 next_free_port() {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const crpc::u16 candidate = next_port();
+        if (port_is_free(candidate)) {
+            return candidate;
+        }
+    }
+    return next_port();
+}
+
 // A running service plus its client, so a case can start/stop as one unit.
 struct node {
-    std::unique_ptr<crpc::iocp_backend> backend;
+    std::unique_ptr<tcp_backend> backend;
     std::unique_ptr<cl::registry_service> service;
     // The transport is shared so a case can hold two clients (legitimate and
     // impersonating) on one connection.
@@ -69,16 +115,33 @@ struct node {
     fs::path state_dir;
     std::string token;
 
-    ~node() { stop(); }
+    ~node() {
+        stop();
+        // Free the backend HERE, not in stop(): a case may still hold a
+        // `registry_client` (stack or local) that shares `client`, and those
+        // are destroyed after this destructor's body runs. Releasing the
+        // backend first would leave their connection closing against a
+        // destroyed backend (use-after-free in `epoll_connection::
+        // detach_conn`). Members destroy in reverse declaration order, so
+        // `client` (declared after `backend`) is already gone by this point.
+        backend.reset();
+    }
 
     bool start(const std::string& dir, const std::string& tok) {
-        backend = std::make_unique<crpc::iocp_backend>();
+        // The epoll backend is created through `create()`; there is no
+        // non-fallible construction, so a failure here is a hard test failure
+        // rather than a silent skip.
+        auto created = tcp_backend_create();
+        if (!created.ok()) {
+            return false;
+        }
+        backend = std::move(created).value();
         token = tok;
         state_dir = fs::path(dir);
 
         cl::registry_service_config config;
         config.state_dir = state_dir;
-        config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+        config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
         config.backend = backend.get();
         cl::acl_rule rule;
         rule.token_hash = fnv1a(tok);
@@ -131,7 +194,6 @@ struct node {
     void stop() noexcept {
         client.reset();
         service.reset();
-        backend.reset();
     }
 };
 
@@ -553,10 +615,10 @@ CRPC_TEST(idempotency_map_evicts_oldest_without_losing_protection) {
     const fs::path dir = fs::temporary_directory().value() / "crpc_g19s2_ttl";
     (void)fs::remove_all(dir);
 
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = tcp_backend_create().value();
     cl::registry_service_config config;
     config.state_dir = dir;
-    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config.backend = backend.get();
     config.max_idempotency_entries = 2;
     config.idempotency_ttl = std::chrono::milliseconds{300000};
@@ -710,10 +772,10 @@ CRPC_TEST(service_destructor_releases_the_lease) {
     (void)fs::remove_all(dir);
     const std::string token = "token-A";
 
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = tcp_backend_create().value();
     cl::registry_service_config config;
     config.state_dir = dir;
-    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config.backend = backend.get();
     config.registry.admin_token = "admin-secret";
     cl::acl_rule rule;
@@ -737,10 +799,10 @@ CRPC_TEST(service_destructor_releases_the_lease) {
 
     // A second service over the SAME directory must be able to acquire the
     // lease. If the destructor left it held, prepare() fails.
-    auto backend2 = std::make_unique<crpc::iocp_backend>();
+    auto backend2 = tcp_backend_create().value();
     cl::registry_service_config config2;
     config2.state_dir = dir;
-    config2.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config2.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config2.backend = backend2.get();
     config2.registry.admin_token = "admin-secret";
     config2.acl.push_back(rule);
@@ -768,10 +830,10 @@ CRPC_TEST(single_instance_lease_refuses_a_second_service_and_is_recoverable) {
     (void)fs::remove_all(dir);
     const std::string token = "token-A";
 
-    auto backend_one = std::make_unique<crpc::iocp_backend>();
+    auto backend_one = tcp_backend_create().value();
     cl::registry_service_config config_one;
     config_one.state_dir = dir;
-    config_one.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config_one.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config_one.backend = backend_one.get();
     cl::acl_rule rule;
     rule.token_hash = fnv1a(token);
@@ -793,10 +855,10 @@ CRPC_TEST(single_instance_lease_refuses_a_second_service_and_is_recoverable) {
 
     // A second service over the SAME state directory must be refused and must
     // not bind a port.
-    auto backend_two = std::make_unique<crpc::iocp_backend>();
+    auto backend_two = tcp_backend_create().value();
     cl::registry_service_config config_two;
     config_two.state_dir = dir;
-    config_two.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config_two.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config_two.backend = backend_two.get();
     config_two.acl.push_back(rule);
     auto second = std::make_unique<cl::registry_service>(std::move(config_two));
@@ -814,10 +876,10 @@ CRPC_TEST(single_instance_lease_refuses_a_second_service_and_is_recoverable) {
     first->stop();
     first.reset();
 
-    auto backend_three = std::make_unique<crpc::iocp_backend>();
+    auto backend_three = tcp_backend_create().value();
     cl::registry_service_config config_three;
     config_three.state_dir = dir;
-    config_three.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config_three.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config_three.backend = backend_three.get();
     config_three.acl.push_back(rule);
     auto third = std::make_unique<cl::registry_service>(std::move(config_three));
@@ -849,14 +911,14 @@ CRPC_TEST(takeover_repair_truncates_a_torn_log_tail) {
     (void)fs::remove_all(dir);
     const std::string token = "token-A";
 
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = tcp_backend_create().value();
     crpc::u16 first_port = 0;
     crpc::u16 second_port = 0;
     {
         // A first service writes two records and is then abandoned.
         cl::registry_service_config config;
         config.state_dir = dir;
-        config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+        config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
         config.backend = backend.get();
         cl::acl_rule rule;
         rule.token_hash = fnv1a(token);
@@ -931,7 +993,7 @@ CRPC_TEST(takeover_repair_truncates_a_torn_log_tail) {
     {
         cl::registry_service_config config;
         config.state_dir = dir;
-        config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+        config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
         config.backend = backend.get();
         cl::acl_rule rule;
         rule.token_hash = fnv1a(token);
@@ -1960,8 +2022,8 @@ CRPC_TEST(a_corrupt_anchor_file_refuses_to_start) {
 
     cl::registry_service_config config;
     config.state_dir = dir;
-    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
+    auto backend = tcp_backend_create().value();
     config.backend = backend.get();
     cl::acl_rule rule;
     rule.token_hash = fnv1a("token-A");
@@ -2162,13 +2224,13 @@ CRPC_TEST(next_fence_uses_fence_authority) {
     // prepare():1091 runs during prepare(), and authority must be present
     // then for the test to exercise it.
     node n;
-    n.backend = std::make_unique<crpc::iocp_backend>();
+    n.backend = tcp_backend_create().value();
     n.token = "token-A";
     n.state_dir = fs::path(dir);
 
     cl::registry_service_config config;
     config.state_dir = n.state_dir;
-    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     config.backend = n.backend.get();
     cl::acl_rule rule;
     rule.token_hash = fnv1a("token-A");
@@ -2221,7 +2283,7 @@ CRPC_TEST(prepare_then_start_twice_is_ok) {
 
     cl::registry_service_config config;
     config.state_dir = dir.str();
-    config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+    config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
     cl::acl_rule rule;
     rule.token_hash = fnv1a("token-A");
     rule.principal_id = "node-A";
@@ -2230,7 +2292,7 @@ CRPC_TEST(prepare_then_start_twice_is_ok) {
     rule.write_prefixes.push_back("");
     config.acl.push_back(rule);
 
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = tcp_backend_create().value();
     config.backend = backend.get();
 
     auto service = std::make_unique<cl::registry_service>(std::move(config));

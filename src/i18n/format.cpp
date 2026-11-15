@@ -45,7 +45,10 @@ constexpr locale_rules kLocales[] = {
     {"fr", ",", "\xE2\x80\xAF", false, "\xC2\xA0", 3},
 };
 
-constexpr std::size_t kLocaleCount = sizeof(kLocales) / sizeof(kLocales[0]);
+// Kept for the table's cardinality even though the formatter walks the entries
+// directly; marking it unused keeps the Clang warning from failing the build.
+[[maybe_unused]] constexpr std::size_t kLocaleCount =
+    sizeof(kLocales) / sizeof(kLocales[0]);
 
 struct currency_symbol {
     const char* language;

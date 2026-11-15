@@ -88,7 +88,8 @@ cl::service_instance make_instance(const std::string& service,
 
 // An epoch-tracked writer: the shape a bridge/service uses. The epoch is
 // obtained from the authority, never manufactured locally.
-cl::write_context make_epoch_ctx(cl::registry& /*reg*/, const std::string& node,
+[[maybe_unused]] cl::write_context make_epoch_ctx(cl::registry& /*reg*/,
+                                                  const std::string& node,
                                  crpc::u64 epoch, crpc::u64 fence = 0,
                                  crpc::u64 incarnation = 0) {
     cl::write_context context = make_ctx(node, fence, incarnation);

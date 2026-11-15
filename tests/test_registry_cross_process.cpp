@@ -16,6 +16,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+
+#if !defined(_WIN32)
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -30,7 +37,7 @@
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
 #include <crpc/io.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -64,6 +71,8 @@ crpc::u64 fnv1a(const std::string& value) {
     return hash;
 }
 
+// The port candidate sequence: deterministic per process so two cases do not
+// deliberately choose the same port.
 crpc::u16 next_port() {
     static std::atomic<unsigned> counter{0};
 #if defined(_WIN32)
@@ -73,6 +82,43 @@ crpc::u16 next_port() {
 #endif
     const unsigned value = base + counter.fetch_add(19, std::memory_order_relaxed);
     return static_cast<crpc::u16>(value % 60000u + 1024u);
+}
+
+// Probes whether a TCP port is free by asking the kernel to bind it. This is
+// the only way a fixed-port case can avoid a race: the parent's service and the
+// child's client are separate processes, and two runs that picked the same
+// candidate would otherwise make `host.start()` fail intermittently.
+[[nodiscard]] bool port_is_free(crpc::u16 port) {
+#if defined(_WIN32)
+    (void)port;
+    return true;
+#else
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool free = ::bind(fd, reinterpret_cast<sockaddr*>(&addr),
+                             sizeof(addr)) == 0;
+    (void)::close(fd);
+    return free;
+#endif
+}
+
+// The next candidate port that is actually free. Only probes when the platform
+// can do so; on Windows the candidate is returned unchanged, preserving the
+// original behaviour there.
+crpc::u16 next_free_port() {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const crpc::u16 candidate = next_port();
+        if (port_is_free(candidate)) {
+            return candidate;
+        }
+    }
+    return next_port();
 }
 
 #if defined(_WIN32)
@@ -163,6 +209,8 @@ bool wait_client(const child_process& child, int& exit_code, int timeout_ms) {
     exit_code = static_cast<int>(code);
     return true;
 #else
+    // The POSIX wait is unbounded; the timeout is a Windows-only knob.
+    (void)timeout_ms;
     int status = 0;
     const pid_t got = ::waitpid(child.pid, &status, 0);
     if (got != child.pid || !WIFEXITED(status)) {
@@ -182,7 +230,7 @@ namespace {
 
 int run_client_impl(crpc::u16 port, const std::string& token,
                     const std::string& action) {
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = std::make_unique<tcp_backend>();
     auto connection = backend->connect(crpc::endpoint::tcp("127.0.0.1", port),
                                        crpc::connect_options{});
     if (!connection) {
@@ -229,7 +277,7 @@ namespace {
 
 // Starts a service in this process and returns it with its bound endpoint.
 struct hosted_service {
-    std::unique_ptr<crpc::iocp_backend> backend;
+    std::unique_ptr<tcp_backend> backend;
     std::unique_ptr<cl::registry_service> service;
     crpc::endpoint bound_ep;
     fs::path state_dir;
@@ -237,11 +285,11 @@ struct hosted_service {
     ~hosted_service() { stop(); }
 
     bool start(const std::string& dir, const std::string& token) {
-        backend = std::make_unique<crpc::iocp_backend>();
+        backend = std::make_unique<tcp_backend>();
         state_dir = fs::path(dir);
         cl::registry_service_config config;
         config.state_dir = state_dir;
-        config.listen = crpc::endpoint::tcp("127.0.0.1", next_port());
+        config.listen = crpc::endpoint::tcp("127.0.0.1", next_free_port());
         config.backend = backend.get();
         cl::acl_rule rule;
         rule.token_hash = fnv1a(token);
@@ -300,7 +348,7 @@ CRPC_TEST(cross_process_second_process_registers_and_queries) {
 
     // The parent must see what the child wrote, which is the point of a
     // registry: the catalog is not process-private.
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = std::make_unique<tcp_backend>();
     auto connection = backend->connect(host.bound_ep, crpc::connect_options{});
     CRPC_REQUIRE(connection != nullptr);
     crpc::rpc::client_options options;
@@ -338,7 +386,7 @@ CRPC_TEST(cross_process_catalog_survives_restart) {
     {
         hosted_service host;
         CRPC_REQUIRE(host.start(dir.str(), token));
-        auto backend = std::make_unique<crpc::iocp_backend>();
+        auto backend = std::make_unique<tcp_backend>();
         auto connection = backend->connect(host.bound_ep, crpc::connect_options{});
         CRPC_REQUIRE(connection != nullptr);
         crpc::rpc::client_options options;
@@ -369,7 +417,7 @@ CRPC_TEST(cross_process_authority_unavailable_is_fail_closed) {
     // A write that succeeds first: the fail-closed answer must be about the
     // missing authority, not about a request the service never accepted.
     {
-        auto backend = std::make_unique<crpc::iocp_backend>();
+        auto backend = std::make_unique<tcp_backend>();
         auto connection = backend->connect(host.bound_ep, crpc::connect_options{});
         CRPC_REQUIRE(connection != nullptr);
         crpc::rpc::client_options options;
@@ -392,7 +440,7 @@ CRPC_TEST(cross_process_authority_unavailable_is_fail_closed) {
 
     // After the stop, a connect must fail (the listener is gone), and a write
     // through a fresh client must be `unavailable`, never a false success.
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = std::make_unique<tcp_backend>();
     auto connection = backend->connect(host.bound_ep, crpc::connect_options{});
     CRPC_CHECK_FALSE(connection != nullptr);
     if (connection != nullptr) {
@@ -425,7 +473,7 @@ CRPC_TEST(cross_process_authority_unavailable_is_fail_closed) {
     {
         hosted_service restarted;
         CRPC_REQUIRE(restarted.start(dir.str(), token));
-        auto restart_backend = std::make_unique<crpc::iocp_backend>();
+        auto restart_backend = std::make_unique<tcp_backend>();
         auto restart_connection =
             restart_backend->connect(restarted.bound_ep, crpc::connect_options{});
         CRPC_REQUIRE(restart_connection != nullptr);

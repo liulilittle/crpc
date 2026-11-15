@@ -180,8 +180,8 @@ private:
     std::size_t pos_ = 0;
 };
 
-bool decode_payload(const std::vector<std::byte>& bytes,
-                    cl::service_instance& out) {
+[[maybe_unused]] bool decode_payload(const std::vector<std::byte>& bytes,
+                                    cl::service_instance& out) {
     payload_reader r(bytes);
     std::uint8_t version = 0;
     std::uint8_t state = 0;
@@ -280,8 +280,8 @@ cl::log_record make_record(u64 index, u64 fence, u64 incarnation,
     return record;
 }
 
-bool payload_fence(const std::vector<std::byte>& payload, u64& fence,
-                   u64& incarnation) {
+[[maybe_unused]] bool payload_fence(const std::vector<std::byte>& payload,
+                                   u64& fence, u64& incarnation) {
     if (payload.size() < 16) {
         return false;
     }

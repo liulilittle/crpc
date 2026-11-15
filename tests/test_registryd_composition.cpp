@@ -30,10 +30,11 @@
 #include <crpc/cluster/registry_log.hpp>
 #include <crpc/cluster/registry_service.hpp>
 #include <crpc/fs/directory.hpp>
+#include <crpc/fs/file.hpp>
 #include <crpc/fs/temp.hpp>
 #include <crpc/http/client.hpp>
 #include <crpc/http/server.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/mvc/router.hpp>
 
 namespace cl = crpc::cluster;
@@ -69,8 +70,10 @@ crpc::span<const std::byte> as_bytes(std::string_view text) noexcept {
 }
 
 // The composition `registryd` builds: one service, one facade, one HTTP server.
-struct daemon {
-    std::unique_ptr<crpc::iocp_backend> backend;
+// The fixture is named after the daemon it mirrors; `daemon` would collide
+// with the POSIX function of the same name once a platform header declares it.
+struct daemon_fixture {
+    std::unique_ptr<tcp_backend> backend;
     std::unique_ptr<cl::kv_store> store;
     std::unique_ptr<cl::registry_service> service;
     std::unique_ptr<cl::consul_http> facade;
@@ -80,6 +83,12 @@ struct daemon {
     std::unique_ptr<crpc::http::http_server> http;
     fs::path dir;
     crpc::u16 port = 0;
+    // True when this daemon was started over a state directory a later
+    // restart must find. `~daemon_fixture` then leaves the tree in place;
+    // deleting it would make `daemon_kv_survives_a_restart` a no-op (and on
+    // POSIX it does delete, unlike Windows where an open handle blocks the
+    // delete and the file survives).
+    bool keep_state = false;
 
     // `preserve` keeps an existing state directory: that is what a restart is.
     // The default wipes it, so each case starts from a known-empty tree.
@@ -95,7 +104,7 @@ struct daemon {
             return false;
         }
 
-        backend = std::make_unique<crpc::iocp_backend>();
+        backend = std::make_unique<tcp_backend>();
         store = std::make_unique<cl::kv_store>();
 
         // The fixture mirrors `registryd`: a single-node raft node over a file
@@ -158,6 +167,11 @@ struct daemon {
         config.acl.push_back(writer);
 
         service = std::make_unique<cl::registry_service>(std::move(config));
+        // Mirror `registryd`: the raft node is attached through `set_raft`,
+        // not merely stored in the config, because attaching is what replays
+        // the committed state machine -- without it a restart starts with an
+        // empty KV table.
+        service->set_raft(raft.get());
         crpc::server::builder binary_builder;
         const crpc::status prepared = service->prepare(binary_builder);
         if (!prepared.ok()) {
@@ -216,7 +230,7 @@ struct daemon {
         return true;
     }
 
-    ~daemon() {
+~daemon_fixture() {
         if (http) {
             http->stop();
         }
@@ -226,7 +240,14 @@ struct daemon {
         service.reset();
         store.reset();
         backend.reset();
-        if (!dir.empty()) {
+        // Close the raft log BEFORE removing the directory. On POSIX unlink
+        // succeeds even with the descriptor open, so the log would be gone by
+        // the time the restart opened it; on Windows the open handle makes
+        // remove_all fail and the file survives, which is why this case only
+        // ever passed there.
+        raft_log.reset();
+        raft.reset();
+        if (!dir.empty() && !keep_state) {
             (void)fs::remove_all(dir);
         }
     }
@@ -274,14 +295,14 @@ struct daemon {
 // --- The KV endpoint answers on a real socket --------------------------------
 
 CRPC_TEST(daemon_kv_put_then_get_over_http) {
-    daemon d;
+    daemon_fixture d;
     CRPC_REQUIRE(d.start("crpc_g19p4_daemon_kv"));
 
-    const daemon::reply put =
+    const daemon_fixture::reply put =
         d.call(crpc::http::method::put, "/v1/kv/composed", "token-A", "hello");
     CRPC_CHECK_EQ(200, put.status);
 
-    const daemon::reply got =
+    const daemon_fixture::reply got =
         d.call(crpc::http::method::get, "/v1/kv/composed", "token-A", "");
     CRPC_CHECK_EQ(200, got.status);
     CRPC_CHECK(got.body.find("\"Value\":") != std::string::npos);
@@ -299,7 +320,7 @@ CRPC_TEST(daemon_kv_put_then_get_over_http) {
 // --- The catalog endpoint answers on a real socket ---------------------------
 
 CRPC_TEST(daemon_register_then_catalog_over_http) {
-    daemon d;
+    daemon_fixture d;
     CRPC_REQUIRE(d.start("crpc_g19p4_daemon_catalog"));
 
     // `ID` must match the ACL principal: the registry injects the principal as
@@ -309,7 +330,7 @@ CRPC_TEST(daemon_register_then_catalog_over_http) {
     const std::string registration =
         "{\"Name\":\"api\",\"ID\":\"node-A\",\"Address\":\"10.0.0.1\","
         "\"Port\":8080}";
-    const daemon::reply put =
+    const daemon_fixture::reply put =
         d.call(crpc::http::method::put, "/v1/agent/service/register",
                "token-A", registration);
     if (put.status != 200) {
@@ -317,7 +338,7 @@ CRPC_TEST(daemon_register_then_catalog_over_http) {
     }
     CRPC_CHECK_EQ(200, put.status);
 
-    const daemon::reply catalog =
+    const daemon_fixture::reply catalog =
         d.call(crpc::http::method::get, "/v1/catalog/services", "token-A", "");
     CRPC_CHECK_EQ(200, catalog.status);
     CRPC_CHECK(catalog.body.find("api") != std::string::npos);
@@ -326,18 +347,18 @@ CRPC_TEST(daemon_register_then_catalog_over_http) {
 // --- The refusal paths survive the composition -------------------------------
 
 CRPC_TEST(daemon_routes_are_reachable_and_refuse_unknown_paths) {
-    daemon d;
+    daemon_fixture d;
     CRPC_REQUIRE(d.start("crpc_g19p4_daemon_routes"));
 
     // A known route with no token is 401, not 404: the route exists and the
     // facade decides the status before dispatch.
-    const daemon::reply anonymous =
+    const daemon_fixture::reply anonymous =
         d.call(crpc::http::method::get, "/v1/catalog/services", "", "");
     CRPC_CHECK_EQ(401, anonymous.status);
 
     // A path the facade does not register must not be answered by a default
     // handler that pretends success.
-    const daemon::reply unknown =
+    const daemon_fixture::reply unknown =
         d.call(crpc::http::method::get, "/v1/nothing-here", "token-A", "");
     CRPC_CHECK(unknown.status == 404 || unknown.status == 405);
 }
@@ -352,21 +373,25 @@ CRPC_TEST(daemon_kv_survives_a_restart) {
     // `prepare` does not replay the committed log.
     const std::string name = "crpc_g19p4_daemon_restart";
     {
-        daemon first;
+        daemon_fixture first;
         CRPC_REQUIRE(first.start(name));
-        const daemon::reply put =
+        const daemon_fixture::reply put =
             first.call(crpc::http::method::put, "/v1/kv/durable", "token-A",
                        "survives");
         CRPC_CHECK_EQ(200, put.status);
         const auto entry = first.store->get("durable");
         CRPC_REQUIRE(entry.ok());
+        // The restart needs the on-disk log. `~daemon_fixture` deletes its
+        // state directory, and on POSIX unlink succeeds even while the log
+        // handle is open, so the delete must be suppressed explicitly here.
+        first.keep_state = true;
     }
 
     // The first daemon is destroyed here: its HTTP server, service, raft node
     // and log are all gone. Only the files under the state directory remain.
-    daemon second;
+    daemon_fixture second;
     CRPC_REQUIRE(second.start(name, /*preserve=*/true));
-    const daemon::reply got =
+    const daemon_fixture::reply got =
         second.call(crpc::http::method::get, "/v1/kv/durable", "token-A", "");
     CRPC_CHECK_EQ(200, got.status);
     CRPC_CHECK(got.body.find("\"Value\":") != std::string::npos);

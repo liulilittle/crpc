@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
+#include <csetjmp>
 #include <exception>
 #include <utility>
 
@@ -47,6 +48,58 @@
 #else
 #include <sys/types.h>
 #include <unistd.h>
+
+namespace crpc {
+namespace test {
+namespace detail {
+
+// POSIX has no SEH. `run_guarded` installs this handler so a body that
+// dereferences null (the exact regression the probe asserts) is reported and
+// turned into the same non-zero code the Windows path returns, instead of
+// killing the process. The previous handler (if any) is restored on scope exit
+// so nesting stays correct.
+class scoped_fault_handler {
+public:
+    scoped_fault_handler() {
+        struct sigaction sa {};
+        sa.sa_sigaction = &on_fault;
+        sa.sa_flags = SA_SIGINFO;
+        (void)::sigemptyset(&sa.sa_mask);
+        (void)::sigaction(SIGSEGV, &sa, &previous_);
+        (void)::sigaction(SIGBUS, &sa, nullptr);
+        active_ = true;
+    }
+    ~scoped_fault_handler() {
+        if (active_) {
+            (void)::sigaction(SIGSEGV, &previous_, nullptr);
+        }
+    }
+
+    // Set by run_guarded before the body runs; the handler longjmps back.
+    static thread_local jmp_buf* escape;
+
+private:
+    static void on_fault(int, siginfo_t*, void*) {
+        static const char msg[] = "SEH-GUARD: structured fault (SIGSEGV/SIGBUS)\n";
+        const ssize_t wrote = ::write(2, msg, sizeof(msg) - 1);
+        (void)wrote;
+        jmp_buf* target = escape;
+        escape = nullptr;
+        if (target != nullptr) {
+            longjmp(*target, 90);
+        }
+        _exit(90);
+    }
+
+    struct sigaction previous_ {};
+    bool active_ = false;
+};
+
+inline thread_local jmp_buf* scoped_fault_handler::escape = nullptr;
+
+} // namespace detail
+} // namespace test
+} // namespace crpc
 #endif
 
 namespace crpc {
@@ -143,7 +196,17 @@ inline int run_guarded(Fn&& body) {
         return 90;
     }
 #else
-    return static_cast<int>(std::forward<Fn>(body)());
+    detail::scoped_fault_handler guard;
+    jmp_buf escape;
+    detail::scoped_fault_handler::escape = &escape;
+    const int fault = setjmp(escape);
+    if (fault != 0) {
+        detail::scoped_fault_handler::escape = nullptr;
+        return fault;
+    }
+    const int out = static_cast<int>(std::forward<Fn>(body)());
+    detail::scoped_fault_handler::escape = nullptr;
+    return out;
 #endif
 }
 

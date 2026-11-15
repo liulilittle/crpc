@@ -18,7 +18,6 @@ namespace {
 // The frame is: u16 version, u8 kind, then kind-specific fields. A version tag
 // makes a later field addition a capability refusal rather than a misparse.
 constexpr u16 kCommandVersion = 1;
-constexpr std::size_t kPrefixBytes = 3;  // u16 version + u8 kind
 
 void put_u8(std::vector<std::byte>& out, u8 value) {
     out.push_back(static_cast<std::byte>(value));

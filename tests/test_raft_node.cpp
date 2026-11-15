@@ -1430,7 +1430,7 @@ CRPC_TEST(raft_election_timeout_is_randomized) {
     }
 
     std::size_t distinct = 0;
-    for (const std::string& id : {"A", "B", "C", "D", "E"}) {
+    for (const char* const id : {"A", "B", "C", "D", "E"}) {
         if (std::find(winners.begin(), winners.end(), id) != winners.end()) {
             ++distinct;
         }

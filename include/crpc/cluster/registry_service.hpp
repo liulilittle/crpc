@@ -22,6 +22,7 @@
 #ifndef CRPC_CLUSTER_REGISTRY_SERVICE_HPP
 #define CRPC_CLUSTER_REGISTRY_SERVICE_HPP
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <map>
@@ -257,6 +258,20 @@ private:
     // otherwise) and applies it. The single replication path both KV writes and
     // ACL administration go through.
     [[nodiscard]] status replicate_command(const struct raft_command& command);
+
+    // The method dispatch table. It lives inside the class because taking the
+    // address of a private handler requires class scope; a namespace-scope
+    // table is rejected by GCC and Clang (MSVC tolerates it, which is how it
+    // went unnoticed).
+    struct dispatch_entry {
+        u64 method_id;
+        status (*handler)(void* self, const call_envelope& envelope,
+                          span<const std::byte> body, buffer& response,
+                          rpc::call_context& ctx);
+    };
+    static constexpr std::size_t dispatch_entry_count = 10;
+    [[nodiscard]] static const std::array<dispatch_entry, dispatch_entry_count>&
+    dispatch_table() noexcept;
 
     // The six RPC handlers. They match `rpc::method_handler` exactly.
     static status on_register(void* self, const call_envelope& envelope,

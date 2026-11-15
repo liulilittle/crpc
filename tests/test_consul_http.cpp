@@ -38,7 +38,7 @@
 #include <crpc/crypto/base64.hpp>
 #include <crpc/fs/directory.hpp>
 #include <crpc/fs/file.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 
 namespace cl = crpc::cluster;
 namespace fs = crpc::fs;
@@ -1209,7 +1209,7 @@ CRPC_TEST(bound_endpoint_reports_actual_port) {
     config.state_dir = state_dir;
     // Port 0: the OS chooses.
     config.listen = crpc::endpoint::tcp("127.0.0.1", 0);
-    auto backend = std::make_unique<crpc::iocp_backend>();
+    auto backend = std::make_unique<tcp_backend>();
     config.backend = backend.get();
     config.kv = store.get();
     config.registry.admin_token = "admin-secret";
@@ -1237,7 +1237,7 @@ CRPC_TEST(bound_endpoint_reports_actual_port) {
     // A fixed port is echoed unchanged.
     cl::registry_service_config fixed_cfg;
     fixed_cfg.state_dir = std::string(state_dir.str()) + "-fixed";
-    auto fixed_backend = std::make_unique<crpc::iocp_backend>();
+    auto fixed_backend = std::make_unique<tcp_backend>();
     fixed_cfg.backend = fixed_backend.get();
     fixed_cfg.listen = crpc::endpoint::tcp("127.0.0.1", 30041);
     fixed_cfg.kv = store.get();

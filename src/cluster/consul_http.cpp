@@ -834,7 +834,10 @@ consul_error to_consul_error(const rpc_error& error) {
     return out;
 }
 
-consul_http::consul_http(registry_service& service, config options)
+consul_http::consul_http(registry_service& service)
+    : consul_http(service, config{}) {}
+
+consul_http::consul_http(registry_service& service, const config& options)
     : service_(service), config_(options) {}
 
 // --- Route registration ------------------------------------------------------

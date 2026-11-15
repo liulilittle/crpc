@@ -126,12 +126,6 @@ private:
     return out;
 }
 
-[[nodiscard]] std::vector<std::byte> scalar_tag_value_u32(u32 value) {
-    std::vector<std::byte> out;
-    append_u32(out, value);
-    return out;
-}
-
 // Appends one tag (id, u32 length, payload) to the tag region.
 void append_tag(std::vector<std::byte>& out, u8 id, const std::vector<std::byte>& value) {
     append_u8(out, id);

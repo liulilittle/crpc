@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -901,7 +902,27 @@ private:
 
 struct epoll_backend::impl::listener_impl final : listener {
     listener_impl(impl& owner, int fd, listen_options o) noexcept
-        : owner_(owner), fd_(fd), opt_(o) {}
+        : owner_(owner), fd_(fd), opt_(o) {
+        // Record the address the kernel actually bound. It matters when the
+        // caller asked for port 0 (the real port is chosen here) and it makes
+        // `server::local_endpoint()` report the truth instead of the base
+        // class's empty endpoint.
+        sockaddr_storage ss{};
+        socklen_t len = sizeof(ss);
+        if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&ss), &len) == 0) {
+            char host[NI_MAXHOST];
+            char serv[NI_MAXSERV];
+            if (::getnameinfo(reinterpret_cast<sockaddr*>(&ss), len, host,
+                              sizeof(host), serv, sizeof(serv),
+                              NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+                const long port = std::strtol(serv, nullptr, 10);
+                if (port > 0 && port <= 65535) {
+                    local_ep_ = endpoint::tcp(host,
+                                              static_cast<std::uint16_t>(port));
+                }
+            }
+        }
+    }
     ~listener_impl() override {
         // The loop thread may be inside on_acceptable() right now. The
         // connection path already guards this with cb_inflight_; the listener
@@ -923,6 +944,10 @@ struct epoll_backend::impl::listener_impl final : listener {
             fd_ = -1;
         }
         owner_.free_slot(token_, kind_listener);
+    }
+
+    [[nodiscard]] endpoint local() const noexcept override {
+        return local_ep_;
     }
 
     void start(accept_sink* sink) override {
@@ -987,6 +1012,7 @@ struct epoll_backend::impl::listener_impl final : listener {
 
     impl& owner_;
     int fd_ = -1;
+    endpoint local_ep_;
     listen_options opt_;
     accept_sink* sink_ = nullptr;
     std::atomic<bool> stopped_{false};

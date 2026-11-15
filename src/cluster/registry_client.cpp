@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <crpc/cluster/registry_client.hpp>

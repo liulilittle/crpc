@@ -31,7 +31,7 @@
 
 #include <crpc/client_facade.hpp>
 #include <crpc/io.hpp>
-#include <crpc/io/iocp_backend.hpp>
+#include "test_tcp_backend.hpp"
 #include <crpc/resilience/circuit_breaker.hpp>
 #include <crpc/resilience/retry.hpp>
 #include <crpc/rpc/call.hpp>

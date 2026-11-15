@@ -11,6 +11,7 @@
 // leave the previous value in place, not a truncated file.
 #include "test_framework.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -268,7 +269,10 @@ CRPC_TEST(raft_state_save_uses_an_atomic_write_mechanism) {
     // place. The creation time is the observable: a rename installs a new file,
     // an in-place truncate keeps the old one. The clock is given room to move so
     // a coarse timestamp resolution cannot make the two look equal.
-    for (volatile int spin = 0; spin < 20000000; ++spin) {
+    // C++20 deprecates `++` on a volatile-qualified type; an atomic keeps the
+    // same "spin so the clock can move" intent without the deprecated operand.
+    for (std::atomic<int> spin{0}; spin.load(std::memory_order_relaxed) < 20000000;
+         spin.fetch_add(1, std::memory_order_relaxed)) {
     }
     CRPC_REQUIRE(cl::raft_state_store::save(dir.root(), {2, "node-b"}).ok());
     const auto after_stat = fs::stat(path);

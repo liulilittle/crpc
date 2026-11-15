@@ -316,7 +316,7 @@ CRPC_TEST(graphemes_follow_uax29_extended_clusters) {
     }
 
     // The views always concatenate back to the input, byte for byte.
-    const char* samples[] = {"", "ascii", "a\xCC\x81" "b", "\xE4\xB8\xAD\xE6\x96\x87",
+    const char* samples[] = {"", "ascii", "a\xCC\x81" "b", "\xE4\xB8\xAD" "\xE6\x96\x87",
                              "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9"};
     for (const char* sample : samples) {
         const std::string text(sample);

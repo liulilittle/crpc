@@ -108,10 +108,10 @@ public:
         if (fd_ < 0) {
             return false;
         }
-        struct flock lock {};
-        lock.l_type = F_WRLCK;
-        lock.l_whence = SEEK_SET;
-        if (::fcntl(fd_, F_SETLK, &lock) < 0) {
+        struct flock file_lock {};
+        file_lock.l_type = F_WRLCK;
+        file_lock.l_whence = SEEK_SET;
+        if (::fcntl(fd_, F_SETLK, &file_lock) < 0) {
             ::close(fd_);
             fd_ = -1;
             return false;
@@ -137,10 +137,10 @@ public:
         name_.clear();
 #else
         if (fd_ >= 0) {
-            struct flock lock {};
-            lock.l_type = F_UNLCK;
-            lock.l_whence = SEEK_SET;
-            (void)::fcntl(fd_, F_SETLK, &lock);
+            struct flock file_lock {};
+            file_lock.l_type = F_UNLCK;
+            file_lock.l_whence = SEEK_SET;
+            (void)::fcntl(fd_, F_SETLK, &file_lock);
             (void)::close(fd_);
             fd_ = -1;
         }
@@ -1970,33 +1970,27 @@ status registry_service::on_ping(void* self, const call_envelope& /*envelope*/,
 // entry against the handler signature, so a handler whose shape changes cannot
 // be wired in silently.
 
-namespace {
-
-struct dispatch_entry {
-    u64 method_id;
-    status (*handler)(void* self, const call_envelope& envelope,
-                      span<const std::byte> body, buffer& response,
-                      rpc::call_context& ctx);
-};
-
-constexpr dispatch_entry kDispatchTable[] = {
-    {registry_method_register, &registry_service::on_register},
-    {registry_method_deregister, &registry_service::on_deregister},
-    {registry_method_set_state, &registry_service::on_set_state},
-    {registry_method_query, &registry_service::on_query},
-    {registry_method_next_fence, &registry_service::on_next_fence},
-    {registry_method_ping, &registry_service::on_ping},
-    {registry_method_kv_get, &registry_service::on_kv_get},
-    {registry_method_kv_put, &registry_service::on_kv_put},
-    {registry_method_kv_cas, &registry_service::on_kv_cas},
-    {registry_method_kv_delete, &registry_service::on_kv_delete},
-};
-
-} // namespace
+const std::array<registry_service::dispatch_entry,
+                 registry_service::dispatch_entry_count>&
+registry_service::dispatch_table() noexcept {
+    static constexpr std::array<dispatch_entry, dispatch_entry_count> table = {{
+        {registry_method_register, &registry_service::on_register},
+        {registry_method_deregister, &registry_service::on_deregister},
+        {registry_method_set_state, &registry_service::on_set_state},
+        {registry_method_query, &registry_service::on_query},
+        {registry_method_next_fence, &registry_service::on_next_fence},
+        {registry_method_ping, &registry_service::on_ping},
+        {registry_method_kv_get, &registry_service::on_kv_get},
+        {registry_method_kv_put, &registry_service::on_kv_put},
+        {registry_method_kv_cas, &registry_service::on_kv_cas},
+        {registry_method_kv_delete, &registry_service::on_kv_delete},
+    }};
+    return table;
+}
 
 status registry_service::dispatch(u64 method_id, span<const std::byte> body,
                                   buffer& response) {
-    for (const dispatch_entry& entry : kDispatchTable) {
+    for (const dispatch_entry& entry : dispatch_table()) {
         if (entry.method_id != method_id) {
             continue;
         }
