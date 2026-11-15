@@ -83,19 +83,32 @@ public:
     // the presented token is an authority issuance (registry L-b) rather than a
     // caller-invented number.
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // The request identity for one logical write. A stale-anchor retry reuses
     // it, because the service keys its idempotency map on it; deriving a fresh
-    // id per attempt would make the retry unrecognisable.
+    // id per attempt would make the retry unrecognisable. Tests set it to a
+    // known value so a retry's idempotency can be observed.
+#if defined(CRPC_TESTING)
     void set_request_identity(const std::string& identity);
+#endif
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // Test/diagnostic seam: how many times a `stale_anchor` answer re-anchors
     // and retries. Zero disables the retry so a caller can observe the raw
     // service answer.
+#if defined(CRPC_TESTING)
     void set_stale_retries(int retries) noexcept;
+#endif
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // Test seam: overrides the token issue time the client puts on the wire.
     // The value is system_clock milliseconds.
+#if defined(CRPC_TESTING)
     void set_token_issued_at(std::chrono::milliseconds issued_at) noexcept;
+#endif
 
     [[nodiscard]] result<registry_write_response> register_instance(
         const service_instance& instance, u64 incarnation, u64 writer_epoch);
@@ -125,9 +138,13 @@ public:
                                          const std::string& node_id);
     [[nodiscard]] result<registry_anchor> ping();
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // The calling thread's anchor for one key. Exposed for tests so a case can
     // assert that two threads observe two independent anchors.
+#if defined(CRPC_TESTING)
     [[nodiscard]] registry_anchor local_anchor_for(const std::string& key) const;
+#endif
 
     // TEST-ONLY SEAM. Do not call this from production code.
     //
@@ -148,9 +165,11 @@ public:
     // outlived-the-service case.
     //
     // Guarded by CRPC_TESTING, which `tests/CMakeLists.txt` defines for test
-    // executables and `CMakeLists.txt` defines for the library in Debug only. A
-    // Release library therefore has neither the declaration nor the definition:
-    // the symbol cannot be named or linked against by a production caller.
+    // executables and `CMakeLists.txt` defines for the library whenever
+    // CRPC_BUILD_TESTS=ON (in every configuration, not only Debug). A pure ship
+    // build (CRPC_BUILD_TESTS=OFF) therefore has neither the declaration nor
+    // the definition: the symbol cannot be named or linked against by a
+    // production caller.
     void set_local_anchor(const std::string& key, const registry_anchor& anchor);
 #endif
 

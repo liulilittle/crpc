@@ -242,13 +242,19 @@ if(CRPC_SANITIZER_OPTIONS)
 endif()
 
 # CRPC_TESTING is defined for the LIBRARY only when the test suite is built
-# (CRPC_BUILD_TESTS=ON), so the test-only seam (`registry_client::set_local_anchor`)
-# is compiled into `crpc.lib` in exactly the same configurations where test
-# executables exist (tests/CMakeLists.txt defines it for those targets too, so
-# declaration, definition and calls all agree). A pure ship build
-# (CRPC_BUILD_TESTS=OFF) defines it nowhere, so the symbol is absent from the
-# shipped library and cannot be reached by a caller -- the header declaration is
-# inside `#if defined(CRPC_TESTING)`.
+# (CRPC_BUILD_TESTS=ON), so the test-only seams are compiled into `crpc.lib` in
+# exactly the same configurations where test executables exist
+# (tests/CMakeLists.txt defines it for those targets too, so declaration,
+# definition and calls all agree). A pure ship build (CRPC_BUILD_TESTS=OFF)
+# defines it nowhere, so the symbols are absent from the shipped library and
+# cannot be reached by a caller -- each header declaration is inside
+# `#if defined(CRPC_TESTING)`. The guarded seams are the 6+1 members:
+#   registry_client::set_request_identity      registry_client::set_stale_retries
+#   registry_client::set_token_issued_at       registry_client::local_anchor_for
+#   registry_client::set_local_anchor          registry_service::set_authority_for_test
+#   registry_service::inject_persist_failure
+# (`registry_client::set_local_anchor` was the first, guarded since 1afd9cb;
+#  the other 6 joined it in the D2 ship-view 6[F] fix.)
 #
 # Keying off CRPC_BUILD_TESTS (not the build configuration) is deliberate: the
 # seam is for tests, and a production build must not carry it in any config. The

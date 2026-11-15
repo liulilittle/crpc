@@ -207,9 +207,13 @@ public:
     // a test can prove two nodes converged on the same rules.
     [[nodiscard]] std::vector<acl_rule> acl_rules() const;
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // Test seam: replaces the fence authority seam so a test can count
     // allocations or inject a null fn (D-A-8: nullptr guard).
+#if defined(CRPC_TESTING)
     void set_authority_for_test(fence_authority authority) noexcept;
+#endif
 
     // The incarnation currently stored for (service, node_id), or 0 when the key
     // has no row. This is the source the HTTP facade uses to advance the
@@ -342,10 +346,16 @@ public:
     // Reads the persisted value without changing the counter.
     [[nodiscard]] static result<u64> read(const fs::path& state_dir);
 
+    // TEST-ONLY SEAM. Do not call this from production code.
+    //
     // Test seam: makes the next `persist()` fail without touching the file, so
     // a crash between "number issued" and "number on disk" is observable. A
-    // production deployment never calls this.
+    // production deployment never calls this. Only this inline member is
+    // guarded; `fail_persist_` and `persist()` stay unconditional (production
+    // read path).
+#if defined(CRPC_TESTING)
     void inject_persist_failure() noexcept { fail_persist_ = true; }
+#endif
 
     // The epoch file path for a state directory.
     [[nodiscard]] static fs::path file_path(const fs::path& state_dir);

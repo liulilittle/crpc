@@ -913,10 +913,12 @@ status registry_service::apply_command_locked(const raft_command& command,
     }
 }
 
+#if defined(CRPC_TESTING)
 void registry_service::set_authority_for_test(fence_authority authority) noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->config.authority = authority;
 }
+#endif
 
 status registry_service::set_acl_rule(const acl_rule& rule) {
     if (rule.token_hash == 0) {

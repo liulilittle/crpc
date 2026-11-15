@@ -209,6 +209,7 @@ void append_token_window(std::vector<std::byte>& tags,
 
 } // namespace
 
+#if defined(CRPC_TESTING)
 void registry_client::set_request_identity(const std::string& identity) {
     impl_->request_identity = identity;
 }
@@ -226,11 +227,13 @@ registry_anchor registry_client::local_anchor_for(const std::string& key) const 
     const auto found = impl_->anchors.find(anchor_slot(key));
     return found != impl_->anchors.end() ? found->second : registry_anchor{};
 }
+#endif
 
 #if defined(CRPC_TESTING)
-// Compiled only in a Debug build of the library (CMakeLists.txt defines
-// CRPC_TESTING for `crpc` under `$<$<CONFIG:Debug>:...>`), and declared only when
-// the same macro is set, so a Release library exports nothing. See the header.
+// Compiled only when the library is built with the test suite (CMakeLists.txt
+// defines CRPC_TESTING for `crpc` under `$<BOOL:${CRPC_BUILD_TESTS}>`, in every
+// configuration), and declared only when the same macro is set, so a pure ship
+// build exports nothing. See the header.
 void registry_client::set_local_anchor(const std::string& key,
                                        const registry_anchor& anchor) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
