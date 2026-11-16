@@ -2850,7 +2850,9 @@ void server::stop() noexcept {
             impl_->listeners[i]->stop();
         }
     }
-    impl_->listeners.clear();
+    // Keep the listeners alive past this point: the shard threads are still
+    // running and a callback may still reference one. They are destroyed after
+    // every shard has been joined, at the end of stop().
 
     // New work is refused from this point; calls already admitted keep running
     // until the drain deadline. GOAWAY is sent after the drain because the
@@ -2895,6 +2897,8 @@ void server::stop() noexcept {
     // The guard table is the last resilience object to go: every shard has
     // been joined and every admitted call has released its permits.
     impl_->clear_guards();
+    // Every shard is joined now, so no callback can still reference a listener.
+    impl_->listeners.clear();
 }
 
 bool server::running() const noexcept {

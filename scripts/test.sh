@@ -140,6 +140,15 @@ for san in "${SAN_LIST[@]}"; do
       case "$san" in
         tsan|all) export TSAN_OPTIONS="${TSAN_OPTIONS:-}:allocator_may_return_null=1" ;;
       esac
+      # TSan dies (exit 66) when a multithreaded parent forks and the child
+      # starts threads, before any test logic runs (test_registry_cross_process
+      # forks then run_client spawns the epoll loop thread). The report is a
+      # toolchain limitation, not a code defect, so allow it and let the test's
+      # own assertions decide. Appended last: TSan resolves repeated options
+      # last-wins, so this overrides a pre-set die_after_fork=1.
+      case "$san" in
+        tsan|all) export TSAN_OPTIONS="${TSAN_OPTIONS:-}:die_after_fork=0" ;;
+      esac
       if ! "$CTEST" "${CTEST_ARGS[@]}" 2>&1 | tee -a "$LOG"; then
         log ERROR "ctest failed $ARCH/$cfg/$san run $r"
         FAILURES=$((FAILURES + 1))
