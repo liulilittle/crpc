@@ -41,10 +41,16 @@
 //     correct sequence for the target: a plain `mov` on x86 (TSO already
 //     supplies the ordering) and `ldar`/`stlr` on AArch64.
 //
-// `full_fence` is a sequentially consistent hardware fence
-// (`std::atomic_thread_fence(seq_cst)`). `signal_fence` is the compiler-only
-// fence intended for communication with a signal handler
-// (`std::atomic_signal_fence(seq_cst)`); it emits no CPU instruction.
+// `full_fence` is a sequentially consistent fence, implemented as a zero-delta
+// `fetch_add` on a private atomic word (`fetch_add(0, seq_cst)`): an
+// acquire/release RMW on one location. On x86 a locked RMW is also a full
+// barrier; on the weaker targets it is the RMW's own ordering, not a global
+// fence. A real `atomic_thread_fence` cannot be used here because GCC's TSan
+// instrumentation rejects the fence builtin under -Wtsan; the modeled RMW
+// keeps the TSan site warning-free (same rationale as the vendored corocc
+// `coro_at_fence_rmw`). `signal_fence` is the compiler-only fence intended for
+// communication with a signal handler (`std::atomic_signal_fence(seq_cst)`);
+// it emits no CPU instruction.
 #ifndef CRPC_CONCURRENCY_VOLATILE_HPP
 #define CRPC_CONCURRENCY_VOLATILE_HPP
 
@@ -149,9 +155,10 @@ inline void volatile_write(T& dst, T value) noexcept {
 #endif
 }
 
-// Full hardware fence (sequentially consistent).
+// Full fence (sequentially consistent).
 inline void full_fence() noexcept {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    static std::atomic<unsigned long long> fence_line{0};
+    (void)fence_line.fetch_add(0, std::memory_order_seq_cst);
 }
 
 // Compiler-only fence, for use in the same thread as an asynchronous signal.

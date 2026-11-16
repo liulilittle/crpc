@@ -616,12 +616,12 @@ CRPC_TEST(lane_queue_global_byte_cap_rejects_across_lanes) {
 // fits, whatever the cap.
 CRPC_TEST(lane_queue_byte_cap_never_refuses_a_run_now) {
     timer_bridge timers;
+    std::vector<std::uint64_t> dropped;
     auto queue = std::make_shared<lane_queue>();
     lane_queue::options opts = timers.options(50ms);
     opts.lane_max_buffered_bytes = 0; // nothing may be buffered
     opts.max_buffered_bytes = 0;
     queue->set_options(opts);
-    std::vector<std::uint64_t> dropped;
 
     CRPC_CHECK_EQ(static_cast<int>(lane_queue::admission::run_now),
                   static_cast<int>(admit_size(*queue, 3, 0, 999999, &dropped)));
