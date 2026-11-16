@@ -7,8 +7,9 @@
 //
 //   1. `push` copies as much of the span as fits into the peer's bounded
 //      queue.  If the whole span fits, the completion runs before `push`
-//      returns.  If only a prefix fits, the remainder stays borrowed from the
-//      caller (valid until `complete`, per I7) and the completion is deferred.
+//      returns.  If only a prefix fits, the remainder is materialised into
+//      channel-owned storage (`pending_owned`), never borrowed from the
+//      caller, and the completion is deferred.
 //   2. `push` then enters the drain loop.  A per-pair `draining` flag makes the
 //      loop single-entry: a nested `push` issued from inside `on_data` only
 //      enqueues and returns, and the outer loop keeps going.  Stack depth is
@@ -36,6 +37,7 @@
 #include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace crpc {
 namespace {
@@ -108,8 +110,10 @@ struct channel {
 
     std::size_t delay_pushes = 0; // while > 0, delivery is deferred
 
-    // At most one deferred push (I5).  The pointer borrows the caller's span
-    // until `pending_completion` runs.
+    // At most one deferred push (I5).  P1: the tail is copied into
+    // `pending_owned` inside push, so `pending_data` never points into the
+    // caller's span and the caller may reuse it once push returns (I7).
+    std::vector<std::byte> pending_owned;
     const std::byte* pending_data = nullptr;
     std::size_t pending_remaining = 0;
     std::size_t pending_accepted = 0;
@@ -541,7 +545,22 @@ void push_data(inproc_state& st, int index, span<const std::byte> data,
                         const std::size_t copy_count =
                             std::min(payload.size(), space);
                         bool enqueued = true;
-                        if (copy_count != 0) {
+                        // P1: materialise the deferred tail into channel-owned
+                        // storage BEFORE the prefix is queued.  Allocating first
+                        // keeps an allocation failure indistinguishable from the
+                        // existing failed-prefix path: nothing is queued and the
+                        // whole frame is rejected with 0 accepted bytes.
+                        const std::size_t tail_n = payload.size() - copy_count;
+                        if (tail_n != 0) {
+                            try {
+                                ch.pending_owned.assign(
+                                    payload.data() + copy_count,
+                                    payload.data() + payload.size());
+                            } catch (...) {
+                                enqueued = false;
+                            }
+                        }
+                        if (enqueued && copy_count != 0) {
                             chunk_node* node = make_chunk(copy_count);
                             if (node == nullptr) {
                                 enqueued = false;
@@ -577,7 +596,7 @@ void push_data(inproc_state& st, int index, span<const std::byte> data,
                                     --ch.reorder_pairs;
                                 }
                             }
-                            ch.pending_data = payload.data() + copy_count;
+                            ch.pending_data = ch.pending_owned.data();
                             ch.pending_remaining = payload.size() - copy_count;
                             ch.pending_accepted = data.size();
                             ch.pending_completion = c;
