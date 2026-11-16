@@ -384,13 +384,16 @@ endif()
 # Tests
 # ---------------------------------------------------------------------------
 
-# enable_testing() has to run for the examples too: examples/CMakeLists.txt
-# registers one CTest entry per example and its header comment promises "a
-# build proves it actually runs". That was only true when CRPC_BUILD_TESTS
-# was also ON, so the configure line examples/README.md documents
-# (BUILD_EXAMPLES=ON, BUILD_TESTS=OFF) produced a tree where `ctest -N`
-# listed 0 tests and nothing ran.
-if(CRPC_BUILD_TESTS OR CRPC_BUILD_EXAMPLES)
+# enable_testing() has to run for the examples and for the shared ship build
+# too: examples/CMakeLists.txt registers one CTest entry per example and its
+# header comment promises "a build proves it actually runs"; a shared build with
+# CRPC_BUILD_TESTS=OFF registers crpc_test_shared_link below, and without
+# enable_testing() add_test() would either fail or be silently ignored, leaving
+# the export gate out of `ctest` in exactly the configuration that ships.
+# That was only true when CRPC_BUILD_TESTS or CRPC_BUILD_EXAMPLES was set, so
+# the ship configuration (BUILD_SHARED=ON, TESTS=OFF, EXAMPLES=OFF) produced a
+# tree where `ctest -N` listed 0 tests and nothing ran.
+if(CRPC_BUILD_TESTS OR CRPC_BUILD_EXAMPLES OR CRPC_BUILD_SHARED)
     enable_testing()
 
     # RTTI's own CMakeLists calls enable_testing() and registers its test
@@ -412,6 +415,31 @@ endif()
 
 if(CRPC_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+# --- Shared-build link gate (ship shape) ------------------------------------
+#
+# This is the same target that tests/CMakeLists.txt builds when the test suite
+# is on. It is registered here as well so the shared-build consumer gate exists
+# in the *ship* configuration (CRPC_BUILD_SHARED=ON, CRPC_BUILD_TESTS=OFF),
+# which is the configuration a release DLL is produced in: without this block
+# `ctest -N` listed 0 tests there, and the only thing that could have caught a
+# public symbol missing from the export table -- the consumer link probe -- was
+# never built at all. The target is defined once per configuration: this block
+# covers TESTS=OFF, tests/CMakeLists.txt covers TESTS=ON, and the guards are
+# mutually exclusive, so no name is ever defined twice.
+if(CRPC_BUILD_SHARED AND NOT CRPC_BUILD_TESTS)
+    # Boundary mirrors tests/CMakeLists.txt: the executable is written to the
+    # build root, beside crpc.dll, so the import resolves from its own directory.
+    add_executable(crpc_test_shared_link
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_shared_link.cpp")
+    target_link_libraries(crpc_test_shared_link PRIVATE crpc_core)
+    target_include_directories(crpc_test_shared_link
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    set_target_properties(crpc_test_shared_link PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    add_test(NAME crpc_test_shared_link COMMAND crpc_test_shared_link)
+    set_tests_properties(crpc_test_shared_link PROPERTIES TIMEOUT 60)
 endif()
 
 if(CRPC_BUILD_BENCH)

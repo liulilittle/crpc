@@ -325,10 +325,23 @@ foreach ($san in $sanList) {
                     if (-not $python) {
                         Write-Log "export gate skipped: python not on PATH" 'WARN'
                     } else {
-                        $gateOut = & $python.Source $gate --root $SourceDir --build-dir $buildDir 2>&1
-                        # Read $LASTEXITCODE before anything else can run: a
-                        # pipeline or another native call would overwrite it.
-                        $gateExit = $LASTEXITCODE
+                        # Same guard as the ctest call above: export_gate.py
+                        # writes diagnostics (and a red result) to stderr, so
+                        # bare `2>&1` under $ErrorActionPreference='Stop'
+                        # terminates the whole script on PS 5.1 with a
+                        # NativeCommandError before the log append, the rc
+                        # read and the failure report below can run. `Continue`
+                        # is scoped to this block only, and $LASTEXITCODE is
+                        # read inside `try`: a later pipeline would overwrite
+                        # it. A non-zero rc must survive to the failure branch.
+                        $savedPreferenceGate = $ErrorActionPreference
+                        $ErrorActionPreference = 'Continue'
+                        try {
+                            $gateOut = & $python.Source $gate --root $SourceDir --build-dir $buildDir 2>&1
+                            $gateExit = $LASTEXITCODE
+                        } finally {
+                            $ErrorActionPreference = $savedPreferenceGate
+                        }
                         $gateOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
                         $gateOut | ForEach-Object { Write-Host $_ }
                         if ($gateExit -ne 0) {
@@ -363,8 +376,19 @@ foreach ($san in $sanList) {
                     if (-not $selftestPython) {
                         Write-Log "export gate selftest skipped: no python interpreter on PATH" 'WARN'
                     } else {
-                        $selftestOut = & $selftestPython.Source $selftest 2>&1
-                        $selftestExit = $LASTEXITCODE
+                        # Same guard as the export gate above: the self-test
+                        # prints failures to stderr, and a bare `2>&1` under
+                        # $ErrorActionPreference='Stop' terminates the script on
+                        # PS 5.1 (NativeCommandError) before the rc read. Read
+                        # $LASTEXITCODE inside `try`; `Continue` is block-scoped.
+                        $savedPreferenceSelftest = $ErrorActionPreference
+                        $ErrorActionPreference = 'Continue'
+                        try {
+                            $selftestOut = & $selftestPython.Source $selftest 2>&1
+                            $selftestExit = $LASTEXITCODE
+                        } finally {
+                            $ErrorActionPreference = $savedPreferenceSelftest
+                        }
                         $selftestOut | ForEach-Object { [System.IO.File]::AppendAllText($script:LogPath, "$_`r`n", [System.Text.UTF8Encoding]::new($false)) }
                         $selftestOut | ForEach-Object { Write-Host $_ }
                         if ($selftestExit -ne 0) {

@@ -233,6 +233,48 @@ jobs:
           path: .opencode/tmp/out/logs
           if-no-files-found: ignore
 
+  # The shared job above keeps the whole test suite, so the shape that actually
+  # produces a ship DLL -- Release, x86, CRPC_BUILD_TESTS=OFF -- had no job of
+  # its own. In that shape the library is a DLL but `ctest -N` used to list 0
+  # tests (the consumer link gate lived under add_subdirectory(tests), which
+  # CRPC_BUILD_TESTS=OFF skips), and scripts/test.ps1 runs
+  # `scripts/export_gate.py`, which compares the public headers against the
+  # export table of that DLL. Nothing else builds exactly this configuration,
+  # so a Release x86 shared build whose export table drifted from the headers
+  # would have shipped. The job is Release/x86 on purpose: x86 is a supported
+  # target and the export set is where the 32-bit layout rules live.
+  ship-export:
+    name: windows/ship-export
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+
+      # One call does both halves: test.ps1 configures with
+      # CRPC_BUILD_TESTS=OFF and CRPC_BUILD_SHARED=ON, builds, then runs CTest
+      # with --no-tests=error (which is what makes a 0-test tree red instead of
+      # silently green) and, because -Shared is set, runs crpc_test_shared_link
+      # and scripts/export_gate.py / export_gate_selftest.py directly. No new
+      # flag is needed: -Shared / -NoTests / -Config / -Arch all exist.
+      - name: Build and test the ship DLL
+        shell: pwsh
+        run: ./scripts/test.ps1 -Config Release -Arch x86 -Shared -NoTests
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-ship-export
+          path: .opencode/tmp/out/logs
+          if-no-files-found: ignore
+
   # The Windows bench job below compiled bench/ on one platform only, and that
   # was enough to miss three Linux-only build failures in it: a `USHORT` local in
   # the non-Windows branch of the allocation tracer, an unguarded
