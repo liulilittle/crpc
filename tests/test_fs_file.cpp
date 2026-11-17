@@ -2,9 +2,13 @@
 // copy, attributes, timestamps).
 #include <crpc/fs/fs.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 #include "test_framework.hpp"
 
@@ -34,29 +38,44 @@ span<const std::byte> bytes_of(const std::string& s) {
 // case fails instead of blocking CTest forever. The watchdog is only a detector
 // -- it cannot unblock a stuck thread, so the process still has to exit after
 // the case returns; that is what turns "hang" into "failure with evidence".
+//
+// Shared state lives behind a shared_ptr captured *by value*, so a detached
+// worker keeps its own reference alive past this function's return instead of
+// writing through a dangling stack reference. `done`/`ok` are atomics because
+// the worker writes them while the polling loop reads them.
 template <class Fn>
 bool runs_within(int timeout_ms, Fn&& body) {
-    bool done = false;
-    bool ok = false;
-    std::thread worker([&]() {
-        ok = body();
-        done = true;
+    struct shared_state {
+        std::atomic<bool> done{false};
+        std::atomic<bool> ok{false};
+    };
+    const auto state = std::make_shared<shared_state>();
+    // Own the callable too: `Fn&& body` binds the parameter, which dies with
+    // this frame, so a detached worker calling through `&body` would read a
+    // dead reference (stack-use-after-scope). Copying it into a shared_ptr by
+    // value gives the detached thread its own object for as long as it runs.
+    using body_t = std::remove_reference_t<Fn>;
+    const auto owned = std::make_shared<body_t>(std::forward<Fn>(body));
+    std::thread worker([state, owned]() {
+        state->ok.store((*owned)(), std::memory_order_release);
+        state->done.store(true, std::memory_order_release);
     });
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (!done && std::chrono::steady_clock::now() < deadline) {
+    while (!state->done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    const bool finished = done;
+    const bool finished = state->done.load(std::memory_order_acquire);
     if (finished) {
         worker.join();
     } else {
         // Detach: the stuck thread must not keep the process alive past main, but
-        // joining it would defeat the watchdog. _exit at the end of run_all is
-        // avoided by the harness's own process exit code.
+        // joining it would defeat the watchdog. Its shared_ptr copy keeps the
+        // state it writes alive for as long as the thread runs.
         worker.detach();
     }
-    return finished && ok;
+    return finished && state->ok.load(std::memory_order_acquire);
 }
 #endif
 
