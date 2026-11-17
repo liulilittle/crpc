@@ -2,12 +2,17 @@
 // copy, attributes, timestamps).
 #include <crpc/fs/fs.hpp>
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "test_framework.hpp"
 
 using namespace crpc;
 using namespace crpc::fs;
+#if defined(CRPC_TESTING)
+using crpc::fs::detail::zero_write_mode;
+#endif
 
 namespace {
 
@@ -22,6 +27,38 @@ struct scratch {
 span<const std::byte> bytes_of(const std::string& s) {
     return span<const std::byte>(reinterpret_cast<const std::byte*>(s.data()), s.size());
 }
+
+#if defined(CRPC_TESTING)
+// Runs `body` on a watchdog-thread budget: if the call under test hangs (the
+// zero-progress spin this file guards against), the body is abandoned and the
+// case fails instead of blocking CTest forever. The watchdog is only a detector
+// -- it cannot unblock a stuck thread, so the process still has to exit after
+// the case returns; that is what turns "hang" into "failure with evidence".
+template <class Fn>
+bool runs_within(int timeout_ms, Fn&& body) {
+    bool done = false;
+    bool ok = false;
+    std::thread worker([&]() {
+        ok = body();
+        done = true;
+    });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!done && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const bool finished = done;
+    if (finished) {
+        worker.join();
+    } else {
+        // Detach: the stuck thread must not keep the process alive past main, but
+        // joining it would defeat the watchdog. _exit at the end of run_all is
+        // avoided by the harness's own process exit code.
+        worker.detach();
+    }
+    return finished && ok;
+}
+#endif
 
 } // namespace
 
@@ -330,5 +367,125 @@ CRPC_TEST(fs_file_overlong_path_is_reported) {
         CRPC_CHECK_FALSE(r.ok());
     }
 }
+
+#if defined(CRPC_TESTING) && !defined(CRPC_OS_WINDOWS)
+// --- Zero-progress write: a `write` that reports success but moves no bytes ---
+//
+// A loop that advances by the transferred count cannot make progress when the
+// OS reports 0 for a non-empty request, so it spins forever -- or, worse,
+// returns "success" having written nothing at all. These cases arm the
+// test-only seam (`detail::set_zero_write_fault`) to make one transfer return
+// zero and assert each public API answers with `internal` and leaves no torn
+// output behind.
+//
+// POSIX only: the Windows branches are separate loops that already carry their
+// own `wrote == 0` guard (and Windows `copy_file` is CopyFileW, not a loop), so
+// the zero-progress condition this defect is about does not exist there. The
+// seam hooks compile on both platforms but are only armed by these cases.
+
+namespace {
+
+void clear_zero_write_fault(const path& p) {
+    detail::set_zero_write_fault(p.str(), zero_write_mode::off);
+}
+
+} // namespace
+
+CRPC_TEST(fs_file_write_all_zero_progress_fails_and_writes_nothing) {
+    scratch s;
+    const path p = s.file("zero.bin");
+    const std::string text = "payload-that-must-not-land";
+
+    detail::set_zero_write_fault(p.str(), zero_write_mode::always);
+    status failed = status();
+    bool finished = false;
+    finished = runs_within(2000, [&]() {
+        failed = write_all_bytes(p, bytes_of(text));
+        return true;
+    });
+    clear_zero_write_fault(p);
+    CRPC_CHECK(finished);
+    CRPC_CHECK_FALSE(failed.ok());
+    CRPC_CHECK_EQ(rpc_code::internal, failed.code());
+    result<byte_buffer> after = read_all_bytes(p);
+    CRPC_CHECK(after.ok());
+    CRPC_CHECK_EQ(static_cast<std::size_t>(0), after.value().size());
+}
+
+CRPC_TEST(fs_file_append_zero_progress_fails_without_torn_tail) {
+    scratch s;
+    const path p = s.file("appended");
+    CRPC_CHECK(write_all_text(p, "head").ok());
+
+    detail::set_zero_write_fault(p.str(), zero_write_mode::once);
+    bool finished = runs_within(2000, [&]() {
+        const status r = append_text(p, "tail-that-must-not-land");
+        return !r.ok();
+    });
+    clear_zero_write_fault(p);
+
+    CRPC_CHECK(finished);
+    CRPC_CHECK_EQ(std::string("head"), read_all_text(p).value());
+}
+
+CRPC_TEST(fs_file_atomic_write_zero_progress_keeps_target) {
+    scratch s;
+    const path p = s.file("cfg");
+    CRPC_CHECK(write_all_text(p, "old-content-that-must-survive").ok());
+
+    // The staging temp name is random per call, so the fault is armed on the
+    // target instead (see detail::set_zero_write_fault): the guarantee under
+    // test is that the target survives.
+    detail::set_zero_write_fault(p.str(), zero_write_mode::once);
+
+    const std::string fresh = "brand-new-content-that-is-much-longer";
+    bool finished = runs_within(2000, [&]() {
+        const status r = write_all_bytes_atomic(p, bytes_of(fresh));
+        return !r.ok();
+    });
+    clear_zero_write_fault(p);
+    CRPC_CHECK(finished);
+
+    // The target still holds the old bytes -- never a torn mix of old and new.
+    CRPC_CHECK_EQ(std::string("old-content-that-must-survive"),
+                  read_all_text(p).value());
+
+    // No temporary clutter left next to the target.
+    result<std::vector<directory_entry>> entries = list_directory(s.dir());
+    CRPC_CHECK(entries.ok());
+    for (const directory_entry& e : entries.value()) {
+        CRPC_CHECK_EQ(e.name.find(".tmp."), std::string::npos);
+    }
+}
+
+#if !defined(CRPC_OS_WINDOWS)
+// Windows `copy_file` is CopyFileW, not a write loop, so the zero-progress
+// condition does not exist there; this case covers the POSIX loop only.
+CRPC_TEST(fs_file_copy_zero_progress_removes_partial_destination) {
+    scratch s;
+    const path from = s.file("src");
+    const path to = s.file("dst");
+    CRPC_CHECK(write_all_text(from, "copy me, then fail on the first transfer")
+                   .ok());
+
+    detail::set_zero_write_fault(to.str(), zero_write_mode::once);
+    bool finished = runs_within(2000, [&]() {
+        const status r = copy_file(from, to);
+        return !r.ok();
+    });
+    clear_zero_write_fault(to);
+    CRPC_CHECK(finished);
+
+    // The partial destination is removed rather than left half-written.
+    result<byte_buffer> after = read_all_bytes(to);
+    CRPC_CHECK_FALSE(after.ok());
+    // The seam cleared, the same copy succeeds.
+    CRPC_CHECK(copy_file(from, to).ok());
+    CRPC_CHECK_EQ(std::string("copy me, then fail on the first transfer"),
+                  read_all_text(to).value());
+}
+#endif
+#endif
+
 CRPC_TEST_MAIN()
 

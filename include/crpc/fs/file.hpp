@@ -83,9 +83,8 @@ CRPC_API status write_all_text(const path& p, const std::string& text);
 //
 // An append spanning multiple `kIoChunk` slices is not atomic, and a failed
 // write does not roll back: already-appended bytes may remain as a torn tail.
-// On POSIX the shared `posix_write_all` helper still lacks an `n == 0` guard
-// (a `::write` returning 0); that gap is W5 because hardening the shared
-// helper would also change `write_all_bytes`.
+// A `::write` reporting zero bytes transferred for a non-empty request fails the
+// call instead of spinning (same on the Windows branch).
 CRPC_API status append_bytes(const path& p, span<const std::byte> data);
 CRPC_API status append_text(const path& p, const std::string& text);
 
@@ -152,6 +151,39 @@ CRPC_API status atomic_write_commit(const path& temp, const path& target);
 // the target is untouched when it does.
 CRPC_API status atomic_write_impl(const path& target, span<const std::byte> data,
                                   std::size_t fault_after = 0);
+
+} // namespace detail
+
+namespace detail {
+
+// --- Test-only zero-write fault injection ------------------------------------
+//
+// TEST-ONLY SEAM. Do not call this from production code.
+//
+// A `::write` / `WriteFile` that reports success while transferring zero bytes
+// makes a `left != 0` / `off < n` loop spin forever: no progress and no error.
+// Regular files almost never do it, so the loop's zero-progress guard cannot be
+// exercised through the published API. These hooks force that one condition,
+// deterministically, in exactly the configurations where a test can name them
+// (`CRPC_TESTING` is defined for the library only under CRPC_BUILD_TESTS=ON --
+// CMakeLists.txt -- and for test targets only).
+//
+// The state is keyed by path rather than being a single global flag: a case
+// sets a fault for its own scratch file and leaves every other write alone, so
+// parallel cases cannot arm each other's faults.
+#if defined(CRPC_TESTING)
+// Arms or clears the zero-write fault for an exact path string (compared in
+// generic form, so either separator spelling matches). `mode == once` fails
+// only the next matching transfer; `mode == always` fails every matching
+// transfer until cleared with `off`. Absent keys are inert.
+//
+// Scope: the fault fires on the *next transfer attempt*. For an atomic write
+// the staging temp name is random per call, so arm it on the target path --
+// the guarantee under test is that the target survives.
+enum class zero_write_mode { off, once, always };
+
+CRPC_API void set_zero_write_fault(const std::string& path, zero_write_mode mode);
+#endif
 
 } // namespace detail
 

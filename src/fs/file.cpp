@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -51,6 +53,107 @@ result<std::wstring> wide(const path& p, std::string_view op) {
 // Retrieves the attribute set without following reparse points is not used:
 // stat reports the reparse flag through the WIN32_FILE_ATTRIBUTE_DATA probe.
 #endif // CRPC_OS_WINDOWS
+
+#if defined(CRPC_TESTING)
+// The single fault store, shared by the writer (set) and every consumer
+// (take/query). Declared before first use so all three agree on the same map.
+std::mutex& zero_write_fault_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::unordered_map<std::string, detail::zero_write_mode>& zero_write_faults() {
+    static std::unordered_map<std::string, detail::zero_write_mode> faults;
+    return faults;
+}
+
+// Test-only zero-write fault injection (see detail::set_zero_write_fault in the
+// header). A map keyed by the exact path string keeps cases independent; the
+// mutex makes concurrent cases safe. Nothing here runs unless a test arms it.
+bool posix_take_zero_write_fault(const std::string& path_text) {
+    // Compare in generic form: `path::str()` keeps the caller's spelling (native
+    // on Windows, '/' on POSIX), and the layer passes that same string to the OS,
+    // so both sides must be normalised before matching.
+    const std::string key = path(path_text).generic_string();
+    std::lock_guard<std::mutex> lock(zero_write_fault_mutex());
+    auto& faults = zero_write_faults();
+    const auto found = faults.find(key);
+    if (found == faults.end()) {
+        return false;
+    }
+    if (found->second == detail::zero_write_mode::once) {
+        faults.erase(found); // one-shot consumed by this transfer
+    }
+    return true;
+}
+#endif
+
+#if defined(CRPC_TESTING)
+bool take_zero_write_fault(const std::string& path_text) {
+    return posix_take_zero_write_fault(path_text);
+}
+#endif
+
+#if defined(CRPC_TESTING)
+// Moves an armed fault from `from` to `to`: the atomic writer stages into a
+// random temp path, so a test arms on the target and this re-keys the fault to
+// the temp the writer actually created. Returns true when a fault was moved.
+bool rebind_zero_write_fault(const std::string& from, const std::string& to) {
+    const std::string from_key = path(from).generic_string();
+    const std::string to_key = path(to).generic_string();
+    std::lock_guard<std::mutex> lock(zero_write_fault_mutex());
+    auto& faults = zero_write_faults();
+    const auto found = faults.find(from_key);
+    if (found == faults.end()) {
+        return false;
+    }
+    const detail::zero_write_mode mode = found->second;
+    faults.erase(found);
+    faults[to_key] = mode;
+    return true;
+}
+#endif
+
+#if defined(CRPC_TESTING)
+// Non-consuming query used by atomic_write_impl: the staging temp path is
+// random, so a test arms on the target and this reports whether it did.
+detail::zero_write_mode zero_write_fault_mode_for(const std::string& target) {
+    const std::string key = path(target).generic_string();
+    std::lock_guard<std::mutex> lock(zero_write_fault_mutex());
+    auto& faults = zero_write_faults();
+    const auto found = faults.find(key);
+    return found == faults.end() ? detail::zero_write_mode::off : found->second;
+}
+#endif
+
+// Emulates one zero-progress transfer: the OS reported success but moved no
+// bytes. Reached only through the guards below (all compiled out in a ship
+// build), so removing a guard removes the only caller and the tests go red.
+#if defined(CRPC_TESTING)
+std::uint64_t emulated_zero_write() {
+    return 0;
+}
+#else
+constexpr std::uint64_t emulated_zero_write() noexcept {
+    return 0xFFFFFFFFFFFFFFFFull;
+}
+#endif
+
+// A `::write` that reports success while transferring nothing is not an errno
+// condition: it leaves `left`/`off` unchanged, so the loop would spin forever.
+// `EIO` classifies as `internal` (errno_to_code's default arm), which is the
+// code this layer already uses for an OS error with no closer classification
+// while still preserving the native code in the message and metadata.
+rpc_error zero_progress_error(std::string_view op, const std::string& path) {
+    return detail::classify_errno(EIO, op, path);
+}
+
+// The transfer size the write loops pass to the OS. Zero-progress protection
+// needs the *requested* count: `n`/`wrote` of 0 is only a hang when the loop
+// asked for more than 0 bytes (which every entry condition here guarantees).
+constexpr bool zero_progress_requested(std::size_t requested) noexcept {
+    return requested != 0;
+}
 
 } // namespace
 
@@ -207,7 +310,17 @@ status posix_write_all(const std::string& path_text, span<const std::byte> data,
     const std::byte* pos = data.data();
     std::size_t left = data.size();
     while (left != 0) {
+#if defined(CRPC_TESTING)
+        // Seam: an armed fault replaces this transfer with a zero-progress
+        // result, so the guard below is what decides the outcome. The Windows
+        // loop keeps its own (pre-existing) wrote == 0 guard and does not take
+        // this seam: the defect is the POSIX loop.
+        const ssize_t n = take_zero_write_fault(path_text)
+                              ? emulated_zero_write()
+                              : ::write(fd, pos, left);
+#else
         const ssize_t n = ::write(fd, pos, left);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -215,6 +328,12 @@ status posix_write_all(const std::string& path_text, span<const std::byte> data,
             const int saved = errno;
             ::close(fd);
             return detail::classify_errno(saved, "write_all", path_text);
+        }
+        if (n == 0 && zero_progress_requested(left)) {
+            const int saved = errno;
+            ::close(fd);
+            return detail::classify_errno(saved != 0 ? saved : EIO, "write_all",
+                                          path_text);
         }
         pos += n;
         left -= static_cast<std::size_t>(n);
@@ -321,8 +440,13 @@ status write_all_bytes(const path& p, span<const std::byte> data) {
             return win_status(code, "write_all", p.str());
         }
         if (wrote == 0) {
+            // Zero bytes transferred for a non-empty request: retrying cannot
+            // make progress. `internal` matches the POSIX guard, which has no
+            // "no progress" errno and classifies EIO as internal.
             CloseHandle(h);
-            return win_status(ERROR_DISK_FULL, "write_all", p.str());
+            return rpc_error(rpc_code::internal,
+                             "fs: write_all: zero-progress transfer for '" +
+                                 p.str() + "'");
         }
         pos += wrote;
         left -= wrote;
@@ -365,8 +489,12 @@ status append_bytes(const path& p, span<const std::byte> data) {
             return win_status(code, "append", p.str());
         }
         if (wrote == 0) {
+            // Same zero-progress contract as write_all: retrying cannot move a
+            // single byte, and it is not a disk-full condition.
             CloseHandle(h);
-            return win_status(ERROR_DISK_FULL, "append", p.str());
+            return rpc_error(rpc_code::internal,
+                             "fs: append: zero-progress transfer for '" +
+                                 p.str() + "'");
         }
         pos += wrote;
         left -= wrote;
@@ -580,11 +708,23 @@ status atomic_write_stage(const path& temp, span<const std::byte> data,
     std::size_t left = limit;
     bool failed = false;
     while (left != 0) {
+#if defined(CRPC_TESTING)
+        const ssize_t n = take_zero_write_fault(temp.str())
+                              ? emulated_zero_write()
+                              : ::write(fd, pos, left);
+#else
         const ssize_t n = ::write(fd, pos, left);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            failed = true;
+            break;
+        }
+        if (n == 0 && zero_progress_requested(left)) {
+            // Zero bytes transferred for a non-empty request: the staging loop
+            // would spin forever, and the commit must never see a partial file.
             failed = true;
             break;
         }
@@ -639,6 +779,14 @@ status atomic_write_commit(const path& temp, const path& target) {
 status atomic_write_impl(const path& target, span<const std::byte> data,
                          std::size_t fault_after) {
     const path temp = atomic_temp_path(target);
+#if defined(CRPC_TESTING)
+    // The staging temp name is random per call, so a test cannot arm it by
+    // path. Arm on the *target* instead; this re-keys the fault to the temp the
+    // writer created, so the staging loop's zero-progress guard sees it.
+    if (zero_write_fault_mode_for(target.str()) != detail::zero_write_mode::off) {
+        rebind_zero_write_fault(target.str(), temp.str());
+    }
+#endif
     status staged = atomic_write_stage(temp, data, fault_after);
     if (!staged) {
         return staged;
@@ -656,6 +804,20 @@ status atomic_write_impl(const path& target, span<const std::byte> data,
 status write_all_bytes_atomic(const path& p, span<const std::byte> data) {
     return detail::atomic_write_impl(p, data, 0);
 }
+
+#if defined(CRPC_TESTING)
+void detail::set_zero_write_fault(const std::string& target,
+                                  detail::zero_write_mode mode) {
+    const std::string key = path(target).generic_string();
+    std::lock_guard<std::mutex> lock(zero_write_fault_mutex());
+    auto& faults = zero_write_faults();
+    if (mode == detail::zero_write_mode::off) {
+        faults.erase(key);
+        return;
+    }
+    faults[key] = mode;
+}
+#endif
 
 status write_all_text_atomic(const path& p, const std::string& text) {
     return write_all_bytes_atomic(
@@ -774,8 +936,16 @@ status copy_file(const path& from, const path& to, bool overwrite) {
         }
         std::size_t off = 0;
         while (off < static_cast<std::size_t>(n)) {
+#if defined(CRPC_TESTING)
+            const ssize_t w =
+                take_zero_write_fault(to.str())
+                    ? emulated_zero_write()
+                    : ::write(out, chunk.data() + off,
+                              static_cast<std::size_t>(n) - off);
+#else
             const ssize_t w = ::write(out, chunk.data() + off,
                                       static_cast<std::size_t>(n) - off);
+#endif
             if (w < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -785,6 +955,15 @@ status copy_file(const path& from, const path& to, bool overwrite) {
                 ::close(out);
                 ::unlink(to.str().c_str());
                 return detail::classify_errno(saved, "copy", from.str());
+            }
+            if (w == 0 && zero_progress_requested(static_cast<std::size_t>(n) - off)) {
+                // Zero bytes transferred for a non-empty request: the inner loop
+                // would spin forever. The partial destination is removed, as on
+                // every other copy failure.
+                ::close(in);
+                ::close(out);
+                ::unlink(to.str().c_str());
+                return zero_progress_error("copy", to.str());
             }
             off += static_cast<std::size_t>(w);
         }
